@@ -11,7 +11,7 @@ The list is based on the survey results and the discussion in wg-etcd-operator. 
 
 ## v0.2.0
 - Upgrade across patches or one minor version
-- Scale in and out, e.g 1 -> 3 -> 5 members and vise versa
+- Scale in and out, e.g 1 -> 3 -> 5 members and vice versa
 - Support customizing etcd options (via flags or env vars)
 
 ## v0.3.0
