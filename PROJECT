@@ -7,4 +7,14 @@ layout:
 - go.kubebuilder.io/v4
 projectName: etcd-operator
 repo: go.etcd.io/etcd-operator
+resources:
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: etcd.io
+  group: clusters
+  kind: EtcdCluster
+  path: go.etcd.io/etcd-operator/api/v1alpha1
+  version: v1alpha1
 version: "3"
