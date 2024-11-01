@@ -1,0 +1,4 @@
+## Append samples of your project ##
+resources:
+- clusters_v1alpha1_etcdcluster.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

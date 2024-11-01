@@ -1,0 +1,23 @@
+# permissions for end users to view etcdclusters.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: etcd-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: etcdcluster-viewer-role
+rules:
+- apiGroups:
+  - clusters.etcd.io
+  resources:
+  - etcdclusters
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - clusters.etcd.io
+  resources:
+  - etcdclusters/status
+  verbs:
+  - get
