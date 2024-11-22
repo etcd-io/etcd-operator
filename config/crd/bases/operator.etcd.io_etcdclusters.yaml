@@ -4,9 +4,9 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.16.4
-  name: etcdclusters.clusters.etcd.io
+  name: etcdclusters.operator.etcd.io
 spec:
-  group: clusters.etcd.io
+  group: operator.etcd.io
   names:
     kind: EtcdCluster
     listKind: EtcdClusterList

@@ -27,7 +27,7 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	clustersv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
+	operatorv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 )
 
 var _ = Describe("EtcdCluster Controller", func() {
@@ -40,13 +40,13 @@ var _ = Describe("EtcdCluster Controller", func() {
 			Name:      resourceName,
 			Namespace: "default", // TODO(user):Modify as needed
 		}
-		etcdcluster := &clustersv1alpha1.EtcdCluster{}
+		etcdcluster := &operatorv1alpha1.EtcdCluster{}
 
 		BeforeEach(func() {
 			By("creating the custom resource for the Kind EtcdCluster")
 			err := k8sClient.Get(ctx, typeNamespacedName, etcdcluster)
 			if err != nil && errors.IsNotFound(err) {
-				resource := &clustersv1alpha1.EtcdCluster{
+				resource := &operatorv1alpha1.EtcdCluster{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      resourceName,
 						Namespace: "default",
@@ -59,7 +59,7 @@ var _ = Describe("EtcdCluster Controller", func() {
 
 		AfterEach(func() {
 			// TODO(user): Cleanup logic after each test, like removing the resource instance.
-			resource := &clustersv1alpha1.EtcdCluster{}
+			resource := &operatorv1alpha1.EtcdCluster{}
 			err := k8sClient.Get(ctx, typeNamespacedName, resource)
 			Expect(err).NotTo(HaveOccurred())
 

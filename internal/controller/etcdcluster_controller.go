@@ -24,7 +24,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	clustersv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
+	operatorv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 )
 
 // EtcdClusterReconciler reconciles a EtcdCluster object
@@ -33,9 +33,9 @@ type EtcdClusterReconciler struct {
 	Scheme *runtime.Scheme
 }
 
-// +kubebuilder:rbac:groups=clusters.etcd.io,resources=etcdclusters,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=clusters.etcd.io,resources=etcdclusters/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=clusters.etcd.io,resources=etcdclusters/finalizers,verbs=update
+// +kubebuilder:rbac:groups=operator.etcd.io,resources=etcdclusters,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=operator.etcd.io,resources=etcdclusters/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=operator.etcd.io,resources=etcdclusters/finalizers,verbs=update
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -45,7 +45,7 @@ type EtcdClusterReconciler struct {
 // the user.
 //
 // For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.19.0/pkg/reconcile
+// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.19.1/pkg/reconcile
 func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	_ = log.FromContext(ctx)
 
@@ -57,7 +57,7 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 // SetupWithManager sets up the controller with the Manager.
 func (r *EtcdClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&clustersv1alpha1.EtcdCluster{}).
+		For(&operatorv1alpha1.EtcdCluster{}).
 		Named("etcdcluster").
 		Complete(r)
 }
