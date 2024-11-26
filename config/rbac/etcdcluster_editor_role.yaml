@@ -8,7 +8,7 @@ metadata:
   name: etcdcluster-editor-role
 rules:
 - apiGroups:
-  - clusters.etcd.io
+  - operator.etcd.io
   resources:
   - etcdclusters
   verbs:
@@ -20,7 +20,7 @@ rules:
   - update
   - watch
 - apiGroups:
-  - clusters.etcd.io
+  - operator.etcd.io
   resources:
   - etcdclusters/status
   verbs:

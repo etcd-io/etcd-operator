@@ -1,4 +1,4 @@
-apiVersion: clusters.etcd.io/v1alpha1
+apiVersion: operator.etcd.io/v1alpha1
 kind: EtcdCluster
 metadata:
   labels:
