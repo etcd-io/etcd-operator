@@ -7,3 +7,12 @@ metadata:
   name: etcdcluster-sample
 spec:
   # TODO(user): Add fields here
+  size: 4
+  version: "3.5.17"
+  tls:
+    member:
+      peerSecret: etcd-peer-tls
+      serverSecret: etcd-server-tls
+    operatorSecret: etcd-client-tls
+    provider: cert-manager
+
