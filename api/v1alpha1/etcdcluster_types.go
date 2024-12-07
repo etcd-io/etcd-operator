@@ -23,6 +23,18 @@ import (
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
 
+type MemberSecrets struct {
+	PeerSecret   string `json:"peerSecret"`
+	ServerSecret string `json:"serverSecret"`
+}
+
+// TLSCertificate defines the certificate issued by the certificate provider
+type TLSCertificate struct {
+	Member         MemberSecrets `json:"member"`
+	OperatorSecret string        `json:"operatorSecret"`
+	Provider       string        `json:"provider"`
+}
+
 // EtcdClusterSpec defines the desired state of EtcdCluster.
 type EtcdClusterSpec struct {
 	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
@@ -31,7 +43,8 @@ type EtcdClusterSpec struct {
 	// Size is the expected size of the etcd cluster.
 	Size int `json:"size"`
 	// Version is the expected version of the etcd container image.
-	Version string `json:"version"`
+	Version string          `json:"version"`
+	TLS     *TLSCertificate `json:"tls,omitempty"`
 }
 
 // EtcdClusterStatus defines the observed state of EtcdCluster.
