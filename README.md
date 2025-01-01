@@ -92,7 +92,7 @@ make build-installer IMG=<some-registry>/etcd-operator:tag
 ```
 
 NOTE: The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
+file in the `config/manifests` directory. This file contains all the resources built
 with Kustomize, which are necessary to install this project without
 its dependencies.
 
@@ -101,7 +101,7 @@ its dependencies.
 Users can just run kubectl apply -f <URL for YAML BUNDLE> to install the project, i.e.:
 
 ```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/etcd-operator/<tag or branch>/dist/install.yaml
+kubectl apply -f https://raw.githubusercontent.com/<org>/etcd-operator/<tag or branch>/config/manifests/install.yaml
 ```
 
 ## Contributing
