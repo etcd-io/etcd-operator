@@ -46,6 +46,28 @@ spec:
                 description: Version is the expected version of the etcd container
                   image.
                 type: string
+              tls:
+                description: TLSCertificate defines the certificate issued by the
+                  certificate provider
+                properties:
+                  member:
+                    properties:
+                      peerSecret:
+                        type: string
+                      serverSecret:
+                        type: string
+                    required:
+                      - peerSecret
+                      - serverSecret
+                    type: object
+                  operatorSecret:
+                    type: string
+                  provider:
+                    type: string
+                required:
+                  - operatorSecret
+                  - provider
+                type: object
             required:
             - size
             - version

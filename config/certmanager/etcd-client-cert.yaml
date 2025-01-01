@@ -1,0 +1,11 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: etcd-client-certificate
+  namespace: etcd-operator-system
+spec:
+  secretName: etcd-client-tls
+  dnsNames:
+    - etcd.etcd-operator-system
+  issuerRef:
+    name: etcd-operator-selfsigned

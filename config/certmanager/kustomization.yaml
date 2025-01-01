@@ -1,0 +1,5 @@
+resources:
+- cert-manager_issuer.yaml
+- etcd-peer-cert.yaml
+- etcd-server-cert.yaml
+- etcd-client-cert.yaml
