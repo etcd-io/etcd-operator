@@ -20,13 +20,11 @@ import (
 	"context"
 	"fmt"
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
-	"go.etcd.io/etcd-operator/internal/etcd"
+	"go.etcd.io/etcd-operator/internal/etcdutils"
 	"go.etcd.io/etcd-operator/internal/utils"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	appsv1 "k8s.io/api/apps/v1"
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
@@ -34,7 +32,6 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
-	"strings"
 	"time"
 )
 
@@ -58,6 +55,10 @@ const (
 // +kubebuilder:rbac:groups=operator.etcd.io,resources=etcdclusters,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=operator.etcd.io,resources=etcdclusters/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=operator.etcd.io,resources=etcdclusters/finalizers,verbs=update
+// +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -72,9 +73,9 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	logger := log.FromContext(ctx)
 
 	// Fetch the EtcdCluster resource
-	var etcdCluster ecv1alpha1.EtcdCluster
+	etcdCluster := &ecv1alpha1.EtcdCluster{}
 
-	err := r.Get(ctx, req.NamespacedName, &etcdCluster)
+	err := r.Get(ctx, req.NamespacedName, etcdCluster)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			logger.Info("EtcdCluster resource not found. Ignoring since object may have been deleted")
@@ -110,27 +111,40 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		}
 	}*/
 
-	logger.Info("Reconciling EtcdCluster", "spec", etcdCluster.Spec)
+	//logger.Info("Reconciling EtcdCluster", "spec", etcdCluster.Spec)
 
 	// Get the statefulsets which has the same name as the EtcdCluster resource
 	stsName := types.NamespacedName{Name: etcdCluster.Name, Namespace: etcdCluster.Namespace}
-	var sts appsv1.StatefulSet
-	err = r.Get(ctx, stsName, &sts)
+	sts := &appsv1.StatefulSet{}
+	err = r.Get(ctx, stsName, sts)
 	if err != nil && errors.IsNotFound(err) {
 		if etcdCluster.Spec.Size > 0 {
 			logger.Info("Creating StatefulSet with 0 replica", "expectedSize", etcdCluster.Spec.Size)
-			status, errCreateSS := utils.CreateOrUpdateStatefulSet(ctx, r.Client, r.Scheme, &etcdCluster, 0)
-			if errCreateSS != nil {
-				logger.Error(err, "Failed to create StatefulSet")
-				return ctrl.Result{}, errCreateSS
+			// Create a new StatefulSet
+
+			err := utils.CreateOrPatchSS(ctx, logger, etcdCluster, &r.Client, 0, r.Scheme)
+			if err != nil {
+				return ctrl.Result{}, err
 			}
-			logger.Info(fmt.Sprintf("StatefulSet %s successfully", status))
+
+			/*err = controllerutil.SetControllerReference(etcdCluster, sts, r.Scheme)
+			if err != nil {
+				return ctrl.Result{}, err
+			}*/
 
 			logger.Info("Now checking StatefulSet's readiness")
-			if !ready(&sts, 0) {
+			if !ready(sts, 0) {
 				logger.Info("StatefulSet not ready", "readyReplicas", sts.Status.ReadyReplicas, "expected", 0)
 				return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 			}
+
+			logger.Info("Creating Headless service to target this statefulset")
+			// Create a headless service to target the statefulset
+			err = utils.CreateHeadlessServiceIfDoesntExist(ctx, logger, r.Client, etcdCluster, r.Scheme)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+
 		} else {
 			// Shouldn't ideally happen, just a safety net
 			logger.Info("Skipping creating statefulsets due to the expected cluster size being 0")
@@ -148,13 +162,48 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 	// If the Statefulsets is not controlled by this EtcdCluster resource, we should log
 	// a warning to the event recorder and return error msg.
-	if !metav1.IsControlledBy(&sts, &etcdCluster) {
-		msg := fmt.Sprintf(MessageResourceExists, sts.Name)
-		r.Recorder.Event(&etcdCluster, corev1.EventTypeWarning, ErrResourceExists, msg)
-		return ctrl.Result{}, fmt.Errorf("%s", msg)
+	err = utils.CheckStatefulSetControlledByEtcdOperator(ctx, r.Client, etcdCluster)
+	if err != nil {
+		logger.Error(err, "StatefulSet is not controlled by this EtcdCluster resource")
+		return ctrl.Result{}, err
 	}
 
-	memberListResp, healthInfos, err := healthCheck(&etcdCluster, &sts, logger)
+	// If statefulset size is 0. try to instantiate the cluster with 1 member
+	if sts.Spec.Replicas != nil && *sts.Spec.Replicas == 0 && etcdCluster.Spec.Size > 0 {
+		logger.Info("StatefulSet has 0 replicas. Trying to create a new cluster with 1 member")
+
+		//err := scaleStatefulSetToDesiredReplicas(ctx, logger, sts, stsName, etcdCluster, 1, r)
+		err := utils.CreateOrPatchSS(ctx, logger, etcdCluster, &r.Client, 1, r.Scheme)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+
+	}
+
+	ssReady, err := utils.WaitForStatefulSetReady(ctx, logger, r.Client, etcdCluster.Name, etcdCluster.Namespace)
+	// This will be a loop to check the status of the statefulset and proceed only when the statefulset is ready
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if !ssReady {
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	// Just a safety net to check service before we do health checks
+	err = utils.CreateHeadlessServiceIfDoesntExist(ctx, logger, r.Client, etcdCluster, r.Scheme)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// Get latest object before proceeding
+	err = r.Get(ctx, stsName, sts)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	logger.Info("Now checking health of the cluster members")
+	memberListResp, healthInfos, err := healthCheck(etcdCluster, sts, logger)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("health check failed: %w", err)
 	}
@@ -163,125 +212,281 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if memberListResp != nil {
 		memberCnt = len(memberListResp.Members)
 	}
-	replica := int(*sts.Spec.Replicas)
-
-	if replica != memberCnt {
-		// TODO: finish the logic later
-		if replica < memberCnt {
-			// a new added learner hasn't started yet
-
-			// re-generate configuration for the new learner member;
-			// increase statefulsets's replica by 1
-		} else {
-			// an already removed member hasn't stopped yet.
-
-			// Decrease the statefulsets's replica by 1
-		}
-		// return
-	}
-
-	if memberCnt != len(healthInfos) {
+	/*if memberCnt != len(healthInfos) {
+		// Only proceed when all members are healthy
 		return ctrl.Result{}, fmt.Errorf("memberCnt (%d) isn't equal to healthy member count (%d)", memberCnt, len(healthInfos))
-	}
+	}*/
 
-	// There should be at most one learner, namely the last one
-	if memberCnt > 0 && healthInfos[memberCnt-1].Status.IsLearner {
-		logger = logger.WithValues("replica", replica, "expectedSize", etcdCluster.Spec.Size)
-
-		learnerStatus := healthInfos[memberCnt-1].Status
-
-		var leaderStatus *clientv3.StatusResponse
-		for i := 0; i < memberCnt-1; i++ {
+	var learnerStatus *clientv3.StatusResponse
+	var learner uint64
+	var leader uint64
+	var leaderStatus *clientv3.StatusResponse
+	if memberCnt > 0 {
+		// Find the leader status
+		for i := range healthInfos {
 			status := healthInfos[i].Status
 			if status.Leader == status.Header.MemberId {
+				leader = status.Header.MemberId
 				leaderStatus = status
 				break
 			}
 		}
 
 		if leaderStatus == nil {
+			// If the leader is not available, let's wait for the leader to be elected
 			return ctrl.Result{}, fmt.Errorf("couldn't find leader, memberCnt: %d", memberCnt)
-		}
-
-		learnerID := healthInfos[memberCnt-1].Status.Header.MemberId
-		if isLearnerReady(leaderStatus, learnerStatus) {
-			logger.Info("Promoting the learner member", "learnerID", learnerID)
-			eps := clientEndpointsFromStatefulsets(&sts)
-			eps = eps[:(len(eps) - 1)]
-			err = etcd.PromoteLearner(eps, learnerID)
-			if err != nil {
-				return ctrl.Result{}, err
-			}
-		}
-
-		logger.Info("The learner member isn't ready to be promoted yet", "learnerID", learnerID)
-
-		return ctrl.Result{}, nil
-	}
-
-	expectedSize := etcdCluster.Spec.Size
-	if replica == expectedSize {
-		// TODO: check version change, and perform upgrade if needed.
-		return ctrl.Result{}, nil
-	}
-
-	var targetReplica int32
-	if replica < expectedSize {
-		// scale out
-		targetReplica = int32(replica + 1)
-		logger = logger.WithValues("targetReplica", targetReplica, "expectedSize", etcdCluster.Spec.Size)
-
-		// TODO: check PV & PVC for the new member. If they already exist,
-		// then it means they haven't been cleaned up yet when scaling in.
-
-		_, peerURL := utils.PeerEndpointForOrdinalIndex(&etcdCluster, replica)
-		if replica > 0 {
-			// if replica == 0, then it's the very first member, then
-			// there is no need to add it as a learner; instead we can
-			// start it as a voting member directly.
-			eps := clientEndpointsFromStatefulsets(&sts)
-			logger.Info("[Scale out] adding a new learner member", "peerURLs", peerURL)
-			if _, err := etcd.AddMember(eps, []string{peerURL}, true); err != nil {
-				return ctrl.Result{}, err
-			}
 		} else {
-			logger.Info("[Scale out] Starting the very first voting member", "peerURLs", peerURL)
+			logger.Info("Leader found", "leaderID", leader)
 		}
-	} else {
+
+		logger.Info("Now checking if there is any pending learner member that needs to be promoted")
+		for i := range healthInfos {
+			if healthInfos[i].Status.IsLearner {
+				learner = healthInfos[i].Status.Header.MemberId
+				learnerStatus = healthInfos[i].Status
+				logger.Info("Learner member found", "memberID", learner)
+				break
+			}
+		}
+	}
+
+	//  Check if the size of the stateful set is less than expected size
+	//  Or if there is a pending learner to be promoted
+	ssSize, err := utils.IsStatefulSetDesiredSize(ctx, etcdCluster, r.Client)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if ssSize == utils.SSSmallerThanDesired || learner > 0 {
+		// There should be at most one learner
+		if memberCnt > 0 {
+			if learner == 0 {
+				// If there is no more learner, then we can proceed to scale the cluster further.
+				// If there is no more member to add, the control will not reach here after the requeue
+
+				targetReplica := int(*sts.Spec.Replicas) + 1
+				_, peerURL := utils.PeerEndpointForOrdinalIndex(etcdCluster, int(*sts.Spec.Replicas)) // The index starts at 0, so we do not need to add 1
+				eps := clientEndpointsFromStatefulsets(sts)
+				logger.Info("[Scale out] adding a new learner member to etcd cluster", "peerURLs", peerURL)
+				if _, err := etcdutils.AddMember(eps, []string{peerURL}, true); err != nil {
+					return ctrl.Result{}, err
+				}
+
+				logger.Info("Learner member added successfully", "peerURLs", peerURL)
+
+				//err := scaleStatefulSetToDesiredReplicas(ctx, logger, sts, stsName, etcdCluster, targetReplica, r)
+				err := utils.CreateOrPatchSS(ctx, logger, etcdCluster, &r.Client, int32(targetReplica), r.Scheme)
+				if err != nil {
+					return ctrl.Result{}, err
+				}
+			} else {
+				// There is at least one learner. Let's try to promote it or wait
+				// Find the learner status
+				logger.Info("Learner found", "learnedID", learner)
+				//logger.Info("There is a learner promotion pending..will wait for it to be promoted before moving further", "learnerID", learner)
+				logger.Info("Learner status", "learnerStatus", learnerStatus)
+				if isLearnerReady(leaderStatus, learnerStatus) {
+					logger.Info("Learner is ready to be promoted to voting member", "learnerID", learner)
+					logger.Info("Promoting the learner member", "learnerID", learner)
+					eps := clientEndpointsFromStatefulsets(sts)
+					eps = eps[:(len(eps) - 1)]
+					err = etcdutils.PromoteLearner(eps, learner)
+					if err != nil {
+						// The member is not promoted yet, so we error out
+						return ctrl.Result{}, err
+					}
+				} else {
+					// Learner is not yet ready. We can't add another learner until this one is promoted
+					// So let's requeue
+					logger.Info("The learner member isn't ready to be promoted yet", "learnerID", learner)
+					return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+				}
+			}
+		}
+	}
+
+	if ssSize == utils.SSBiggerThanDesired {
 		// scale in
-		targetReplica = int32(replica - 1)
+		targetReplica := int(*sts.Spec.Replicas) - 1
 		logger = logger.WithValues("targetReplica", targetReplica, "expectedSize", etcdCluster.Spec.Size)
 
 		memberID := healthInfos[memberCnt-1].Status.Header.MemberId
 
 		logger.Info("[Scale in] removing one member", "memberID", memberID)
-		eps := clientEndpointsFromStatefulsets(&sts)
+		eps := clientEndpointsFromStatefulsets(sts)
 		eps = eps[:targetReplica]
-		if err := etcd.RemoveMember(eps, memberID); err != nil {
+		if err := etcdutils.RemoveMember(eps, memberID); err != nil {
+			return ctrl.Result{}, err
+		}
+		//err := scaleStatefulSetToDesiredReplicas(ctx, logger, sts, stsName, etcdCluster, targetReplica, r)
+		err := utils.CreateOrPatchSS(ctx, logger, etcdCluster, &r.Client, int32(targetReplica), r.Scheme)
+		if err != nil {
 			return ctrl.Result{}, err
 		}
 	}
 
-	logger.Info("Applying etcd cluster state")
-	if err := applyEtcdClusterState(ctx, &etcdCluster, int(targetReplica), r.Client); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	logger.Info("Updating statefulsets")
-	_, err = utils.CreateOrUpdateStatefulSet(ctx, r.Client, r.Scheme, &etcdCluster, targetReplica)
+	allMembersHealthy, err := areAllMembersHealthy(etcdCluster, sts, logger)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// Emit event for successful reconciliation
-	r.Recorder.Eventf(&etcdCluster, corev1.EventTypeNormal, "Reconcile", "Reconciled StatefulSet for EtcdCluster %s", etcdCluster.Name)
+	ssReady, err = utils.WaitForStatefulSetReady(ctx, logger, r.Client, etcdCluster.Name, etcdCluster.Namespace)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
 
-	logger.Info("Reconciliation completed successfully", "name", etcdCluster.Name)
+	ssSize, err = utils.IsStatefulSetDesiredSize(ctx, etcdCluster, r.Client)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if ssSize != utils.SSEqualToDesired || !ssReady || !allMembersHealthy {
+		// Requeue if the statefulset size is not equal to the expected size of ETCD cluster
+		// Or if the statefulset is not ready
+		// Or if all members of the cluster are not healthy
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	logger.Info("EtcdCluster reconciled successfully")
 	return ctrl.Result{}, nil
+
+	/*
+		// Now that it's guaranteed that the statefulset is ready, let's check the health of the members
+		memberListResp, healthInfos, err := healthCheck(etcdCluster, sts, logger)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("health check failed: %w", err)
+		}
+
+		memberCnt := 0
+		if memberListResp != nil {
+			memberCnt = len(memberListResp.Members)
+		}
+
+		replica := int(*sts.Spec.Replicas)
+
+		if replica != memberCnt {
+			// TODO: finish the logic later
+			if replica < memberCnt {
+				// a new added learner hasn't started yet
+
+				// re-generate configuration for the new learner member;
+				// increase statefulsets's replica by 1
+			} else {
+				// an already removed member hasn't stopped yet.
+
+				// Decrease the statefulsets's replica by 1
+			}
+			// return
+		}
+
+		if memberCnt != len(healthInfos) {
+			return ctrl.Result{}, fmt.Errorf("memberCnt (%d) isn't equal to healthy member count (%d)", memberCnt, len(healthInfos))
+		}
+
+		// There should be at most one learner, namely the last one
+		if memberCnt > 0 && healthInfos[memberCnt-1].Status.IsLearner {
+			logger = logger.WithValues("replica", replica, "expectedSize", etcdCluster.Spec.Size)
+
+			learnerStatus := healthInfos[memberCnt-1].Status
+
+			var leaderStatus *clientv3.StatusResponse
+			for i := 0; i < memberCnt-1; i++ {
+				status := healthInfos[i].Status
+				if status.Leader == status.Header.MemberId {
+					leaderStatus = status
+					break
+				}
+			}
+
+			if leaderStatus == nil {
+				return ctrl.Result{}, fmt.Errorf("couldn't find leader, memberCnt: %d", memberCnt)
+			}
+
+			learnerID := healthInfos[memberCnt-1].Status.Header.MemberId
+			if isLearnerReady(leaderStatus, learnerStatus) {
+				logger.Info("Promoting the learner member", "learnerID", learnerID)
+				eps := clientEndpointsFromStatefulsets(sts)
+				eps = eps[:(len(eps) - 1)]
+				err = etcdutils.PromoteLearner(eps, learnerID)
+				if err != nil {
+					return ctrl.Result{}, err
+				}
+			}
+
+			logger.Info("The learner member isn't ready to be promoted yet", "learnerID", learnerID)
+
+			return ctrl.Result{}, nil
+		}
+
+		expectedSize := etcdCluster.Spec.Size
+		if replica == expectedSize {
+			// TODO: check version change, and perform upgrade if needed.
+			return ctrl.Result{}, nil
+		}
+
+		var targetReplica int32
+
+		if replica < expectedSize {
+			// scale out
+			targetReplica = int32(replica + 1)
+			logger = logger.WithValues("targetReplica", targetReplica, "expectedSize", etcdCluster.Spec.Size)
+
+			// TODO: check PV & PVC for the new member. If they already exist,
+			// then it means they haven't been cleaned up yet when scaling in.
+
+			_, peerURL := utils.PeerEndpointForOrdinalIndex(etcdCluster, replica)
+			if replica > 0 {
+				// if replica == 0, then it's the very first member, then
+				// there is no need to add it as a learner; instead we can
+				// start it as a voting member directly.
+				eps := clientEndpointsFromStatefulsets(sts)
+				logger.Info("[Scale out] adding a new learner member", "peerURLs", peerURL)
+				if _, err := etcdutils.AddMember(eps, []string{peerURL}, true); err != nil {
+					return ctrl.Result{}, err
+				}
+			} else {
+				logger.Info("[Scale out] Starting the very first voting member", "peerURLs", peerURL)
+			}
+		} else {
+			// scale in
+			targetReplica = int32(replica - 1)
+			logger = logger.WithValues("targetReplica", targetReplica, "expectedSize", etcdCluster.Spec.Size)
+
+			memberID := healthInfos[memberCnt-1].Status.Header.MemberId
+
+			logger.Info("[Scale in] removing one member", "memberID", memberID)
+			eps := clientEndpointsFromStatefulsets(sts)
+			eps = eps[:targetReplica]
+			if err := etcdutils.RemoveMember(eps, memberID); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+
+		logger.Info("Applying etcd cluster state")
+		if err := applyEtcdClusterState(ctx, etcdCluster, int(targetReplica), r.Client); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		logger.Info("Updating statefulsets")
+		// Get latest object before Updating
+		err = r.Get(ctx, stsName, sts)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		// Update the Statefulsets size to the expected size
+		sts.Spec.Replicas = &targetReplica
+		err = r.Client.Update(ctx, sts)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+
+		// Emit event for successful reconciliation
+		r.Recorder.Eventf(etcdCluster, corev1.EventTypeNormal, "Reconcile", "Reconciled StatefulSet for EtcdCluster %s", etcdCluster.Name)
+	*/
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *EtcdClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	r.Recorder = mgr.GetEventRecorderFor("etcdcluster-controller")
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&ecv1alpha1.EtcdCluster{}).
 		Owns(&appsv1.StatefulSet{}).
@@ -303,7 +508,7 @@ func (r *EtcdClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // healthCheck returns a memberList and an error.
 // If any member (excluding not yet started or already removed member)
 // is unhealthy, the error won't be nil.
-func healthCheck(etcdCluster *ecv1alpha1.EtcdCluster, sts *appsv1.StatefulSet, lg klog.Logger) (*clientv3.MemberListResponse, []etcd.EpHealth, error) {
+func healthCheck(etcdCluster *ecv1alpha1.EtcdCluster, sts *appsv1.StatefulSet, lg klog.Logger) (*clientv3.MemberListResponse, []etcdutils.EpHealth, error) {
 	replica := int(*sts.Spec.Replicas)
 	if replica == 0 {
 		return nil, nil, nil
@@ -311,7 +516,7 @@ func healthCheck(etcdCluster *ecv1alpha1.EtcdCluster, sts *appsv1.StatefulSet, l
 
 	endpoints := clientEndpointsFromStatefulsets(sts)
 
-	memberlistResp, err := etcd.MemberList(endpoints)
+	memberlistResp, err := etcdutils.MemberList(endpoints)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -327,7 +532,7 @@ func healthCheck(etcdCluster *ecv1alpha1.EtcdCluster, sts *appsv1.StatefulSet, l
 	lg.Info("health checking", "replica", replica, "len(members)", memberCnt)
 	endpoints = endpoints[:cnt]
 
-	healthInfos, err := etcd.ClusterHealth(endpoints)
+	healthInfos, err := etcdutils.ClusterHealth(endpoints)
 	if err != nil {
 		return memberlistResp, nil, err
 	}
@@ -359,32 +564,6 @@ func clientEndpointForOrdinalIndex(sts *appsv1.StatefulSet, index int) string {
 		sts.Name, index, sts.Name, sts.Namespace)
 }
 
-func newEtcdClusterState(ec *ecv1alpha1.EtcdCluster, replica int) *corev1.ConfigMap {
-	// We always add members one by one, so the state is always
-	// "existing" if replica > 1.
-	state := "new"
-	if replica > 1 {
-		state = "existing"
-	}
-
-	var initialCluster []string
-	for i := 0; i < replica; i++ {
-		name, peerURL := utils.PeerEndpointForOrdinalIndex(ec, i)
-		initialCluster = append(initialCluster, fmt.Sprintf("%s=%s", name, peerURL))
-	}
-
-	return &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      utils.ConfigMapNameForEtcdCluster(ec),
-			Namespace: ec.Namespace,
-		},
-		Data: map[string]string{
-			"ETCD_INITIAL_CLUSTER_STATE": state,
-			"ETCD_INITIAL_CLUSTER":       strings.Join(initialCluster, ","),
-		},
-	}
-}
-
 func isLearnerReady(leaderStatus, learnerStatus *clientv3.StatusResponse) bool {
 	leaderRev := leaderStatus.Header.Revision
 	learnerRev := learnerStatus.Header.Revision
@@ -393,19 +572,48 @@ func isLearnerReady(leaderStatus, learnerStatus *clientv3.StatusResponse) bool {
 	return learnerReadyPercent >= 0.9
 }
 
-func applyEtcdClusterState(ctx context.Context, ec *ecv1alpha1.EtcdCluster, replica int, c client.Client) error {
-	cm := newEtcdClusterState(ec, replica)
-
-	err := c.Get(ctx, types.NamespacedName{Name: utils.ConfigMapNameForEtcdCluster(ec), Namespace: ec.Namespace}, &corev1.ConfigMap{})
-	if err != nil && errors.IsNotFound(err) {
-		createErr := c.Create(ctx, cm)
-		return createErr
+/*func scaleStatefulSetToDesiredReplicas(ctx context.Context, logger logr.Logger, sts *appsv1.StatefulSet, stsName types.NamespacedName, etcdCluster *ecv1alpha1.EtcdCluster, targetReplica int, r *EtcdClusterReconciler) error {
+	logger.Info("Applying etcd cluster state")
+	err := applyEtcdClusterState(ctx, etcdCluster, targetReplica, r.Client)
+	if err != nil {
+		return err
 	}
 
-	if err != nil && !errors.IsNotFound(err) {
-		return fmt.Errorf("cannot find ConfigMap for EtcdCluster %s: %w", ec.Name, err)
+	// Get latest object before Updating
+
+	err = r.Get(ctx, stsName, sts)
+	if err != nil {
+		return err
 	}
 
-	updateErr := c.Update(ctx, cm)
-	return updateErr
+	logger.Info("Patching statefulsets to desired size of %d replicas", targetReplica)
+	patch := sts.DeepCopy()
+	patch.Spec.Replicas = utils.IntToInt32Ptr(targetReplica)
+	// Update the Statefulsets size to the expected size
+	err = r.Client.Patch(ctx, patch, client.MergeFrom(sts))
+	if err != nil {
+		return err
+	}
+	return nil
+}*/
+
+/*func isStatefulSetReady(sts *appsv1.StatefulSet, logger logr.Logger) bool {
+	// This will be a loop to check the status of the statefulset and proceed only when the statefulset is ready
+	if err := utils.WaitForStatefulSetReady()
+	logger.Info("StatefulSet not ready", "readyReplicas", sts.Status.ReadyReplicas, "expected", *sts.Spec.Replicas)
+	return false
+}*/
+
+func areAllMembersHealthy(etcdCluster *ecv1alpha1.EtcdCluster, sts *appsv1.StatefulSet, logger klog.Logger) (bool, error) {
+	_, health, err := healthCheck(etcdCluster, sts, logger)
+	if err != nil {
+		return false, err
+	}
+
+	for _, h := range health {
+		if !h.Health {
+			return false, nil
+		}
+	}
+	return true, nil
 }

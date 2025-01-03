@@ -1,7 +1,8 @@
-package etcd
+package etcdutils
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	"go.etcd.io/etcd/client/pkg/v3/logutil"
@@ -112,7 +113,7 @@ func ClusterHealth(eps []string) ([]EpHealth, error) {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			_, err = cli.Get(ctx, "health", clientv3.WithSerializable())
 			eh := EpHealth{Ep: ep, Health: false, Took: time.Since(startTs).String()}
-			if err == nil || err == rpctypes.ErrPermissionDenied {
+			if err == nil || errors.Is(err, rpctypes.ErrPermissionDenied) {
 				eh.Health = true
 			} else {
 				eh.Error = err.Error()
@@ -145,31 +146,6 @@ func ClusterHealth(eps []string) ([]EpHealth, error) {
 	sort.Sort(healthReport(healthList))
 
 	return healthList, nil
-}
-
-func memberStatus(ep string) (*clientv3.StatusResponse, error) {
-	cfg := clientv3.Config{
-		Endpoints:            []string{ep},
-		DialTimeout:          2 * time.Second,
-		DialKeepAliveTime:    2 * time.Second,
-		DialKeepAliveTimeout: 6 * time.Second,
-	}
-
-	c, err := clientv3.New(cfg)
-	if err != nil {
-		return nil, err
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer func() {
-		err := c.Close()
-		if err != nil {
-			return
-		}
-		cancel()
-	}()
-
-	return c.Status(ctx, ep)
 }
 
 func AddMember(eps []string, peerURLs []string, learner bool) (*clientv3.MemberAddResponse, error) {
