@@ -35,7 +35,7 @@ import (
 )
 
 const (
-	RequeueDuration = 10 * time.Second
+	requeueDuration = 10 * time.Second
 )
 
 // EtcdClusterReconciler reconciles a EtcdCluster object
@@ -102,7 +102,7 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			// attempt processing again later. This could have been caused by a
 			// temporary network failure, or any other transient reason.
 			logger.Error(err, "Failed to get StatefulSet. Requesting requeue")
-			return ctrl.Result{RequeueAfter: RequeueDuration}, nil
+			return ctrl.Result{RequeueAfter: requeueDuration}, nil
 		}
 	}
 
@@ -139,10 +139,22 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if memberListResp != nil {
 		memberCnt = len(memberListResp.Members)
 	}
+	targetReplica := *sts.Spec.Replicas // Start with the current size of the stateful set
 
-	if memberCnt != len(healthInfos) {
-		// Only proceed when all members are healthy
-		return ctrl.Result{}, fmt.Errorf("memberCnt (%d) isn't equal to healthy member count (%d)", memberCnt, len(healthInfos))
+	// TODO: finish the logic later
+	if int(targetReplica) != memberCnt {
+		// TODO: finish the logic later
+		if int(targetReplica) < memberCnt {
+			// a new added learner hasn't started yet
+
+			// re-generate configuration for the new learner member;
+			// increase statefulsets's replica by 1
+		} else {
+			// an already removed member hasn't stopped yet.
+
+			// Decrease the statefulsets's replica by 1
+		}
+		// return
 	}
 
 	var (
@@ -154,14 +166,12 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if memberCnt > 0 {
 		// Find the leader status
 		_, leaderStatus = etcdutils.FindLeaderStatus(healthInfos, logger)
-
 		if leaderStatus == nil {
 			// If the leader is not available, let's wait for the leader to be elected
 			return ctrl.Result{}, fmt.Errorf("couldn't find leader, memberCnt: %d", memberCnt)
 		}
 
 		learner, learnerStatus = etcdutils.FindLearnerStatus(healthInfos, logger)
-
 		if learner > 0 {
 			// There is at least one learner. Let's try to promote it or wait
 			// Find the learner status
@@ -180,35 +190,22 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 				// Learner is not yet ready. We can't add another learner or proceed further until this one is promoted
 				// So let's requeue
 				logger.Info("The learner member isn't ready to be promoted yet", "learnerID", learner)
-				return ctrl.Result{RequeueAfter: RequeueDuration}, nil
+				return ctrl.Result{RequeueAfter: requeueDuration}, nil
 			}
 		}
 	}
 
-	targetReplica := *sts.Spec.Replicas // Start with the current size of the stateful set
-	eps := clientEndpointsFromStatefulsets(sts)
-
-	// TODO: finish the logic later
-	if int(targetReplica) != memberCnt {
-		// TODO: finish the logic later
-		if int(targetReplica) < memberCnt {
-			// a new added learner hasn't started yet
-
-			// re-generate configuration for the new learner member;
-			// increase statefulsets's replica by 1
-		} else {
-			// an already removed member hasn't stopped yet.
-
-			// Decrease the statefulsets's replica by 1
-		}
-		// return
+	if targetReplica == int32(etcdCluster.Spec.Size) {
+		logger.Info("EtcdCluster is already up-to-date")
+		return ctrl.Result{}, nil
 	}
 
-	//  Check if the size of the stateful set is less than expected size
-	if targetReplica < int32(etcdCluster.Spec.Size) {
-		// If there is no more learner, then we can proceed to scale the cluster further.
-		// If there is no more member to add, the control will not reach here after the requeue
+	eps := clientEndpointsFromStatefulsets(sts)
 
+	// If there is no more learner, then we can proceed to scale the cluster further.
+	// If there is no more member to add, the control will not reach here after the requeue
+	if targetReplica < int32(etcdCluster.Spec.Size) {
+		// scale out
 		_, peerURL := peerEndpointForOrdinalIndex(etcdCluster, int(targetReplica)) // The index starts at 0, so we should do this before incrementing targetReplica
 		targetReplica++
 		logger.Info("[Scale out] adding a new learner member to etcd cluster", "peerURLs", peerURL)
@@ -217,10 +214,7 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		}
 
 		logger.Info("Learner member added successfully", "peerURLs", peerURL)
-	}
-
-	//  Check if the size of the stateful set is bigger than expected size
-	if targetReplica > int32(etcdCluster.Spec.Size) {
+	} else {
 		// scale in
 		targetReplica--
 		logger = logger.WithValues("targetReplica", targetReplica, "expectedSize", etcdCluster.Spec.Size)
@@ -247,7 +241,7 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if *sts.Spec.Replicas != int32(etcdCluster.Spec.Size) || !allMembersHealthy {
 		// Requeue if the statefulset size is not equal to the expected size of ETCD cluster
 		// Or if all members of the cluster are not healthy
-		return ctrl.Result{RequeueAfter: RequeueDuration}, nil
+		return ctrl.Result{RequeueAfter: requeueDuration}, nil
 	}
 
 	logger.Info("EtcdCluster reconciled successfully")
