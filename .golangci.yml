@@ -42,6 +42,8 @@ linters:
     - unused
 
 linters-settings:
+  goimports:
+    local-prefixes: go.etcd.io # Put imports beginning with prefix after 3rd-party packages.
   revive:
     rules:
       - name: comment-spacings
