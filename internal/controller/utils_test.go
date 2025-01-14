@@ -8,10 +8,6 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/assert"
-	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
-	"go.etcd.io/etcd-operator/internal/etcdutils"
-	"go.etcd.io/etcd/api/v3/etcdserverpb"
-	clientv3 "go.etcd.io/etcd/client/v3"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -21,6 +17,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
+	"go.etcd.io/etcd-operator/internal/etcdutils"
+	"go.etcd.io/etcd/api/v3/etcdserverpb"
+	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 func TestMain(m *testing.M) {

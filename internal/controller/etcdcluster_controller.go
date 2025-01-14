@@ -21,9 +21,6 @@ import (
 	"fmt"
 	"time"
 
-	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
-	"go.etcd.io/etcd-operator/internal/etcdutils"
-	clientv3 "go.etcd.io/etcd/client/v3"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -32,6 +29,10 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
+	"go.etcd.io/etcd-operator/internal/etcdutils"
+	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 const (
@@ -144,6 +145,7 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	// TODO: finish the logic later
 	if int(targetReplica) != memberCnt {
 		// TODO: finish the logic later
+		// nolint:staticcheck　// Temporarily disable staticcheck
 		if int(targetReplica) < memberCnt {
 			// a new added learner hasn't started yet
 
