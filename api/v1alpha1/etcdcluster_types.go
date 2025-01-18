@@ -36,6 +36,7 @@ type EtcdClusterSpec struct {
 	Version string `json:"version"`
 	// StorageSpec is the name of the StorageSpec to use for the etcd cluster. If not provided, then each POD just uses the temporary storage inside the container.
 	StorageSpec *StorageSpec `json:"storageSpec,omitempty"`
+<<<<<<< HEAD
 	// TLS is the TLS certificate configuration to use for the etcd cluster and etcd operator.
 	TLS *TLSCertificate `json:"tls,omitempty"`
 }
@@ -54,6 +55,8 @@ type ProviderAutoConfig struct {
 }
 
 type ProviderCertManagerConfig struct {
+=======
+>>>>>>> ce09237 (Support data persistent: integrate with storageClass)
 }
 
 // EtcdClusterStatus defines the observed state of EtcdCluster.
