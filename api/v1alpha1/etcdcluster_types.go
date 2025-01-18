@@ -17,6 +17,8 @@ limitations under the License.
 package v1alpha1
 
 import (
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -32,6 +34,8 @@ type EtcdClusterSpec struct {
 	Size int `json:"size"`
 	// Version is the expected version of the etcd container image.
 	Version string `json:"version"`
+	// StorageSpec is the name of the StorageSpec to use for the etcd cluster. If not provided, then each POD just uses the temporary storage inside the container.
+	StorageSpec *StorageSpec `json:"storageSpec,omitempty"`
 }
 
 // EtcdClusterStatus defines the observed state of EtcdCluster.
@@ -59,6 +63,14 @@ type EtcdClusterList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []EtcdCluster `json:"items"`
+}
+
+type StorageSpec struct {
+	AccessModes       corev1.PersistentVolumeAccessMode `json:"accessModes,omitempty"`      // `ReadWriteOnce` (default) or `ReadWriteMany`. Note that `ReadOnlyMany` isn't allowed.
+	StorageClassName  string                            `json:"storageClassName,omitempty"` // optional, the default one will be used if not specified
+	PVCName           string                            `json:"pvcName,omitempty"`          // optional, only used when access mode is ReadWriteMany
+	VolumeSizeRequest resource.Quantity                 `json:"volumeSizeRequest"`          // required.
+	VolumeSizeLimit   resource.Quantity                 `json:"volumeSizeLimit,omitempty"`  // optional
 }
 
 func init() {
