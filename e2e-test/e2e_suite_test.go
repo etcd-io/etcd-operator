@@ -24,7 +24,6 @@ import (
 	"testing"
 	"time"
 
-	// "sigs.k8s.io/e2e-framework/klient"
 	"sigs.k8s.io/e2e-framework/klient/wait"
 	"sigs.k8s.io/e2e-framework/klient/wait/conditions"
 	"sigs.k8s.io/e2e-framework/pkg/env"
@@ -32,7 +31,6 @@ import (
 	"sigs.k8s.io/e2e-framework/pkg/envfuncs"
 	"sigs.k8s.io/e2e-framework/support/kind"
 	"sigs.k8s.io/e2e-framework/support/utils"
-	// "go.etcd.io/etcd-operator/test/utils"
 )
 
 var (
