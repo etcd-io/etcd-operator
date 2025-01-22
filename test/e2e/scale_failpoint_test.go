@@ -1,8 +1,10 @@
 package e2e
 
 import (
+	"encoding/json"
 	"fmt"
 	"os/exec"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -10,214 +12,233 @@ import (
 
 	"go.etcd.io/etcd-operator/test/utils"
 	gofail "go.etcd.io/gofail/runtime"
+
+	appsv1 "k8s.io/api/apps/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	operatorv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 )
 
-var _ = Describe("Manager", Label("failpoint"), Ordered, func() {
-	// Temp
-	err := gofail.Enable("CrashAfterAddMember", `return("hello")`)
-	if err != nil {
-		fmt.Println("Failed to enable failpoint")
-	}
-	var controllerPodName string
+var _ = Describe("Scale scenarios with failpoints", Ordered, Label("failpoint"), func() {
 
-	// Before running the tests, set up the environment by creating the namespace,
-	// installing CRDs, and deploying the controller.
+	var (
+		controllerPodName string
+		etcdClusterName   = "failpoint-test"
+	)
+
 	BeforeAll(func() {
-		By("creating manager namespace")
+		By("creating test namespace if not exists")
 		cmd := exec.Command("kubectl", "create", "ns", namespace)
-		_, err := utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to create namespace")
+		_, _ = utils.Run(cmd) // Ignore the error (if there is one already)
 
 		By("installing CRDs")
 		cmd = exec.Command("make", "install")
-		_, err = utils.Run(cmd)
+		_, err := utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to install CRDs")
 
 		By("deploying the controller-manager")
 		cmd = exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", projectImage))
 		_, err = utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to deploy the controller-manager")
+
+		// Wait for the Controller to become Running
+		waitForControllerRunning(&controllerPodName)
 	})
 
-	// After all tests have been executed, clean up by undeploying the controller, uninstalling CRDs,
-	// and deleting the namespace.
 	AfterAll(func() {
-		By("cleaning up the curl pod for metrics")
-		cmd := exec.Command("kubectl", "delete", "pod", "curl-metrics", "-n", namespace)
-		_, _ = utils.Run(cmd)
-
 		By("undeploying the controller-manager")
-		cmd = exec.Command("make", "undeploy")
+		cmd := exec.Command("make", "undeploy")
 		_, _ = utils.Run(cmd)
 
 		By("uninstalling CRDs")
 		cmd = exec.Command("make", "uninstall")
 		_, _ = utils.Run(cmd)
 
-		By("removing manager namespace")
-		cmd = exec.Command("kubectl", "delete", "ns", namespace)
+		By("removing manager namespace (if empty)")
+		cmd = exec.Command("kubectl", "delete", "ns", namespace, "--ignore-not-found=true")
 		_, _ = utils.Run(cmd)
 	})
 
-	// After each test, check for failures and collect logs, events,
-	// and pod descriptions for debugging.
 	AfterEach(func() {
+		// Processing when we want to keep logs, events, etc. in case of failure
 		specReport := CurrentSpecReport()
 		if specReport.Failed() {
-			By("Fetching controller manager pod logs")
-			cmd := exec.Command("kubectl", "logs", controllerPodName, "-n", namespace)
-			controllerLogs, err := utils.Run(cmd)
-			if err == nil {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Controller logs:\n %s", controllerLogs)
-			} else {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Failed to get Controller logs: %s", err)
-			}
-
-			By("Fetching Kubernetes events")
-			cmd = exec.Command("kubectl", "get", "events", "-n", namespace, "--sort-by=.lastTimestamp")
-			eventsOutput, err := utils.Run(cmd)
-			if err == nil {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Kubernetes events:\n%s", eventsOutput)
-			} else {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Failed to get Kubernetes events: %s", err)
-			}
-
-			By("Fetching curl-metrics logs")
-			cmd = exec.Command("kubectl", "logs", "curl-metrics", "-n", namespace)
-			metricsOutput, err := utils.Run(cmd)
-			if err == nil {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Metrics logs:\n %s", metricsOutput)
-			} else {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Failed to get curl-metrics logs: %s", err)
-			}
-
-			By("Fetching controller manager pod description")
-			cmd = exec.Command("kubectl", "describe", "pod", controllerPodName, "-n", namespace)
-			podDescription, err := utils.Run(cmd)
-			if err == nil {
-				fmt.Println("Pod description:\n", podDescription)
-			} else {
-				fmt.Println("Failed to describe controller pod")
-			}
+			dumpLogsAndEvents(controllerPodName)
 		}
 	})
 
-	SetDefaultEventuallyTimeout(2 * time.Minute)
-	SetDefaultEventuallyPollingInterval(time.Second)
-
-	Context("Manager", func() {
-		It("should run successfully", func() {
-			By("validating that the controller-manager pod is running as expected")
-			verifyControllerUp := func(g Gomega) {
-				// Get the name of the controller-manager pod
-				cmd := exec.Command("kubectl", "get",
-					"pods", "-l", "control-plane=controller-manager",
-					"-o", "go-template={{ range .items }}"+
-						"{{ if not .metadata.deletionTimestamp }}"+
-						"{{ .metadata.name }}"+
-						"{{ \"\\n\" }}{{ end }}{{ end }}",
-					"-n", namespace,
-				)
-
-				podOutput, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred(), "Failed to retrieve controller-manager pod information")
-				podNames := utils.GetNonEmptyLines(podOutput)
-				g.Expect(podNames).To(HaveLen(1), "expected 1 controller pod running")
-				controllerPodName = podNames[0]
-				g.Expect(controllerPodName).To(ContainSubstring("controller-manager"))
-
-				// Validate the pod's status
-				cmd = exec.Command("kubectl", "get",
-					"pods", controllerPodName, "-o", "jsonpath={.status.phase}",
-					"-n", namespace,
-				)
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(Equal("Running"), "Incorrect controller-manager pod status")
-			}
-			Eventually(verifyControllerUp).Should(Succeed())
-		})
-
-		It("should ensure the metrics endpoint is serving metrics", func() {
-			By("creating a ClusterRoleBinding for the service account to allow access to metrics")
-			cmd := exec.Command("kubectl", "create", "clusterrolebinding", metricsRoleBindingName,
-				"--clusterrole=etcd-operator-metrics-reader",
-				fmt.Sprintf("--serviceaccount=%s:%s", namespace, serviceAccountName),
-			)
-			_, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), "Failed to create ClusterRoleBinding")
-
-			By("validating that the metrics service is available")
-			cmd = exec.Command("kubectl", "get", "service", metricsServiceName, "-n", namespace)
-			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), "Metrics service should exist")
-
-			By("validating that the ServiceMonitor for Prometheus is applied in the namespace")
-			cmd = exec.Command("kubectl", "get", "ServiceMonitor", "-n", namespace)
-			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), "ServiceMonitor should exist")
-
-			By("getting the service account token")
-			token, err := serviceAccountToken()
+	Context("Scale out with CrashAfterAddMember failpoint", func() {
+		BeforeAll(func() {
+			By("Enabling CrashAfterAddMember failpoint (inject panic)")
+			// gofail: var CrashAfterAddMember struct{}
+			err := gofail.Enable("CrashAfterAddMember",
+				`panic("failpoint CrashAfterAddMember triggered")`)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(token).NotTo(BeEmpty())
-
-			By("waiting for the metrics endpoint to be ready")
-			verifyMetricsEndpointReady := func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "endpoints", metricsServiceName, "-n", namespace)
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(ContainSubstring("8443"), "Metrics endpoint is not ready")
-			}
-			Eventually(verifyMetricsEndpointReady).Should(Succeed())
-
-			By("verifying that the controller manager is serving the metrics server")
-			verifyMetricsServerStarted := func(g Gomega) {
-				cmd := exec.Command("kubectl", "logs", controllerPodName, "-n", namespace)
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(ContainSubstring("controller-runtime.metrics\tServing metrics server"),
-					"Metrics server not yet started")
-			}
-			Eventually(verifyMetricsServerStarted).Should(Succeed())
-
-			By("creating the curl-metrics pod to access the metrics endpoint")
-			cmd = exec.Command("kubectl", "run", "curl-metrics", "--restart=Never",
-				"--namespace", namespace,
-				"--image=curlimages/curl:7.78.0",
-				"--", "/bin/sh", "-c", fmt.Sprintf(
-					"curl -v -k -H 'Authorization: Bearer %s' https://%s.%s.svc.cluster.local:8443/metrics",
-					token, metricsServiceName, namespace))
-			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), "Failed to create curl-metrics pod")
-
-			By("waiting for the curl-metrics pod to complete.")
-			verifyCurlUp := func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "pods", "curl-metrics",
-					"-o", "jsonpath={.status.phase}",
-					"-n", namespace)
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(Equal("Succeeded"), "curl pod in wrong status")
-			}
-			Eventually(verifyCurlUp, 5*time.Minute).Should(Succeed())
-
-			By("getting the metrics by checking curl-metrics logs")
-			metricsOutput := getMetricsOutput()
-			Expect(metricsOutput).To(ContainSubstring(
-				"controller_runtime_reconcile_total",
-			))
 		})
 
-		// +kubebuilder:scaffold:e2e-webhooks-checks
+		AfterAll(func() {
+			By("Disabling CrashAfterAddMember failpoint")
+			_ = gofail.Disable("CrashAfterAddMember")
+		})
 
-		// TODO: Customize the e2e test suite with scenarios specific to your project.
-		// Consider applying sample/CR(s) and check their status and/or verifying
-		// the reconciliation by using the metrics, i.e.:
-		// metricsOutput := getMetricsOutput()
-		// Expect(metricsOutput).To(ContainSubstring(
-		//    fmt.Sprintf(`controller_runtime_reconcile_total{controller="%s",result="success"} 1`,
-		//    strings.ToLower(<Kind>),
-		// ))
+		It("should eventually scale out to size=2 even if operator crashes in the middle", func() {
+			By("Creating an EtcdCluster with size=1")
+			createOrUpdateEtcdCluster(etcdClusterName, 1)
+
+			By("Waiting until the cluster is stable at size=1")
+			waitForEtcdClusterReady(etcdClusterName, 1)
+
+			By("Patching the EtcdCluster to size=2 to trigger scale-out")
+			patchEtcdClusterSize(etcdClusterName, 2)
+
+			By("Expecting operator to panic on CrashAfterAddMember -> operator restarts")
+			Eventually(func(g Gomega) {
+				// To detect a crash, the Pod will temporarily go into CrashLoopBackOff and check the restart count.
+				out, err := exec.Command("kubectl", "get", "pod", controllerPodName, "-n", namespace,
+					"-o", "jsonpath={.status.containerStatuses[0].restartCount}").CombinedOutput()
+				g.Expect(err).NotTo(HaveOccurred())
+				restartCount := string(out)
+				// If the program has been restarted at least once, it is considered to have panicked.
+				g.Expect(restartCount).NotTo(Equal("0"))
+			}, 3*time.Minute, 5*time.Second).Should(Succeed(), "operator did not restart")
+
+			By("Waiting for operator to become Running again")
+			waitForControllerRunning(&controllerPodName)
+
+			By("Eventually the cluster should scale out to 2 replicas")
+			waitForEtcdClusterReady(etcdClusterName, 2)
+		})
 	})
+
+	Context("Scale in with CrashAfterRemoveMember failpoint", func() {
+		BeforeAll(func() {
+			By("Enabling CrashAfterRemoveMember failpoint (inject panic)")
+			// gofail: var CrashAfterRemoveMember struct{}
+			err := gofail.Enable("CrashAfterRemoveMember",
+				`panic("failpoint CrashAfterRemoveMember triggered")`)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		AfterAll(func() {
+			By("Disabling CrashAfterRemoveMember failpoint")
+			_ = gofail.Disable("CrashAfterRemoveMember")
+		})
+
+		It("should eventually scale in to size=1 even if operator crashes in the middle", func() {
+			By("Creating an EtcdCluster with size=2")
+			createOrUpdateEtcdCluster(etcdClusterName, 2)
+
+			By("Waiting until the cluster is stable at size=2")
+			waitForEtcdClusterReady(etcdClusterName, 2)
+
+			By("Patching the EtcdCluster to size=1 to trigger scale-in")
+			patchEtcdClusterSize(etcdClusterName, 1)
+
+			By("Expecting operator to panic on CrashAfterRemoveMember -> operator restarts")
+			Eventually(func(g Gomega) {
+				out, err := exec.Command("kubectl", "get", "pod", controllerPodName, "-n", namespace,
+					"-o", "jsonpath={.status.containerStatuses[0].restartCount}").CombinedOutput()
+				g.Expect(err).NotTo(HaveOccurred())
+				restartCount := string(out)
+				g.Expect(restartCount).NotTo(Equal("0"))
+			}, 3*time.Minute, 5*time.Second).Should(Succeed(), "operator did not restart on remove")
+
+			By("Waiting for operator to become Running again")
+			waitForControllerRunning(&controllerPodName)
+
+			By("Eventually the cluster should scale in to 1 replica")
+			waitForEtcdClusterReady(etcdClusterName, 1)
+		})
+	})
+
 })
+
+// createOrUpdateEtcdCluster creates or updates an EtcdCluster resource with the specified size.
+func createOrUpdateEtcdCluster(name string, size int) {
+	cluster := &operatorv1alpha1.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+		},
+		Spec: operatorv1alpha1.EtcdClusterSpec{
+			Size:    size,
+			Version: "3.5.17",
+		},
+	}
+	b, _ := json.Marshal(cluster)
+	// Simple with kubectl apply
+	cmd := exec.Command("kubectl", "apply", "-f", "-")
+	cmd.Stdin = strings.NewReader(string(b))
+	_, err := utils.Run(cmd)
+	Expect(err).NotTo(HaveOccurred(), "failed to create/update EtcdCluster")
+}
+
+// patchEtcdClusterSize patches the EtcdCluster's spec.size
+func patchEtcdClusterSize(name string, newSize int) {
+	patchStr := fmt.Sprintf(`{"spec":{"size":%d}}`, newSize)
+	cmd := exec.Command("kubectl", "-n", namespace, "patch", "etcdclusters", name,
+		"--type=merge", "-p", patchStr)
+	_, err := utils.Run(cmd)
+	Expect(err).NotTo(HaveOccurred(), "failed to patch EtcdCluster size")
+}
+
+// waitForEtcdClusterReady waits until the statefulset's readyReplicas == desired.
+func waitForEtcdClusterReady(name string, desired int) {
+	Eventually(func(g Gomega) {
+		sts := &appsv1.StatefulSet{}
+		cmd := exec.Command("kubectl", "get", "statefulset", name, "-n", namespace, "-o", "json")
+		out, err := utils.Run(cmd)
+		g.Expect(err).NotTo(HaveOccurred())
+
+		err = json.Unmarshal([]byte(out), sts)
+		g.Expect(err).NotTo(HaveOccurred(), "failed to unmarshal statefulset")
+
+		g.Expect(sts.Status.ReadyReplicas).To(BeEquivalentTo(desired),
+			fmt.Sprintf("waiting for ReadyReplicas=%d, got %d", desired, sts.Status.ReadyReplicas))
+	}, 5*time.Minute, 5*time.Second).Should(Succeed())
+}
+
+// waitForControllerRunning waits until the controller-manager Pod is Running.
+func waitForControllerRunning(controllerPodName *string) {
+	Eventually(func(g Gomega) {
+		cmd := exec.Command("kubectl", "get",
+			"pods", "-l", "control-plane=controller-manager",
+			"-o", "jsonpath={.items[0].metadata.name}",
+			"-n", namespace,
+		)
+		podOutput, err := utils.Run(cmd)
+		g.Expect(err).NotTo(HaveOccurred(), "Failed to retrieve controller-manager pod name")
+
+		*controllerPodName = strings.TrimSpace(podOutput)
+		g.Expect(*controllerPodName).NotTo(BeEmpty(), "no controller-manager pod found")
+
+		cmd = exec.Command("kubectl", "get",
+			"pods", *controllerPodName, "-o", "jsonpath={.status.phase}",
+			"-n", namespace,
+		)
+		phaseOutput, err := utils.Run(cmd)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(phaseOutput).To(Equal("Running"), "controller-manager pod is not running yet")
+	}, 2*time.Minute, 5*time.Second).Should(Succeed())
+}
+
+// dumpLogsAndEvents is called on test failure to print logs, events, etc.
+func dumpLogsAndEvents(podName string) {
+	By("Fetching controller manager pod logs")
+	cmd := exec.Command("kubectl", "logs", podName, "-n", namespace)
+	controllerLogs, err := utils.Run(cmd)
+	if err == nil {
+		fmt.Fprintf(GinkgoWriter, "\n--- controller-manager logs ---\n%s\n", controllerLogs)
+	} else {
+		fmt.Fprintf(GinkgoWriter, "Failed to get Controller logs: %s\n", err)
+	}
+
+	By("Fetching Kubernetes events in the namespace")
+	cmd = exec.Command("kubectl", "get", "events", "-n", namespace, "--sort-by=.lastTimestamp")
+	eventsOutput, err := utils.Run(cmd)
+	if err == nil {
+		fmt.Fprintf(GinkgoWriter, "\n--- K8s Events ---\n%s\n", eventsOutput)
+	} else {
+		fmt.Fprintf(GinkgoWriter, "Failed to get Kubernetes events: %s\n", err)
+	}
+}
