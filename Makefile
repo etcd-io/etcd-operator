@@ -81,7 +81,7 @@ test-e2e: manifests generate fmt vet ## Run the e2e tests. Expected an isolated 
 	go test ./test/e2e/ -v -ginkgo.v
 
 .PHONY: test-e2e-failpoint
-test-e2e-fault: manifests generate fmt vet ## Run the e2e tests using gofail. Expected an isolated environment using Kind.
+test-e2e-failpoint: manifests generate fmt vet ## Run the e2e tests using gofail. Expected an isolated environment using Kind.
 	@command -v kind >/dev/null 2>&1 || { \
 		echo "Kind is not installed. Please install Kind manually."; \
 		exit 1; \

@@ -45,7 +45,10 @@ const metricsRoleBindingName = "etcd-operator-metrics-binding"
 
 var _ = Describe("Manager", Ordered, func() {
 	// Temp
-	gofail.Enable("CrashAfterAddMember", `return("hello")`)
+	err := gofail.Enable("CrashAfterAddMember", `return("hello")`)
+	if err != nil {
+		fmt.Println("Failed to enable failpoint")
+	}
 	var controllerPodName string
 
 	// Before running the tests, set up the environment by creating the namespace,
