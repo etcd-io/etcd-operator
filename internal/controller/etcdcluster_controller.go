@@ -227,8 +227,6 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		}
 		// We will interrupt this state and crash the operator before updating the StatefulSet replicas.
 		// gofail: var CrashAfterAddMember struct{}
-		// logger.Info("gofail CrashAfterAddMember triggered")
-		// os.Exit(1)
 
 		logger.Info("Learner member added successfully", "peerURLs", peerURL)
 	} else {
@@ -246,8 +244,6 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 		// We will interrupt this state and crash the operator before updating the StatefulSet replicas.
 		// gofail: var CrashAfterRemoveMember struct{}
-		// logger.Info("gofail CrashAfterRemoveMember triggered")
-		// os.Exit(1)
 
 		logger.Info("Member removed successfully", "memberID", memberID)
 	}

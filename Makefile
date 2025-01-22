@@ -80,6 +80,18 @@ test-e2e: manifests generate fmt vet ## Run the e2e tests. Expected an isolated 
 	}
 	go test ./test/e2e/ -v -ginkgo.v
 
+.PHONY: test-e2e-failpoint
+test-e2e-fault: manifests generate fmt vet ## Run the e2e tests using gofail. Expected an isolated environment using Kind.
+	@command -v kind >/dev/null 2>&1 || { \
+		echo "Kind is not installed. Please install Kind manually."; \
+		exit 1; \
+	}
+	@kind get clusters | grep -q 'kind' || { \
+		echo "No Kind cluster is running. Please start a Kind cluster before running the e2e tests."; \
+		exit 1; \
+	}
+	go test ./test/e2e_failpoint/ -v -ginkgo.v
+
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter
 	$(GOLANGCI_LINT) run
@@ -166,6 +178,15 @@ api-docs: crd-ref-docs ## Generate api references docs.
 		--templates-dir=./docs/api-references/template/ \
 		--config=./docs/api-references/config.yaml
 
+##@ gofail
+.PHONY: gofail-enable
+gofail-enable: gofail
+	gofail enable .
+
+.PHONY: gofail-disable
+gofail-disable: gofail
+	gofail disable .
+
 ##@ Dependencies
 
 ## Location to install dependencies to
@@ -212,6 +233,10 @@ $(CRD_REF_DOCS): $(LOCALBIN)
 golangci-lint: $(GOLANGCI_LINT) ## Download golangci-lint locally if necessary.
 $(GOLANGCI_LINT): $(LOCALBIN)
 	$(call go-install-tool,$(GOLANGCI_LINT),github.com/golangci/golangci-lint/cmd/golangci-lint,$(GOLANGCI_LINT_VERSION))
+
+.PHONY: gofail
+gofail:
+	go install go.etcd.io/gofail
 
 # go-install-tool will 'go install' any package with custom target and name of binary, if it doesn't exist
 # $1 - target path with name of binary
