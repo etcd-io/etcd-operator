@@ -28,6 +28,7 @@ import (
 	. "github.com/onsi/gomega"
 
 	"go.etcd.io/etcd-operator/test/utils"
+	gofail "go.etcd.io/gofail/runtime"
 )
 
 // namespace where the project is deployed in
@@ -43,6 +44,8 @@ const metricsServiceName = "etcd-operator-controller-manager-metrics-service"
 const metricsRoleBindingName = "etcd-operator-metrics-binding"
 
 var _ = Describe("Manager", Ordered, func() {
+	// Temp
+	gofail.Enable("CrashAfterAddMember", `return("hello")`)
 	var controllerPodName string
 
 	// Before running the tests, set up the environment by creating the namespace,
