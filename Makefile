@@ -78,7 +78,7 @@ test-e2e: manifests generate fmt vet ## Run the e2e tests. Expected an isolated 
 		echo "No Kind cluster is running. Please start a Kind cluster before running the e2e tests."; \
 		exit 1; \
 	}
-	go test ./test/e2e/ -v -ginkgo.v -ginkgo.skip="failpoint"
+	go test ./test/e2e/ -v -ginkgo.v -ginkgo.label-filter="!failpoint"
 
 .PHONY: test-e2e-failpoint
 test-e2e-failpoint: manifests generate fmt vet ## Run the e2e tests using gofail. Expected an isolated environment using Kind.
