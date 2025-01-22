@@ -90,7 +90,7 @@ test-e2e-failpoint: manifests generate fmt vet ## Run the e2e tests using gofail
 		echo "No Kind cluster is running. Please start a Kind cluster before running the e2e tests."; \
 		exit 1; \
 	}
-	go test ./test/e2e_failpoint/ -v -ginkgo.v -ginkgo.label-filter="failpoint"
+	go test ./test/e2e/ -v -ginkgo.v -ginkgo.label-filter="failpoint"
 
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter
