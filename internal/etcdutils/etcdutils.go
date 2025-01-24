@@ -10,10 +10,11 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	"go.uber.org/zap"
+
 	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	"go.etcd.io/etcd/client/pkg/v3/logutil"
 	clientv3 "go.etcd.io/etcd/client/v3"
-	"go.uber.org/zap"
 )
 
 func MemberList(eps []string) (*clientv3.MemberListResponse, error) {
