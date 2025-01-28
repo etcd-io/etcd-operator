@@ -142,21 +142,27 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 	targetReplica := *sts.Spec.Replicas // Start with the current size of the stateful set
 
-	// TODO: finish the logic later
+	// The number of replicas in the StatefulSet doesn't match the number of etcd members in the cluster.
 	if int(targetReplica) != memberCnt {
-		// TODO: finish the logic later
-		// nolint:staticcheck　// Temporarily disable staticcheck
+		logger.Info("The expected number of replicas doesn't match the number of etcd members in the cluster", "targetReplica", targetReplica, "memberCnt", memberCnt)
 		if int(targetReplica) < memberCnt {
-			// a new added learner hasn't started yet
-
-			// re-generate configuration for the new learner member;
-			// increase statefulsets's replica by 1
+			logger.Info("An etcd member was added into the cluster, but the StatefulSet hasn't scaled out yet")
+			newReplicaCount := targetReplica + 1
+			logger.Info("Increasing StatefulSet replicas to match the etcd cluster member count", "oldReplicaCount", targetReplica, "newReplicaCount", newReplicaCount)
+			_, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, newReplicaCount, r.Scheme)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
 		} else {
-			// an already removed member hasn't stopped yet.
-
-			// Decrease the statefulsets's replica by 1
+			logger.Info("An etcd member was removed from the cluster, but the StatefulSet hasn't scaled in yet")
+			newReplicaCount := targetReplica - 1
+			logger.Info("Decreasing StatefulSet replicas to remove the unneeded Pod.", "oldReplicaCount", targetReplica, "newReplicaCount", newReplicaCount)
+			_, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, newReplicaCount, r.Scheme)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
 		}
-		// return
+		return ctrl.Result{RequeueAfter: requeueDuration}, nil
 	}
 
 	var (
