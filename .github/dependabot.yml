@@ -14,6 +14,16 @@ updates:
     onsi:
       patterns:
       - "github.com/onsi/*"
+    etcd:
+      patterns:
+      - "go.etcd.io/*"
+
+- package-ecosystem: gomod
+  directory: /tools/mod # Not linked from /go.mod
+  schedule:
+    interval: weekly
+  allow:
+    - dependency-type: direct
 
 - package-ecosystem: "docker"
   directory: "/"
