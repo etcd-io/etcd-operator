@@ -41,6 +41,11 @@ var (
 	ctrlGenVer   = "v0.16.4"
 	dockerImage = "razashahid107/etcd-operator:v0.1"
 
+	certMgrVer = "v1.13.1"
+	certMgrUrl = fmt.Sprintf("https://github.com/jetstack/cert-manager/releases/download/%s/cert-manager.yaml", certMgrVer)
+	promVer    = "v0.60.0"
+	promUrl    = fmt.Sprintf("https://github.com/prometheus-operator/prometheus-operator/releases/download/%s/bundle.yaml", promVer)
+
 )
 
 func TestMain(m *testing.M) {
@@ -53,6 +58,35 @@ func TestMain(m *testing.M) {
 	testenv.Setup(
 		envfuncs.CreateCluster(kindCluster, kindClusterName),
 		envfuncs.CreateNamespace(namespace),
+		// install cluster dependencies mgr
+		func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
+			log.Println("Installing prometheus operator...")
+			if p := utils.RunCommand(fmt.Sprintf("kubectl apply -f %s --server-side", promUrl)); p.Err() != nil {
+				log.Printf("Failed to deploy prometheus: %s: %s", p.Err(), p.Out())
+				return ctx, p.Err()
+			}
+
+			log.Println("Installing cert-manager...")
+			client := cfg.Client()
+
+			if p := utils.RunCommand(fmt.Sprintf("kubectl apply -f %s", certMgrUrl)); p.Err() != nil {
+				log.Printf("Failed to deploy cert-manager: %s: %s", p.Err(), p.Out())
+				return ctx, p.Err()
+			}
+
+			// wait for CertManager to be ready
+			log.Println("Waiting for cert-manager deployment to be available...")
+			if err := wait.For(
+				conditions.New(client.Resources()).DeploymentAvailable("cert-manager-webhook", "cert-manager"),
+				wait.WithTimeout(5*time.Minute),
+				wait.WithInterval(10*time.Second),
+			); err != nil {
+				log.Printf("Timedout while waiting for cert-manager deployment: %s", err)
+				return ctx, err
+			}
+			return ctx, nil
+		},
+		
 		// install tool dependencies
 		func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
 			log.Println("Installing bin tools...")
