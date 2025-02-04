@@ -1,3 +1,4 @@
+// e2e_suite_test.go
 /*
 Copyright 2024.
 
@@ -6,7 +7,6 @@ you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
-
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -17,104 +17,182 @@ limitations under the License.
 package e2e
 
 import (
+	"context"
 	"fmt"
+	"log"
 	"os"
-	"os/exec"
+	// "os/exec"
 	"testing"
+	"time"
 
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
+	"sigs.k8s.io/e2e-framework/klient/wait"
+	"sigs.k8s.io/e2e-framework/klient/wait/conditions"
+	"sigs.k8s.io/e2e-framework/pkg/env"
+	"sigs.k8s.io/e2e-framework/pkg/envconf"
+	"sigs.k8s.io/e2e-framework/pkg/envfuncs"
+	"sigs.k8s.io/e2e-framework/support/kind"
+	"sigs.k8s.io/e2e-framework/support/utils"
 
-	"go.etcd.io/etcd-operator/test/utils"
+
+	// "go.etcd.io/etcd-operator/test/utils"
 )
 
 var (
-	// Optional Environment Variables:
-	// - PROMETHEUS_INSTALL_SKIP=true: Skips Prometheus Operator installation during test setup.
-	// - CERT_MANAGER_INSTALL_SKIP=true: Skips CertManager installation during test setup.
-	// These variables are useful if Prometheus or CertManager is already installed, avoiding
-	// re-installation and conflicts.
-	skipPrometheusInstall  = os.Getenv("PROMETHEUS_INSTALL_SKIP") == "true"
-	skipCertManagerInstall = os.Getenv("CERT_MANAGER_INSTALL_SKIP") == "true"
-	// isPrometheusOperatorAlreadyInstalled will be set true when prometheus CRDs be found on the cluster
-	isPrometheusOperatorAlreadyInstalled = false
-	// isCertManagerAlreadyInstalled will be set true when CertManager CRDs be found on the cluster
-	isCertManagerAlreadyInstalled = false
+	testEnv env.Environment
 
-	// projectImage is the name of the image which will be build and loaded
-	// with the code source changes to be tested.
-	projectImage = "example.com/etcd-operator:v0.0.1"
+	dockerImage  = "etcd-operator-controller:v0.1"
+	kustomizeVer = "v5.5.0"
+	ctrlGenVer   = "v0.16.4"
+
+	certMgrVer = "v1.13.1"
+	certMgrUrl = fmt.Sprintf("https://github.com/jetstack/cert-manager/releases/download/%s/cert-manager.yaml", certMgrVer)
+	promVer    = "v0.60.0"
+	promUrl    = fmt.Sprintf("https://github.com/prometheus-operator/prometheus-operator/releases/download/%s/bundle.yaml", promVer)
+
+	namespace = "etcd-operator-system"
 )
 
-// TestE2E runs the end-to-end (e2e) test suite for the project. These tests execute in an isolated,
-// temporary environment to validate project changes with the the purposed to be used in CI jobs.
-// The default setup requires Kind, builds/loads the Manager Docker image locally, and installs
-// CertManager and Prometheus.
-func TestE2E(t *testing.T) {
-	RegisterFailHandler(Fail)
-	_, _ = fmt.Fprintf(GinkgoWriter, "Starting etcd-operator integration test suite\n")
-	RunSpecs(t, "e2e suite")
+var (
+    // Optional Environment Variables (same as before):
+    skipPrometheusInstall  = os.Getenv("PROMETHEUS_INSTALL_SKIP") == "true"
+    skipCertManagerInstall = os.Getenv("CERT_MANAGER_INSTALL_SKIP") == "true"
+
+    // Flags to detect if Prometheus/CertManager is already installed
+    isPrometheusOperatorAlreadyInstalled = false
+    isCertManagerAlreadyInstalled        = false
+
+    // The manager image you want to build & load
+    projectImage = "example.com/etcd-operator:v0.0.1"
+
+    testenv env.Environment
+)
+
+func TestMain(m *testing.M) {
+	testEnv = env.New()
+	kindClusterName := "etcd-cluster"
+	kindCluster := kind.NewCluster(kindClusterName)
+
+	log.Println("Creating KinD cluster...")
+	testEnv.Setup(
+		envfuncs.CreateCluster(kindCluster, kindClusterName),
+		envfuncs.CreateNamespace(namespace),
+
+		// install cluster dependencies mgr
+		func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
+			log.Println("Installing prometheus operator...")
+			if p := utils.RunCommand(fmt.Sprintf("kubectl apply -f %s --server-side", promUrl)); p.Err() != nil {
+				log.Printf("Failed to deploy prometheus: %s: %s", p.Err(), p.Out())
+				return ctx, p.Err()
+			}
+
+			log.Println("Installing cert-manager...")
+			client := cfg.Client()
+
+			if p := utils.RunCommand(fmt.Sprintf("kubectl apply -f %s", certMgrUrl)); p.Err() != nil {
+				log.Printf("Failed to deploy cert-manager: %s: %s", p.Err(), p.Out())
+				return ctx, p.Err()
+			}
+
+			// wait for CertManager to be ready
+			log.Println("Waiting for cert-manager deployment to be available...")
+			if err := wait.For(
+				conditions.New(client.Resources()).DeploymentAvailable("cert-manager-webhook", "cert-manager"),
+				wait.WithTimeout(5*time.Minute),
+				wait.WithInterval(10*time.Second),
+			); err != nil {
+				log.Printf("Timedout while waiting for cert-manager deployment: %s", err)
+				return ctx, err
+			}
+			return ctx, nil
+		},
+
+		// install tool dependencies
+		func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
+			log.Println("Installing bin tools...")
+			if p := utils.RunCommand(fmt.Sprintf("go install sigs.k8s.io/kustomize/kustomize/v5@%s", kustomizeVer)); p.Err() != nil {
+				log.Printf("Failed to install kustomize binary: %s: %s", p.Err(), p.Out())
+				return ctx, p.Err()
+			}
+			if p := utils.RunCommand(fmt.Sprintf("go install sigs.k8s.io/controller-tools/cmd/controller-gen@%s", ctrlGenVer)); p.Err() != nil {
+				log.Printf("Failed to install controller-gen binary: %s: %s", p.Err(), p.Out())
+				return ctx, p.Err()
+			}
+			return ctx, nil
+		},
+
+		// generate and deploy resource configurations
+		func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
+			log.Println("Building source components...")
+			origWd, _ := os.Getwd()
+
+			// change dir for Make file or it will fail
+			if err := os.Chdir("../../"); err != nil {
+				log.Printf("Unable to set working directory: %s", err)
+				return ctx, err
+			}
+
+			// gen manifest files
+			log.Println("Generate manifests...")
+			if p := utils.RunCommand(`controller-gen rbac:roleName=manager-role crd webhook paths="./..." output:crd:artifacts:config=config/crd/bases`); p.Err() != nil {
+				log.Printf("Failed to generate manifests: %s: %s", p.Err(), p.Out())
+				return ctx, p.Err()
+			}
+
+			// Build docker image
+			log.Println("Building docker image...")
+			if p := utils.RunCommand(fmt.Sprintf("docker build -t %s .", dockerImage)); p.Err() != nil {
+				log.Printf("Failed to build docker image: %s: %s", p.Err(), p.Out())
+				return ctx, p.Err()
+			}
+
+			// Load docker image into kind
+			log.Println("Loading docker image into kind cluster...")
+			if err := kindCluster.LoadImage(ctx, dockerImage); err != nil {
+				log.Printf("Failed to load image into kind: %s", err)
+				return ctx, err
+			}
+
+			// Deploy components
+			log.Println("Deploying controller-manager resources...")
+			if p := utils.RunCommand(`bash -c "kustomize build config/default | kubectl apply --server-side -f -"`); p.Err() != nil {
+				log.Printf("Failed to deploy resource configurations: %s: %s", p.Err(), p.Out())
+				return ctx, p.Err()
+			}
+
+			// wait for controller-manager to be ready
+			log.Println("Waiting for controller-manager deployment to be available...")
+			client := cfg.Client()
+			if err := wait.For(
+				conditions.New(client.Resources()).DeploymentAvailable("etcd-operator-controller-manager", "etcd-operator-system"),
+				wait.WithTimeout(3*time.Minute),
+				wait.WithInterval(10*time.Second),
+			); err != nil {
+				log.Printf("Timed out while waiting for controller-manager deployment: %s", err)
+				return ctx, err
+			}
+
+			if err := os.Chdir(origWd); err != nil {
+				log.Printf("Unable to set working directory: %s", err)
+				return ctx, err
+			}
+
+			return ctx, nil
+		},
+	)
+
+	// Use the Environment.Finish method to define clean up steps
+	testEnv.Finish(
+		func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
+			log.Println("Finishing tests, cleaning cluster ...")
+			utils.RunCommand(fmt.Sprintf("kubectl delete -f %s", promUrl))
+			utils.RunCommand(fmt.Sprintf("kubectl delete -f %s", certMgrUrl))
+			utils.RunCommand(`bash -c "kustomize build config/default | kubectl delete -f -"`)
+			return ctx, nil
+		},
+		envfuncs.DeleteNamespace(namespace),
+		envfuncs.DestroyCluster(kindClusterName),
+	)
+
+	// Use Environment.Run to launch the test
+	os.Exit(testEnv.Run(m))
 }
-
-var _ = BeforeSuite(func() {
-	By("Ensure that Prometheus is enabled")
-	_ = utils.UncommentCode("config/default/kustomization.yaml", "#- ../prometheus", "#")
-
-	By("generating files")
-	cmd := exec.Command("make", "generate")
-	_, err := utils.Run(cmd)
-	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to run make generate")
-
-	By("generating manifests")
-	cmd = exec.Command("make", "manifests")
-	_, err = utils.Run(cmd)
-	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to run make manifests")
-
-	By("building the manager(Operator) image")
-	cmd = exec.Command("make", "docker-build", fmt.Sprintf("IMG=%s", projectImage))
-	_, err = utils.Run(cmd)
-	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to build the manager(Operator) image")
-
-	// TODO(user): If you want to change the e2e test vendor from Kind, ensure the image is
-	// built and available before running the tests. Also, remove the following block.
-	By("loading the manager(Operator) image on Kind")
-	err = utils.LoadImageToKindClusterWithName(projectImage)
-	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to load the manager(Operator) image into Kind")
-
-	// The tests-e2e are intended to run on a temporary cluster that is created and destroyed for testing.
-	// To prevent errors when tests run in environments with Prometheus or CertManager already installed,
-	// we check for their presence before execution.
-	// Setup Prometheus and CertManager before the suite if not skipped and if not already installed
-	if !skipPrometheusInstall {
-		By("checking if prometheus is installed already")
-		isPrometheusOperatorAlreadyInstalled = utils.IsPrometheusCRDsInstalled()
-		if !isPrometheusOperatorAlreadyInstalled {
-			_, _ = fmt.Fprintf(GinkgoWriter, "Installing Prometheus Operator...\n")
-			Expect(utils.InstallPrometheusOperator()).To(Succeed(), "Failed to install Prometheus Operator")
-		} else {
-			_, _ = fmt.Fprintf(GinkgoWriter, "WARNING: Prometheus Operator is already installed. Skipping installation...\n")
-		}
-	}
-	if !skipCertManagerInstall {
-		By("checking if cert manager is installed already")
-		isCertManagerAlreadyInstalled = utils.IsCertManagerCRDsInstalled()
-		if !isCertManagerAlreadyInstalled {
-			_, _ = fmt.Fprintf(GinkgoWriter, "Installing CertManager...\n")
-			Expect(utils.InstallCertManager()).To(Succeed(), "Failed to install CertManager")
-		} else {
-			_, _ = fmt.Fprintf(GinkgoWriter, "WARNING: CertManager is already installed. Skipping installation...\n")
-		}
-	}
-})
-
-var _ = AfterSuite(func() {
-	// Teardown Prometheus and CertManager after the suite if not skipped and if they were not already installed
-	if !skipPrometheusInstall && !isPrometheusOperatorAlreadyInstalled {
-		_, _ = fmt.Fprintf(GinkgoWriter, "Uninstalling Prometheus Operator...\n")
-		utils.UninstallPrometheusOperator()
-	}
-	if !skipCertManagerInstall && !isCertManagerAlreadyInstalled {
-		_, _ = fmt.Fprintf(GinkgoWriter, "Uninstalling CertManager...\n")
-		utils.UninstallCertManager()
-	}
-})
