@@ -1,6 +1,6 @@
 module go.etcd.io/etcd-operator
 
-toolchain go1.23.5
+toolchain go1.23.6
 
 go 1.23.0
 
