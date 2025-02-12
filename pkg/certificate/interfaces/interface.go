@@ -2,29 +2,9 @@ package certificate
 
 import (
 	"context"
-	"fmt"
 	"net"
 	"time"
 )
-
-type ProviderType string
-
-const (
-	Auto        ProviderType = "auto"
-	CertManager ProviderType = "cert-manager"
-	// add more ...
-)
-
-func NewProvider(pt ProviderType) (Provider, error) {
-	switch pt {
-	case Auto:
-		return nil, nil // change me later
-	case CertManager:
-		return nil, nil // change me later
-	}
-
-	return nil, fmt.Errorf("unknown provider type: %s", pt)
-}
 
 // AltNames contains the domain names and IP addresses that will be added
 // to the x509 certificate SubAltNames fields. The values will be passed
