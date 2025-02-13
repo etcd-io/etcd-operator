@@ -15,6 +15,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -175,43 +176,37 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 
 func waitForStatefulSetReady(ctx context.Context, logger logr.Logger, r client.Client, name, namespace string) error {
 	logger.Info("Now checking the readiness of statefulset", "name", name, "namespace", namespace)
-	// Define backoff parameters
-	initialDuration := 3 * time.Second
-	factor := 2.0
-	maxSteps := 5
 
-	duration := initialDuration
+	backoff := wait.Backoff{
+		Duration: 3 * time.Second,
+		Factor:   2.0,
+		Steps:    5,
+	}
 
-	for i := 0; i < maxSteps; i++ {
+	err := wait.ExponentialBackoffWithContext(ctx, backoff, func(ctx context.Context) (bool, error) {
 		// Fetch the StatefulSet
 		sts, err := getStatefulSet(ctx, r, name, namespace)
 		if err != nil {
-			return err
+			return false, err
 		}
 
 		// Check if the StatefulSet is ready
 		if sts.Status.ReadyReplicas == *sts.Spec.Replicas {
 			// StatefulSet is ready
 			logger.Info("StatefulSet is ready", "name", name, "namespace", namespace)
-			return nil
+			return true, nil
 		}
 
 		// Log the current status
 		logger.Info("StatefulSet is not ready", "ReadyReplicas", strconv.Itoa(int(sts.Status.ReadyReplicas)), "DesiredReplicas", strconv.Itoa(int(*sts.Spec.Replicas)))
+		return false, nil
+	})
 
-		// Wait for the backoff duration
-		select {
-		case <-ctx.Done():
-			return ctx.Err() // Context canceled or timed out
-		case <-time.After(duration):
-			// Proceed to the next retry
-		}
-
-		// Increase the backoff duration
-		duration = time.Duration(float64(duration) * factor)
+	if err != nil {
+		return fmt.Errorf("StatefulSet %s/%s did not become ready: %w", namespace, name, err)
 	}
 
-	return fmt.Errorf("StatefulSet %s/%s did not become ready after %d attempts", namespace, name, maxSteps)
+	return nil
 }
 
 func createHeadlessServiceIfNotExist(ctx context.Context, logger logr.Logger, c client.Client, ec *ecv1alpha1.EtcdCluster, scheme *runtime.Scheme) error {
