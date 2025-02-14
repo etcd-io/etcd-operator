@@ -111,3 +111,8 @@ kubectl apply -f https://raw.githubusercontent.com/<org>/etcd-operator/<tag or b
 **NOTE:** Run `make help` for more information on all potential `make` targets
 
 More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
+
+## License
+
+etcd-operator uses the [Apache License 2.0](https://apache.org/licenses/LICENSE-2.0.txt) to strike a balance between
+open contributions and allowing you to use the software however you want.

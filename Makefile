@@ -88,6 +88,18 @@ lint: golangci-lint ## Run golangci-lint linter
 lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes
 	$(GOLANGCI_LINT) run --fix
 
+.PHONY: check-license
+check-license: ## Check License Header.
+	hawkeye check --config licenserc.toml
+
+.PHONY: format-license
+format-license: ## Format License Header.
+	hawkeye format --config licenserc.toml
+
+.PHONY: remove-license
+remove-license: ## Remove License Header.
+	hawkeye remove --config licenserc.toml
+
 ##@ Build
 
 .PHONY: build
@@ -180,6 +192,7 @@ CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
 ENVTEST ?= $(LOCALBIN)/setup-envtest
 GOLANGCI_LINT = $(LOCALBIN)/golangci-lint
 CRD_REF_DOCS ?= $(LOCALBIN)/crd-ref-docs
+HAWKEYE ?= $(LOCALBIN)/hawkeye
 
 ## Tool Versions
 KUSTOMIZE_VERSION = $(shell cd tools/mod && go list -m -f {{.Version}} sigs.k8s.io/kustomize/kustomize/v5)
@@ -187,6 +200,7 @@ CONTROLLER_TOOLS_VERSION = $(shell cd tools/mod && go list -m -f {{.Version}} si
 ENVTEST_VERSION = $(shell cd tools/mod && go list -m -f {{.Version}} sigs.k8s.io/controller-runtime/tools/setup-envtest)
 GOLANGCI_LINT_VERSION = $(shell cd tools/mod && go list -m -f {{.Version}} github.com/golangci/golangci-lint)
 CRD_REF_DOCS_VERSION = $(shell cd tools/mod && go list -m -f {{.Version}} github.com/elastic/crd-ref-docs)
+KAWKEYE_VERSION ?= v6.0.0
 
 .PHONY: kustomize
 kustomize: $(KUSTOMIZE) ## Download kustomize locally if necessary.
@@ -198,13 +212,17 @@ controller-gen: $(CONTROLLER_GEN) ## Download controller-gen locally if necessar
 $(CONTROLLER_GEN): $(LOCALBIN)
 	$(call go-install-tool,$(CONTROLLER_GEN),sigs.k8s.io/controller-tools/cmd/controller-gen,$(CONTROLLER_TOOLS_VERSION))
 
+.PHONY: hawkeye
+hawkeye: ## Download hawkeye locally if necessary, ref: https://github.com/korandoru/hawkeye.
+	curl --proto '=https' --tlsv1.2 -LsSf https://github.com/korandoru/hawkeye/releases/download/${KAWKEYE_VERSION}/hawkeye-installer.sh | sh
+
 .PHONY: envtest
 envtest: $(ENVTEST) ## Download setup-envtest locally if necessary.
 $(ENVTEST): $(LOCALBIN)
 	$(call go-install-tool,$(ENVTEST),sigs.k8s.io/controller-runtime/tools/setup-envtest,$(ENVTEST_VERSION))
 
 .PHONY: crd-ref-docs
-crd-ref-docs: $(CRD_REF_DOCS) ## Install crd-ref-docs tool, ref: https://github.com/elastic/crd-ref-docs.
+crd-ref-docs: $(CRD_REF_DOCS) ## Download crd-ref-docs locally if necessary, ref: https://github.com/elastic/crd-ref-docs.
 $(CRD_REF_DOCS): $(LOCALBIN)
 	$(call go-install-tool,$(CRD_REF_DOCS),github.com/elastic/crd-ref-docs,$(CRD_REF_DOCS_VERSION))
 
