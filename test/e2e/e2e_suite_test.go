@@ -6,7 +6,7 @@ you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
--
+
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -64,35 +64,9 @@ func TestMain(m *testing.M) {
 
 		// prepare the resources
 		func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
-<<<<<<< HEAD
 			// Build docker image
 			log.Println("Building docker image...")
 			cmd := exec.Command("make", "docker-build", fmt.Sprintf("IMG=%s", dockerImage))
-=======
-			log.Println("Installing bin tools...")
-			cmd := exec.Command("make", "kustomize")
-			if _, err := test_utils.Run(cmd); err != nil {
-				log.Printf("Failed to install kustomize binary: %s", err)
-				return ctx, err
-			}
-			cmd = exec.Command("make", "controller-gen")
-			if _, err := test_utils.Run(cmd); err != nil {
-				log.Printf("Failed to install controller-gen binary: %s", err)
-				return ctx, err
-			}
-
-			// gen manifest files
-			log.Println("Generate manifests...")
-			cmd = exec.Command("make", "manifests")
-			if _, err := test_utils.Run(cmd); err != nil {
-				log.Printf("Failed to generate manifests: %s", err)
-				return ctx, err
-			}
-
-			// Build docker image
-			log.Println("Building docker image...")
-			cmd = exec.Command("make", "docker-build", fmt.Sprintf("IMG=%s", dockerImage))
->>>>>>> 2d8205f (Convert existing e2e tests from Gingko to e2e framework)
 			if _, err := test_utils.Run(cmd); err != nil {
 				log.Printf("Failed to build docker image: %s", err)
 				return ctx, err
