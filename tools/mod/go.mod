@@ -1,17 +1,17 @@
 module go.etcd.io/etcd-operator/tools/mod
 
-toolchain go1.23.6
+toolchain go1.24.0
 
-go 1.23.0
+go 1.24
 
 require (
 	github.com/elastic/crd-ref-docs v0.1.0
 	github.com/golangci/golangci-lint v1.64.5
 	sigs.k8s.io/controller-runtime/tools/setup-envtest v0.0.0-20250106171007-7436275c4311 // @release-0.19
 	sigs.k8s.io/controller-tools v0.17.2
-	sigs.k8s.io/kustomize/kustomize/v5 v5.6.0
 	sigs.k8s.io/kind v0.27.0
-) 
+	sigs.k8s.io/kustomize/kustomize/v5 v5.6.0
+)
 
 require (
 	4d63.com/gocheckcompilerdirectives v1.2.1 // indirect
