@@ -64,21 +64,9 @@ func TestMain(m *testing.M) {
 
 		// prepare the resources
 		func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
-			log.Println("Installing bin tools...")
-			cmd := exec.Command("make", "kustomize")
-			if _, err := test_utils.Run(cmd); err != nil {
-				log.Printf("Failed to install kustomize binary: %s", err)
-				return ctx, err
-			}
-			cmd = exec.Command("make", "controller-gen")
-			if _, err := test_utils.Run(cmd); err != nil {
-				log.Printf("Failed to install controller-gen binary: %s", err)
-				return ctx, err
-			}
-
 			// gen manifest files
 			log.Println("Generate manifests...")
-			cmd = exec.Command("make", "manifests")
+			cmd := exec.Command("make", "manifests")
 			if _, err := test_utils.Run(cmd); err != nil {
 				log.Printf("Failed to generate manifests: %s", err)
 				return ctx, err
