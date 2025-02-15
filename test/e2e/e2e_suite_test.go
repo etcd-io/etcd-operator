@@ -64,17 +64,9 @@ func TestMain(m *testing.M) {
 
 		// prepare the resources
 		func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
-			// gen manifest files
-			log.Println("Generate manifests...")
-			cmd := exec.Command("make", "manifests")
-			if _, err := test_utils.Run(cmd); err != nil {
-				log.Printf("Failed to generate manifests: %s", err)
-				return ctx, err
-			}
-
 			// Build docker image
 			log.Println("Building docker image...")
-			cmd = exec.Command("make", "docker-build", fmt.Sprintf("IMG=%s", dockerImage))
+			cmd := exec.Command("make", "docker-build", fmt.Sprintf("IMG=%s", dockerImage))
 			if _, err := test_utils.Run(cmd); err != nil {
 				log.Printf("Failed to build docker image: %s", err)
 				return ctx, err
