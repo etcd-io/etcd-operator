@@ -1,8 +1,8 @@
 module go.etcd.io/etcd-operator
 
-toolchain go1.23.6
+toolchain go1.24.0
 
-go 1.23.0
+go 1.24
 
 require (
 	github.com/go-logr/logr v1.4.2
