@@ -19,13 +19,7 @@ require (
 	k8s.io/client-go v0.32.2
 	k8s.io/klog/v2 v2.130.1
 	k8s.io/utils v0.0.0-20241104100929-3ea5e8cea738
-	sigs.k8s.io/controller-runtime v0.20.2
-)
-
-require (
-	github.com/moby/spdystream v0.5.0 // indirect
-	github.com/mxk/go-flowrate v0.0.0-20140419014527-cca7078d478f // indirect
-	github.com/vladimirvivien/gexe v0.4.1 // indirect
+	sigs.k8s.io/controller-runtime v0.20.1
 )
 
 require (
