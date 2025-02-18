@@ -11,7 +11,8 @@ require (
 	sigs.k8s.io/controller-tools v0.17.2
 	sigs.k8s.io/kind v0.27.0
 	sigs.k8s.io/kustomize/kustomize/v5 v5.6.0
-)
+	sigs.k8s.io/kind v0.27.0
+) 
 
 require (
 	4d63.com/gocheckcompilerdirectives v1.3.0 // indirect
