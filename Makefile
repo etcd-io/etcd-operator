@@ -69,8 +69,8 @@ test: manifests generate fmt vet envtest ## Run tests.
 # - PROMETHEUS_INSTALL_SKIP=true
 # - CERT_MANAGER_INSTALL_SKIP=true
 .PHONY: test-e2e
-test-e2e: generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
-	go test ./test/e2e/ -v
+test-e2e: generate fmt vet kind ## Run the e2e tests. Expected an isolated environment using Kind.
+	PATH="$(LOCALBIN):$(PATH)" go test ./test/e2e/ -v
 
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter
@@ -172,6 +172,7 @@ CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
 ENVTEST ?= $(LOCALBIN)/setup-envtest
 GOLANGCI_LINT = $(LOCALBIN)/golangci-lint
 CRD_REF_DOCS ?= $(LOCALBIN)/crd-ref-docs
+KIND ?= $(LOCALBIN)/kind
 
 ## Tool Versions
 KUSTOMIZE_VERSION = $(shell cd tools/mod && go list -m -f {{.Version}} sigs.k8s.io/kustomize/kustomize/v5)
@@ -179,6 +180,7 @@ CONTROLLER_TOOLS_VERSION = $(shell cd tools/mod && go list -m -f {{.Version}} si
 ENVTEST_VERSION = $(shell cd tools/mod && go list -m -f {{.Version}} sigs.k8s.io/controller-runtime/tools/setup-envtest)
 GOLANGCI_LINT_VERSION = $(shell cd tools/mod && go list -m -f {{.Version}} github.com/golangci/golangci-lint)
 CRD_REF_DOCS_VERSION = $(shell cd tools/mod && go list -m -f {{.Version}} github.com/elastic/crd-ref-docs)
+KIND_VERSION = $(shell cd tools/mod && go list -m -f {{.Version}} sigs.k8s.io/kind)
 
 .PHONY: kustomize
 kustomize: $(KUSTOMIZE) ## Download kustomize locally if necessary.
@@ -199,6 +201,11 @@ $(ENVTEST): $(LOCALBIN)
 crd-ref-docs: $(CRD_REF_DOCS) ## Install crd-ref-docs tool, ref: https://github.com/elastic/crd-ref-docs.
 $(CRD_REF_DOCS): $(LOCALBIN)
 	$(call go-install-tool,$(CRD_REF_DOCS),github.com/elastic/crd-ref-docs,$(CRD_REF_DOCS_VERSION))
+
+.PHONY: kind
+kind: $(KIND) ## Download kind locally if necessary.
+$(KIND): $(LOCALBIN)
+	$(call go-install-tool,$(KIND),sigs.k8s.io/kind,$(KIND_VERSION))
 
 .PHONY: golangci-lint
 golangci-lint: $(GOLANGCI_LINT) ## Download golangci-lint locally if necessary.

@@ -10,11 +10,13 @@ require (
 	sigs.k8s.io/controller-runtime/tools/setup-envtest v0.0.0-20250106171007-7436275c4311 // @release-0.19
 	sigs.k8s.io/controller-tools v0.17.2
 	sigs.k8s.io/kustomize/kustomize/v5 v5.6.0
-)
+	sigs.k8s.io/kind v0.27.0
+) 
 
 require (
 	4d63.com/gocheckcompilerdirectives v1.2.1 // indirect
 	4d63.com/gochecknoglobals v0.2.2 // indirect
+	al.essio.dev/pkg/shellescape v1.5.1 // indirect
 	github.com/4meepo/tagalign v1.4.1 // indirect
 	github.com/Abirdcfly/dupword v0.1.3 // indirect
 	github.com/Antonboom/errname v1.0.0 // indirect
@@ -56,6 +58,7 @@ require (
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/denis-tingaikin/go-header v0.5.0 // indirect
 	github.com/ettle/strcase v0.2.0 // indirect
+	github.com/evanphx/json-patch/v5 v5.6.0 // indirect
 	github.com/fatih/color v1.18.0 // indirect
 	github.com/fatih/structtag v1.2.0 // indirect
 	github.com/firefart/nonamedreturns v1.0.5 // indirect
@@ -94,6 +97,7 @@ require (
 	github.com/google/gnostic-models v0.6.9 // indirect
 	github.com/google/go-cmp v0.6.0 // indirect
 	github.com/google/gofuzz v1.2.0 // indirect
+	github.com/google/safetext v0.0.0-20220905092116-b49f7bc46da2 // indirect
 	github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/gordonklaus/ineffassign v0.1.0 // indirect
