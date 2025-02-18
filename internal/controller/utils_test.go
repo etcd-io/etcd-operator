@@ -132,7 +132,7 @@ func TestWaitForStatefulSetReady(t *testing.T) {
 				},
 			},
 			expectedResult: false,
-			expectedError:  errors.New("StatefulSet default/test-sts did not become ready after 5 attempts"),
+			expectedError:  errors.New("StatefulSet default/test-sts did not become ready: timed out waiting for the condition"),
 		},
 		{
 			name:           "StatefulSet does not exist",
