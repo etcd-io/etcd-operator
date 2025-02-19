@@ -21,7 +21,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"testing"
 	"time"
 
@@ -30,6 +29,7 @@ import (
 	"sigs.k8s.io/e2e-framework/pkg/env"
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
 	"sigs.k8s.io/e2e-framework/pkg/envfuncs"
+	"sigs.k8s.io/e2e-framework/pkg/utils"
 	"sigs.k8s.io/e2e-framework/support/kind"
 
 	test_utils "go.etcd.io/etcd-operator/test/utils"
@@ -64,12 +64,19 @@ func TestMain(m *testing.M) {
 
 		// prepare the resources
 		func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
+			dir, _ := test_utils.GetProjectDir()
+			// change dir for Make file or it will fail
+			if err := os.Chdir(dir); err != nil {
+				log.Printf("Unable to set working directory: %s", err)
+				return ctx, err
+			}
+
 			// Build docker image
 			log.Println("Building docker image...")
-			cmd := exec.Command("make", "docker-build", fmt.Sprintf("IMG=%s", dockerImage))
-			if _, err := test_utils.Run(cmd); err != nil {
-				log.Printf("Failed to build docker image: %s", err)
-				return ctx, err
+			cmd := fmt.Sprintf("make docker-build IMG=%s", dockerImage)
+			if p := utils.RunCommand(cmd); p.Err() != nil {
+				log.Printf("Failed to build docker image: %s", p.Err())
+				return ctx, p.Err()
 			}
 
 			// Load docker image into kind
@@ -99,30 +106,22 @@ func TestMain(m *testing.M) {
 
 		// set up environment
 		func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
-			// create namespace
-			var err error
-			ctx, err = envfuncs.CreateNamespace(namespace)(ctx, cfg)
-			if err != nil {
-				log.Printf("failed to create namespace: %s", err)
-				return ctx, err
-			}
-
 			// install crd
 			log.Println("Install crd...")
-			cmd := exec.Command("make", "install")
-			if _, err := test_utils.Run(cmd); err != nil {
-				log.Printf("Failed to install crd: %s", err)
-				return ctx, err
+			cmd := "make install"
+			if p := utils.RunCommand(cmd); p.Err() != nil {
+				log.Printf("Failed to install crd: %s", p.Err())
+				return ctx, p.Err()
 			}
 
 			// Deploy components
 			log.Println("Deploying components...")
 
 			log.Println("Deploying controller-manager resources...")
-			cmd = exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", dockerImage))
-			if _, err := test_utils.Run(cmd); err != nil {
-				log.Printf("Failed to deploy resource configurations: %s", err)
-				return ctx, err
+			cmd = fmt.Sprintf("make deploy IMG=%s", dockerImage)
+			if p := utils.RunCommand(cmd); p.Err() != nil {
+				log.Printf("Failed to deploy resource configurations: %s", p.Err())
+				return ctx, p.Err()
 			}
 
 			// wait for controller to get ready
@@ -147,29 +146,21 @@ func TestMain(m *testing.M) {
 		// cleanup environment
 		func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
 			log.Println("Finishing tests, cleaning cluster ...")
-
 			// undeploy etcd operator
 			log.Println("Undeploy etcd controller...")
-			cmd := exec.Command("make", "undeploy", "ignore-not-found=true")
-			if _, err := test_utils.Run(cmd); err != nil {
-				log.Printf("Warning: Failed to undeploy controller: %s", err)
+			cmd := "make undeploy ignore-not-found=true"
+			if p := utils.RunCommand(cmd); p.Err() != nil {
+				log.Printf("Warning: Failed to undeploy controller: %s", p.Err())
 			}
 
 			// uninstall crd
 			log.Println("Uninstalling crd...")
-			cmd = exec.Command("make", "uninstall", "ignore-not-found=true")
-			if _, err := test_utils.Run(cmd); err != nil {
-				log.Printf("Warning: Failed to install crd: %s", err)
+			cmd = "make uninstall ignore-not-found=true"
+			if p := utils.RunCommand(cmd); p.Err() != nil {
+				log.Printf("Warning: Failed to install crd: %s", p.Err())
 			}
 
-			// remove namespace
-			var err error
-			log.Println("Destroying namespace...")
-			ctx, err = envfuncs.DeleteNamespace(namespace)(ctx, cfg)
-			if err != nil {
-				log.Printf("failed to delete namespace: %s", err)
-			}
-
+			// no need to remove namespace because `make undeploy` has already done this.
 			return ctx, nil
 		},
 
