@@ -23,8 +23,6 @@ import (
 	"os"
 	"os/exec"
 	"strings"
-
-	. "github.com/onsi/ginkgo/v2" //nolint:golint,revive
 )
 
 const (
@@ -37,7 +35,7 @@ const (
 )
 
 func warnError(err error) {
-	_, _ = fmt.Fprintf(GinkgoWriter, "warning: %v\n", err)
+	fmt.Printf("warning: %v\n", err)
 }
 
 // Run executes the provided command within this context
@@ -46,12 +44,12 @@ func Run(cmd *exec.Cmd) (string, error) {
 	cmd.Dir = dir
 
 	if err := os.Chdir(cmd.Dir); err != nil {
-		_, _ = fmt.Fprintf(GinkgoWriter, "chdir dir: %s\n", err)
+		fmt.Printf("chdir dir error: %s\n", err)
 	}
 
 	cmd.Env = append(os.Environ(), "GO111MODULE=on")
 	command := strings.Join(cmd.Args, " ")
-	_, _ = fmt.Fprintf(GinkgoWriter, "running: %s\n", command)
+	fmt.Printf("running: %s\n", command)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return string(output), fmt.Errorf("%s failed with error: (%v) %s", command, err, string(output))
