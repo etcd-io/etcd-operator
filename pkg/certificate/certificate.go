@@ -20,7 +20,7 @@ func NewProvider(pt ProviderType) (certInterface.Provider, error) {
 	case Auto:
 		return nil, nil // change me later
 	case CertManager:
-		return &certManager.CertManagerProvider{}, nil // change me later
+		return certManager.New(), nil // change me later
 	}
 
 	return nil, fmt.Errorf("unknown provider type: %s", pt)

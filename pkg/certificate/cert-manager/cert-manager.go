@@ -22,6 +22,10 @@ type CertManagerProvider struct {
 	Scheme *runtime.Scheme
 }
 
+func New() *CertManagerProvider {
+	return &CertManagerProvider{}
+}
+
 func (cm *CertManagerProvider) EnsureCertificateSecret(
 	ctx context.Context,
 	secretName string,
@@ -79,16 +83,21 @@ func (cm *CertManagerProvider) ValidateCertificateSecret(
 
 	certificateData, exists := secret.Data["tls.crt"]
 	if !exists {
-		return false, fmt.Errorf("interfaces not found in secret")
+		return false, fmt.Errorf("certificate not found in secret")
+	}
+
+	_, keyExists := secret.Data["tls.key"]
+	if !keyExists {
+		return false, fmt.Errorf("private key not found in secret")
 	}
 
 	parseCert, err := x509.ParseCertificate(certificateData)
 	if err != nil {
-		return false, fmt.Errorf("failed to parse interfaces: %v", err)
+		return false, fmt.Errorf("failed to parse certificate: %v", err)
 	}
 
 	if parseCert.NotAfter.Before(time.Now()) {
-		return false, fmt.Errorf("interfaces has expired")
+		return false, fmt.Errorf("certificate has expired")
 	}
 
 	return true, nil
@@ -122,7 +131,7 @@ func (cm *CertManagerProvider) GetCertificateConfig(
 	cmCertificate := &certmanagerv1.Certificate{}
 	err := cm.Get(ctx, client.ObjectKey{Name: secretName, Namespace: namespace}, cmCertificate)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get interfaces: %v", err)
+		return nil, fmt.Errorf("failed to get certificate: %v", err)
 	}
 
 	cfg := &interfaces.Config{
