@@ -16,6 +16,7 @@ import (
 	certmanagerv1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -189,8 +190,31 @@ func (cm *CertManagerProvider) DeleteCertificateSecret(ctx context.Context, secr
 }
 
 func (cm *CertManagerProvider) RevokeCertificate(ctx context.Context, secretName string, namespace string) error {
-	// TODO
-	panic("TODO")
+	cmCertificate := &certmanagerv1.Certificate{}
+	getCertificateErr := cm.Get(ctx, client.ObjectKey{Name: secretName, Namespace: namespace}, cmCertificate)
+	if getCertificateErr != nil {
+		return getCertificateErr
+	}
+
+	deleteCertificateErr := cm.Delete(ctx, cmCertificate)
+	if deleteCertificateErr != nil {
+		return deleteCertificateErr
+	}
+
+	// By default, cert-manager Certificate deletion does not delete the associated secret.
+	// Existing secret will allow to services relying on that Certificate, so additionally delete it
+	// More info: https://cert-manager.io/docs/usage/certificate/#cleaning-up-secrets-when-certificates-are-deleted
+	deleteCertificateSecretErr := cm.DeleteCertificateSecret(ctx, secretName, namespace)
+	if deleteCertificateSecretErr != nil {
+		if errors.IsNotFound(deleteCertificateSecretErr) {
+			fmt.Println("Certificate secret not found, maybe already deleted")
+		} else {
+			return deleteCertificateSecretErr
+		}
+
+	}
+
+	return nil
 }
 
 func (cm *CertManagerProvider) GetCertificateConfig(
