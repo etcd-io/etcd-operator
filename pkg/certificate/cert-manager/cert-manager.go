@@ -31,12 +31,6 @@ func (cm *CertManagerProvider) EnsureCertificateSecret(
 	secretName string,
 	namespace string,
 	cfg *interfaces.Config) error {
-	foundCert := &certmanagerv1.Certificate{}
-	foundErr := cm.Get(ctx, client.ObjectKey{Name: secretName, Namespace: namespace}, foundCert)
-	if foundErr != nil {
-		return foundErr
-	}
-
 	issuerName, ok := cfg.ExtraConfig["issuerName"].(string)
 	if !ok {
 		return fmt.Errorf("issuerName is missing in ExtraConfig")
@@ -67,14 +61,13 @@ func (cm *CertManagerProvider) EnsureCertificateSecret(
 	}
 
 	return nil
-
 }
 
 func (cm *CertManagerProvider) ValidateCertificateSecret(
 	ctx context.Context,
 	secretName string,
 	namespace string,
-	cfg *interfaces.Config) (bool, error) {
+	_ *interfaces.Config) (bool, error) {
 	secret := &corev1.Secret{}
 	err := cm.Get(ctx, client.ObjectKey{Name: secretName, Namespace: namespace}, secret)
 	if err != nil {
