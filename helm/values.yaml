@@ -1,0 +1,62 @@
+
+# Default values for etcd-operator.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+# If you do want to specify resources, use the following example, and adjust
+# it as necessary.
+resources:
+  limits:
+    cpu: 500m
+    memory: 128Mi
+  requests:
+    cpu: 10m
+    memory: 64Mi
+
+image:
+  repository: quay.io/coreos/etcd
+  tag: v3.5.18
+
+manager:
+  replicas: 1
+
+prometheus:
+  enabled: false
+
+serviceAccount:
+  # -- Specifies whether a service account should be created
+  create: false
+  # -- The name of the service account to use.
+  # If not set and create is true, a name is generated using the fullname template
+  name: "controller-manager"
+  # -- Annotations to add to the service account
+  annotations: {}
+
+# -- Labels that get applied to every resource's metadata
+commonLabels: {}
+
+# -- [Pod security context](https://kubernetes.io/docs/tasks/configure-pod-container/security-context/#set-the-security-context-for-a-pod) configuration.
+# To remove the default, set it to null (or `~`).
+podSecurityContext: {}
+
+podAnnotations: {}
+
+annotations: {}
+
+affinity: {}
+
+terminationGracePeriodSeconds: 10
+
+livenessProbe:
+  initialDelaySeconds: 15
+  periodSeconds: 20
+  failureThreshold: 3
+  timeoutSeconds: 1
+  port: 8081
+
+readinessProbe:
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  failureThreshold: 12
+  timeoutSeconds: 1
+  port: 8081
