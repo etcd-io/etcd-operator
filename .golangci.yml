@@ -22,7 +22,6 @@ linters:
     - copyloopvar
     - dupl
     - errcheck
-    - ginkgolinter
     - goconst
     - gocyclo
     - gofmt

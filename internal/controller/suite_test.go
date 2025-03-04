@@ -19,15 +19,12 @@ package controller
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"runtime"
 	"testing"
 
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
-
 	"k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -37,60 +34,70 @@ import (
 	// +kubebuilder:scaffold:imports
 )
 
-// These tests use Ginkgo (BDD-style Go testing framework). Refer to
-// http://onsi.github.io/ginkgo/ to learn more about Ginkgo.
+var (
+	k8sClient client.Client
+)
 
-var cfg *rest.Config
-var k8sClient client.Client
-var testEnv *envtest.Environment
-var ctx context.Context
-var cancel context.CancelFunc
+func TestMain(m *testing.M) {
+	logf.SetLogger(zap.New(zap.UseDevMode(true)))
+	_, cancel := context.WithCancel(context.Background())
 
-func TestControllers(t *testing.T) {
-	RegisterFailHandler(Fail)
-
-	RunSpecs(t, "Controller Suite")
-}
-
-var _ = BeforeSuite(func() {
-	logf.SetLogger(zap.New(zap.WriteTo(GinkgoWriter), zap.UseDevMode(true)))
-
-	ctx, cancel = context.WithCancel(context.TODO())
-
-	By("bootstrapping test environment")
-	testEnv = &envtest.Environment{
-		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "config", "crd", "bases")},
-		ErrorIfCRDPathMissing: true,
-
-		// The BinaryAssetsDirectory is only required if you want to run the tests directly
-		// without call the makefile target test. If not informed it will look for the
-		// default path defined in controller-runtime which is /usr/local/kubebuilder/.
-		// Note that you must have the required binaries setup under the bin directory to perform
-		// the tests directly. When we run make test it will be setup and used automatically.
-		BinaryAssetsDirectory: filepath.Join("..", "..", "bin", "k8s",
-			fmt.Sprintf("1.31.0-%s-%s", runtime.GOOS, runtime.GOARCH)),
+	// read ENVTEST_K8S_VERSION
+	envTestK8sVersion := os.Getenv("ENVTEST_K8S_VERSION")
+	if envTestK8sVersion == "" {
+		envTestK8sVersion = "1.31.0"
 	}
 
-	var err error
-	// cfg is defined in this file globally.
-	cfg, err = testEnv.Start()
-	Expect(err).NotTo(HaveOccurred())
-	Expect(cfg).NotTo(BeNil())
+	// Set up the test environment
+	testEnv := &envtest.Environment{
+		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "config", "crd", "bases")},
+		ErrorIfCRDPathMissing: true,
+		BinaryAssetsDirectory: filepath.Join(
+			"..", "..", "bin", "k8s",
+			fmt.Sprintf("%s-%s-%s", envTestK8sVersion, runtime.GOOS, runtime.GOARCH),
+		),
+	}
 
+	// Start the envtest environment.
+	var err error
+	cfg, err := testEnv.Start()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to start test environment: %v\n", err)
+		os.Exit(1)
+	}
+	if cfg == nil {
+		fmt.Fprintln(os.Stderr, "Test environment started with nil config")
+		os.Exit(1)
+	}
+
+	// Teardown after tests
+	defer func() {
+		cancel()
+		if err := testEnv.Stop(); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to stop test environment: %v\n", err)
+			os.Exit(1)
+		}
+	}()
+
+	// Add custom resource’s scheme.
 	err = operatorv1alpha1.AddToScheme(scheme.Scheme)
-	Expect(err).NotTo(HaveOccurred())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to add operator scheme: %v\n", err)
+		os.Exit(1)
+	}
 
 	// +kubebuilder:scaffold:scheme
 
+	// Create a Kubernetes client to be used in tests.
 	k8sClient, err = client.New(cfg, client.Options{Scheme: scheme.Scheme})
-	Expect(err).NotTo(HaveOccurred())
-	Expect(k8sClient).NotTo(BeNil())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create k8s client: %v\n", err)
+		os.Exit(1)
+	}
 
-})
+	// Run all tests.
+	code := m.Run()
 
-var _ = AfterSuite(func() {
-	By("tearing down the test environment")
-	cancel()
-	err := testEnv.Stop()
-	Expect(err).NotTo(HaveOccurred())
-})
+	// Exit with the test code.
+	os.Exit(code)
+}
