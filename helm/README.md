@@ -31,6 +31,7 @@ The official Kubernetes operator for etcd.
 | livenessProbe.port | int | `8081` |  |
 | livenessProbe.timeoutSeconds | int | `1` |  |
 | manager.replicas | int | `1` |  |
+| networkPolicy.enabled | bool | `false` |  |
 | podAnnotations | object | `{}` |  |
 | podSecurityContext | object | `{}` | [Pod security context](https://kubernetes.io/docs/tasks/configure-pod-container/security-context/#set-the-security-context-for-a-pod) configuration. To remove the default, set it to null (or `~`). |
 | prometheus.enabled | bool | `false` |  |

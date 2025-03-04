@@ -45,6 +45,9 @@ annotations: {}
 
 affinity: {}
 
+networkPolicy:
+  enabled: false
+
 terminationGracePeriodSeconds: 10
 
 livenessProbe:
