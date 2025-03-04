@@ -17,10 +17,8 @@ limitations under the License.
 package controller
 
 import (
-	"context"
+	"testing"
 
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -30,55 +28,67 @@ import (
 	operatorv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 )
 
-var _ = Describe("EtcdCluster Controller", func() {
-	Context("When reconciling a resource", func() {
-		const resourceName = "test-resource"
+func TestEtcdClusterController(t *testing.T) {
+	ctx := t.Context()
 
-		ctx := context.Background()
+	const resourceName = "test-etcd-cluster"
+	typeNamespacedName := types.NamespacedName{
+		Name:      resourceName,
+		Namespace: "etcd-operator-system",
+	}
 
-		typeNamespacedName := types.NamespacedName{
-			Name:      resourceName,
-			Namespace: "default", // TODO(user):Modify as needed
-		}
+	t.Run("When reconciling a resource", func(t *testing.T) {
 		etcdcluster := &operatorv1alpha1.EtcdCluster{}
 
-		BeforeEach(func() {
-			By("creating the custom resource for the Kind EtcdCluster")
-			err := k8sClient.Get(ctx, typeNamespacedName, etcdcluster)
-			if err != nil && errors.IsNotFound(err) {
-				resource := &operatorv1alpha1.EtcdCluster{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      resourceName,
-						Namespace: "default",
-					},
-					// TODO(user): Specify other spec details if needed.
-				}
-				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+		t.Log("Creating or retrieving the EtcdCluster resource")
+		err := k8sClient.Get(ctx, typeNamespacedName, etcdcluster)
+		if err != nil && errors.IsNotFound(err) {
+			resource := &operatorv1alpha1.EtcdCluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      resourceName,
+					Namespace: "default",
+				},
 			}
-		})
+			if createErr := k8sClient.Create(ctx, resource); createErr != nil {
+				t.Fatalf("Failed to create EtcdCluster resource: %v", createErr)
+			}
+		} else if err != nil {
+			t.Fatalf("Failed to get EtcdCluster resource: %v", err)
+		}
 
-		AfterEach(func() {
-			// TODO(user): Cleanup logic after each test, like removing the resource instance.
+		// Defer a cleanup function to remove the resource after the test finishes.
+		defer func() {
+			t.Log("Cleaning up the EtcdCluster resource")
 			resource := &operatorv1alpha1.EtcdCluster{}
-			err := k8sClient.Get(ctx, typeNamespacedName, resource)
-			Expect(err).NotTo(HaveOccurred())
-
-			By("Cleanup the specific resource instance EtcdCluster")
-			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
-		})
-		It("should successfully reconcile the resource", func() {
-			By("Reconciling the created resource")
-			controllerReconciler := &EtcdClusterReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
+			if getErr := k8sClient.Get(ctx, typeNamespacedName, resource); getErr != nil {
+				if !errors.IsNotFound(getErr) {
+					t.Errorf("Failed to get EtcdCluster resource before deletion: %v", getErr)
+				}
+			} else {
+				if deleteErr := k8sClient.Delete(ctx, resource); deleteErr != nil {
+					t.Errorf("Failed to delete EtcdCluster resource: %v", deleteErr)
+				}
 			}
+		}()
 
-			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
-				NamespacedName: typeNamespacedName,
-			})
-			Expect(err).NotTo(HaveOccurred())
-			// TODO(user): Add more specific assertions depending on your controller's reconciliation logic.
-			// Example: If you expect a certain status condition after reconciliation, verify it here.
+		reconciler := &EtcdClusterReconciler{
+			Client: k8sClient,
+			Scheme: k8sClient.Scheme(),
+		}
+
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: typeNamespacedName,
 		})
+		if err != nil {
+			t.Fatalf("Reconciliation failed: %v", err)
+		}
+
+		// TODO: Add more specific checks (e.g., verifying status conditions or created resources).
+		// For example:
+		// updated := &operatorv1alpha1.EtcdCluster{}
+		// if err := k8sClient.Get(ctx, typeNamespacedName, updated); err != nil {
+		//     t.Fatalf("Failed to retrieve updated resource: %v", err)
+		// }
+		// // Validate updated fields or status
 	})
-})
+}
