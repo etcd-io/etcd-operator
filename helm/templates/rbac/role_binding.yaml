@@ -3,7 +3,7 @@ kind: ClusterRoleBinding
 metadata:
   labels:
     {{- include "etcd-operator.labels" . | nindent 4 }}
-  name: manager-rolebinding
+  name: {{ include "etcd-operator.name" . }}-rolebinding
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
