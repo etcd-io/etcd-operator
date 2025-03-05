@@ -4,7 +4,7 @@ kind: Role
 metadata:
   labels:
     {{- include "etcd-operator.labels" . | nindent 4 }}
-  name: leader-election-role
+  name: {{ include "etcd-operator.name" . }}-leader-election-role
 rules:
 - apiGroups:
   - ""
