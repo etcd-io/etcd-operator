@@ -38,6 +38,8 @@ type EtcdClusterSpec struct {
 	StorageSpec *StorageSpec `json:"storageSpec,omitempty"`
 	// TLS is the TLS certificate configuration to use for the etcd cluster and etcd operator.
 	TLS *TLSCertificate `json:"tls,omitempty"`
+	// etcd configuration options are passed as command line arguments to the etcd container, refer to etcd documentation for configuration options applicable for the version of etcd being used.
+	EtcdOptions []string `json:"etcdOptions,omitempty"`
 }
 
 type TLSCertificate struct {

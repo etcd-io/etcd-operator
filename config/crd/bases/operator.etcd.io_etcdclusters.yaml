@@ -39,6 +39,13 @@ spec:
           spec:
             description: EtcdClusterSpec defines the desired state of EtcdCluster.
             properties:
+              etcdOptions:
+                description: etcd configuration options are passed as command line
+                  arguments to the etcd container, refer to etcd documentation for
+                  configuration options applicable for the version of etcd being used.
+                items:
+                  type: string
+                type: array
               size:
                 description: Size is the expected size of the etcd cluster.
                 type: integer

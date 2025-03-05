@@ -503,3 +503,97 @@ func TestApplyEtcdClusterState(t *testing.T) {
 		assert.Contains(t, updatedConfigMap.Data["ETCD_INITIAL_CLUSTER"], "test-etcd-0=http://test-etcd-0.test-etcd.default.svc.cluster.local:2380")
 	})
 }
+
+func TestCreatingArgs(t *testing.T) {
+	tests := []struct {
+		testName       string
+		etcdOptions    []string
+		clusterName    string
+		expectedResult []string
+	}{
+		{
+			testName:    "No etcdOptions provided",
+			etcdOptions: nil,
+			clusterName: "testCluster",
+			expectedResult: []string{
+				"--name=$(POD_NAME)",
+				"--listen-peer-urls=http://0.0.0.0:2380",
+				"--listen-client-urls=http://0.0.0.0:2379",
+				"--initial-advertise-peer-urls=http://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc.cluster.local:2380",
+				"--advertise-client-urls=http://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc.cluster.local:2379",
+			},
+		},
+		{
+			testName: "Etcd options with = sign",
+			etcdOptions: []string{
+				"--max-wals=7",
+				"--discovery-failbox=proxy",
+			},
+			clusterName: "testCluster",
+			expectedResult: []string{
+				"--name=$(POD_NAME)",
+				"--listen-peer-urls=http://0.0.0.0:2380",
+				"--listen-client-urls=http://0.0.0.0:2379",
+				"--initial-advertise-peer-urls=http://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc.cluster.local:2380",
+				"--advertise-client-urls=http://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc.cluster.local:2379",
+				"--max-wals=7",
+				"--discovery-failbox=proxy",
+			},
+		},
+		{
+			testName: "Etcd options with spaces",
+			etcdOptions: []string{
+				"--max-wals 7",
+				"--discovery-failbox proxy",
+			},
+			clusterName: "testCluster",
+			expectedResult: []string{
+				"--name=$(POD_NAME)",
+				"--listen-peer-urls=http://0.0.0.0:2380",
+				"--listen-client-urls=http://0.0.0.0:2379",
+				"--initial-advertise-peer-urls=http://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc.cluster.local:2380",
+				"--advertise-client-urls=http://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc.cluster.local:2379",
+				"--max-wals 7",
+				"--discovery-failbox proxy",
+			},
+		},
+		{
+			testName: "Etcd switch options",
+			etcdOptions: []string{
+				"--experimental-peer-skip-client-san-verification",
+			},
+			clusterName: "testCluster",
+			expectedResult: []string{
+				"--name=$(POD_NAME)",
+				"--listen-peer-urls=http://0.0.0.0:2380",
+				"--listen-client-urls=http://0.0.0.0:2379",
+				"--initial-advertise-peer-urls=http://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc.cluster.local:2380",
+				"--advertise-client-urls=http://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc.cluster.local:2379",
+				"--experimental-peer-skip-client-san-verification",
+			},
+		},
+		{
+			testName: "Overwrite default arg",
+			etcdOptions: []string{
+				"--listen-peer-urls=http://0.0.0.0:3200",
+				"--experimental-peer-skip-client-san-verification",
+			},
+			clusterName: "testCluster",
+			expectedResult: []string{
+				"--name=$(POD_NAME)",
+				"--listen-client-urls=http://0.0.0.0:2379",
+				"--initial-advertise-peer-urls=http://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc.cluster.local:2380",
+				"--advertise-client-urls=http://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc.cluster.local:2379",
+				"--listen-peer-urls=http://0.0.0.0:3200",
+				"--experimental-peer-skip-client-san-verification",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.testName, func(t *testing.T) {
+			result := createArgs(tt.clusterName, tt.etcdOptions)
+			assert.Equal(t, tt.expectedResult, result)
+		})
+	}
+
+}
