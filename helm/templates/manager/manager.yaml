@@ -38,7 +38,7 @@ spec:
         args:
           - --leader-elect
           - --health-probe-bind-address=:8081
-        image: controller:latest
+        image: {{ .Values.image.repository }}:{{ .Values.image.tage }} 
         name: manager
         securityContext:
           allowPrivilegeEscalation: false
