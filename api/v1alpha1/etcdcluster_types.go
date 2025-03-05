@@ -30,6 +30,8 @@ type EtcdClusterSpec struct {
 	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
 
+	// etcd configuration options are passed as environmental vars to the etcd container, refer to etcd documentation for configuration options application for the version of etcd being used.
+	EtcdOptions []EtcdOption `json:"etcdOptions,omitempty"`
 	// Size is the expected size of the etcd cluster.
 	Size int `json:"size"`
 	// Version is the expected version of the etcd container image.
@@ -81,6 +83,11 @@ type EtcdClusterList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []EtcdCluster `json:"items"`
+}
+
+type EtcdOption struct {
+	Name  string `json:"name" protobuf:"bytes,1,opt,name=name"` // required
+	Value string `json:"value,omitempty" protobuf:"bytes,2,opt,name=value"`
 }
 
 type StorageSpec struct {
