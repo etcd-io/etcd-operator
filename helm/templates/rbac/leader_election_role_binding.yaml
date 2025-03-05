@@ -3,7 +3,7 @@ kind: RoleBinding
 metadata:
   labels:
     {{- include "etcd-operator.labels" . | nindent 4 }}
-  name: leader-election-rolebinding
+  name: {{ include "etcd-operator.name" . }}-leader-election-rolebinding
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
