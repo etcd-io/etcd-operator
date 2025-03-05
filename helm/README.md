@@ -23,14 +23,15 @@ The official Kubernetes operator for etcd.
 | affinity | object | `{}` |  |
 | annotations | object | `{}` |  |
 | commonLabels | object | `{}` | Labels that get applied to every resource's metadata |
-| image.repository | string | `"quay.io/coreos/etcd"` |  |
-| image.tag | string | `"v3.5.18"` |  |
+| image.repository | string | `"quay.io/coreos/etcd-operator"` |  |
+| image.tag | string | `"1.0.0"` |  |
 | livenessProbe.failureThreshold | int | `3` |  |
 | livenessProbe.initialDelaySeconds | int | `15` |  |
 | livenessProbe.periodSeconds | int | `20` |  |
 | livenessProbe.port | int | `8081` |  |
 | livenessProbe.timeoutSeconds | int | `1` |  |
 | manager.replicas | int | `1` |  |
+| nameOverride | string | `nil` |  |
 | networkPolicy.enabled | bool | `false` |  |
 | podAnnotations | object | `{}` |  |
 | podSecurityContext | object | `{}` | [Pod security context](https://kubernetes.io/docs/tasks/configure-pod-container/security-context/#set-the-security-context-for-a-pod) configuration. To remove the default, set it to null (or `~`). |
@@ -45,7 +46,7 @@ The official Kubernetes operator for etcd.
 | resources.requests.cpu | string | `"10m"` |  |
 | resources.requests.memory | string | `"64Mi"` |  |
 | serviceAccount.annotations | object | `{}` | Annotations to add to the service account |
-| serviceAccount.create | bool | `false` | Specifies whether a service account should be created |
+| serviceAccount.create | bool | `true` | Specifies whether a service account should be created |
 | serviceAccount.name | string | `"controller-manager"` | The name of the service account to use. If not set and create is true, a name is generated using the fullname template |
 | terminationGracePeriodSeconds | int | `10` |  |
 
