@@ -10,7 +10,7 @@ The official Kubernetes operator for etcd.
 
 | Name | Email | Url |
 | ---- | ------ | --- |
-| etcd-io |  |  |
+| etcd-io |  |  |c
 
 ## Source Code
 
