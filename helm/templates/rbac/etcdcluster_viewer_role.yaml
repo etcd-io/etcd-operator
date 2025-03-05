@@ -4,7 +4,7 @@ kind: ClusterRole
 metadata:
   labels:
     {{- include "etcd-operator.labels" . | nindent 4 }}
-  name: etcdcluster-viewer-role
+  name: {{ include "etcd-operator.name" . }}-viewer-role
 rules:
 - apiGroups:
   - operator.etcd.io
