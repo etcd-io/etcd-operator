@@ -149,6 +149,17 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 		},
 	}
 
+	if len(ec.Spec.EtcdOptions) > 0 {
+		for i := 0; i < len(podSpec.Containers); i++ {
+			if podSpec.Containers[0].Name == "etcd" {
+				for _, v := range ec.Spec.EtcdOptions {
+					podSpec.Containers[0].Env = append(podSpec.Containers[0].Env, corev1.EnvVar{Name: v.Name, Value: v.Value})
+				}
+				break
+			}
+		}
+	}
+
 	stsSpec := appsv1.StatefulSetSpec{
 		Replicas:    &replicas,
 		ServiceName: ec.Name,
