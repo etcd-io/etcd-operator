@@ -13,8 +13,8 @@ resources:
     memory: 64Mi
 
 image:
-  repository: quay.io/coreos/etcd
-  tag: v3.5.18
+  repository: quay.io/coreos/etcd-operator
+  tag:
 
 manager:
   replicas: 1

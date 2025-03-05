@@ -5,7 +5,6 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     control-plane: controller-manager
-    app.kubernetes.io/name: etcd-operator
     {{- include "etcd-operator.labels" . | nindent 4 }}
   annotations:
     {{- toYaml .Values.annotations | nindent 4 }}
@@ -38,7 +37,7 @@ spec:
         args:
           - --leader-elect
           - --health-probe-bind-address=:8081
-        image: {{ .Values.image.repository }}:{{ .Values.image.tage }} 
+        image: {{ .Values.image.repository }}:{{ .Values.image.tag }} 
         name: manager
         securityContext:
           allowPrivilegeEscalation: false
