@@ -8,7 +8,7 @@ The official Kubernetes operator for etcd.
 
 ## Maintainers
 
-| Name | Email | Url |
+| Name | Email | Url |.
 | ---- | ------ | --- |
 | etcd-io |  |  |
 
