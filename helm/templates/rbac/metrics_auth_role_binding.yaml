@@ -5,7 +5,7 @@ metadata:
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: metrics-auth-role
+  name: {{ include "etcd-operator.name" . }}-metrics-auth-role
 subjects:
 - kind: ServiceAccount
   name: {{ include "etcd-operator.serviceAccountName" . }}
