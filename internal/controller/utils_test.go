@@ -71,6 +71,10 @@ func TestReconcileStatefulSet(t *testing.T) {
 		Spec: ecv1alpha1.EtcdClusterSpec{
 			Size:    3,
 			Version: "3.5.17",
+			EtcdOptions: []ecv1alpha1.EtcdOption{
+				{Name: "MAX_WALS", Value: "7"},
+				{Name: "DISCOVERY_FAILBACK", Value: "proxy"},
+			},
 		},
 	}
 
