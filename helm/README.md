@@ -1,6 +1,6 @@
 # etcd-operator
 
-![Version: 3.5.18](https://img.shields.io/badge/Version-3.5.18-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: v3.5.18](https://img.shields.io/badge/AppVersion-v3.5.18-informational?style=flat-square)
+![Version: 0.1.0](https://img.shields.io/badge/Version-0.1.0-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: v0.1.0](https://img.shields.io/badge/AppVersion-v0.1.0-informational?style=flat-square)
 
 The official Kubernetes operator for etcd.
 
@@ -24,7 +24,7 @@ The official Kubernetes operator for etcd.
 | annotations | object | `{}` |  |
 | commonLabels | object | `{}` | Labels that get applied to every resource's metadata |
 | image.repository | string | `"quay.io/coreos/etcd-operator"` |  |
-| image.tag | string | `"1.0.0"` |  |
+| image.tag | string | `"0.1.0"` |  |
 | livenessProbe.failureThreshold | int | `3` |  |
 | livenessProbe.initialDelaySeconds | int | `15` |  |
 | livenessProbe.periodSeconds | int | `20` |  |
