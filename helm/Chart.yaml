@@ -25,7 +25,7 @@ icon: https://avatars.githubusercontent.com/u/41972792?s=48&v=4
 
 home: https://github.com/etcd-io/etcd-operator/tree/main
 sources:
-  - https://github.com/luismacosta/etcd-operator/helm
+  - https://github.com/etcd-io/etcd-operator/helm
 
 maintainers:
   - name: etcd-io

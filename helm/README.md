@@ -14,7 +14,7 @@ The official Kubernetes operator for etcd.
 
 ## Source Code
 
-* <https://github.com/luismacosta/etcd-operator/helm>
+* <https://github.com/etcd-io/etcd-operator/helm>
 
 ## Values
 
