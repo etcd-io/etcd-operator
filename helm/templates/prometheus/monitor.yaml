@@ -3,12 +3,13 @@
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
+  name: {{ include "etcd-operator.name" . }}-controller-manager-metrics-monitor
+  namespace: {{ .Release.Namespace }}
   labels:
     control-plane: controller-manager
     app.kubernetes.io/name: etcd-operator
     app.kubernetes.io/managed-by: kustomize
-  name: controller-manager-metrics-monitor
-  namespace: {{ .Release.Namespace }}
+
 spec:
   endpoints:
     - path: /metrics
