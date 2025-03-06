@@ -1,7 +1,7 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: controller-manager
+  name: {{ include "etcd-operator.name" . }}-controller-manager
   namespace: {{ .Release.Namespace }}
   labels:
     control-plane: controller-manager
