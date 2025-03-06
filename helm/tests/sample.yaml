@@ -2,8 +2,6 @@
 apiVersion: operator.etcd.io/v1alpha1
 kind: EtcdCluster
 metadata:
-  labels:
-    app.kubernetes.io/name: etcd-operator
   name: etcdcluster-sample
 spec:
   version: v3.5.19
