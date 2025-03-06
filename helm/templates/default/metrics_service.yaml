@@ -4,7 +4,7 @@ metadata:
   labels:
     control-plane: controller-manager
     app.kubernetes.io/name: etcd-operator
-  name: controller-manager-metrics-service
+  name: {{ include "etcd-operator.name" . }}-controller-manager-metrics-service
   namespace: {{ .Release.Namespace }}
 spec:
   ports:
