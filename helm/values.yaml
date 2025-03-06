@@ -13,8 +13,8 @@ resources:
     memory: 64Mi
 
 image:
-  repository: hub.talkdeskapp.com/talkdesk/etcd-operator
-  tag: PR-673-e513e949
+  repository: quay.io/coreos/etcd-operator
+  tag: 1.0.0
 
 manager:
   replicas: 1

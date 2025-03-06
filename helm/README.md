@@ -23,8 +23,8 @@ The official Kubernetes operator for etcd.
 | affinity | object | `{}` |  |
 | annotations | object | `{}` |  |
 | commonLabels | object | `{}` | Labels that get applied to every resource's metadata |
-| image.repository | string | `"hub.talkdeskapp.com/talkdesk/etcd-operator"` |  |
-| image.tag | string | `"PR-673-e513e949"` |  |
+| image.repository | string | `"quay.io/coreos/etcd-operator"` |  |
+| image.tag | string | `"1.0.0"` |  |
 | livenessProbe.failureThreshold | int | `3` |  |
 | livenessProbe.initialDelaySeconds | int | `15` |  |
 | livenessProbe.periodSeconds | int | `20` |  |
