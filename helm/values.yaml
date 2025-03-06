@@ -13,11 +13,16 @@ resources:
     memory: 64Mi
 
 image:
-  repository: quay.io/coreos/etcd-operator
-  tag: 0.1.0
+  repository: hub.talkdeskapp.com/talkdesk/etcd-operator
+  tag: PR-673-e513e949
 
 manager:
   replicas: 1
+  command:
+    - "/manager"
+  args:
+    - "--leader-elect"
+    - "--health-probe-bind-address=:8081"
 
 prometheus:
   enabled: false

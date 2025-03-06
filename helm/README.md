@@ -23,13 +23,16 @@ The official Kubernetes operator for etcd.
 | affinity | object | `{}` |  |
 | annotations | object | `{}` |  |
 | commonLabels | object | `{}` | Labels that get applied to every resource's metadata |
-| image.repository | string | `"quay.io/coreos/etcd-operator"` |  |
-| image.tag | string | `"0.1.0"` |  |
+| image.repository | string | `"hub.talkdeskapp.com/talkdesk/etcd-operator"` |  |
+| image.tag | string | `"PR-673-e513e949"` |  |
 | livenessProbe.failureThreshold | int | `3` |  |
 | livenessProbe.initialDelaySeconds | int | `15` |  |
 | livenessProbe.periodSeconds | int | `20` |  |
 | livenessProbe.port | int | `8081` |  |
 | livenessProbe.timeoutSeconds | int | `1` |  |
+| manager.args[0] | string | `"--leader-elect"` |  |
+| manager.args[1] | string | `"--health-probe-bind-address=:8081"` |  |
+| manager.command[0] | string | `"/manager"` |  |
 | manager.replicas | int | `1` |  |
 | nameOverride | string | `nil` |  |
 | networkPolicy.enabled | bool | `false` |  |
