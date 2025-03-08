@@ -2,7 +2,6 @@
 
 The official Kubernetes operator for etcd.
 
-
 ## Community, discussion, contribution, and support
 
 Learn how to engage with the Kubernetes community on the [community page](http://kubernetes.io/community/).
@@ -20,7 +19,7 @@ Participation in the Kubernetes community is governed by the [Kubernetes Code of
 
 ### Prerequisites
 
-- go version v1.24.0+
+- go version v1.24+
 - docker version 17.03+.
 - kubectl version v1.11.3+.
 - Access to a Kubernetes v1.11.3+ cluster.
