@@ -7,6 +7,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -16,7 +17,7 @@ import (
 	certmanagerv1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -24,16 +25,16 @@ import (
 	interfaces "go.etcd.io/etcd-operator/pkg/certificate/interfaces"
 )
 
-type CertManagerProvider struct {
+type Provider struct {
 	client.Client
 	Scheme *runtime.Scheme
 }
 
-func New() *CertManagerProvider {
-	return &CertManagerProvider{}
+func New() *Provider {
+	return &Provider{}
 }
 
-func (cm *CertManagerProvider) createCertificate(
+func (cm *Provider) createCertificate(
 	ctx context.Context,
 	secretName string,
 	namespace string,
@@ -56,12 +57,7 @@ func (cm *CertManagerProvider) createCertificate(
 		},
 	}
 
-	createErr := cm.Create(ctx, certificateResource)
-	if createErr != nil {
-		return createErr
-	}
-
-	return nil
+	return cm.Create(ctx, certificateResource)
 }
 
 // parsePrivateKey parses the private key from the PEM-encoded data.
@@ -69,7 +65,7 @@ func parsePrivateKey(privateKeyData []byte) (crypto.PrivateKey, error) {
 	// Try to parse the private key in the format it might be provided in (e.g., PKCS#8, PEM)
 	block, _ := pem.Decode(privateKeyData)
 	if block == nil {
-		return nil, fmt.Errorf("failed to decode private key: invalid PEM")
+		return nil, errors.New("failed to decode private key: invalid PEM")
 	}
 
 	// Parse the private key from the PEM block
@@ -78,7 +74,7 @@ func parsePrivateKey(privateKeyData []byte) (crypto.PrivateKey, error) {
 		// Try to parse the private key in another format (e.g., RSA)
 		privateKey, err = x509.ParsePKCS1PrivateKey(block.Bytes)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse private key: %v", err)
+			return nil, fmt.Errorf("failed to parse private key: %w", err)
 		}
 	}
 
@@ -92,13 +88,13 @@ func checkKeyPair(cert *x509.Certificate, privateKey crypto.PrivateKey) error {
 		// Check if the private key matches the certificate by validating the public key
 		pub := cert.PublicKey.(*rsa.PublicKey)
 		if !key.PublicKey.Equal(pub) {
-			return fmt.Errorf("private key does not match the public key in the certificate")
+			return errors.New("private key does not match the public key in the certificate")
 		}
 	case *ecdsa.PrivateKey:
 		// Check if the private key matches the certificate by validating the public key
 		pub := cert.PublicKey.(*ecdsa.PublicKey)
 		if !key.PublicKey.Equal(pub) {
-			return fmt.Errorf("private key does not match the public key in the certificate")
+			return errors.New("private key does not match the public key in the certificate")
 		}
 	default:
 		return fmt.Errorf("unsupported private key type: %T", key)
@@ -107,31 +103,36 @@ func checkKeyPair(cert *x509.Certificate, privateKey crypto.PrivateKey) error {
 	return nil
 }
 
-func (cm *CertManagerProvider) EnsureCertificateSecret(
+func (cm *Provider) EnsureCertificateSecret(
 	ctx context.Context,
 	secretName string,
 	namespace string,
 	cfg *interfaces.Config) error {
 	issuerName, found := cfg.ExtraConfig["issuerName"].(string)
 	if !found || len(strings.TrimSpace(issuerName)) == 0 {
-		return fmt.Errorf("issuerName is missing in ExtraConfig")
+		return errors.New("issuerName is missing in ExtraConfig")
 	}
 	issuerKind, found := cfg.ExtraConfig["issuerKind"].(string)
 	if !found || len(strings.TrimSpace(issuerKind)) == 0 {
-		return fmt.Errorf("issuerKind is missing in ExtraConfig")
+		return errors.New("issuerKind is missing in ExtraConfig")
 	}
 
 	checkCertSecret, valErr := cm.ValidateCertificateSecret(ctx, secretName, namespace, cfg)
-	if checkCertSecret {
-		return fmt.Errorf("certificate secret: %s already present in namespace: %s, please delete and try again",
+	if valErr != nil {
+		return fmt.Errorf("invalid certificate secret: %s present in namespace: %s, please delete and try again",
 			secretName, namespace)
 	}
-	log.Println(valErr)
+	if checkCertSecret {
+		return fmt.Errorf("valid certificate secret: %s already present in namespace: %s , skipping Certificate creation",
+			secretName, namespace)
+	}
+	log.Printf("certificate secret: %s not present in namespace: %s , creating new Certificate",
+		secretName, namespace)
 
 	return cm.createCertificate(ctx, secretName, namespace, cfg)
 }
 
-func (cm *CertManagerProvider) ValidateCertificateSecret(
+func (cm *Provider) ValidateCertificateSecret(
 	ctx context.Context,
 	secretName string,
 	namespace string,
@@ -139,57 +140,57 @@ func (cm *CertManagerProvider) ValidateCertificateSecret(
 	secret := &corev1.Secret{}
 	err := cm.Get(ctx, client.ObjectKey{Name: secretName, Namespace: namespace}, secret)
 	if err != nil {
-		return false, fmt.Errorf("failed to get secret: %v", err)
+		return false, nil
 	}
 
 	certificateData, exists := secret.Data["tls.crt"]
 	if !exists {
-		return false, fmt.Errorf("certificate not found in secret")
+		return false, errors.New("certificate not found in secret")
 	}
 
 	privateKeyData, keyExists := secret.Data["tls.key"]
 	if !keyExists {
-		return false, fmt.Errorf("private key not found in secret")
+		return false, errors.New("private key not found in secret")
 	}
 
 	parseCert, err := x509.ParseCertificate(certificateData)
 	if err != nil {
-		return false, fmt.Errorf("failed to parse certificate: %v", err)
+		return false, fmt.Errorf("failed to parse certificate: %w", err)
 	}
 
 	if parseCert.NotAfter.Before(time.Now()) {
-		return false, fmt.Errorf("certificate has expired")
+		return false, errors.New("certificate has expired")
 	}
 
 	privateKey, err := parsePrivateKey(privateKeyData)
 	if err != nil {
-		return false, fmt.Errorf("failed to parse private key: %v", err)
+		return false, fmt.Errorf("failed to parse private key: %w", err)
 	}
 
-	if err := checkKeyPair(parseCert, privateKey); err != nil {
-		return false, fmt.Errorf("private key does not match certificate: %v", err)
+	if checkKeyPairErr := checkKeyPair(parseCert, privateKey); checkKeyPairErr != nil {
+		return false, fmt.Errorf("private key does not match certificate: %w", checkKeyPairErr)
 	}
 
 	return true, nil
 }
 
-func (cm *CertManagerProvider) DeleteCertificateSecret(ctx context.Context, secretName string, namespace string) error {
+func (cm *Provider) DeleteCertificateSecret(ctx context.Context, secretName string, namespace string) error {
 	secret := &corev1.Secret{}
 	err := cm.Get(ctx, client.ObjectKey{Name: secretName, Namespace: namespace}, secret)
 	if err != nil {
-		return fmt.Errorf("failed to get secret: %v", err)
+		return fmt.Errorf("failed to get secret: %w", err)
 	}
 
 	// Delete the Secret
 	err = cm.Delete(ctx, secret)
 	if err != nil {
-		return fmt.Errorf("failed to delete secret: %v", err)
+		return fmt.Errorf("failed to delete secret: %w", err)
 	}
 
 	return nil
 }
 
-func (cm *CertManagerProvider) RevokeCertificate(ctx context.Context, secretName string, namespace string) error {
+func (cm *Provider) RevokeCertificate(ctx context.Context, secretName string, namespace string) error {
 	cmCertificate := &certmanagerv1.Certificate{}
 	getCertificateErr := cm.Get(ctx, client.ObjectKey{Name: secretName, Namespace: namespace}, cmCertificate)
 	if getCertificateErr != nil {
@@ -206,7 +207,7 @@ func (cm *CertManagerProvider) RevokeCertificate(ctx context.Context, secretName
 	// More info: https://cert-manager.io/docs/usage/certificate/#cleaning-up-secrets-when-certificates-are-deleted
 	deleteCertificateSecretErr := cm.DeleteCertificateSecret(ctx, secretName, namespace)
 	if deleteCertificateSecretErr != nil {
-		if errors.IsNotFound(deleteCertificateSecretErr) {
+		if k8serrors.IsNotFound(deleteCertificateSecretErr) {
 			fmt.Println("Certificate secret not found, maybe already deleted")
 		} else {
 			return deleteCertificateSecretErr
@@ -217,14 +218,14 @@ func (cm *CertManagerProvider) RevokeCertificate(ctx context.Context, secretName
 	return nil
 }
 
-func (cm *CertManagerProvider) GetCertificateConfig(
+func (cm *Provider) GetCertificateConfig(
 	ctx context.Context,
 	secretName string,
 	namespace string) (*interfaces.Config, error) {
 	cmCertificate := &certmanagerv1.Certificate{}
 	err := cm.Get(ctx, client.ObjectKey{Name: secretName, Namespace: namespace}, cmCertificate)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get certificate: %v", err)
+		return nil, fmt.Errorf("failed to get certificate: %w", err)
 	}
 
 	cfg := &interfaces.Config{

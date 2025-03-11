@@ -9,16 +9,16 @@ import (
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
 	"sigs.k8s.io/e2e-framework/pkg/features"
 
-	certmanager "go.etcd.io/etcd-operator/pkg/certificate/cert-manager"
+	"go.etcd.io/etcd-operator/pkg/certificate/cert_manager"
 	interfaces "go.etcd.io/etcd-operator/pkg/certificate/interfaces"
 )
 
-func TestCertManagerCM(t *testing.T) {
+func TestCertManagerProvider(t *testing.T) {
 	feature := features.New("Cert-Manager Certificate").WithLabel("app", "cert-manager")
 
 	feature.Setup(
 		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
-			cmProvider := certmanager.New()
+			cmProvider := cert_manager.New()
 			_, getCertConfigErr := cmProvider.GetCertificateConfig(ctx, "test-cert-secret", cfg.Namespace())
 			if errors.IsNotFound(getCertConfigErr) {
 				t.Log(getCertConfigErr)
@@ -43,7 +43,7 @@ func TestCertManagerCM(t *testing.T) {
 
 	feature.Assess("Validate certificate secret",
 		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
-			cmProvider := certmanager.New()
+			cmProvider := cert_manager.New()
 			valid, err := cmProvider.ValidateCertificateSecret(ctx, "test-cert-secret", cfg.Namespace(), &interfaces.Config{})
 			if err != nil {
 				t.Fatal(err)
@@ -54,7 +54,7 @@ func TestCertManagerCM(t *testing.T) {
 
 	feature.Teardown(
 		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
-			cmProvider := certmanager.New()
+			cmProvider := cert_manager.New()
 			deleteSecretErr := cmProvider.DeleteCertificateSecret(ctx, "test-cert-secret", cfg.Namespace())
 			if errors.IsNotFound(deleteSecretErr) {
 				t.Log(deleteSecretErr)

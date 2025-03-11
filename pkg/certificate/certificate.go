@@ -3,7 +3,7 @@ package certificate
 import (
 	"fmt"
 
-	certManager "go.etcd.io/etcd-operator/pkg/certificate/cert-manager"
+	"go.etcd.io/etcd-operator/pkg/certificate/cert_manager"
 	certInterface "go.etcd.io/etcd-operator/pkg/certificate/interfaces"
 )
 
@@ -20,7 +20,7 @@ func NewProvider(pt ProviderType) (certInterface.Provider, error) {
 	case Auto:
 		return nil, nil // change me later
 	case CertManager:
-		return certManager.New(), nil // change me later
+		return cert_manager.New(), nil // change me later
 	}
 
 	return nil, fmt.Errorf("unknown provider type: %s", pt)
