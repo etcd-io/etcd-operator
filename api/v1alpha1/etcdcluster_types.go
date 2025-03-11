@@ -87,7 +87,7 @@ type EtcdClusterList struct {
 
 type EtcdOption struct {
 	Name  string `json:"name" protobuf:"bytes,1,opt,name=name"` // required
-	Value string `json:"value,omitempty" protobuf:"bytes,2,opt,name=value"`
+	Value string `json:"value" protobuf:"bytes,2,opt,name=value"`
 }
 
 type StorageSpec struct {

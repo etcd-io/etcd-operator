@@ -51,6 +51,7 @@ spec:
                       type: string
                   required:
                   - name
+                  - value
                   type: object
                 type: array
               size:
