@@ -6,4 +6,19 @@ metadata:
     app.kubernetes.io/managed-by: kustomize
   name: etcdcluster-sample
 spec:
-  # TODO(user): Add fields here
+  size: 3
+  version: "v3.5.19"
+  tls:
+    provider: "cert-manager"
+    providerCfg:
+      certManagerCfg:
+        commonName: "etcd.etcd-operator-system"
+        organizations:
+          - "etcd-operator"
+        dnsNames:
+         - "etcd.etcd-operator-system"
+        ipAddresses:
+          - 192.168.0.5
+        duration: 2160
+        issuerName: "selfsigned"
+        issuerKind: "ClusterIssuer"
