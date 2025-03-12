@@ -17,6 +17,9 @@ limitations under the License.
 package v1alpha1
 
 import (
+	"net"
+	"time"
+
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -54,6 +57,13 @@ type ProviderAutoConfig struct {
 }
 
 type ProviderCertManagerConfig struct {
+	CommonName   string        `json:"commonName"`
+	Organization []string      `json:"organizations"`
+	DNSNames     []string      `json:"dnsNames"`
+	IPs          []net.IP      `json:"ipAddresses"`
+	Duration     time.Duration `json:"duration"`
+	IssuerName   string        `json:"issuerName"`
+	IssuerKind   string        `json:"issuerKind"`
 }
 
 // EtcdClusterStatus defines the observed state of EtcdCluster.

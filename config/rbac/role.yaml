@@ -8,6 +8,8 @@ rules:
   - ""
   resources:
   - configmaps
+  - pods
+  - secrets
   - services
   verbs:
   - create
@@ -37,6 +39,17 @@ rules:
   - get
   - list
   - patch
+  - update
+  - watch
+- apiGroups:
+  - cert-manager.io
+  resources:
+  - certificates
+  verbs:
+  - create
+  - delete
+  - get
+  - list
   - update
   - watch
 - apiGroups:
