@@ -7,10 +7,10 @@ go 1.24
 require (
 	github.com/go-logr/logr v1.4.2
 	github.com/stretchr/testify v1.10.0
-	go.etcd.io/etcd/api/v3 v3.5.18
-	go.etcd.io/etcd/client/pkg/v3 v3.5.18
-	go.etcd.io/etcd/client/v3 v3.5.18
-	go.etcd.io/etcd/server/v3 v3.5.18
+	go.etcd.io/etcd/api/v3 v3.5.19
+	go.etcd.io/etcd/client/pkg/v3 v3.5.19
+	go.etcd.io/etcd/client/v3 v3.5.19
+	go.etcd.io/etcd/server/v3 v3.5.19
 	go.uber.org/zap v1.27.0
 	k8s.io/api v0.32.2
 	k8s.io/apimachinery v0.32.2
@@ -85,9 +85,9 @@ require (
 	github.com/x448/float16 v0.8.4 // indirect
 	github.com/xiang90/probing v0.0.0-20221125231312-a49e3df8f510 // indirect
 	go.etcd.io/bbolt v1.3.11 // indirect
-	go.etcd.io/etcd/client/v2 v2.305.18 // indirect
-	go.etcd.io/etcd/pkg/v3 v3.5.18 // indirect
-	go.etcd.io/etcd/raft/v3 v3.5.18 // indirect
+	go.etcd.io/etcd/client/v2 v2.305.19 // indirect
+	go.etcd.io/etcd/pkg/v3 v3.5.19 // indirect
+	go.etcd.io/etcd/raft/v3 v3.5.19 // indirect
 	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.53.0 // indirect
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.53.0 // indirect
 	go.opentelemetry.io/otel v1.28.0 // indirect
@@ -98,14 +98,14 @@ require (
 	go.opentelemetry.io/otel/trace v1.28.0 // indirect
 	go.opentelemetry.io/proto/otlp v1.3.1 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
-	golang.org/x/crypto v0.32.0 // indirect
+	golang.org/x/crypto v0.35.0 // indirect
 	golang.org/x/exp v0.0.0-20240719175910-8a7402abbf56 // indirect
-	golang.org/x/net v0.34.0 // indirect
+	golang.org/x/net v0.36.0 // indirect
 	golang.org/x/oauth2 v0.23.0 // indirect
-	golang.org/x/sync v0.10.0 // indirect
-	golang.org/x/sys v0.29.0 // indirect
-	golang.org/x/term v0.28.0 // indirect
-	golang.org/x/text v0.21.0 // indirect
+	golang.org/x/sync v0.11.0 // indirect
+	golang.org/x/sys v0.30.0 // indirect
+	golang.org/x/term v0.29.0 // indirect
+	golang.org/x/text v0.22.0 // indirect
 	golang.org/x/time v0.7.0 // indirect
 	gomodules.xyz/jsonpatch/v2 v2.4.0 // indirect
 	google.golang.org/genproto v0.0.0-20240123012728-ef4313101c80 // indirect
