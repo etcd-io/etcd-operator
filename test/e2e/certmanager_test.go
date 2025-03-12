@@ -18,7 +18,8 @@ func TestCertManagerProvider(t *testing.T) {
 
 	feature.Setup(
 		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
-			cmProvider := cert_manager.New()
+			client := cfg.Client()
+			cmProvider := cert_manager.New(client.Resources().GetControllerRuntimeClient())
 			_, getCertConfigErr := cmProvider.GetCertificateConfig(ctx, "test-cert-secret", cfg.Namespace())
 			if errors.IsNotFound(getCertConfigErr) {
 				t.Log(getCertConfigErr)
@@ -43,7 +44,8 @@ func TestCertManagerProvider(t *testing.T) {
 
 	feature.Assess("Validate certificate secret",
 		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
-			cmProvider := cert_manager.New()
+			client := cfg.Client()
+			cmProvider := cert_manager.New(client.Resources().GetControllerRuntimeClient())
 			valid, err := cmProvider.ValidateCertificateSecret(ctx, "test-cert-secret", cfg.Namespace(), &interfaces.Config{})
 			if err != nil {
 				t.Fatal(err)
@@ -54,7 +56,8 @@ func TestCertManagerProvider(t *testing.T) {
 
 	feature.Teardown(
 		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
-			cmProvider := cert_manager.New()
+			client := cfg.Client()
+			cmProvider := cert_manager.New(client.Resources().GetControllerRuntimeClient())
 			deleteSecretErr := cmProvider.DeleteCertificateSecret(ctx, "test-cert-secret", cfg.Namespace())
 			if errors.IsNotFound(deleteSecretErr) {
 				t.Log(deleteSecretErr)

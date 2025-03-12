@@ -19,7 +19,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	interfaces "go.etcd.io/etcd-operator/pkg/certificate/interfaces"
@@ -27,11 +26,12 @@ import (
 
 type Provider struct {
 	client.Client
-	Scheme *runtime.Scheme
 }
 
-func New() *Provider {
-	return &Provider{}
+func New(client client.Client) *Provider {
+	return &Provider{
+		client,
+	}
 }
 
 func (cm *Provider) createCertificate(
@@ -119,8 +119,8 @@ func (cm *Provider) EnsureCertificateSecret(
 
 	checkCertSecret, valErr := cm.ValidateCertificateSecret(ctx, secretName, namespace, cfg)
 	if valErr != nil {
-		return fmt.Errorf("invalid certificate secret: %s present in namespace: %s, please delete and try again",
-			secretName, namespace)
+		return fmt.Errorf("invalid certificate secret: %s present in namespace: %s, please delete and try again.\nError: %s",
+			secretName, namespace, valErr)
 	}
 	if checkCertSecret {
 		return fmt.Errorf("valid certificate secret: %s already present in namespace: %s , skipping Certificate creation",
@@ -148,12 +148,17 @@ func (cm *Provider) ValidateCertificateSecret(
 		return false, errors.New("certificate not found in secret")
 	}
 
+	decodeCertificatePem, _ := pem.Decode(certificateData)
+	if decodeCertificatePem == nil {
+		return false, errors.New("failed to decode PEM block")
+	}
+
 	privateKeyData, keyExists := secret.Data["tls.key"]
 	if !keyExists {
 		return false, errors.New("private key not found in secret")
 	}
 
-	parseCert, err := x509.ParseCertificate(certificateData)
+	parseCert, err := x509.ParseCertificate(decodeCertificatePem.Bytes)
 	if err != nil {
 		return false, fmt.Errorf("failed to parse certificate: %w", err)
 	}
