@@ -44,15 +44,7 @@ spec:
                   vars to the etcd container, refer to etcd documentation for configuration
                   options application for the version of etcd being used.
                 items:
-                  properties:
-                    name:
-                      type: string
-                    value:
-                      type: string
-                  required:
-                  - name
-                  - value
-                  type: object
+                  type: string
                 type: array
               size:
                 description: Size is the expected size of the etcd cluster.

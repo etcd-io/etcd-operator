@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -77,6 +78,66 @@ func reconcileStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1alpha
 	return getStatefulSet(ctx, c, ec.Name, ec.Namespace)
 }
 
+func setDefaultArgs(name string) []string {
+	return []string{
+		"--name=$(POD_NAME)",
+		"--listen-peer-urls=http://0.0.0.0:2380",   // TODO: only listen on 127.0.0.1 and host IP
+		"--listen-client-urls=http://0.0.0.0:2379", // TODO: only listen on 127.0.0.1 and host IP
+		fmt.Sprintf("--initial-advertise-peer-urls=http://$(POD_NAME).%s.$(POD_NAMESPACE).svc.cluster.local:2380", name),
+		fmt.Sprintf("--advertise-client-urls=http://$(POD_NAME).%s.$(POD_NAMESPACE).svc.cluster.local:2379", name),
+	}
+}
+
+func RemoveStringFromSlice(defaultArgs []string, s string) []string {
+	var compareStr string
+	var index int
+	exists := false
+
+	for i := range defaultArgs {
+		compareStr = getArgName(defaultArgs[i])
+		if compareStr == s {
+			index = i
+			exists = true
+			break
+		}
+	}
+	if exists {
+		defaultArgs = slices.Delete(defaultArgs, index, index+1)
+	}
+	return defaultArgs
+}
+
+func getArgName(s string) string {
+	idx := strings.Index(s, "=")
+
+	if idx != -1 {
+		return s[:idx]
+	}
+
+	idx = strings.Index(s, " ")
+	if idx != -1 {
+		return s[:idx]
+	}
+
+	//Assume arg is bool switch if idx is still -1
+	return s
+}
+
+func createArgs(name string, etcdOptions []string) []string {
+
+	defaultArgs := setDefaultArgs(name)
+	if len(etcdOptions) > 0 {
+		var argName string
+		// Remove default arguments if conflicts with user supplied
+		for i := range etcdOptions {
+			argName = getArgName(etcdOptions[i])
+			defaultArgs = RemoveStringFromSlice(defaultArgs, argName)
+		}
+	}
+	defaultArgs = append(defaultArgs, etcdOptions...)
+	return defaultArgs
+}
+
 func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1alpha1.EtcdCluster, c client.Client, replicas int32, scheme *runtime.Scheme) error {
 	sts := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
@@ -100,14 +161,8 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 			{
 				Name:    "etcd",
 				Command: []string{"/usr/local/bin/etcd"},
-				Args: []string{
-					"--name=$(POD_NAME)",
-					"--listen-peer-urls=http://0.0.0.0:2380",   // TODO: only listen on 127.0.0.1 and host IP
-					"--listen-client-urls=http://0.0.0.0:2379", // TODO: only listen on 127.0.0.1 and host IP
-					fmt.Sprintf("--initial-advertise-peer-urls=http://$(POD_NAME).%s.$(POD_NAMESPACE).svc.cluster.local:2380", ec.Name),
-					fmt.Sprintf("--advertise-client-urls=http://$(POD_NAME).%s.$(POD_NAMESPACE).svc.cluster.local:2379", ec.Name),
-				},
-				Image: fmt.Sprintf("gcr.io/etcd-development/etcd:%s", ec.Spec.Version),
+				Args:    createArgs(ec.Name, ec.Spec.EtcdOptions),
+				Image:   fmt.Sprintf("gcr.io/etcd-development/etcd:%s", ec.Spec.Version),
 				Env: []corev1.EnvVar{
 					{
 						Name: "POD_NAME",
@@ -147,17 +202,6 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 				},
 			},
 		},
-	}
-
-	if len(ec.Spec.EtcdOptions) > 0 {
-		for i := range podSpec.Containers {
-			if podSpec.Containers[i].Name == "etcd" {
-				for _, v := range ec.Spec.EtcdOptions {
-					podSpec.Containers[i].Env = append(podSpec.Containers[i].Env, corev1.EnvVar{Name: v.Name, Value: v.Value})
-				}
-				break
-			}
-		}
 	}
 
 	stsSpec := appsv1.StatefulSetSpec{
