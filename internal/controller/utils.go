@@ -119,7 +119,7 @@ func getArgName(s string) string {
 		return s[:idx]
 	}
 
-	//Assume arg is bool switch if idx is still -1
+	// Assume arg is bool switch if idx is still -1
 	return s
 }
 
