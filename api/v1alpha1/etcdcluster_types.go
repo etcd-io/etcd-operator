@@ -30,7 +30,7 @@ type EtcdClusterSpec struct {
 	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
 
-	// etcd configuration options are passed as environmental vars to the etcd container, refer to etcd documentation for configuration options application for the version of etcd being used.
+	// etcd configuration options are passed as command line arguments to the etcd container, refer to etcd documentation for configuration options applicable for the version of etcd being used.
 	EtcdOptions []string `json:"etcdOptions,omitempty"`
 	// Size is the expected size of the etcd cluster.
 	Size int `json:"size"`
