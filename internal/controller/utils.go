@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
+	"net"
 	"strconv"
 	"strings"
 	"time"
@@ -24,9 +26,12 @@ import (
 	"k8s.io/klog/v2"
 	"k8s.io/utils/ptr"
 
+	clientv3 "go.etcd.io/etcd/client/v3"
+
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 	"go.etcd.io/etcd-operator/internal/etcdutils"
-	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.etcd.io/etcd-operator/pkg/certificate"
+	certInterface "go.etcd.io/etcd-operator/pkg/certificate/interfaces"
 )
 
 const (
@@ -468,4 +473,96 @@ func healthCheck(sts *appsv1.StatefulSet, lg klog.Logger) (*clientv3.MemberListR
 	}
 
 	return memberlistResp, healthInfos, nil
+}
+
+func (r *EtcdClusterReconciler) getStatefulSetPods(sts *appsv1.StatefulSet, ctx context.Context) (*corev1.PodList, error) {
+	podList := corev1.PodList{}
+	err := r.Client.List(ctx, &podList, client.InNamespace(sts.Namespace), client.MatchingLabels(sts.Spec.Selector.MatchLabels))
+	if err != nil {
+		return nil, err
+	}
+	return &podList, nil
+}
+
+func createCMCertificateConfig(ec *ecv1alpha1.ProviderCertManagerConfig) *certInterface.Config {
+	config := &certInterface.Config{
+		CommonName:   ec.CommonName,
+		Organization: ec.Organization,
+		AltNames: certInterface.AltNames{
+			DNSNames: ec.DNSNames,
+			IPs:      make([]net.IP, len(ec.IPs)),
+		},
+		ExtraConfig: map[string]any{
+			"issuerName": ec.IssuerName,
+			"issuerKind": ec.IssuerKind,
+		},
+	}
+	return config
+}
+
+func createAutoCertificateConfig(ec *ecv1alpha1.ProviderAutoConfig) *certInterface.Config {
+	// TODO
+	config := &certInterface.Config{}
+	return config
+}
+
+func (r *EtcdClusterReconciler) createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, podName, podNamespace, certType string) error {
+	certName := fmt.Sprintf("%s-%s-tls", podName, certType)
+	cert, certErr := certificate.NewProvider(certificate.ProviderType(ec.Spec.TLS.Provider), r.Client)
+	if certErr != nil {
+		// TODO: instead of error, set default autoConfig
+		return certErr
+	}
+	_, getCertError := cert.GetCertificateConfig(ctx, podName, podNamespace)
+	if getCertError != nil {
+		if k8serrors.IsNotFound(getCertError) {
+			switch {
+			case ec.Spec.TLS.ProviderCfg.AutoCfg != nil:
+				cmConfig := createAutoCertificateConfig(ec.Spec.TLS.ProviderCfg.AutoCfg)
+				createCertErr := cert.EnsureCertificateSecret(ctx, certName, podNamespace, cmConfig)
+				if createCertErr != nil {
+					log.Printf("Error creating %s certificate: %s", certType, createCertErr)
+				}
+				return nil
+			case ec.Spec.TLS.ProviderCfg.CertManagerCfg != nil:
+				cmConfig := createCMCertificateConfig(ec.Spec.TLS.ProviderCfg.CertManagerCfg)
+				createCertErr := cert.EnsureCertificateSecret(ctx, certName, podNamespace, cmConfig)
+				if createCertErr != nil {
+					log.Printf("Error creating %s certificate: %s", certType, createCertErr)
+				}
+				return nil
+			default:
+				if ec.Spec.TLS.ProviderCfg.AutoCfg == nil {
+					// TODO: instead of error, set default autoConfig which will be applied if Provider/ProviderConfig is not set
+					return errors.New("default autoCertificate config not defined")
+				}
+				cmConfig := createAutoCertificateConfig(ec.Spec.TLS.ProviderCfg.AutoCfg)
+				createCertErr := cert.EnsureCertificateSecret(ctx, certName, podNamespace, cmConfig)
+				log.Printf("Error creating certificate, maybe already present: %s", createCertErr)
+				return nil
+			}
+		}
+	}
+
+	log.Printf("Error getting certificate: %s", getCertError)
+	return nil
+}
+
+func (r *EtcdClusterReconciler) checkServerPeerCertificate(ec *ecv1alpha1.EtcdCluster, sts *appsv1.StatefulSet, ctx context.Context) error {
+	podList, podListErr := r.getStatefulSetPods(sts, ctx)
+	if podListErr != nil {
+		return podListErr
+	}
+	for _, pod := range podList.Items {
+		createServerCertErr := r.createCertificate(ec, ctx, pod.Name, pod.Namespace, "server")
+		log.Println(createServerCertErr)
+		createPeerCertErr := r.createCertificate(ec, ctx, pod.Name, pod.Namespace, "peer")
+		log.Println(createPeerCertErr)
+	}
+	return nil
+}
+
+func (r *EtcdClusterReconciler) checkClientCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context) error {
+	createClientCertErr := r.createCertificate(ec, ctx, ec.Name, ec.Namespace, "client")
+	return createClientCertErr
 }
