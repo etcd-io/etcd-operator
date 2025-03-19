@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -77,6 +78,57 @@ func reconcileStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1alpha
 	return getStatefulSet(ctx, c, ec.Name, ec.Namespace)
 }
 
+func defaultArgs(name string) []string {
+	return []string{
+		"--name=$(POD_NAME)",
+		"--listen-peer-urls=http://0.0.0.0:2380",   // TODO: only listen on 127.0.0.1 and host IP
+		"--listen-client-urls=http://0.0.0.0:2379", // TODO: only listen on 127.0.0.1 and host IP
+		fmt.Sprintf("--initial-advertise-peer-urls=http://$(POD_NAME).%s.$(POD_NAMESPACE).svc.cluster.local:2380", name),
+		fmt.Sprintf("--advertise-client-urls=http://$(POD_NAME).%s.$(POD_NAMESPACE).svc.cluster.local:2379", name),
+	}
+}
+
+func RemoveStringFromSlice(s []string, str string) []string {
+	for i := range s {
+		defaultArg := getArgName(s[i])
+		if defaultArg == str {
+			s = slices.Delete(s, i, i+1)
+			break
+		}
+	}
+	return s
+}
+
+func getArgName(s string) string {
+	idx := strings.Index(s, "=")
+
+	if idx != -1 {
+		return s[:idx]
+	}
+
+	idx = strings.Index(s, " ")
+	if idx != -1 {
+		return s[:idx]
+	}
+
+	// Assume arg is bool switch if idx is still -1
+	return strings.TrimSpace(s)
+}
+
+func createArgs(name string, etcdOptions []string) []string {
+	defaultArgs := defaultArgs(name)
+	if len(etcdOptions) > 0 {
+		var argName string
+		// Remove default arguments if conflicts with user supplied
+		for i := range etcdOptions {
+			argName = getArgName(etcdOptions[i])
+			defaultArgs = RemoveStringFromSlice(defaultArgs, argName)
+		}
+	}
+	defaultArgs = append(defaultArgs, etcdOptions...)
+	return defaultArgs
+}
+
 func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1alpha1.EtcdCluster, c client.Client, replicas int32, scheme *runtime.Scheme) error {
 	sts := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
@@ -100,14 +152,8 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 			{
 				Name:    "etcd",
 				Command: []string{"/usr/local/bin/etcd"},
-				Args: []string{
-					"--name=$(POD_NAME)",
-					"--listen-peer-urls=http://0.0.0.0:2380",   // TODO: only listen on 127.0.0.1 and host IP
-					"--listen-client-urls=http://0.0.0.0:2379", // TODO: only listen on 127.0.0.1 and host IP
-					fmt.Sprintf("--initial-advertise-peer-urls=http://$(POD_NAME).%s.$(POD_NAMESPACE).svc.cluster.local:2380", ec.Name),
-					fmt.Sprintf("--advertise-client-urls=http://$(POD_NAME).%s.$(POD_NAMESPACE).svc.cluster.local:2379", ec.Name),
-				},
-				Image: fmt.Sprintf("gcr.io/etcd-development/etcd:%s", ec.Spec.Version),
+				Args:    createArgs(ec.Name, ec.Spec.EtcdOptions),
+				Image:   fmt.Sprintf("gcr.io/etcd-development/etcd:%s", ec.Spec.Version),
 				Env: []corev1.EnvVar{
 					{
 						Name: "POD_NAME",
