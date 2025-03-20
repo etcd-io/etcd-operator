@@ -43,8 +43,8 @@ type EtcdClusterSpec struct {
 }
 
 type TLSCertificate struct {
-	Provider    string          `json:"provider,omitempty"` // Defaults to Auto provider if not present
-	ProviderCfg *ProviderConfig `json:"providerCfg,omitempty"`
+	Provider    string         `json:"provider,omitempty"` // Defaults to Auto provider if not present
+	ProviderCfg ProviderConfig `json:"providerCfg,omitempty"`
 }
 
 type ProviderConfig struct {
