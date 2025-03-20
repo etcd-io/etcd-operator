@@ -17,6 +17,8 @@ limitations under the License.
 package v1alpha1
 
 import (
+	"net"
+
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -56,6 +58,42 @@ type ProviderAutoConfig struct {
 }
 
 type ProviderCertManagerConfig struct {
+	// accepts a secret name with CABundle present
+	// this secret will be used to create an Issuer
+	// +optional
+	CABundle string `json:"caBundle,omitempty"`
+
+	// accepts a string for a human-readable name of the certificate
+	CommonName string `json:"commonName"`
+
+	// accepts a string array, if nil programmatically populates the
+	// CommonName as DNSNames
+	// +optional
+	DNSNames []string `json:"dnsNames,omitempty"`
+
+	// accepts a string which can be parsed with time.ParseDuration()
+	// if nil, defaults to 90 days
+	// +optional
+	Duration string `json:"duration,omitempty"`
+
+	// accepts a net.IP array of IP Addresses as alternative names
+	// +optional
+	IPs []net.IP `json:"ipAddresses,omitempty"`
+
+	// accepts a string as the kind of Issuer
+	// either "ClusterIssuer" or "Issuer"
+	// if nil, programmatically creates a selfsigned issuer
+	// +optional
+	IssuerKind string `json:"issuerKind,omitempty"`
+
+	// accepts a string as the name of Issuer
+	// if nil, programmatically creates an issuer with name:selfsigned
+	// +optional
+	IssuerName string `json:"issuerName,omitempty"`
+
+	// organizations to be used on the Certificate.
+	// +optional
+	Organization []string `json:"organizations,omitempty"`
 }
 
 // EtcdClusterStatus defines the observed state of EtcdCluster.
