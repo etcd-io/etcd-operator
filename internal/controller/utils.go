@@ -246,7 +246,7 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 				{
 					ObjectMeta: pvcObjectMeta,
 					Spec: corev1.PersistentVolumeClaimSpec{
-						AccessModes: []corev1.PersistentVolumeAccessMode{ec.Spec.StorageSpec.AccessModes},
+						AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
 						Resources:   pvcResources,
 					},
 				},
