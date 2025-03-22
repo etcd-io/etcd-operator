@@ -1,0 +1,67 @@
+package e2e
+
+import (
+	"context"
+	"fmt"
+	"log"
+
+	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
+	corev1 "k8s.io/api/core/v1"
+	"sigs.k8s.io/e2e-framework/klient"
+	"sigs.k8s.io/e2e-framework/klient/k8s"
+	"sigs.k8s.io/e2e-framework/klient/wait"
+	"sigs.k8s.io/e2e-framework/klient/wait/conditions"
+	"sigs.k8s.io/e2e-framework/pkg/envconf"
+	"sigs.k8s.io/e2e-framework/pkg/envfuncs"
+)
+
+func getContainerByName(containers []corev1.Container, name string) (corev1.Container, error) {
+	var container corev1.Container
+	for c := range containers {
+		if containers[c].Name == name {
+			container = containers[c]
+			return container, nil
+		}
+	}
+	return container, fmt.Errorf("container named %s not found", name)
+}
+
+func setupTestRun(ctx context.Context, cfg *envconf.Config, client klient.Client, etcdCluster *ecv1alpha1.EtcdCluster) (context.Context, error) {
+
+	ctx, err := envfuncs.CreateNamespace(etcdCluster.Namespace)(ctx, cfg)
+	if err != nil {
+		log.Printf("failed to create namespace: %s", err)
+		return ctx, nil
+	}
+
+	// create etcd cluster
+	if err := client.Resources().Create(ctx, etcdCluster); err != nil {
+		return ctx, fmt.Errorf("unable to create etcd cluster: %s", err)
+	}
+
+	// get etcd cluster object
+	var ec ecv1alpha1.EtcdCluster
+
+	if err := client.Resources().Get(ctx, etcdCluster.Name, etcdCluster.Namespace, &ec); err != nil {
+		return ctx, fmt.Errorf("unable to fetch etcd cluster: %s", err)
+	}
+
+	return ctx, nil
+}
+
+// Gets K8S object from cluster, accepts wait options. Returns error if resource does not exist
+func getKubernetesObject(object k8s.Object, ctx context.Context, client klient.Client, etcdCluster *ecv1alpha1.EtcdCluster, outObj k8s.Object, options ...wait.Option) (context.Context, error) {
+
+	if err := wait.For(
+		conditions.New(client.Resources()).ResourceMatch(object, func(object k8s.Object) bool {
+			err := client.Resources().Get(ctx, etcdCluster.Name, etcdCluster.Namespace, outObj)
+			return err == nil
+		}),
+		options...,
+	); err != nil {
+		fmt.Println(outObj)
+		return ctx, fmt.Errorf("unable to get sts: %s", err)
+	}
+
+	return ctx, nil
+}
