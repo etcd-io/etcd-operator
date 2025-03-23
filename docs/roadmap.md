@@ -6,12 +6,12 @@ The list is based on the survey results and the discussion in wg-etcd-operator. 
 - Create a new etcd cluster, e.g 3 or 5 members cluster
   - Users should be able to set at least the etcd version and cluster size
 - Understand health of a cluster
-- Enabling TLS communication
-  - Should also support certificate renewal
+- Scale in and out, e.g 1 -> 3 -> 5 members and vice versa
 
 ## v0.2.0
+- Enabling TLS communication
+  - Should also support certificate renewal
 - Upgrade across patches or one minor version
-- Scale in and out, e.g 1 -> 3 -> 5 members and vice versa
 - Support customizing etcd options (via flags or env vars)
 
 ## v0.3.0
