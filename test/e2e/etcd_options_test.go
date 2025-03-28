@@ -137,13 +137,11 @@ func TestEtcdOptions(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		var etcdContainer corev1.Container
-		for c := range sts.Spec.Template.Spec.Containers {
-			if sts.Spec.Template.Spec.Containers[c].Name == "etcd" {
-				etcdContainer = sts.Spec.Template.Spec.Containers[c]
-				break
-			}
+		etcdContainer, err := getContainerByName(sts.Spec.Template.Spec.Containers, "etcd")
+		if err != nil {
+			t.Fatal(err)
 		}
+
 		if !reflect.DeepEqual(expectedArgs, etcdContainer.Args) {
 			t.Fatalf("Expecting args to be %v got %v", expectedArgs, etcdContainer.Args)
 		}
