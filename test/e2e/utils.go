@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 
-	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/e2e-framework/klient"
 	"sigs.k8s.io/e2e-framework/klient/k8s"
@@ -13,6 +12,8 @@ import (
 	"sigs.k8s.io/e2e-framework/klient/wait/conditions"
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
 	"sigs.k8s.io/e2e-framework/pkg/envfuncs"
+
+	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 )
 
 func getContainerByName(containers []corev1.Container, name string) (corev1.Container, error) {
@@ -53,10 +54,11 @@ func setupTestRun(ctx context.Context, cfg *envconf.Config, client klient.Client
 func getKubernetesResource(object k8s.Object, ctx context.Context, client klient.Client, etcdCluster *ecv1alpha1.EtcdCluster, outObj k8s.Object, options ...wait.Option) (context.Context, error) {
 
 	if err := wait.For(
-		conditions.New(client.Resources()).ResourceMatch(object, func(object k8s.Object) bool {
-			err := client.Resources().Get(ctx, etcdCluster.Name, etcdCluster.Namespace, outObj)
-			return err == nil
-		}),
+		conditions.New(client.Resources()).ResourceMatch(object,
+			func(object k8s.Object) bool {
+				err := client.Resources().Get(ctx, etcdCluster.Name, etcdCluster.Namespace, outObj)
+				return err == nil
+			}),
 		options...,
 	); err != nil {
 		fmt.Println(outObj)
