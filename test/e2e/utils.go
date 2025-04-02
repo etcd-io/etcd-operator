@@ -50,7 +50,7 @@ func setupTestRun(ctx context.Context, cfg *envconf.Config, client klient.Client
 }
 
 // Gets K8S object from cluster, accepts wait options. Returns error if resource does not exist
-func getKubernetesObject(object k8s.Object, ctx context.Context, client klient.Client, etcdCluster *ecv1alpha1.EtcdCluster, outObj k8s.Object, options ...wait.Option) (context.Context, error) {
+func getKubernetesResource(object k8s.Object, ctx context.Context, client klient.Client, etcdCluster *ecv1alpha1.EtcdCluster, outObj k8s.Object, options ...wait.Option) (context.Context, error) {
 
 	if err := wait.For(
 		conditions.New(client.Resources()).ResourceMatch(object, func(object k8s.Object) bool {

@@ -104,7 +104,7 @@ func TestEtcdOptions(t *testing.T) {
 				wait.WithInterval(5 * time.Second),
 			}
 
-			ctx, err := getKubernetesObject(stsObj, ctx, client, etcdCluster, &sts, ops...)
+			ctx, err := getKubernetesResource(stsObj, ctx, client, etcdCluster, &sts, ops...)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -118,7 +118,7 @@ func TestEtcdOptions(t *testing.T) {
 			client := cfg.Client()
 			var sts appsv1.StatefulSet
 
-			ctx, err := getKubernetesObject(stsObj, ctx, client, etcdCluster, &sts)
+			ctx, err := getKubernetesResource(stsObj, ctx, client, etcdCluster, &sts)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -141,7 +141,7 @@ func TestEtcdOptions(t *testing.T) {
 			client := cfg.Client()
 			var sts appsv1.StatefulSet
 
-			ctx, err := getKubernetesObject(stsObj, ctx, client, etcdCluster, &sts)
+			ctx, err := getKubernetesResource(stsObj, ctx, client, etcdCluster, &sts)
 			if err != nil {
 				t.Fatal(err)
 			}
