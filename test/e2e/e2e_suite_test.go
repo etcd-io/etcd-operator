@@ -42,9 +42,10 @@ import (
 )
 
 var (
-	testEnv     env.Environment
-	dockerImage = "etcd-operator:v0.1"
-	namespace   = "etcd-operator-system"
+	testEnv       env.Environment
+	imageName     = "etcd-operator:v0.1"
+	namespace     = "etcd-operator-system"
+	containerTool = os.Getenv("CONTAINER_TOOL")
 )
 
 func TestMain(m *testing.M) {
@@ -72,16 +73,16 @@ func TestMain(m *testing.M) {
 		func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
 			// Build docker image
 			log.Println("Building docker image...")
-			cmd := exec.Command("make", "docker-build", fmt.Sprintf("IMG=%s", dockerImage))
+			cmd := exec.Command("make", "docker-build", fmt.Sprintf("IMG=%s", imageName))
 			if _, err := test_utils.Run(cmd); err != nil {
 				log.Printf("Failed to build docker image: %s", err)
 				return ctx, err
 			}
 
-			// Load docker image into kind
-			log.Println("Loading docker image into kind cluster...")
-			if err := kindCluster.LoadImage(ctx, dockerImage); err != nil {
-				log.Printf("Failed to load image into kind: %s", err)
+			if err := test_utils.LoadContainerImageToKindCluster(ctx,
+				kindCluster,
+				imageName, containerTool); err != nil {
+				log.Println(err)
 				return ctx, err
 			}
 
@@ -125,7 +126,7 @@ func TestMain(m *testing.M) {
 			log.Println("Deploying components...")
 
 			log.Println("Deploying controller-manager resources...")
-			cmd = exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", dockerImage))
+			cmd = exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", imageName))
 			if _, err := test_utils.Run(cmd); err != nil {
 				log.Printf("Failed to deploy resource configurations: %s", err)
 				return ctx, err
