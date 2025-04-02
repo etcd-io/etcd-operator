@@ -22,6 +22,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -205,16 +206,6 @@ func TestMain(m *testing.M) {
 
 			return ctx, nil
 		},
-
-		func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
-			if containerTool == "podman" {
-				log.Println("deleting image archive")
-				if err := removeImageArchive(); err != nil {
-					log.Printf("failed to delete image archive: %s", err)
-				}
-			}
-			return ctx, nil
-		},
 	)
 
 	// Use Environment.Run to launch the test
@@ -223,40 +214,46 @@ func TestMain(m *testing.M) {
 
 func useImageArchive(kindCluster *kind.Cluster, ctx context.Context) (context.Context, error) {
 	var err error
+	dname, err := os.MkdirTemp("", "etcdOperator")
+	if err != nil {
+		return ctx, nil
+	}
+
+	fname := filepath.Join(dname, archiveName)
+
+	defer func() {
+		err := os.RemoveAll(fname)
+		log.Printf("failed to remove %s: %s", fname, err)
+	}()
+
 	log.Println("Creating docker image archive...")
-	err = createImageArchive()
+	err = createImageArchive(fname)
 	if err != nil {
 		log.Printf("Failed to create archive %s:", err)
 		return ctx, err
 	}
+
 	log.Println("Loading docker image archive...")
-	ctx, err = loadImageArchive(*kindCluster, ctx)
+	ctx, err = loadImageArchive(*kindCluster, ctx, fname)
 	if err != nil {
 		return ctx, err
 	}
 	return ctx, nil
 }
 
-func createImageArchive() error {
+func createImageArchive(archivePath string) error {
 	// Save docker image archive
-	cmd := exec.Command("make", "docker-save", fmt.Sprintf("ARCHIVE_NAME=%s", archiveName))
+	cmd := exec.Command("make", "docker-save", fmt.Sprintf("ARCHIVE_NAME=%s", archivePath))
 	if _, err := test_utils.Run(cmd); err != nil {
 		return err
 	}
 	return nil
 }
 
-func loadImageArchive(kindCluster kind.Cluster, ctx context.Context) (context.Context, error) {
+func loadImageArchive(kindCluster kind.Cluster, ctx context.Context, archivePath string) (context.Context, error) {
 	// Load archive into cluster
-	if err := kindCluster.LoadImageArchive(ctx, archiveName); err != nil {
+	if err := kindCluster.LoadImageArchive(ctx, archivePath); err != nil {
 		return ctx, err
 	}
 	return ctx, nil
-}
-
-func removeImageArchive() error {
-	if err := os.Remove(archiveName); err != nil {
-		return err
-	}
-	return nil
 }
