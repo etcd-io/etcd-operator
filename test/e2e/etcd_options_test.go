@@ -1,5 +1,5 @@
 /*
-Copyright 2021 The Kubernetes Authors.
+Copyright 2024.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ package e2e
 
 import (
 	"context"
+	"os"
 	"reflect"
 	"testing"
 	"time"
@@ -60,7 +61,7 @@ func TestEtcdOptions(t *testing.T) {
 		},
 		Spec: ecv1alpha1.EtcdClusterSpec{
 			Size:    1,
-			Version: "v3.5.17",
+			Version: os.Getenv("ETCD_VERSION"),
 			StorageSpec: &ecv1alpha1.StorageSpec{
 				AccessModes:       corev1.ReadWriteOnce,
 				VolumeSizeRequest: resource.MustParse("4Mi"),

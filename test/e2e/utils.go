@@ -1,3 +1,19 @@
+/*
+Copyright 2024.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package e2e
 
 import (
@@ -27,7 +43,12 @@ func getContainerByName(containers []corev1.Container, name string) (corev1.Cont
 	return container, fmt.Errorf("container named %s not found", name)
 }
 
-func setupTestRun(ctx context.Context, cfg *envconf.Config, client klient.Client, etcdCluster *ecv1alpha1.EtcdCluster) (context.Context, error) {
+func setupTestRun(ctx context.Context,
+	cfg *envconf.Config,
+	client klient.Client,
+	etcdCluster *ecv1alpha1.EtcdCluster) (
+	context.Context,
+	error) {
 
 	ctx, err := envfuncs.CreateNamespace(etcdCluster.Namespace)(ctx, cfg)
 	if err != nil {
@@ -51,7 +72,14 @@ func setupTestRun(ctx context.Context, cfg *envconf.Config, client klient.Client
 }
 
 // Gets K8S object from cluster, accepts wait options. Returns error if resource does not exist
-func getKubernetesResource(object k8s.Object, ctx context.Context, client klient.Client, etcdCluster *ecv1alpha1.EtcdCluster, outObj k8s.Object, options ...wait.Option) (context.Context, error) {
+func getKubernetesResource(
+	object k8s.Object,
+	ctx context.Context,
+	client klient.Client,
+	etcdCluster *ecv1alpha1.EtcdCluster,
+	outObj k8s.Object, options ...wait.Option) (
+	context.Context,
+	error) {
 
 	if err := wait.For(
 		conditions.New(client.Resources()).ResourceMatch(object,
