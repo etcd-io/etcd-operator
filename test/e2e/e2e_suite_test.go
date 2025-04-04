@@ -22,6 +22,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -36,9 +37,11 @@ import (
 )
 
 var (
-	testEnv     env.Environment
-	dockerImage = "etcd-operator:v0.1"
-	namespace   = "etcd-operator-system"
+	testEnv       env.Environment
+	dockerImage   = "etcd-operator:v0.1"
+	namespace     = "etcd-operator-system"
+	containerTool = os.Getenv("CONTAINER_TOOL")
+	archiveName   = "etcdOperator.tar"
 )
 
 func TestMain(m *testing.M) {
@@ -72,11 +75,16 @@ func TestMain(m *testing.M) {
 				return ctx, err
 			}
 
-			// Load docker image into kind
-			log.Println("Loading docker image into kind cluster...")
-			if err := kindCluster.LoadImage(ctx, dockerImage); err != nil {
-				log.Printf("Failed to load image into kind: %s", err)
-				return ctx, err
+			if containerTool == "podman" {
+				if ctx, err := useImageArchive(kindCluster, ctx); err != nil {
+					log.Println(err)
+					return ctx, err
+				}
+			} else {
+				if err := kindCluster.LoadImage(ctx, dockerImage); err != nil {
+					log.Printf("Failed to load image into kind: %s", err)
+					return ctx, err
+				}
 			}
 
 			return ctx, nil
@@ -202,4 +210,50 @@ func TestMain(m *testing.M) {
 
 	// Use Environment.Run to launch the test
 	os.Exit(testEnv.Run(m))
+}
+
+func useImageArchive(kindCluster *kind.Cluster, ctx context.Context) (context.Context, error) {
+	var err error
+	dname, err := os.MkdirTemp("", "etcdOperator")
+	if err != nil {
+		return ctx, nil
+	}
+
+	fname := filepath.Join(dname, archiveName)
+
+	defer func() {
+		err := os.RemoveAll(fname)
+		log.Printf("failed to remove %s: %s", fname, err)
+	}()
+
+	log.Println("Creating docker image archive...")
+	err = createImageArchive(fname)
+	if err != nil {
+		log.Printf("Failed to create archive %s:", err)
+		return ctx, err
+	}
+
+	log.Println("Loading docker image archive...")
+	ctx, err = loadImageArchive(*kindCluster, ctx, fname)
+	if err != nil {
+		return ctx, err
+	}
+	return ctx, nil
+}
+
+func createImageArchive(archivePath string) error {
+	// Save docker image archive
+	cmd := exec.Command("make", "docker-save", fmt.Sprintf("ARCHIVE_NAME=%s", archivePath))
+	if _, err := test_utils.Run(cmd); err != nil {
+		return err
+	}
+	return nil
+}
+
+func loadImageArchive(kindCluster kind.Cluster, ctx context.Context, archivePath string) (context.Context, error) {
+	// Load archive into cluster
+	if err := kindCluster.LoadImageArchive(ctx, archivePath); err != nil {
+		return ctx, err
+	}
+	return ctx, nil
 }
