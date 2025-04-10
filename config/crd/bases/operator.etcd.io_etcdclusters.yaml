@@ -86,6 +86,52 @@ spec:
                       autoCfg:
                         type: object
                       certManagerCfg:
+                        properties:
+                          caBundle:
+                            description: |-
+                              accepts a secret name with CABundle present
+                              this secret will be used to create an Issuer
+                            type: string
+                          commonName:
+                            description: accepts a string for a human-readable name
+                              of the certificate
+                            type: string
+                          dnsNames:
+                            description: |-
+                              accepts a string array, if nil programmatically populates the
+                              CommonName as DNSNames
+                            items:
+                              type: string
+                            type: array
+                          duration:
+                            description: |-
+                              accepts a string which can be parsed with time.ParseDuration()
+                              if nil, defaults to 90 days
+                            type: string
+                          ipAddresses:
+                            description: accepts a net.IP array of IP Addresses as
+                              alternative names
+                            items:
+                              type: string
+                            type: array
+                          issuerKind:
+                            description: |-
+                              accepts a string as the kind of Issuer
+                              either "ClusterIssuer" or "Issuer"
+                              if nil, programmatically creates a selfsigned issuer
+                            type: string
+                          issuerName:
+                            description: |-
+                              accepts a string as the name of Issuer
+                              if nil, programmatically creates an issuer with name:selfsigned
+                            type: string
+                          organizations:
+                            description: organizations to be used on the Certificate.
+                            items:
+                              type: string
+                            type: array
+                        required:
+                        - commonName
                         type: object
                     type: object
                 type: object
