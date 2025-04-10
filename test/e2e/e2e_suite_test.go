@@ -32,6 +32,12 @@ import (
 	"sigs.k8s.io/e2e-framework/pkg/envfuncs"
 	"sigs.k8s.io/e2e-framework/support/kind"
 
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
+
 	test_utils "go.etcd.io/etcd-operator/test/utils"
 )
 
@@ -137,6 +143,12 @@ func TestMain(m *testing.M) {
 				log.Printf("Timed out while waiting for etcd-operator-controller-manager deployment: %s", err)
 				return ctx, err
 			}
+
+			// Add schemes
+			_ = appsv1.AddToScheme(client.Resources().GetScheme())
+			_ = corev1.AddToScheme(client.Resources().GetScheme())
+			_ = metav1.AddMetaToScheme(client.Resources().GetScheme())
+			_ = ecv1alpha1.AddToScheme(client.Resources().GetScheme())
 
 			return ctx, nil
 		},
