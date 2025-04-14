@@ -48,6 +48,7 @@ spec:
                 type: array
               size:
                 description: Size is the expected size of the etcd cluster.
+                minimum: 1
                 type: integer
               storageSpec:
                 description: StorageSpec is the name of the StorageSpec to use for
