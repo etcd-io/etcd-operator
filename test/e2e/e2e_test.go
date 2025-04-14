@@ -36,8 +36,6 @@ func TestClusterHealthy(t *testing.T) {
 	feature.Assess("ensure the etcd-operator pod is running",
 		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
 			client := cfg.Client()
-			_ = corev1.AddToScheme(client.Resources().GetScheme())
-			_ = appsv1.AddToScheme(client.Resources().GetScheme())
 
 			// get the etcd controller deployment
 			var deployment appsv1.Deployment
