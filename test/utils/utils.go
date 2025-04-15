@@ -19,10 +19,19 @@ package utils
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
+
+	"sigs.k8s.io/e2e-framework/support/kind"
+)
+
+var (
+	archiveName = "etcdOperator.tar"
 )
 
 const (
@@ -163,18 +172,6 @@ func IsCertManagerCRDsInstalled() bool {
 	return false
 }
 
-// LoadImageToKindClusterWithName loads a local docker image to the kind cluster
-func LoadImageToKindClusterWithName(name string) error {
-	cluster := "kind"
-	if v, ok := os.LookupEnv("KIND_CLUSTER"); ok {
-		cluster = v
-	}
-	kindOptions := []string{"load", "docker-image", name, "--name", cluster}
-	cmd := exec.Command("kind", kindOptions...)
-	_, err := Run(cmd)
-	return err
-}
-
 // GetNonEmptyLines converts given command output string into individual objects
 // according to line breakers, and ignores the empty elements in it.
 func GetNonEmptyLines(output string) []string {
@@ -246,4 +243,51 @@ func UncommentCode(filename, target, prefix string) error {
 	// false positive
 	// nolint:gosec
 	return os.WriteFile(filename, out.Bytes(), 0644)
+}
+
+// LoadImage does not work when using podman, so LoadImageArchive is used instead
+// refer to https://github.com/kubernetes-sigs/kind/issues/2038
+func LoadContainerImageToKindCluster(ctx context.Context,
+	kindCluster *kind.Cluster,
+	dockerImage string,
+	containerTool string) error {
+	if containerTool == "podman" {
+		if err := useImageArchive(ctx, kindCluster); err != nil {
+			log.Println(err)
+			return err
+		}
+	} else {
+		if err := kindCluster.LoadImage(ctx, dockerImage); err != nil {
+			log.Printf("Failed to load image into kind: %s", err)
+			return err
+		}
+	}
+	return nil
+}
+
+func useImageArchive(ctx context.Context, kindCluster *kind.Cluster) error {
+	dirName, err := os.MkdirTemp("", "etcdOperator")
+	if err != nil {
+		return err
+	}
+
+	archivePath := filepath.Join(dirName, archiveName)
+
+	defer func() {
+		if err := os.RemoveAll(dirName); err != nil {
+			log.Printf("failed to remove %s: %s", archivePath, err)
+		}
+	}()
+
+	// Save docker image archive
+	cmd := exec.Command("make", "docker-save", fmt.Sprintf("ARCHIVE_NAME=%s", archivePath))
+	if _, err := Run(cmd); err != nil {
+		return err
+	}
+
+	// Load archive into cluster
+	if err := kindCluster.LoadImageArchive(ctx, archivePath); err != nil {
+		return err
+	}
+	return nil
 }
