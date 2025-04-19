@@ -2,6 +2,8 @@
 IMG ?= controller:latest
 # ENVTEST_K8S_VERSION refers to the version of kubebuilder assets to be downloaded by envtest binary.
 ENVTEST_K8S_VERSION = 1.31.0
+# The version of ETCD to run e2e tests against
+E2E_ETCD_VERSION ?= $(shell go list -m -f {{.Version}} go.etcd.io/etcd/api/v3)
 
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
@@ -72,7 +74,7 @@ test: manifests generate fmt vet envtest ## Run tests.
 # - CERT_MANAGER_INSTALL_SKIP=true
 .PHONY: test-e2e
 test-e2e: generate fmt vet kind ## Run the e2e tests. Expected an isolated environment using Kind.
-	PATH="$(LOCALBIN):$(PATH)" go test ./test/e2e/ -v
+	ETCD_VERSION="$(E2E_ETCD_VERSION)" PATH="$(LOCALBIN):$(PATH)" go test ./test/e2e/ -v
 
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter
