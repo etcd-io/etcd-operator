@@ -62,6 +62,21 @@ type ProviderCertManagerConfig struct {
 type EtcdClusterStatus struct {
 	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
+
+	// ReadyReplicas is the number of pods targeted by this EtcdCluster with a Ready condition.
+	ReadyReplicas int32 `json:"readyReplicas,omitempty"`
+	// Members is the number of etcd members in the cluster reported by etcd API.
+	Members int32 `json:"members,omitempty"`
+	// CurrentVersion is the version of the etcd cluster.
+	CurrentVersion string `json:"currentVersion,omitempty"`
+	// Phase indicates the state of the EtcdCluster.
+	Phase string `json:"phase,omitempty"`
+	// Conditions represent the latest available observations of a replica set's state.
+	// +optional
+	// +patchMergeKey=type
+	// +patchStrategy=merge
+	// +listType=atomic
+	Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type"`
 }
 
 // +kubebuilder:object:root=true
