@@ -23,6 +23,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
@@ -78,8 +79,24 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, err
 	}
 
+	// Keep a copy of the old status for patching later
+	oldEtcdCluster := etcdCluster.DeepCopy()
+
+	// --- Defer the status update ---
+	// Use a closure to capture the logger and handle potential errors from updateStatusIfNeeded
+	defer func() {
+		if err := r.updateStatusIfNeeded(ctx, etcdCluster, oldEtcdCluster); err != nil {
+			// Log the error from status update, but don't change the Reconcile return value here.
+			// Controller Runtime will likely retry anyway if the status update failed.
+			logger.Error(err, "Deferred status update failed")
+		}
+	}()
+
 	if etcdCluster.Spec.Size == 0 {
 		logger.Info("EtcdCluster size is 0..Skipping next steps")
+		etcdCluster.Status.Phase = "Idle" // Example: Set a phase even for size 0
+		etcdCluster.Status.ReadyReplicas = 0
+		etcdCluster.Status.Members = 0
 		return ctrl.Result{}, nil
 	}
 
@@ -91,11 +108,13 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	sts, err := getStatefulSet(ctx, r.Client, etcdCluster.Name, etcdCluster.Namespace)
 	if err != nil {
 		if errors.IsNotFound(err) {
+			etcdCluster.Status.Phase = "Creating"
 			logger.Info("Creating StatefulSet with 0 replica", "expectedSize", etcdCluster.Spec.Size)
 			// Create a new StatefulSet
-
 			sts, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, 0, r.Scheme)
 			if err != nil {
+				logger.Error(err, "Failed to create StatefulSet")
+				etcdCluster.Status.Phase = "Failed"
 				return ctrl.Result{}, err
 			}
 		} else {
@@ -103,36 +122,59 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			// attempt processing again later. This could have been caused by a
 			// temporary network failure, or any other transient reason.
 			logger.Error(err, "Failed to get StatefulSet. Requesting requeue")
+			etcdCluster.Status.Phase = "Failed"
 			return ctrl.Result{RequeueAfter: requeueDuration}, nil
 		}
 	}
+
+	// At this point, sts should exist (either found or created)
+	if sts == nil {
+		// This case should ideally not happen if error handling above is correct
+		err := fmt.Errorf("statefulSet is unexpectedly nil after get/create")
+		logger.Error(err, "Internal error")
+		etcdCluster.Status.Phase = "Failed"
+		return ctrl.Result{}, err // Return error, defer will update status
+	}
+
+	// Update status based on STS before proceeding
+	etcdCluster.Status.ReadyReplicas = sts.Status.ReadyReplicas
 
 	// If the Statefulsets is not controlled by this EtcdCluster resource, we should log
 	// a warning to the event recorder and return error msg.
 	err = checkStatefulSetControlledByEtcdOperator(etcdCluster, sts)
 	if err != nil {
 		logger.Error(err, "StatefulSet is not controlled by this EtcdCluster resource")
+		etcdCluster.Status.Phase = "Failed"
 		return ctrl.Result{}, err
 	}
 
 	// If statefulset size is 0. try to instantiate the cluster with 1 member
 	if sts.Spec.Replicas != nil && *sts.Spec.Replicas == 0 {
 		logger.Info("StatefulSet has 0 replicas. Trying to create a new cluster with 1 member")
-
 		sts, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, 1, r.Scheme)
 		if err != nil {
+			logger.Error(err, "Failed to scale StatefulSet to 1 replica")
+			etcdCluster.Status.Phase = "Failed"
 			return ctrl.Result{}, err
 		}
+		// Successfully scaled to 1, update status fields and requeue to wait for pod readiness
+		etcdCluster.Status.ReadyReplicas = sts.Status.ReadyReplicas
+		etcdCluster.Status.Phase = "Initializing"
+		// return ctrl.Result{RequeueAfter: requeueDuration}, nil // Requeue to check readiness, should we do it?
 	}
 
 	err = createHeadlessServiceIfNotExist(ctx, logger, r.Client, etcdCluster, r.Scheme)
 	if err != nil {
+		logger.Error(err, "Failed to create Headless Service")
+		etcdCluster.Status.Phase = "Failed"
 		return ctrl.Result{}, err
 	}
 
 	logger.Info("Now checking health of the cluster members")
 	memberListResp, healthInfos, err := healthCheck(sts, logger)
 	if err != nil {
+		logger.Error(err, "Health check failed")
+		etcdCluster.Status.Phase = "Degraded" // Or "Unavailable"?
 		return ctrl.Result{}, fmt.Errorf("health check failed: %w", err)
 	}
 
@@ -140,17 +182,24 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if memberListResp != nil {
 		memberCnt = len(memberListResp.Members)
 	}
+	etcdCluster.Status.Members = int32(memberCnt)
+	// TODO: Update CurrentVersion from healthInfos
+	// TODO: Update Conditions based on healthInfos
+
 	targetReplica := *sts.Spec.Replicas // Start with the current size of the stateful set
 
 	// The number of replicas in the StatefulSet doesn't match the number of etcd members in the cluster.
 	if int(targetReplica) != memberCnt {
 		logger.Info("The expected number of replicas doesn't match the number of etcd members in the cluster", "targetReplica", targetReplica, "memberCnt", memberCnt)
+		etcdCluster.Status.Phase = "Scaling"
 		if int(targetReplica) < memberCnt {
 			logger.Info("An etcd member was added into the cluster, but the StatefulSet hasn't scaled out yet")
 			newReplicaCount := targetReplica + 1
 			logger.Info("Increasing StatefulSet replicas to match the etcd cluster member count", "oldReplicaCount", targetReplica, "newReplicaCount", newReplicaCount)
 			_, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, newReplicaCount, r.Scheme)
 			if err != nil {
+				logger.Error(err, "Failed to adjust StatefulSet replicas to match member count")
+				etcdCluster.Status.Phase = "Failed"
 				return ctrl.Result{}, err
 			}
 		} else {
@@ -159,9 +208,13 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			logger.Info("Decreasing StatefulSet replicas to remove the unneeded Pod.", "oldReplicaCount", targetReplica, "newReplicaCount", newReplicaCount)
 			_, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, newReplicaCount, r.Scheme)
 			if err != nil {
+				logger.Error(err, "Failed to adjust StatefulSet replicas to match member count")
+				etcdCluster.Status.Phase = "Failed"
 				return ctrl.Result{}, err
 			}
 		}
+		// Successfully adjusted STS, update status and requeue
+		etcdCluster.Status.ReadyReplicas = sts.Status.ReadyReplicas
 		return ctrl.Result{RequeueAfter: requeueDuration}, nil
 	}
 
@@ -175,6 +228,10 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		// Find the leader status
 		_, leaderStatus = etcdutils.FindLeaderStatus(healthInfos, logger)
 		if leaderStatus == nil {
+			err := fmt.Errorf("couldn't find leader, memberCnt: %d", memberCnt)
+			logger.Error(err, "Leader election might be in progress or cluster unhealthy")
+			etcdCluster.Status.Phase = "Degraded" // Or Unavailable
+			// TODO: Add Condition
 			// If the leader is not available, let's wait for the leader to be elected
 			return ctrl.Result{}, fmt.Errorf("couldn't find leader, memberCnt: %d", memberCnt)
 		}
@@ -191,13 +248,18 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 				eps = eps[:(len(eps) - 1)]
 				err = etcdutils.PromoteLearner(eps, learner)
 				if err != nil {
+					logger.Error(err, "Failed to promote learner")
+					etcdCluster.Status.Phase = "Failed" // Promotion failed
+					// TODO: Add Condition
 					// The member is not promoted yet, so we error out
 					return ctrl.Result{}, err
 				}
+				etcdCluster.Status.Phase = "PromotingLearner" // Indicate promotion happened
 			} else {
 				// Learner is not yet ready. We can't add another learner or proceed further until this one is promoted
 				// So let's requeue
 				logger.Info("The learner member isn't ready to be promoted yet", "learnerID", learner)
+				etcdCluster.Status.Phase = "PromotingLearner" // Still trying to promote
 				return ctrl.Result{RequeueAfter: requeueDuration}, nil
 			}
 		}
@@ -218,6 +280,9 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		targetReplica++
 		logger.Info("[Scale out] adding a new learner member to etcd cluster", "peerURLs", peerURL)
 		if _, err := etcdutils.AddMember(eps, []string{peerURL}, true); err != nil {
+			logger.Error(err, "Failed to add learner member")
+			etcdCluster.Status.Phase = "Failed" // Scaling failed
+			// TODO: Add Condition
 			return ctrl.Result{}, err
 		}
 
@@ -232,29 +297,59 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		logger.Info("[Scale in] removing one member", "memberID", memberID)
 		eps = eps[:targetReplica]
 		if err := etcdutils.RemoveMember(eps, memberID); err != nil {
+			logger.Error(err, "Failed to remove member")
+			etcdCluster.Status.Phase = "Failed" // Scaling failed
+			// TODO: Add Condition
 			return ctrl.Result{}, err
 		}
 	}
 
 	sts, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, targetReplica, r.Scheme)
 	if err != nil {
+		logger.Error(err, "Failed to update StatefulSet during scaling")
+		etcdCluster.Status.Phase = "Failed"
 		return ctrl.Result{}, err
 	}
 
 	allMembersHealthy, err := areAllMembersHealthy(sts, logger)
 	if err != nil {
+		logger.Error(err, "Final health check failed")
+		etcdCluster.Status.Phase = "Degraded"
+		// TODO: Add Condition
 		return ctrl.Result{}, err
 	}
 
 	if *sts.Spec.Replicas != int32(etcdCluster.Spec.Size) || !allMembersHealthy {
 		// Requeue if the statefulset size is not equal to the expected size of ETCD cluster
 		// Or if all members of the cluster are not healthy
+		etcdCluster.Status.Phase = "Degraded"
+		// TODO: Add Condition
 		return ctrl.Result{RequeueAfter: requeueDuration}, nil
 	}
 
+	etcdCluster.Status.Phase = "Running" // Final healthy state
+	// TODO: Set Available Condition to True
 	logger.Info("EtcdCluster reconciled successfully")
 	return ctrl.Result{}, nil
 
+}
+
+// updateStatusIfNeeded compares the old and new status and patches if changed.
+func (r *EtcdClusterReconciler) updateStatusIfNeeded(ctx context.Context, etcdCluster *ecv1alpha1.EtcdCluster, oldEtcdCluster *ecv1alpha1.EtcdCluster) error {
+	logger := log.FromContext(ctx)
+	// Compare the new status with the old status
+	if !equality.Semantic.DeepEqual(oldEtcdCluster.Status, etcdCluster.Status) {
+		logger.Info("Updating EtcdCluster status", "namespace", etcdCluster.Namespace, "name", etcdCluster.Name)
+		err := r.Status().Patch(ctx, etcdCluster, client.MergeFrom(oldEtcdCluster))
+		if err != nil {
+			logger.Error(err, "Failed to update EtcdCluster status", "namespace", etcdCluster.Namespace, "name", etcdCluster.Name)
+			return err // Return the error so the Reconcile loop retries
+		}
+		logger.Info("Successfully updated EtcdCluster status", "namespace", etcdCluster.Namespace, "name", etcdCluster.Name)
+	} else {
+		logger.V(1).Info("EtcdCluster status is already up-to-date", "namespace", etcdCluster.Namespace, "name", etcdCluster.Name) // Use V(1) for less important info
+	}
+	return nil // No error occurred during status update itself
 }
 
 // SetupWithManager sets up the controller with the Manager.
