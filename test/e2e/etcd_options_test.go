@@ -25,6 +25,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	runtimeClient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/e2e-framework/klient/k8s"
 	"sigs.k8s.io/e2e-framework/klient/wait"
 	"sigs.k8s.io/e2e-framework/klient/wait/conditions"
@@ -33,6 +34,7 @@ import (
 	"sigs.k8s.io/e2e-framework/pkg/features"
 
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
+	"go.etcd.io/etcd-operator/test/utils"
 )
 
 func TestEtcdOptions(t *testing.T) {
@@ -67,12 +69,7 @@ func TestEtcdOptions(t *testing.T) {
 		},
 	}
 
-	stsObj := &appsv1.StatefulSet{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      etcdClusterName,
-			Namespace: namespace,
-		},
-	}
+	objKey := runtimeClient.ObjectKeyFromObject(etcdCluster)
 
 	feature.Setup(func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
 
@@ -95,7 +92,7 @@ func TestEtcdOptions(t *testing.T) {
 			wait.WithInterval(5 * time.Second),
 		}
 
-		if err := getKubernetesResource(ctx, etcdCluster, client, &ec, ops...); err != nil {
+		if err := utils.GetKubernetesResource(ctx, client, objKey, &ec, ops...); err != nil {
 			t.Fatalf("unable to fetch etcd cluster: %s", err)
 		}
 
@@ -113,7 +110,7 @@ func TestEtcdOptions(t *testing.T) {
 				wait.WithInterval(5 * time.Second),
 			}
 
-			if err := getKubernetesResource(ctx, stsObj, client, &sts, ops...); err != nil {
+			if err := utils.GetKubernetesResource(ctx, client, objKey, &sts, ops...); err != nil {
 				t.Fatal(err)
 			}
 			return ctx
@@ -126,11 +123,11 @@ func TestEtcdOptions(t *testing.T) {
 			client := cfg.Client()
 			var sts appsv1.StatefulSet
 
-			if err := getKubernetesResource(ctx, stsObj, client, &sts); err != nil {
+			if err := utils.GetKubernetesResource(ctx, client, objKey, &sts); err != nil {
 				t.Fatal(err)
 			}
 
-			etcdContainer, err := getContainerByName(sts.Spec.Template.Spec.Containers, "etcd")
+			etcdContainer, err := utils.GetContainerByName(sts.Spec.Template.Spec.Containers, "etcd")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -148,7 +145,7 @@ func TestEtcdOptions(t *testing.T) {
 			client := cfg.Client()
 			var sts appsv1.StatefulSet
 
-			if err := getKubernetesResource(ctx, stsObj, client, &sts); err != nil {
+			if err := utils.GetKubernetesResource(ctx, client, objKey, &sts); err != nil {
 				t.Fatal(err)
 			}
 

@@ -27,6 +27,11 @@ import (
 	"path/filepath"
 	"strings"
 
+	corev1 "k8s.io/api/core/v1"
+	runtimeClient "sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/e2e-framework/klient"
+	"sigs.k8s.io/e2e-framework/klient/k8s"
+	"sigs.k8s.io/e2e-framework/klient/wait"
 	"sigs.k8s.io/e2e-framework/support/kind"
 )
 
@@ -245,6 +250,7 @@ func UncommentCode(filename, target, prefix string) error {
 	return os.WriteFile(filename, out.Bytes(), 0644)
 }
 
+// LoadContainerImageToKindCluster loads an image into the kind cluster.
 // LoadImage does not work when using podman, so LoadImageArchive is used instead
 // refer to https://github.com/kubernetes-sigs/kind/issues/2038
 func LoadContainerImageToKindCluster(ctx context.Context,
@@ -290,4 +296,33 @@ func useImageArchive(ctx context.Context, kindCluster *kind.Cluster) error {
 		return err
 	}
 	return nil
+}
+
+// GetKubernetesResource retrieves a Kubernetes object from the cluster.
+// It accepts wait options and returns an error if the resource cannot be found within the given conditions.
+func GetKubernetesResource(ctx context.Context, client klient.Client, objKey runtimeClient.ObjectKey,
+	outObj k8s.Object, options ...wait.Option) error {
+	if err := wait.For(
+		func(context.Context) (done bool, err error) {
+			rerr := client.Resources().Get(ctx, objKey.Name, objKey.Namespace, outObj)
+			return rerr == nil, rerr
+		},
+		options...,
+	); err != nil {
+		return fmt.Errorf("unable to find %s: %w", objKey.String(), err)
+	}
+
+	return nil
+}
+
+// GetContainerByName retrieves a container by name, if found.
+func GetContainerByName(containers []corev1.Container, name string) (corev1.Container, error) {
+	var container corev1.Container
+	for c := range containers {
+		if containers[c].Name == name {
+			container = containers[c]
+			return container, nil
+		}
+	}
+	return container, fmt.Errorf("container named %s not found", name)
 }
