@@ -18,6 +18,7 @@ package e2e
 
 import (
 	"context"
+	"os"
 	"testing"
 	"time"
 
@@ -34,7 +35,10 @@ import (
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 )
 
+var etcdVersion = os.Getenv("ETCD_VERSION")
+
 // TestZeroMemberCluster tests if zero member Etcd Cluster does not create its StatefulSet
+// TODO: update this test once https://github.com/etcd-io/etcd-operator/issues/125 is addressed
 func TestZeroMemberCluster(t *testing.T) {
 	feature := features.New("zero-member-cluster")
 	etcdClusterName := "etcd-cluster-zero"
@@ -51,7 +55,7 @@ func TestZeroMemberCluster(t *testing.T) {
 		},
 		Spec: ecv1alpha1.EtcdClusterSpec{
 			Size:    size,
-			Version: "v3.5.18",
+			Version: etcdVersion,
 		},
 	}
 
@@ -85,6 +89,53 @@ func TestZeroMemberCluster(t *testing.T) {
 
 	_ = testEnv.Test(t, feature.Feature())
 
+}
+
+// TestNegativeClusterSize tests negative membership cluster creation
+func TestNegativeClusterSize(t *testing.T) {
+	feature := features.New("negative-member-cluster")
+	etcdClusterName := "etcd-cluster-negative"
+	size := -1
+
+	etcdClusterSpec := &ecv1alpha1.EtcdCluster{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "operator.etcd.io/v1alpha1",
+			Kind:       "EtcdCluster",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      etcdClusterName,
+			Namespace: namespace,
+		},
+		Spec: ecv1alpha1.EtcdClusterSpec{
+			Size:    size,
+			Version: etcdVersion,
+		},
+	}
+
+	feature.Setup(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+
+		err := c.Client().Resources().Create(ctx, etcdClusterSpec)
+		if !errors.IsInvalid(err) {
+			t.Fatalf("etcdCluster with negative size failed with unexpected error: %s", err)
+		}
+
+		return ctx
+	})
+
+	feature.Assess("etcdCluster resource should not be created when etcdCluster.Spec.Size is negative",
+		func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+
+			var etcdCluster ecv1alpha1.EtcdCluster
+			err := c.Client().Resources().Get(ctx, etcdClusterName, namespace, &etcdCluster)
+			if !errors.IsNotFound(err) {
+				t.Fatalf("found etcdCluster resource with negative size: %s", err)
+			}
+
+			return ctx
+		},
+	)
+
+	_ = testEnv.Test(t, feature.Feature())
 }
 
 func TestClusterHealthy(t *testing.T) {
