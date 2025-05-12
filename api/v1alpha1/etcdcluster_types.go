@@ -65,20 +65,44 @@ type EtcdClusterStatus struct {
 
 	// ReadyReplicas is the number of pods targeted by this EtcdCluster with a Ready condition.
 	ReadyReplicas int32 `json:"readyReplicas,omitempty"`
-	// Members is the number of etcd members in the cluster reported by etcd API.
-	Members int32 `json:"members,omitempty"`
+	// CurrentReplicas is the number of pods managed by this EtcdCluster (via StatefulSet).
+	CurrentReplicas int32 `json:"CurrentReplicas,omitempty"`
+	// MembersCount is the number of etcd members in the cluster reported by etcd API.
+	MembersCount int32 `json:"members,omitempty"`
 	// CurrentVersion is the version of the etcd cluster.
 	CurrentVersion string `json:"currentVersion,omitempty"`
 	// Phase indicates the state of the EtcdCluster.
 	Phase string `json:"phase,omitempty"`
 	// CurreLeaderId is the ID of etcd cluster leader.
 	LeaderId string `json:"leaderId,omitempty"`
+
+	// Members provides the status of each individual etcd member.
+	// +optional
+	Members []MemberStatus `json:"members,omitempty"`
 	// Conditions represent the latest available observations of a replica set's state.
 	// +optional
 	// +patchMergeKey=type
 	// +patchStrategy=merge
 	// +listType=atomic
 	Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type"`
+}
+
+type MemberStatus struct {
+	// Name of the etcd member.
+	Name string `json:"name,omitempty"`
+	// ID of the etcd member as reported by etcd.
+	ID string `json:"id,omitempty"`
+	// Version of etcd running on this member.
+	Version string `json:"version,omitempty"`
+	// IsHealthy indicates if the member is considered healthy by etcd.
+	IsHealthy bool `json:"isHealthy,omitempty"`
+	// IsLearner indicates if the member is a learner.
+	IsLearner bool `json:"isLearner,omitempty"`
+	// ClientURL is the client URL for this member.
+	ClientURL string `json:"clientURL,omitempty"`
+	// PeerURL is the peer URL for this member.
+	PeerURL string `json:"peerURL,omitempty"`
+	// TODO: Add more fields later like Alarms, DBSize, etc.
 }
 
 // +kubebuilder:object:root=true

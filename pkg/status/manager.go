@@ -18,11 +18,9 @@ type Manager struct {
 // The slice passed must be a pointer, as the manager will modify it directly.
 func NewManager(conditions *[]metav1.Condition, generation int64) *Manager {
 	if conditions == nil {
-		// Initialize if nil to prevent panics, although the caller should ensure this.
+		// Initialize if nil to prevent panics.
 		emptyConditions := make([]metav1.Condition, 0)
 		conditions = &emptyConditions
-		// Or return an error/panic based on desired strictness
-		// panic("conditions slice cannot be nil")
 	}
 	return &Manager{conditions: conditions, generation: generation}
 }

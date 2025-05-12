@@ -162,6 +162,9 @@ spec:
               currentVersion:
                 description: CurrentVersion is the version of the etcd cluster.
                 type: string
+              leaderId:
+                description: CurreLeaderId is the ID of etcd cluster leader.
+                type: string
               members:
                 description: Members is the number of etcd members in the cluster
                   reported by etcd API.
