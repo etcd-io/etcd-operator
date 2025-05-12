@@ -71,6 +71,8 @@ type EtcdClusterStatus struct {
 	CurrentVersion string `json:"currentVersion,omitempty"`
 	// Phase indicates the state of the EtcdCluster.
 	Phase string `json:"phase,omitempty"`
+	// CurreLeaderId is the ID of etcd cluster leader.
+	LeaderId string `json:"leaderId,omitempty"`
 	// Conditions represent the latest available observations of a replica set's state.
 	// +optional
 	// +patchMergeKey=type
