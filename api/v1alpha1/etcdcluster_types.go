@@ -33,6 +33,7 @@ type EtcdClusterSpec struct {
 	// Important: Run "make" to regenerate code after modifying this file
 
 	// Size is the expected size of the etcd cluster.
+	// +kubebuilder:validation:Minimum=0
 	Size int `json:"size"`
 	// Version is the expected version of the etcd container image.
 	Version string `json:"version"`

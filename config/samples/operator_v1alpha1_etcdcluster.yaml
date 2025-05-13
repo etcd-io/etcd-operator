@@ -6,4 +6,5 @@ metadata:
     app.kubernetes.io/managed-by: kustomize
   name: etcdcluster-sample
 spec:
-  # TODO(user): Add fields here
+  version: v3.5.20
+  size: 3
