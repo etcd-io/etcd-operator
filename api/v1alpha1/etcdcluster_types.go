@@ -79,30 +79,45 @@ type EtcdClusterStatus struct {
 	// Members provides the status of each individual etcd member.
 	// +optional
 	Members []MemberStatus `json:"members,omitempty"`
-	// Conditions represent the latest available observations of a replica set's state.
+	// Conditions represent the latest available observations of the EtcdCluster's state.
 	// +optional
 	// +patchMergeKey=type
 	// +patchStrategy=merge
-	// +listType=atomic
+	// +listType=map
+	// +listMapKey=type
 	Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type"`
 }
 
+// MemberStatus defines the observed state of a single etcd member.
 type MemberStatus struct {
 	// Name of the etcd member.
+	// +optional
 	Name string `json:"name,omitempty"`
 	// ID of the etcd member as reported by etcd.
 	ID string `json:"id,omitempty"`
 	// Version of etcd running on this member.
+	// +optional
 	Version string `json:"version,omitempty"`
 	// IsHealthy indicates if the member is considered healthy by etcd.
-	IsHealthy bool `json:"isHealthy,omitempty"`
+	IsHealthy bool `json:"isHealthy"` // No omitempty, always show health
 	// IsLearner indicates if the member is a learner.
 	IsLearner bool `json:"isLearner,omitempty"`
-	// ClientURL is the client URL for this member.
+	// ClientURL is one of the client URLs for this member.
+	// +optional
 	ClientURL string `json:"clientURL,omitempty"`
-	// PeerURL is the peer URL for this member.
+	// PeerURL is one of the peer URLs for this member.
+	// +optional
 	PeerURL string `json:"peerURL,omitempty"`
-	// TODO: Add more fields later like Alarms, DBSize, etc.
+	// DBSize is the current database size in bytes of this member.
+	// +optional
+	DBSize int64 `json:"dbSize,omitempty"`
+	// DBSizeInUse is the actual disk space actively used by the database.
+	// +optional
+	DBSizeInUse int64 `json:"dbSizeInUse,omitempty"`
+	// Alarms are active alarms on this member.
+	// +optional
+	Alarms []string `json:"alarms,omitempty"`
+	// TODO: Add other relevant fields like storageVersion, downgradeInfo if needed.
 }
 
 // +kubebuilder:object:root=true
