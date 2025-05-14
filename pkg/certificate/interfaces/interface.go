@@ -2,8 +2,24 @@ package certificate
 
 import (
 	"context"
+	"errors"
 	"net"
 	"time"
+)
+
+var (
+	// ErrPending is returned when the Certificate is not in "Ready" state
+	ErrPending = errors.New("certificate creation pending")
+
+	// ErrUnknown is returned when the Certificate status does not match the provider defined states
+	ErrUnknown = errors.New("certificate status unknown")
+)
+
+const (
+	// MaxRetries is the maximum number of retry attempts for EnsureCertificateSecret
+	// with a delay of RetryInterval between consecutive retries
+	MaxRetries    = 36
+	RetryInterval = 5 * time.Second
 )
 
 // AltNames contains the domain names and IP addresses that will be added
