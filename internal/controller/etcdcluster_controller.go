@@ -78,11 +78,6 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, err
 	}
 
-	if etcdCluster.Spec.Size == 0 {
-		logger.Info("EtcdCluster size is 0..Skipping next steps")
-		return ctrl.Result{}, nil
-	}
-
 	logger.Info("Reconciling EtcdCluster", "spec", etcdCluster.Spec)
 
 	// Get the statefulsets which has the same name as the EtcdCluster resource

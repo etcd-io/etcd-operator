@@ -18,7 +18,9 @@ package e2e
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -37,12 +39,16 @@ import (
 
 var etcdVersion = os.Getenv("ETCD_VERSION")
 
-// TestZeroMemberCluster tests if zero member Etcd Cluster does not create its StatefulSet
-// TODO: update this test once https://github.com/etcd-io/etcd-operator/issues/125 is addressed
-func TestZeroMemberCluster(t *testing.T) {
-	feature := features.New("zero-member-cluster")
-	etcdClusterName := "etcd-cluster-zero"
-	size := 0
+// TestInvalidClusterSize test minimum cluster size behavior
+func TestInvalidClusterSize(t *testing.T) {
+	feature := features.New("invalid-member-cluster")
+	etcdClusterName := "etcd-cluster"
+
+	// test invalid cluster sizes
+	tt := map[string]int{
+		"with-zero-members":     0,
+		"with-negative-members": -1,
+	}
 
 	etcdClusterSpec := &ecv1alpha1.EtcdCluster{
 		TypeMeta: metav1.TypeMeta{
@@ -54,86 +60,39 @@ func TestZeroMemberCluster(t *testing.T) {
 			Namespace: namespace,
 		},
 		Spec: ecv1alpha1.EtcdClusterSpec{
-			Size:    size,
+			Size:    0,
 			Version: etcdVersion,
 		},
 	}
 
-	feature.Setup(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+	for name, size := range tt {
+		feature.Setup(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
 
-		if err := c.Client().Resources().Create(ctx, etcdClusterSpec); err != nil {
-			t.Fatalf("fail to create Etcd cluster: %s", err)
-		}
+			// update cluster name
+			etcdClusterSpec.ObjectMeta.Name = strings.Join([]string{etcdClusterName, name}, "-")
+			etcdClusterSpec.Spec.Size = size
 
-		return ctx
-	})
-
-	feature.Assess("statefulSet is not created when etcdCluster.Spec.Size is 0",
-		func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-
-			var etcdCluster ecv1alpha1.EtcdCluster
-			if err := c.Client().Resources().Get(ctx, etcdClusterName, namespace, &etcdCluster); err != nil {
-				t.Fatalf("unable to fetch Etcd cluster: %s", err)
-			}
-
-			var sts appsv1.StatefulSet
-			err := c.Client().Resources().Get(ctx, etcdClusterName, namespace, &sts)
-
-			if !errors.IsNotFound(err) {
-				t.Fatalf("statefulSet found when Etcd Cluster size is zero: %s", err)
+			err := c.Client().Resources().Create(ctx, etcdClusterSpec)
+			if !errors.IsInvalid(err) {
+				t.Fatalf("expected invalid etcdCluster %s with size %d. Got: %v", name, size, err)
 			}
 
 			return ctx
-		},
-	)
+		})
 
-	_ = testEnv.Test(t, feature.Feature())
+		feature.Assess(fmt.Sprintf("etcdCluster %s should not be created when etcdCluster.Spec.Size is %d", name, size),
+			func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
 
-}
+				var etcdCluster ecv1alpha1.EtcdCluster
+				err := c.Client().Resources().Get(ctx, etcdClusterName, namespace, &etcdCluster)
+				if !errors.IsNotFound(err) {
+					t.Fatalf("found unexpected etcdCluster %s with size %d. Got: %v", name, size, err)
+				}
 
-// TestNegativeClusterSize tests negative membership cluster creation
-func TestNegativeClusterSize(t *testing.T) {
-	feature := features.New("negative-member-cluster")
-	etcdClusterName := "etcd-cluster-negative"
-	size := -1
-
-	etcdClusterSpec := &ecv1alpha1.EtcdCluster{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: "operator.etcd.io/v1alpha1",
-			Kind:       "EtcdCluster",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      etcdClusterName,
-			Namespace: namespace,
-		},
-		Spec: ecv1alpha1.EtcdClusterSpec{
-			Size:    size,
-			Version: etcdVersion,
-		},
+				return ctx
+			},
+		)
 	}
-
-	feature.Setup(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-
-		err := c.Client().Resources().Create(ctx, etcdClusterSpec)
-		if !errors.IsInvalid(err) {
-			t.Fatalf("etcdCluster with negative size failed with unexpected error: %s", err)
-		}
-
-		return ctx
-	})
-
-	feature.Assess("etcdCluster resource should not be created when etcdCluster.Spec.Size is negative",
-		func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-
-			var etcdCluster ecv1alpha1.EtcdCluster
-			err := c.Client().Resources().Get(ctx, etcdClusterName, namespace, &etcdCluster)
-			if !errors.IsNotFound(err) {
-				t.Fatalf("found etcdCluster resource with negative size: %s", err)
-			}
-
-			return ctx
-		},
-	)
 
 	_ = testEnv.Test(t, feature.Feature())
 }
