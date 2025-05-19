@@ -9,7 +9,7 @@ require (
 	github.com/golangci/golangci-lint v1.64.8
 	sigs.k8s.io/controller-runtime/tools/setup-envtest v0.0.0-20250106171007-7436275c4311 // @release-0.19
 	sigs.k8s.io/controller-tools v0.18.0
-	sigs.k8s.io/kind v0.27.0
+	sigs.k8s.io/kind v0.28.0
 	sigs.k8s.io/kustomize/kustomize/v5 v5.6.0
 )
 
@@ -96,7 +96,6 @@ require (
 	github.com/golangci/unconvert v0.0.0-20240309020433-c5143eacb3ed // indirect
 	github.com/google/gnostic-models v0.6.9 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
-	github.com/google/safetext v0.0.0-20220905092116-b49f7bc46da2 // indirect
 	github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/gordonklaus/ineffassign v0.1.0 // indirect
