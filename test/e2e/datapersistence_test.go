@@ -31,7 +31,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
+	"go.etcd.io/etcd-operator/test/utils"
 
+	runtimeClient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/e2e-framework/klient"
 	"sigs.k8s.io/e2e-framework/klient/k8s"
 	"sigs.k8s.io/e2e-framework/klient/wait"
@@ -70,12 +72,7 @@ func TestDataPersistence(t *testing.T) {
 		},
 	}
 
-	stsObj := &appsv1.StatefulSet{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      etcdClusterName,
-			Namespace: namespace,
-		},
-	}
+	objKey := runtimeClient.ObjectKeyFromObject(etcdCluster)
 
 	feature.Setup(func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
 		client := cfg.Client()
@@ -100,14 +97,12 @@ func TestDataPersistence(t *testing.T) {
 
 			var sts appsv1.StatefulSet
 
-			if err := wait.For(
-				conditions.New(client.Resources()).ResourceMatch(stsObj, func(object k8s.Object) bool {
-					err := client.Resources().Get(ctx, etcdClusterName, namespace, &sts)
-					return err == nil
-				}),
-				wait.WithTimeout(3*time.Minute),
-				wait.WithInterval(30*time.Second),
-			); err != nil {
+			ops := []wait.Option{
+				wait.WithTimeout(3 * time.Minute),
+				wait.WithInterval(10 * time.Second),
+			}
+
+			if err := utils.GetKubernetesResource(ctx, client, objKey, &sts, ops...); err != nil {
 				t.Fatalf("unable to get sts: %s", err)
 			}
 
@@ -115,8 +110,7 @@ func TestDataPersistence(t *testing.T) {
 				conditions.New(client.Resources()).ResourceScaled(&sts, func(object k8s.Object) int32 {
 					return sts.Status.ReadyReplicas
 				}, 1),
-				wait.WithTimeout(3*time.Minute),
-				wait.WithInterval(10*time.Second),
+				ops...,
 			); err != nil {
 				t.Fatalf("unable to create sts with size 1: %s", err)
 			}
@@ -169,9 +163,10 @@ func TestDataPersistence(t *testing.T) {
 
 			// wait until sts's ReadyReplicas turn to 1
 			var sts appsv1.StatefulSet
-			if err := client.Resources().Get(ctx, etcdClusterName, namespace, &sts); err != nil {
+			if err := utils.GetKubernetesResource(ctx, client, objKey, &sts); err != nil {
 				t.Fatalf("unable to get sts post pod deletion: %s", err)
 			}
+
 			if err := wait.For(
 				conditions.New(client.Resources()).ResourceScaled(&sts, func(object k8s.Object) int32 {
 					return sts.Status.ReadyReplicas
