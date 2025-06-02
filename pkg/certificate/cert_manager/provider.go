@@ -43,31 +43,39 @@ func New(c client.Client) *CertManagerProvider {
 	}
 }
 
-func (cm *CertManagerProvider) EnsureCertificateSecret(
-	ctx context.Context,
-	secretName string,
-	namespace string,
+func (cm *CertManagerProvider) EnsureCertificateSecret(ctx context.Context, secretName, namespace string,
 	cfg *interfaces.Config) error {
+	checkCertExists := cm.checkCertificateExists(secretName, namespace, ctx)
+	if checkCertExists != nil {
+		if k8serrors.IsNotFound(checkCertExists) {
+			valErr := cm.validateCertificateConfig(ctx, namespace, cfg)
+			if valErr != nil {
+				return valErr
+			}
+			err := cm.createCertificate(ctx, secretName, namespace, cfg)
+			if err != nil {
+				return err
+			}
+		}
+		return checkCertExists
+	}
+
+	log.Printf("valid certificate: %s present in namespace: %s, validating associated secret...", secretName, namespace)
 	valErr := cm.ValidateCertificateSecret(ctx, secretName, namespace, cfg)
 	if valErr != nil {
 		if k8serrors.IsNotFound(valErr) {
-			log.Printf("certificate secret: %s not present in namespace: %s , creating new Certificate",
-				secretName, namespace)
-			return cm.createCertificate(ctx, secretName, namespace, cfg)
+			return valErr
 		} else {
 			return fmt.Errorf("invalid certificate secret: %s present in namespace: %s, please delete and try again.\nError: %s",
 				secretName, namespace, valErr)
 		}
 	}
 
-	return fmt.Errorf("valid certificate secret: %s already present in namespace: %s , skipping Certificate creation",
-		secretName, namespace)
+	log.Printf("valid certificate secret: %s already present in namespace: %s", secretName, namespace)
+	return nil
 }
 
-func (cm *CertManagerProvider) ValidateCertificateSecret(
-	ctx context.Context,
-	secretName string,
-	namespace string,
+func (cm *CertManagerProvider) ValidateCertificateSecret(ctx context.Context, secretName, namespace string,
 	_ *interfaces.Config) error {
 	secret := &corev1.Secret{}
 	err := cm.Get(ctx, client.ObjectKey{Name: secretName, Namespace: namespace}, secret)
@@ -155,10 +163,8 @@ func (cm *CertManagerProvider) RevokeCertificate(ctx context.Context, secretName
 	return nil
 }
 
-func (cm *CertManagerProvider) GetCertificateConfig(
-	ctx context.Context,
-	secretName string,
-	namespace string) (*interfaces.Config, error) {
+func (cm *CertManagerProvider) GetCertificateConfig(ctx context.Context,
+	secretName, namespace string) (*interfaces.Config, error) {
 	cmCertificate := &certmanagerv1.Certificate{}
 	err := cm.Get(ctx, client.ObjectKey{Name: secretName, Namespace: namespace}, cmCertificate)
 	if err != nil {
@@ -191,7 +197,7 @@ func getExtraConfigByName(key string, cfg *interfaces.Config) (string, error) {
 	return value, nil
 }
 
-// checkIssuerExists checks for if the provided issuer is present in the cluster
+// checkIssuerExists checks for if the provided issuer is present in the namespace/cluster
 func (cm *CertManagerProvider) checkIssuerExists(issuerName, issuerKind, namespace string, ctx context.Context) error {
 	switch issuerKind {
 	case "Issuer":
@@ -212,14 +218,18 @@ func (cm *CertManagerProvider) checkIssuerExists(issuerName, issuerKind, namespa
 	return nil
 }
 
-// createCertificate creates a cert-manager Certificate resource in the specified namespace.
-// DNSNames and IPAddresses if not user-defined, will be set to default value in runtime:
-// fmt.Sprintf("%s-%d.%s.%s.svc.cluster.local", ec.Name, index, ec.Name, ec.Namespace)
-// returns an error if the Certificate resource cannot be created.
-func (cm *CertManagerProvider) createCertificate(
-	ctx context.Context,
-	secretName string,
-	namespace string,
+// checkCertificateExists checks if the requested certificate already exists in the namespace
+func (cm *CertManagerProvider) checkCertificateExists(certificateName, namespace string, ctx context.Context) error {
+	cmCertificate := &certmanagerv1.Certificate{}
+	err := cm.Get(ctx, client.ObjectKey{Name: certificateName, Namespace: namespace}, cmCertificate)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateCertificateConfig checks if the config passed is valid
+func (cm *CertManagerProvider) validateCertificateConfig(ctx context.Context, namespace string,
 	cfg *interfaces.Config) error {
 	issuerName, err := getExtraConfigByName(IssuerNameKey, cfg)
 	if err != nil {
@@ -229,10 +239,26 @@ func (cm *CertManagerProvider) createCertificate(
 	if err != nil {
 		return err
 	}
-
 	checkIssuerExist := cm.checkIssuerExists(issuerName, issuerKind, namespace, ctx)
 	if checkIssuerExist != nil {
 		return checkIssuerExist
+	}
+	return nil
+}
+
+// createCertificate creates a cert-manager Certificate resource in the specified namespace.
+// DNSNames and IPAddresses if not user-defined, will be set to default value in runtime:
+// fmt.Sprintf("%s-%d.%s.%s.svc.cluster.local", ec.Name, index, ec.Name, ec.Namespace)
+// returns an error if the Certificate resource cannot be created.
+func (cm *CertManagerProvider) createCertificate(ctx context.Context, secretName, namespace string,
+	cfg *interfaces.Config) error {
+	issuerName, err := getExtraConfigByName(IssuerNameKey, cfg)
+	if err != nil {
+		return err
+	}
+	issuerKind, err := getExtraConfigByName(IssuerKindKey, cfg)
+	if err != nil {
+		return err
 	}
 
 	certificateResource := &certmanagerv1.Certificate{
