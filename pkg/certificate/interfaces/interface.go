@@ -2,9 +2,16 @@ package certificate
 
 import (
 	"context"
+	"errors"
 	"net"
 	"time"
 )
+
+// ErrPending is returned when the Certificate is not in "Ready" state
+var ErrPending = errors.New("certificate creation pending")
+
+// ErrUnknown is returned when the Certificate status does not match the provider defined states
+var ErrUnknown = errors.New("certificate status unknown")
 
 // AltNames contains the domain names and IP addresses that will be added
 // to the x509 certificate SubAltNames fields. The values will be passed

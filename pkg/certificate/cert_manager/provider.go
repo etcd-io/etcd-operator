@@ -37,7 +37,7 @@ type CertManagerProvider struct {
 
 var _ interfaces.Provider = (*CertManagerProvider)(nil)
 
-func New(c client.Client) *CertManagerProvider {
+func New(c client.Client) interfaces.Provider {
 	return &CertManagerProvider{
 		c,
 	}
@@ -45,9 +45,10 @@ func New(c client.Client) *CertManagerProvider {
 
 func (cm *CertManagerProvider) EnsureCertificateSecret(ctx context.Context, secretName, namespace string,
 	cfg *interfaces.Config) error {
-	checkCertExists := cm.checkCertificateExists(secretName, namespace, ctx)
-	if checkCertExists != nil {
-		if k8serrors.IsNotFound(checkCertExists) {
+	cmCertificate := &certmanagerv1.Certificate{}
+	err := cm.Get(ctx, client.ObjectKey{Name: secretName, Namespace: namespace}, cmCertificate)
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
 			valErr := cm.validateCertificateConfig(ctx, namespace, cfg)
 			if valErr != nil {
 				return valErr
@@ -57,27 +58,27 @@ func (cm *CertManagerProvider) EnsureCertificateSecret(ctx context.Context, secr
 				return err
 			}
 		}
-		return checkCertExists
+		return err
 	}
 
-	log.Printf("valid certificate: %s present in namespace: %s, checking certificate status...", secretName, namespace)
-	certStatusErr := cm.getCertificateStatus(secretName, namespace, ctx)
-	if certStatusErr != nil {
-		return certStatusErr
+	log.Printf("Valid certificate: %s present in namespace: %s, checking certificate status...", secretName, namespace)
+	err = cm.checkCertificateStatus(secretName, namespace, ctx)
+	if err != nil {
+		return err
 	}
 
-	log.Printf("certificate: %s ready in namespace: %s, validating associated secret...", secretName, namespace)
-	valErr := cm.ValidateCertificateSecret(ctx, secretName, namespace, cfg)
-	if valErr != nil {
-		if k8serrors.IsNotFound(valErr) {
-			return valErr
+	log.Printf("Certificate: %s ready in namespace: %s, validating associated secret...", secretName, namespace)
+	err = cm.ValidateCertificateSecret(ctx, secretName, namespace, cfg)
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			return err
 		} else {
 			return fmt.Errorf("invalid certificate secret: %s present in namespace: %s, please delete and try again.\nError: %s",
-				secretName, namespace, valErr)
+				secretName, namespace, err)
 		}
 	}
 
-	log.Printf("valid certificate secret: %s already present in namespace: %s", secretName, namespace)
+	log.Printf("Valid certificate secret: %s already present in namespace: %s", secretName, namespace)
 	return nil
 }
 
@@ -126,26 +127,11 @@ func (cm *CertManagerProvider) ValidateCertificateSecret(ctx context.Context, se
 }
 
 func (cm *CertManagerProvider) DeleteCertificateSecret(ctx context.Context, secretName string, namespace string) error {
-	secret := &corev1.Secret{}
-	err := cm.Get(ctx, client.ObjectKey{Name: secretName, Namespace: namespace}, secret)
-	if err != nil {
-		return fmt.Errorf("failed to get secret: %w", err)
-	}
-
-	// Delete the Secret
-	err = cm.Delete(ctx, secret)
-	if err != nil {
-		return fmt.Errorf("failed to delete secret: %w", err)
-	}
-
-	return nil
-}
-
-func (cm *CertManagerProvider) RevokeCertificate(ctx context.Context, secretName string, namespace string) error {
 	cmCertificate := &certmanagerv1.Certificate{}
-	getCertificateErr := cm.Get(ctx, client.ObjectKey{Name: secretName, Namespace: namespace}, cmCertificate)
-	if getCertificateErr != nil {
-		return getCertificateErr
+	certStatusErr := cm.checkCertificateStatus(secretName, namespace, ctx)
+	if certStatusErr != nil {
+		log.Printf("Certificate associated not ready yet, try again later.")
+		return certStatusErr
 	}
 
 	dErr := cm.Delete(ctx, cmCertificate)
@@ -166,6 +152,12 @@ func (cm *CertManagerProvider) RevokeCertificate(ctx context.Context, secretName
 
 	}
 
+	return nil
+}
+
+// RevokeCertificate does not exist, certificates can only be deleted which is handled by DeleteCertificateSecret as per
+// official documentation: https://cert-manager.io/docs/usage/certificate/#inner-workings-diagram-for-developers
+func (cm *CertManagerProvider) RevokeCertificate(ctx context.Context, secretName string, namespace string) error {
 	return nil
 }
 
@@ -194,8 +186,8 @@ func (cm *CertManagerProvider) GetCertificateConfig(ctx context.Context,
 	return cfg, nil
 }
 
-// getCertificateStatus returns the current status of the certificate creation
-func (cm *CertManagerProvider) getCertificateStatus(certificateName, namespace string, ctx context.Context) error {
+// checkCertificateStatus returns the current status of the certificate creation
+func (cm *CertManagerProvider) checkCertificateStatus(certificateName, namespace string, ctx context.Context) error {
 	cmCertificate := &certmanagerv1.Certificate{}
 	err := cm.Get(ctx, client.ObjectKey{Name: certificateName, Namespace: namespace}, cmCertificate)
 	if err != nil {
@@ -209,23 +201,14 @@ func (cm *CertManagerProvider) getCertificateStatus(certificateName, namespace s
 				condition.Status, condition.Reason, condition.Message)
 			return nil
 		case certmanagerv1.CertificateConditionIssuing:
-			return fmt.Errorf("Certificate Issuing: %v (Reason: %s, Message: %s)\n",
-				condition.Status, condition.Reason, condition.Message)
+			return fmt.Errorf("certificate Issuing: %v (Reason: %s, Message: %s), error: %w \n",
+				condition.Status, condition.Reason, condition.Message, interfaces.ErrPending)
 		default:
-			return fmt.Errorf("Certificate status unknown: %v (Reason: %s, Message: %s)\n",
-				condition.Status, condition.Reason, condition.Message)
+			return fmt.Errorf("certificate status unknown: %v (Reason: %s, Message: %s), error: %w\n",
+				condition.Status, condition.Reason, condition.Message, interfaces.ErrUnknown)
 		}
 	}
 	return nil
-}
-
-// getExtraConfigByName checks if the ExtraConfig keys has been defined with a valid string
-func getExtraConfigByName(key string, cfg *interfaces.Config) (string, error) {
-	value, isValid := cfg.ExtraConfig[key].(string)
-	if !isValid {
-		return "", fmt.Errorf("value for %s not correctly provided, try again", key)
-	}
-	return value, nil
 }
 
 // checkIssuerExists checks for if the provided issuer is present in the namespace/cluster
@@ -249,26 +232,16 @@ func (cm *CertManagerProvider) checkIssuerExists(issuerName, issuerKind, namespa
 	return nil
 }
 
-// checkCertificateExists checks if the requested certificate already exists in the namespace
-func (cm *CertManagerProvider) checkCertificateExists(certificateName, namespace string, ctx context.Context) error {
-	cmCertificate := &certmanagerv1.Certificate{}
-	err := cm.Get(ctx, client.ObjectKey{Name: certificateName, Namespace: namespace}, cmCertificate)
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
 // validateCertificateConfig checks if the config passed is valid
 func (cm *CertManagerProvider) validateCertificateConfig(ctx context.Context, namespace string,
 	cfg *interfaces.Config) error {
-	issuerName, err := getExtraConfigByName(IssuerNameKey, cfg)
-	if err != nil {
-		return err
+	issuerName, isValid := cfg.ExtraConfig[IssuerNameKey].(string)
+	if !isValid {
+		return fmt.Errorf("value for %s not correctly provided, try again", IssuerNameKey)
 	}
-	issuerKind, err := getExtraConfigByName(IssuerKindKey, cfg)
-	if err != nil {
-		return err
+	issuerKind, isValid := cfg.ExtraConfig[IssuerKindKey].(string)
+	if !isValid {
+		return fmt.Errorf("value for %s not correctly provided, try again", IssuerKindKey)
 	}
 	checkIssuerExist := cm.checkIssuerExists(issuerName, issuerKind, namespace, ctx)
 	if checkIssuerExist != nil {
@@ -283,13 +256,13 @@ func (cm *CertManagerProvider) validateCertificateConfig(ctx context.Context, na
 // returns an error if the Certificate resource cannot be created.
 func (cm *CertManagerProvider) createCertificate(ctx context.Context, secretName, namespace string,
 	cfg *interfaces.Config) error {
-	issuerName, err := getExtraConfigByName(IssuerNameKey, cfg)
-	if err != nil {
-		return err
+	issuerName, isValid := cfg.ExtraConfig[IssuerNameKey].(string)
+	if !isValid {
+		return fmt.Errorf("value for %s not correctly provided, try again", IssuerNameKey)
 	}
-	issuerKind, err := getExtraConfigByName(IssuerKindKey, cfg)
-	if err != nil {
-		return err
+	issuerKind, isValid := cfg.ExtraConfig[IssuerKindKey].(string)
+	if !isValid {
+		return fmt.Errorf("value for %s not correctly provided, try again", IssuerKindKey)
 	}
 
 	certificateResource := &certmanagerv1.Certificate{
