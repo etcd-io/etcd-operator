@@ -5,7 +5,7 @@ go 1.24.0
 toolchain go1.24.3
 
 require (
-	github.com/go-logr/logr v1.4.2
+	github.com/go-logr/logr v1.4.3
 	github.com/stretchr/testify v1.10.0
 	go.etcd.io/etcd/api/v3 v3.6.0
 	go.etcd.io/etcd/client/pkg/v3 v3.6.0
