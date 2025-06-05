@@ -98,6 +98,15 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 	// Defer the actual patch operation. The mutate function will apply the final 'calculatedStatus'.
 	defer func() {
+		// Using the named return value `err`, we can determine if the reconciliation
+		// was successful before patching the status.
+		// We should only update ObservedGeneration if the reconciliation cycle completed without an error.
+		if err == nil {
+			// If we are about to exit without an error, it means we have successfully
+			// processed the current spec generation.
+			calculatedStatus.ObservedGeneration = etcdCluster.Generation
+		}
+
 		// Call PatchStatusMutate. The mutate function copies the calculatedStatus
 		// onto the latest version fetched inside the patch retry loop.
 		patchErr := status.PatchStatusMutate(ctx, r.Client, etcdCluster, func(latest *ecv1alpha1.EtcdCluster) error {
@@ -234,6 +243,12 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		cm.SetDegraded(true, status.ReasonHealthCheckError, status.FormatError("Health check failed", err))
 		// Keep Progressing True as we need to retry health check
 		cm.SetProgressing(true, status.ReasonHealthCheckError, "Retrying after health check failure")
+
+		// Clear stale data on error to avoid using stale member status
+		calculatedStatus.Members = nil
+		calculatedStatus.MemberCount = 0
+		calculatedStatus.LeaderId = ""
+		calculatedStatus.CurrentVersion = ""
 		return ctrl.Result{}, fmt.Errorf("health check failed: %w", err)
 	}
 	// calculatedStatus.LastHealthCheckTime = metav1.Now() // TODO: Add this field
@@ -246,6 +261,8 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		memberCnt = len(memberListResp.Members)
 	}
 	calculatedStatus.MemberCount = int32(memberCnt)
+	// Populate the detailed member status slice using our new helper function.
+	calculatedStatus.Members = r.populateMemberStatuses(ctx, memberListResp, healthInfos)
 
 	// ---------------------------------------------------------------------
 	// 6. Handle Member/Replica Mismatch
@@ -304,6 +321,10 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			return ctrl.Result{RequeueAfter: requeueDuration}, err
 		}
 		calculatedStatus.LeaderId = fmt.Sprintf("%x", leaderStatus.Header.MemberId)
+		// Set the cluster's current version based on the leader's version.
+		if leaderStatus.Version != "" {
+			calculatedStatus.CurrentVersion = leaderStatus.Version
+		}
 
 		learner, learnerStatus = etcdutils.FindLearnerStatus(healthInfos, logger)
 		if learner > 0 {
@@ -372,6 +393,14 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			cm.SetProgressing(true, scalingReason, scalingMessage)
 			cm.SetAvailable(false, scalingReason, "Cluster is scaling down")
 
+			// TODO: The current logic for selecting a member to remove is not robust.
+			// It assumes the last member in `healthInfos` (sorted alphabetically by endpoint)
+			// is the member with the highest ordinal index. This can be incorrect under
+			// certain naming conventions (e.g., with more than 10 pods) and could lead
+			// to removing the wrong member.
+			// A robust implementation should find the member to remove by its pod name
+			// (e.g., "etcd-cluster-N") instead of relying on slice order.
+			// This will be addressed in a future PR to keep this change focused.
 			memberID := healthInfos[memberCnt-1].Status.Header.MemberId
 			logger.Info("[Scale in] removing one member", "memberID", memberID)
 			eps = eps[:targetReplica]
@@ -497,6 +526,74 @@ func (r *EtcdClusterReconciler) updateStatusFromStatefulSet(
 		etcdClusterStatus.CurrentReplicas = 0 // Should not occur with a valid STS spec
 	}
 	etcdClusterStatus.ReadyReplicas = sts.Status.ReadyReplicas
+}
+
+// populateMemberStatuses translates the raw health and member info from etcd into the
+// structured MemberStatus API type.
+func (r *EtcdClusterReconciler) populateMemberStatuses(
+	ctx context.Context,
+	memberListResp *clientv3.MemberListResponse,
+	healthInfos []etcdutils.EpHealth,
+) []ecv1alpha1.MemberStatus {
+	logger := log.FromContext(ctx)
+	// If there's no member list, there's nothing to populate.
+	if memberListResp == nil || len(memberListResp.Members) == 0 {
+		return nil
+	}
+
+	// Create a map of health info keyed by member ID for efficient lookups.
+	healthMap := make(map[uint64]etcdutils.EpHealth)
+	for _, hi := range healthInfos {
+		if hi.Status != nil && hi.Status.Header != nil {
+			healthMap[hi.Status.Header.MemberId] = hi
+		}
+	}
+
+	// Allocate space for the resulting statuses.
+	statuses := make([]ecv1alpha1.MemberStatus, 0, len(memberListResp.Members))
+
+	// Iterate through the canonical member list from etcd.
+	for _, etcdMember := range memberListResp.Members {
+		// Start building the status for this specific member.
+		ms := ecv1alpha1.MemberStatus{
+			ID:        fmt.Sprintf("%x", etcdMember.ID), // Use hex representation for the uint64 ID.
+			Name:      etcdMember.Name,
+			IsLearner: etcdMember.IsLearner,
+		}
+
+		// Populate URLs, taking the first one if available.
+		if len(etcdMember.ClientURLs) > 0 {
+			ms.ClientURL = etcdMember.ClientURLs[0]
+		}
+		if len(etcdMember.PeerURLs) > 0 {
+			ms.PeerURL = etcdMember.PeerURLs[0]
+		}
+
+		// Look up the detailed health status for this member in the map.
+		if healthInfo, found := healthMap[etcdMember.ID]; found {
+			// A health record was found for this member.
+			ms.IsHealthy = healthInfo.Health
+			ms.ErrorMessage = healthInfo.Error
+			ms.Alarms = healthInfo.Alarms // Directly use the pre-processed []string from EpHealth.
+
+			// Populate fields from the detailed StatusResponse if it exists.
+			if healthInfo.Status != nil {
+				ms.Version = healthInfo.Status.Version
+				ms.DBSize = healthInfo.Status.DbSize
+				ms.DBSizeInUse = healthInfo.Status.DbSizeInUse
+			}
+		} else {
+			// A member was present in the member list but we couldn't get its
+			// individual health status (e.g., its endpoint was unreachable during the check).
+			ms.IsHealthy = false
+			ms.ErrorMessage = "Health status for this member could not be retrieved."
+			logger.Info("No detailed health status found for etcd member, marking as unhealthy by default", "memberID", ms.ID, "memberName", ms.Name)
+		}
+
+		statuses = append(statuses, ms)
+	}
+
+	return statuses
 }
 
 // SetupWithManager sets up the controller with the Manager.
