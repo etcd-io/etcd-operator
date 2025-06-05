@@ -130,7 +130,7 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		logger.Info("EtcdCluster size is 0..Skipping next steps")
 		calculatedStatus.ReadyReplicas = 0
 		calculatedStatus.CurrentReplicas = 0
-		calculatedStatus.MembersCount = 0
+		calculatedStatus.MemberCount = 0
 		cm.SetAvailable(false, status.ReasonSizeIsZero, "Desired cluster size is 0")
 		cm.SetProgressing(false, status.ReasonSizeIsZero, "Desired cluster size is 0")
 		return ctrl.Result{}, nil
@@ -245,7 +245,7 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if memberListResp != nil {
 		memberCnt = len(memberListResp.Members)
 	}
-	calculatedStatus.MembersCount = int32(memberCnt)
+	calculatedStatus.MemberCount = int32(memberCnt)
 
 	// ---------------------------------------------------------------------
 	// 6. Handle Member/Replica Mismatch

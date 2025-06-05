@@ -63,22 +63,48 @@ type EtcdClusterStatus struct {
 	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
 
-	// ReadyReplicas is the number of pods targeted by this EtcdCluster with a Ready condition.
+	// ObservedGeneration is the most recent generation observed for this EtcdCluster by the controller.
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// CurrentReplicas is the number of etcd pods managed by the StatefulSet for this cluster.
+	// This reflects the .spec.replicas of the underlying StatefulSet.
+	// +optional
+	CurrentReplicas int32 `json:"currentReplicas,omitempty"`
+
+	// ReadyReplicas is the number of etcd pods managed by the StatefulSet that are currently ready.
+	// This reflects the .status.readyReplicas of the underlying StatefulSet.
+	// +optional
 	ReadyReplicas int32 `json:"readyReplicas,omitempty"`
-	// CurrentReplicas is the number of pods managed by this EtcdCluster (via StatefulSet).
-	CurrentReplicas int32 `json:"CurrentReplicas,omitempty"`
-	// MembersCount is the number of etcd members in the cluster reported by etcd API.
-	MembersCount int32 `json:"members,omitempty"`
-	// CurrentVersion is the version of the etcd cluster.
+
+	// MemberCount is the number of members currently registered in the etcd cluster,
+	// as reported by the etcd 'member list' API. This may differ from CurrentReplicas
+	// during scaling operations or if members are added/removed outside the operator's direct control.
+	// +optional
+	MemberCount int32 `json:"memberCount,omitempty"`
+
+	// CurrentVersion is the observed etcd version of the cluster.
+	// This is typically derived from the version of the healthy leader or a consensus among healthy members.
+	// +optional
 	CurrentVersion string `json:"currentVersion,omitempty"`
-	// Phase indicates the state of the EtcdCluster.
-	Phase string `json:"phase,omitempty"`
-	// CurreLeaderId is the ID of etcd cluster leader.
+
+	// LeaderId is the hex-encoded ID of the current etcd cluster leader, if one exists and is known.
+	// +optional
 	LeaderId string `json:"leaderId,omitempty"`
+
+	// Phase indicates the current lifecycle phase of the EtcdCluster.
+	// Examples: "Pending", "Initializing", "Running", "Scaling", "Upgrading", "Failed", "Idle".
+	// +optional
+	Phase string `json:"phase,omitempty"`
 
 	// Members provides the status of each individual etcd member.
 	// +optional
+	// +listType=map
+	// +listMapKey=id
+	// Alternative listMapKey could be 'name' if 'id' is not always immediately available or stable during init.
+	// However, 'id' is more canonical once a member is part of the cluster.
 	Members []MemberStatus `json:"members,omitempty"`
+
 	// Conditions represent the latest available observations of the EtcdCluster's state.
 	// +optional
 	// +patchMergeKey=type
@@ -90,34 +116,58 @@ type EtcdClusterStatus struct {
 
 // MemberStatus defines the observed state of a single etcd member.
 type MemberStatus struct {
-	// Name of the etcd member.
+	// Name of the etcd member, typically the pod name (e.g., "etcd-cluster-example-0").
+	// This can also be the name reported by etcd itself if set.
 	// +optional
 	Name string `json:"name,omitempty"`
-	// ID of the etcd member as reported by etcd.
-	ID string `json:"id,omitempty"`
+
+	// ID is the hex-encoded member ID as reported by etcd.
+	// This is the canonical identifier for an etcd member.
+	ID string `json:"id"` // Made non-optional as it's key for identification
+
 	// Version of etcd running on this member.
 	// +optional
 	Version string `json:"version,omitempty"`
-	// IsHealthy indicates if the member is considered healthy by etcd.
+
+	// IsHealthy indicates if the member is considered healthy.
+	// A member is healthy if its etcd /health endpoint is reachable and reports OK,
+	// and its Status endpoint does not report any 'Errors'.
 	IsHealthy bool `json:"isHealthy"` // No omitempty, always show health
-	// IsLearner indicates if the member is a learner.
+
+	// IsLearner indicates if the member is currently a learner in the etcd cluster.
+	// +optional
 	IsLearner bool `json:"isLearner,omitempty"`
+
 	// ClientURL is one of the client URLs for this member.
 	// +optional
 	ClientURL string `json:"clientURL,omitempty"`
+
 	// PeerURL is one of the peer URLs for this member.
 	// +optional
 	PeerURL string `json:"peerURL,omitempty"`
-	// DBSize is the current database size in bytes of this member.
+
+	// DBSize is the current database size in bytes of this member, as reported by etcd.
+	// This is the physically allocated size.
 	// +optional
 	DBSize int64 `json:"dbSize,omitempty"`
-	// DBSizeInUse is the actual disk space actively used by the database.
+
+	// DBSizeInUse is the actual disk space logically in use by the database, in bytes, of this member.
 	// +optional
 	DBSizeInUse int64 `json:"dbSizeInUse,omitempty"`
-	// Alarms are active alarms on this member.
+
+	// Alarms are active alarms on this member (e.g., "NOSPACE", "CORRUPT").
+	// This lists specific alarm types.
 	// +optional
 	Alarms []string `json:"alarms,omitempty"`
-	// TODO: Add other relevant fields like storageVersion, downgradeInfo if needed.
+
+	// ErrorMessage provides any error associated with fetching status for this member,
+	// or errors reported by the member itself via its StatusResponse.Errors field.
+	// +optional
+	ErrorMessage string `json:"errorMessage,omitempty"`
+
+	// TODO: Consider adding these in future iterations if deemed valuable:
+	// StorageVersion string `json:"storageVersion,omitempty"` // Raft storage version
+	// DowngradeInfo string `json:"downgradeInfo,omitempty"`   // Information about downgrade capabilities
 }
 
 // +kubebuilder:object:root=true
