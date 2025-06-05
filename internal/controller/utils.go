@@ -35,6 +35,13 @@ const (
 	volumeName  = "etcd-data"
 )
 
+type etcdClusterState string
+
+const (
+	etcdClusterStateNew      etcdClusterState = "new"
+	etcdClusterStateExisting etcdClusterState = "existing"
+)
+
 func prepareOwnerReference(ec *ecv1alpha1.EtcdCluster, scheme *runtime.Scheme) ([]metav1.OwnerReference, error) {
 	gvk, err := apiutil.GVKForObject(ec, scheme)
 	if err != nil {
@@ -385,9 +392,10 @@ func peerEndpointForOrdinalIndex(ec *ecv1alpha1.EtcdCluster, index int) (string,
 func newEtcdClusterState(ec *ecv1alpha1.EtcdCluster, replica int) *corev1.ConfigMap {
 	// We always add members one by one, so the state is always
 	// "existing" if replica > 1.
-	state := "new"
+
+	state := etcdClusterStateNew
 	if replica > 1 {
-		state = "existing"
+		state = etcdClusterStateExisting
 	}
 
 	var initialCluster []string
@@ -402,7 +410,7 @@ func newEtcdClusterState(ec *ecv1alpha1.EtcdCluster, replica int) *corev1.Config
 			Namespace: ec.Namespace,
 		},
 		Data: map[string]string{
-			"ETCD_INITIAL_CLUSTER_STATE": state,
+			"ETCD_INITIAL_CLUSTER_STATE": string(state),
 			"ETCD_INITIAL_CLUSTER":       strings.Join(initialCluster, ","),
 			"ETCD_DATA_DIR":              etcdDataDir,
 		},
