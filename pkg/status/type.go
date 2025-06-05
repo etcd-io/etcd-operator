@@ -4,7 +4,9 @@ package status
 
 // Condition types used for EtcdCluster status.
 // Adhering to Kubernetes API conventions as much as possible.
-// See: https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#typical-status-properties
+// See:
+// github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md
+
 const (
 	// ConditionAvailable indicates that the etcd cluster has reached its desired state,
 	// has quorum, and is ready to serve requests. All members are healthy.

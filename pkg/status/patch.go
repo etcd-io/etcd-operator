@@ -66,7 +66,8 @@ func PatchStatusMutate[T client.Object](
 		// Check if the generation changed during our reconcile. This might mean the spec changed
 		// and our calculated status is stale.
 		if startGeneration != latestFetchedObj.GetGeneration() {
-			logger.Info("Object generation changed during reconcile, status calculated based on old spec might be stale. Aborting this patch attempt.",
+			logger.Info("Object generation changed during reconcile, status calculated based on old spec might be stale. "+
+				"Aborting this patch attempt.",
 				"key", key, "startGeneration", startGeneration, "currentGeneration", latestFetchedObj.GetGeneration())
 			// Returning nil here means we acknowledge the generation change and decide *not* to patch stale status.
 			// The main Reconcile loop will requeue soon with the new generation.
@@ -83,7 +84,8 @@ func PatchStatusMutate[T client.Object](
 		if err := mutateFn(latestFetchedObj); err != nil {
 			// If the mutation logic itself fails, we likely want to stop retrying the patch.
 			logger.Error(err, "Mutation function failed during status patch attempt.")
-			return fmt.Errorf("mutate function failed during status patch: %w", err) // Stop retries by returning non-conflict error
+			// Stop retries by returning non-conflict error
+			return fmt.Errorf("mutate function failed during status patch: %w", err)
 		}
 
 		// Compare the object's status before and after mutation.

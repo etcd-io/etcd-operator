@@ -163,7 +163,11 @@ func ClusterHealth(eps []string) ([]EpHealth, error) {
 		// clusterOpClient will be nil
 	}
 	if clusterOpClient != nil {
-		defer clusterOpClient.Close()
+		defer func() {
+			if err := clusterOpClient.Close(); err != nil {
+				lg.Warn("Failed to close cluster operation client", zap.Error(err))
+			}
+		}()
 	}
 
 	// 2. Fetch cluster-wide alarms ONCE
@@ -311,7 +315,11 @@ func checkSingleEndpointCoreHealth(ctx context.Context, cfg clientv3.Config, par
 		// Took is not measured if client creation fails.
 		return epHealth
 	}
-	defer cli.Close()
+	defer func() {
+		if err := cli.Close(); err != nil {
+			parentLogger.Warn("Failed to close etcd client for endpoint", zap.String("endpoint", ep), zap.Error(err))
+		}
+	}()
 
 	startTs := time.Now()
 
@@ -339,9 +347,6 @@ func checkSingleEndpointCoreHealth(ctx context.Context, cfg clientv3.Config, par
 		if len(epStatus.Errors) > 0 { // Errors reported by the etcd member itself
 			epHealth.Health = false
 			epHealth.Error = appendError(epHealth.Error, fmt.Sprintf("etcd member reported errors: %s", strings.Join(epStatus.Errors, ", ")))
-		} else if !epHealth.Health {
-			// If Get failed but Status succeeded without internal errors,
-			// it's a mixed signal. For now, if Get failed, overall Health is false.
 		}
 	}
 
