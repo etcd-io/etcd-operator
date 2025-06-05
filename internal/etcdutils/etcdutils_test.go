@@ -152,7 +152,7 @@ func TestClusterHealth(t *testing.T) {
 				// Activate a NOSPACE alarm on the server
 				_, err := e.Server.Alarm(context.Background(), &etcdserverpb.AlarmRequest{
 					Action:   etcdserverpb.AlarmRequest_ACTIVATE,
-					MemberID: uint64(e.Server.ID()),
+					MemberID: uint64(e.Server.MemberID()),
 					Alarm:    etcdserverpb.AlarmType_NOSPACE,
 				})
 				assert.NoError(t, err)
@@ -184,7 +184,7 @@ func TestClusterHealth(t *testing.T) {
 					// Disarm the NOSPACE alarm to clean up the state for the next test.
 					_, _ = e.Server.Alarm(context.Background(), &etcdserverpb.AlarmRequest{
 						Action:   etcdserverpb.AlarmRequest_DEACTIVATE,
-						MemberID: uint64(e.Server.ID()),
+						MemberID: uint64(e.Server.MemberID()),
 						Alarm:    etcdserverpb.AlarmType_NOSPACE,
 					})
 				})
