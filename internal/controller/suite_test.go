@@ -25,8 +25,10 @@ import (
 	"testing"
 
 	"k8s.io/client-go/kubernetes/scheme"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	operatorv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 	// +kubebuilder:scaffold:imports
@@ -64,6 +66,8 @@ func TestMain(m *testing.M) {
 	if cfg == nil {
 		logger.Fatalf("Test environment started with nil config")
 	}
+
+	ctrl.SetLogger(zap.New())
 
 	// Teardown after tests
 	defer func() {
