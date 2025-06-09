@@ -52,9 +52,9 @@ type Provider interface {
 	// - cfg: Configuration to validate against.
 	//
 	// Returns:
-	// - true if the Secret is valid, false otherwise, along with
+	// - nil if the Secret is valid, otherwise returns
 	//   an error if validation fails.
-	ValidateCertificateSecret(ctx context.Context, secretName string, namespace string, cfg *Config) (bool, error)
+	ValidateCertificateSecret(ctx context.Context, secretName string, namespace string, cfg *Config) error
 
 	// DeleteCertificateSecret explicitly deletes the Secret containing
 	// the certificate. This should only be used if the certificate
