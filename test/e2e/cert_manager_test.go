@@ -3,6 +3,7 @@ package e2e
 import (
 	"context"
 	"testing"
+	"time"
 
 	certv1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	appsv1 "k8s.io/api/apps/v1"
@@ -14,18 +15,23 @@ import (
 
 	apiextensionsV1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 
+	interfaces "go.etcd.io/etcd-operator/pkg/certificate/interfaces"
+
 	"go.etcd.io/etcd-operator/pkg/certificate/cert_manager"
 )
 
 const cmIssuerName = "selfsigned"
+const cmIssuerType = "ClusterIssuer"
 const cmCertificateName = "sample-cert"
+const cmCertificateNamespace = "default"
+const cmCertificatealidity = 24 * time.Hour
 
 func TestCertManagerProvider(t *testing.T) {
 	feature := features.New("Cert-Manager Certificate").WithLabel("app", "cert-manager")
 
 	cmIssuer := &certv1.ClusterIssuer{
 		TypeMeta: metav1.TypeMeta{
-			Kind: "ClusterIssuer",
+			Kind: cmIssuerType,
 		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name: cmIssuerName,
@@ -34,6 +40,15 @@ func TestCertManagerProvider(t *testing.T) {
 			IssuerConfig: certv1.IssuerConfig{
 				SelfSigned: &certv1.SelfSignedIssuer{},
 			}},
+	}
+
+	cmConfig := &interfaces.Config{
+		CommonName:       cmCertificateName,
+		ValidityDuration: cmCertificatealidity,
+		ExtraConfig: map[string]any{
+			"issuerName": cmIssuerName,
+			"issuerKind": cmIssuerType,
+		},
 	}
 
 	feature.Setup(
@@ -45,7 +60,7 @@ func TestCertManagerProvider(t *testing.T) {
 			_ = apiextensionsV1.AddToScheme(client.Resources().GetScheme())
 
 			var issuer certv1.ClusterIssuer
-			if err := client.Resources().Get(ctx, cmIssuerName, "", &issuer); err != nil {
+			if err := client.Resources().Get(ctx, cmIssuerName, cmCertificateNamespace, &issuer); err != nil {
 				if k8serrors.IsNotFound(err) {
 					t.Logf("No cert-manager selfsigned issuer found, creating clusterIssuer: %s", cmIssuerName)
 					// Create cert-manager issuer
@@ -59,13 +74,46 @@ func TestCertManagerProvider(t *testing.T) {
 			return ctx
 		})
 
+	feature.Assess("Ensure certificate",
+		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+			client := cfg.Client()
+			cmProvider := cert_manager.New(client.Resources().GetControllerRuntimeClient())
+			err := cmProvider.EnsureCertificateSecret(ctx, cmCertificateName, cmCertificateNamespace, cmConfig)
+			if err != nil {
+				t.Fatalf("Cert-Manager Certificate could not be created: %v", err)
+			}
+			return ctx
+		})
+
+	feature.Assess("Validate certificate secret",
+		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+			client := cfg.Client()
+			cmProvider := cert_manager.New(client.Resources().GetControllerRuntimeClient())
+			err := cmProvider.ValidateCertificateSecret(ctx, cmCertificateName, cmCertificateNamespace, cmConfig)
+			if err != nil {
+				t.Fatalf("Failed to validate Cert-Manager Certificate secret: %v", err)
+			}
+			return ctx
+		})
+
 	feature.Assess("Get certificate config",
 		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
 			client := cfg.Client()
 			cmProvider := cert_manager.New(client.Resources().GetControllerRuntimeClient())
-			_, err := cmProvider.GetCertificateConfig(ctx, cmCertificateName, "")
+			_, err := cmProvider.GetCertificateConfig(ctx, cmCertificateName, cmCertificateNamespace)
 			if err != nil {
-				t.Logf("Cert-Manager Certificate not found")
+				t.Fatalf("Cert-Manager Certificate not found: %v", err)
+			}
+			return ctx
+		})
+
+	feature.Assess("Delete certificate secret",
+		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+			client := cfg.Client()
+			cmProvider := cert_manager.New(client.Resources().GetControllerRuntimeClient())
+			err := cmProvider.DeleteCertificateSecret(ctx, cmCertificateName, cmCertificateNamespace)
+			if err != nil {
+				t.Fatalf("Failed to delete Certificate secret: %v", err)
 			}
 			return ctx
 		})
@@ -74,7 +122,7 @@ func TestCertManagerProvider(t *testing.T) {
 		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
 			client := cfg.Client()
 			cmProvider := cert_manager.New(client.Resources().GetControllerRuntimeClient())
-			err := cmProvider.RevokeCertificate(ctx, cmCertificateName, "")
+			err := cmProvider.RevokeCertificate(ctx, cmCertificateName, cmCertificateNamespace)
 			if err != nil {
 				t.Logf("Cert-Manager Certificate not found")
 			}
