@@ -1,7 +1,6 @@
 package etcdutils
 
 import (
-	"context"
 	"testing"
 	"time"
 
@@ -57,7 +56,7 @@ func TestMemberList(t *testing.T) {
 			},
 		}
 
-		_, err := e.Server.AddMember(context.Background(), member)
+		_, err := e.Server.AddMember(t.Context(), member)
 		assert.NoError(t, err)
 
 		eps := []string{"http://localhost:2379"}

@@ -1,7 +1,6 @@
 package controller
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"testing"
@@ -55,7 +54,7 @@ func TestReconcileStatefulSet(t *testing.T) {
 	_ = ecv1alpha1.AddToScheme(scheme)
 
 	fakeClient := fake.NewClientBuilder().Build()
-	logger := log.FromContext(context.Background())
+	logger := log.FromContext(t.Context())
 
 	ec := &ecv1alpha1.EtcdCluster{
 		ObjectMeta: metav1.ObjectMeta{
@@ -68,10 +67,10 @@ func TestReconcileStatefulSet(t *testing.T) {
 		},
 	}
 
-	_, _ = reconcileStatefulSet(context.Background(), logger, ec, fakeClient, 3, scheme)
+	_, _ = reconcileStatefulSet(t.Context(), logger, ec, fakeClient, 3, scheme)
 
 	sts := &appsv1.StatefulSet{}
-	err := fakeClient.Get(context.Background(), client.ObjectKey{Name: "test-etcd", Namespace: "default"}, sts)
+	err := fakeClient.Get(t.Context(), client.ObjectKey{Name: "test-etcd", Namespace: "default"}, sts)
 	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
 	}
@@ -146,7 +145,7 @@ func TestWaitForStatefulSetReady(t *testing.T) {
 			}
 			fakeClient := clientBuilder.Build()
 
-			ctx := context.Background()
+			ctx := t.Context()
 			logger := log.FromContext(ctx)
 
 			err := waitForStatefulSetReady(ctx, logger, fakeClient, "test-sts", "default")
@@ -161,7 +160,7 @@ func TestWaitForStatefulSetReady(t *testing.T) {
 }
 
 func TestCreateHeadlessServiceIfNotExist(t *testing.T) {
-	ctx := context.TODO()
+	ctx := t.Context()
 	logger := log.FromContext(ctx)
 
 	// Create a scheme and register the necessary types
@@ -452,7 +451,7 @@ func TestAreAllMembersHealthy(t *testing.T) {
 }
 
 func TestApplyEtcdClusterState(t *testing.T) {
-	ctx := context.TODO()
+	ctx := t.Context()
 	logger := log.FromContext(ctx)
 
 	// Create a scheme and register the necessary types
