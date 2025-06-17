@@ -1,7 +1,16 @@
 run:
   timeout: 5m
   allow-parallel-runners: true
-
+formatters:
+  enable:
+    - gci
+  settings: # please keep this alphabetized
+    gci:
+      sections:
+        - standard
+        - default
+        - prefix(go.etcd.io)
+        - skipGenerated
 issues:
   # don't skip warning about doc comments
   # don't exclude the default set of lint
@@ -42,6 +51,13 @@ linters:
     - usetesting
 
 linters-settings:
+  gci:
+    skipGenerated: true
+    preserveComments: true
+    customOrder:
+      - std
+      - default
+      - prefix(go.etcd.io)
   goimports:
     local-prefixes: go.etcd.io # Put imports beginning with prefix after 3rd-party packages.
   revive:
