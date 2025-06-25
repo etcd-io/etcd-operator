@@ -2,8 +2,45 @@ package certificate
 
 import (
 	"context"
+	"errors"
 	"net"
 	"time"
+)
+
+var (
+	// ErrPending is returned when the Certificate is not in "Ready" state
+	ErrPending = errors.New("certificate creation pending")
+
+	// ErrUnknown is returned when the Certificate status does not match the provider defined states
+	ErrUnknown = errors.New("certificate status unknown")
+
+	// ErrTLSKey is returned when private key not found in Certificate secret
+	ErrTLSKey = errors.New("private key not found in secret")
+
+	// ErrTLSCert is returned when private key certificate not found in Certificate secret
+	ErrTLSCert = errors.New("certificate not found in secret")
+
+	// ErrDecodeCert is returned when failed to decode PEM block of tls.crt of Certificate secret
+	ErrDecodeCert = errors.New("failed to decode PEM block")
+
+	// ErrCertExpired is returned when certificate has expired
+	ErrCertExpired = errors.New("certificate has expired")
+
+	// ErrRSAKeyPair is returned when private key(RSA) does not match the public key in the Certificate secret
+	ErrRSAKeyPair = errors.New("private key(RSA) does not match the public key in the certificate")
+
+	// ErrECDSAKeyPair is returned when private key(ECDSA) does not match the public key in the Certificate secret
+	ErrECDSAKeyPair = errors.New("private key(ECDSA) does not match the public key in the certificate")
+
+	// ErrED25519KeyPair is returned when private key(ED25519) does not match the public key in the Certificate secret
+	ErrED25519KeyPair = errors.New("private key(ED25519) does not match the public key in the certificate")
+)
+
+const (
+	// MaxRetries is the maximum number of retry attempts for EnsureCertificateSecret, ValidateCertificateSecret
+	// with a delay of RetryInterval between consecutive retries
+	MaxRetries    = 36
+	RetryInterval = 5 * time.Second
 )
 
 // AltNames contains the domain names and IP addresses that will be added
