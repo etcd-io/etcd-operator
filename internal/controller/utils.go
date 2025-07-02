@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"maps"
+	"net"
 	"slices"
 	"strconv"
 	"strings"
@@ -25,6 +27,8 @@ import (
 
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 	"go.etcd.io/etcd-operator/internal/etcdutils"
+	"go.etcd.io/etcd-operator/pkg/certificate"
+	certInterface "go.etcd.io/etcd-operator/pkg/certificate/interfaces"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
@@ -44,6 +48,12 @@ func reconcileStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1alpha
 
 	// prepare/update configmap for StatefulSet
 	err := applyEtcdClusterState(ctx, ec, int(replicas), c, scheme, logger)
+	if err != nil {
+		return nil, err
+	}
+
+	// Add server and peer certificate
+	err = applyEtcdMemberCerts(ctx, c, ec, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -174,6 +184,29 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 				},
 			},
 		},
+	}
+
+	// mount server and peer certificate secret to each pods of the statefulset via PodSpec
+	var certVolume []corev1.Volume
+	serverCertName := fmt.Sprintf("%s-%s-tls", ec.Name, "server")
+	peerCertName := fmt.Sprintf("%s-%s-tls", ec.Name, "peer")
+	if ec.Spec.TLS != nil {
+		serverCertVolume := corev1.Volume{
+			Name: "server-secret",
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{SecretName: serverCertName},
+			},
+		}
+		peerCertVolume := corev1.Volume{
+			Name: "peer-secret",
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{SecretName: peerCertName},
+			},
+		}
+		certVolume = append(certVolume, serverCertVolume, peerCertVolume)
+	}
+	if len(certVolume) != 0 {
+		podSpec.Volumes = certVolume
 	}
 
 	// Prepare pod template metadata
@@ -516,4 +549,125 @@ func healthCheck(sts *appsv1.StatefulSet, lg klog.Logger) (*clientv3.MemberListR
 	}
 
 	return memberlistResp, healthInfos, nil
+}
+
+func createCMCertificateConfig(ec *ecv1alpha1.EtcdCluster) *certInterface.Config {
+	cmConfig := ec.Spec.TLS.ProviderCfg.CertManagerCfg
+	duration, err := time.ParseDuration(cmConfig.ValidityDuration)
+	if err != nil {
+		log.Printf("Failed to parse ValidityDuration: %s", err)
+	}
+
+	var getAltNames certInterface.AltNames
+	if cmConfig.AltNames.DNSNames != nil {
+		getAltNames = certInterface.AltNames{
+			DNSNames: cmConfig.AltNames.DNSNames,
+			IPs:      make([]net.IP, len(cmConfig.AltNames.DNSNames)),
+		}
+	} else {
+		defaultDNSNames := []string{fmt.Sprintf("%s.svc.cluster.local", cmConfig.CommonName)}
+		getAltNames = certInterface.AltNames{
+			DNSNames: defaultDNSNames,
+		}
+	}
+
+	config := &certInterface.Config{
+		CommonName:       cmConfig.CommonName,
+		Organization:     cmConfig.Organization,
+		ValidityDuration: duration,
+		AltNames:         getAltNames,
+		ExtraConfig: map[string]any{
+			"issuerName": cmConfig.IssuerName,
+			"issuerKind": cmConfig.IssuerKind,
+		},
+	}
+	return config
+}
+
+func createAutoCertificateConfig(ec *ecv1alpha1.EtcdCluster) *certInterface.Config {
+	// TODO
+	config := &certInterface.Config{}
+	return config
+}
+
+func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client.Client, certName string) error {
+	cert, certErr := certificate.NewProvider(certificate.ProviderType(ec.Spec.TLS.Provider), c)
+	if certErr != nil {
+		// TODO: instead of error, set default autoConfig
+		return certErr
+	}
+	_, getCertError := cert.GetCertificateConfig(ctx, certName, ec.Namespace)
+	if getCertError != nil {
+		if k8serrors.IsNotFound(getCertError) {
+			log.Printf("Creating certificate: %s for etcd-operator: %s\n", certName, ec.Name)
+			switch {
+			case ec.Spec.TLS.ProviderCfg.AutoCfg != nil:
+				cmConfig := createAutoCertificateConfig(ec)
+				createCertErr := cert.EnsureCertificateSecret(ctx, certName, ec.Namespace, cmConfig)
+				if createCertErr != nil {
+					log.Printf("Error creating certificate: %s", createCertErr)
+				}
+				return nil
+			case ec.Spec.TLS.ProviderCfg.CertManagerCfg != nil:
+				cmConfig := createCMCertificateConfig(ec)
+				createCertErr := cert.EnsureCertificateSecret(ctx, certName, ec.Namespace, cmConfig)
+				if createCertErr != nil {
+					log.Printf("Error creating certificate: %s", createCertErr)
+				}
+				return nil
+			default:
+				// TODO: Use AuthProvider, since both AutoCfg and CertManagerCfg is not present
+				log.Printf("Error creating certificate, valid certificate provider not defined.")
+				return nil
+			}
+		} else {
+			return fmt.Errorf("%s:Error getting certificate", getCertError)
+		}
+	}
+
+	return nil
+}
+
+func createClientCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client.Client) error {
+	certName := fmt.Sprintf("%s-%s-tls", ec.Name, "client")
+	createClientCertErr := createCertificate(ec, ctx, c, certName)
+	return createClientCertErr
+}
+
+func createServerCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client.Client) error {
+	serverCertName := fmt.Sprintf("%s-%s-tls", ec.Name, "server")
+	createServerCertErr := createCertificate(ec, ctx, c, serverCertName)
+	if createServerCertErr != nil {
+		return createServerCertErr
+	}
+	return nil
+}
+
+func createPeerCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client.Client) error {
+	peerCertName := fmt.Sprintf("%s-%s-tls", ec.Name, "peer")
+	createPeerCertErr := createCertificate(ec, ctx, c, peerCertName)
+	if createPeerCertErr != nil {
+		return createPeerCertErr
+	}
+	return nil
+}
+
+func applyEtcdMemberCerts(ctx context.Context, c client.Client, ec *ecv1alpha1.EtcdCluster, logger logr.Logger) error {
+	var err error
+	if ec.Spec.TLS != nil {
+		createServerCertErr := createServerCertificate(ec, ctx, c)
+		if createServerCertErr != nil {
+			err = createServerCertErr
+			logger.Error(createServerCertErr, "Error creating Server Certificate")
+
+		}
+		createPeerCertErr := createPeerCertificate(ec, ctx, c)
+		if createPeerCertErr != nil {
+			err = createPeerCertErr
+			logger.Error(createPeerCertErr, "Error creating Peer Certificate")
+
+		}
+
+	}
+	return err
 }
