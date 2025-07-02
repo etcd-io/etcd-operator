@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
+	"net"
 	"slices"
 	"strconv"
 	"strings"
@@ -24,9 +26,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
+	clientv3 "go.etcd.io/etcd/client/v3"
+
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 	"go.etcd.io/etcd-operator/internal/etcdutils"
-	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.etcd.io/etcd-operator/pkg/certificate"
+	certInterface "go.etcd.io/etcd-operator/pkg/certificate/interfaces"
 )
 
 const (
@@ -521,4 +526,81 @@ func healthCheck(sts *appsv1.StatefulSet, lg klog.Logger) (*clientv3.MemberListR
 	}
 
 	return memberlistResp, healthInfos, nil
+}
+
+func createCMCertificateConfig(ec *ecv1alpha1.ProviderCertManagerConfig) *certInterface.Config {
+	duration, err := time.ParseDuration(ec.ValidityDuration)
+	if err != nil {
+		log.Printf("Failed to parse ValidityDuration: %s", err)
+	}
+	config := &certInterface.Config{
+		CommonName:       ec.CommonName,
+		Organization:     ec.Organization,
+		ValidityDuration: duration,
+		AltNames: certInterface.AltNames{
+			DNSNames: ec.AltNames.DNSNames,
+			IPs:      make([]net.IP, len(ec.AltNames.DNSNames)),
+		},
+		ExtraConfig: map[string]any{
+			"issuerName": ec.IssuerName,
+			"issuerKind": ec.IssuerKind,
+		},
+	}
+	return config
+}
+
+func createAutoCertificateConfig(ec *ecv1alpha1.ProviderAutoConfig) *certInterface.Config {
+	// TODO
+	config := &certInterface.Config{}
+	return config
+}
+
+func (r *EtcdClusterReconciler) createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, certName string) error {
+	cert, certErr := certificate.NewProvider(certificate.ProviderType(ec.Spec.TLS.Provider), r.Client)
+	if certErr != nil {
+		// TODO: instead of error, set default autoConfig
+		return certErr
+	}
+	_, getCertError := cert.GetCertificateConfig(ctx, certName, ec.Namespace)
+	if getCertError != nil {
+		if k8serrors.IsNotFound(getCertError) {
+			log.Printf("Creating certificate: %s for etcd-operator: %s\n", certName, ec.Name)
+			switch {
+			case ec.Spec.TLS.ProviderCfg.AutoCfg != nil:
+				cmConfig := createAutoCertificateConfig(ec.Spec.TLS.ProviderCfg.AutoCfg)
+				createCertErr := cert.EnsureCertificateSecret(ctx, certName, ec.Namespace, cmConfig)
+				if createCertErr != nil {
+					log.Printf("Error creating certificate: %s", createCertErr)
+				}
+				return nil
+			case ec.Spec.TLS.ProviderCfg.CertManagerCfg != nil:
+				cmConfig := createCMCertificateConfig(ec.Spec.TLS.ProviderCfg.CertManagerCfg)
+				createCertErr := cert.EnsureCertificateSecret(ctx, certName, ec.Namespace, cmConfig)
+				if createCertErr != nil {
+					log.Printf("Error creating certificate: %s", createCertErr)
+				}
+				return nil
+			default:
+				if ec.Spec.TLS.ProviderCfg.AutoCfg == nil {
+					// TODO: instead of error, set default autoConfig which will be applied if Provider/ProviderConfig is not set
+					return errors.New("default autoCertificate config not defined")
+				}
+				cmConfig := createAutoCertificateConfig(ec.Spec.TLS.ProviderCfg.AutoCfg)
+				createCertErr := cert.EnsureCertificateSecret(ctx, certName, ec.Namespace, cmConfig)
+				log.Printf("Error creating certificate, maybe already present: %s", createCertErr)
+				return nil
+			}
+		} else {
+			log.Printf("Error getting certificate")
+			return getCertError
+		}
+	}
+
+	return nil
+}
+
+func (r *EtcdClusterReconciler) checkClientCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context) error {
+	certName := fmt.Sprintf("%s-%s-tls", ec.Name, "client")
+	createClientCertErr := r.createCertificate(ec, ctx, certName)
+	return createClientCertErr
 }
