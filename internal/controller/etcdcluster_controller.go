@@ -56,6 +56,7 @@ type EtcdClusterReconciler struct {
 // +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch;get;list;update
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;patch;update;delete
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="cert-manager.io",resources=certificates,verbs=get;list;watch;create;patch;update;delete
 // +kubebuilder:rbac:groups="cert-manager.io",resources=clusterissuers,verbs=get;list;watch
 // +kubebuilder:rbac:groups="cert-manager.io",resources=issuers,verbs=get;list;watch
@@ -115,6 +116,17 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			logger.Error(err, "Failed to get StatefulSet. Requesting requeue")
 			return ctrl.Result{RequeueAfter: requeueDuration}, nil
 		}
+	}
+
+	// Create Server and Peer Certificate for etcd-operator to communicate within the members
+	if etcdCluster.Spec.TLS != nil {
+		createServerPeerCertErr := r.checkServerPeerCertificate(etcdCluster, sts, ctx)
+		if createServerPeerCertErr != nil {
+			logger.Error(createServerPeerCertErr, "Error creating Server or Peer Certificate")
+		}
+	} else {
+		// TODO: instead of logging error, set default autoConfig
+		logger.Error(fmt.Errorf("missing TLS config for %s", etcdCluster.Name), "certificates cannot be created")
 	}
 
 	// If the Statefulsets is not controlled by this EtcdCluster resource, we should log
