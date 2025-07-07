@@ -528,6 +528,15 @@ func healthCheck(sts *appsv1.StatefulSet, lg klog.Logger) (*clientv3.MemberListR
 	return memberlistResp, healthInfos, nil
 }
 
+func (r *EtcdClusterReconciler) getStatefulSetPods(sts *appsv1.StatefulSet, ctx context.Context) (*corev1.PodList, error) {
+	podList := corev1.PodList{}
+	err := r.Client.List(ctx, &podList, client.InNamespace(sts.Namespace), client.MatchingLabels(sts.Spec.Selector.MatchLabels))
+	if err != nil {
+		return nil, err
+	}
+	return &podList, nil
+}
+
 func createCMCertificateConfig(ec *ecv1alpha1.ProviderCertManagerConfig) *certInterface.Config {
 	duration, err := time.ParseDuration(ec.ValidityDuration)
 	if err != nil {
@@ -603,4 +612,20 @@ func (r *EtcdClusterReconciler) checkClientCertificate(ec *ecv1alpha1.EtcdCluste
 	certName := fmt.Sprintf("%s-%s-tls", ec.Name, "client")
 	createClientCertErr := r.createCertificate(ec, ctx, certName)
 	return createClientCertErr
+}
+
+func (r *EtcdClusterReconciler) checkServerPeerCertificate(ec *ecv1alpha1.EtcdCluster, sts *appsv1.StatefulSet, ctx context.Context) error {
+	podList, podListErr := r.getStatefulSetPods(sts, ctx)
+	if podListErr != nil {
+		return podListErr
+	}
+	for _, pod := range podList.Items {
+		serverCertName := fmt.Sprintf("%s-%s-tls", pod.Name, "server")
+		peerCertName := fmt.Sprintf("%s-%s-tls", pod.Name, "peer")
+		createServerCertErr := r.createCertificate(ec, ctx, serverCertName)
+		log.Println(createServerCertErr)
+		createPeerCertErr := r.createCertificate(ec, ctx, peerCertName)
+		log.Println(createPeerCertErr)
+	}
+	return nil
 }
