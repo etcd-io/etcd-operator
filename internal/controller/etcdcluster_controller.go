@@ -80,8 +80,8 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	// Determine desired etcd image registry
-	if etcdCluster.Spec.Registry == "" {
-		etcdCluster.Spec.Registry = r.ImageRegistry
+	if etcdCluster.Spec.ImageRegistry == "" {
+		etcdCluster.Spec.ImageRegistry = r.ImageRegistry
 	}
 
 	logger.Info("Reconciling EtcdCluster", "spec", etcdCluster.Spec)
