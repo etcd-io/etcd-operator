@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"time"
 
+	certv1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -30,9 +31,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	clientv3 "go.etcd.io/etcd/client/v3"
+
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 	"go.etcd.io/etcd-operator/internal/etcdutils"
-	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 const (
@@ -53,6 +55,11 @@ type EtcdClusterReconciler struct {
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch;get;list;update
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;patch;update;delete
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups="cert-manager.io",resources=certificates,verbs=get;list;watch;create;patch;update;delete
+// +kubebuilder:rbac:groups="cert-manager.io",resources=clusterissuers,verbs=get;list;watch
+// +kubebuilder:rbac:groups="cert-manager.io",resources=issuers,verbs=get;list;watch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -78,6 +85,17 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, err
 	}
 
+	// Create Client Certificate for etcd-operator to communicate with the etcdCluster
+	if etcdCluster.Spec.TLS != nil {
+		clientCertErr := r.checkClientCertificate(etcdCluster, ctx)
+		if clientCertErr != nil {
+			logger.Error(clientCertErr, "Failed to create Client Certificate.")
+		}
+	} else {
+		// TODO: instead of logging error, set default autoConfig
+		logger.Error(fmt.Errorf("missing TLS config for %s", etcdCluster.Name), "certificates cannot be created")
+	}
+
 	logger.Info("Reconciling EtcdCluster", "spec", etcdCluster.Spec)
 
 	// Get the statefulsets which has the same name as the EtcdCluster resource
@@ -98,6 +116,17 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			logger.Error(err, "Failed to get StatefulSet. Requesting requeue")
 			return ctrl.Result{RequeueAfter: requeueDuration}, nil
 		}
+	}
+
+	// Create Server and Peer Certificate for etcd-operator to communicate within the members
+	if etcdCluster.Spec.TLS != nil {
+		createServerPeerCertErr := r.checkServerPeerCertificate(etcdCluster, sts, ctx)
+		if createServerPeerCertErr != nil {
+			logger.Error(createServerPeerCertErr, "Error creating Server or Peer Certificate")
+		}
+	} else {
+		// TODO: instead of logging error, set default autoConfig
+		logger.Error(fmt.Errorf("missing TLS config for %s", etcdCluster.Name), "certificates cannot be created")
 	}
 
 	// If the Statefulsets is not controlled by this EtcdCluster resource, we should log
@@ -258,5 +287,6 @@ func (r *EtcdClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&appsv1.StatefulSet{}).
 		Owns(&corev1.Service{}).
 		Owns(&corev1.ConfigMap{}).
+		Owns(&certv1.Certificate{}).
 		Complete(r)
 }
