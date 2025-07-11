@@ -159,7 +159,7 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 				Name:    "etcd",
 				Command: []string{"/usr/local/bin/etcd"},
 				Args:    createArgs(ec.Name, ec.Spec.EtcdOptions),
-				Image:   fmt.Sprintf("gcr.io/etcd-development/etcd:%s", ec.Spec.Version),
+				Image:   fmt.Sprintf("%s:%s", ec.Spec.ImageRegistry, ec.Spec.Version),
 				Env: []corev1.EnvVar{
 					{
 						Name: "POD_NAME",
