@@ -93,13 +93,13 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 	// Create Client Certificate for etcd-operator to communicate with the etcdCluster
 	if etcdCluster.Spec.TLS != nil {
-		clientCertErr := r.checkClientCertificate(etcdCluster, ctx)
+		clientCertErr := createClientCertificate(etcdCluster, ctx, r.Client)
 		if clientCertErr != nil {
 			logger.Error(clientCertErr, "Failed to create Client Certificate.")
 		}
 	} else {
 		// TODO: instead of logging error, set default autoConfig
-		logger.Error(fmt.Errorf("missing TLS config for %s", etcdCluster.Name), "certificates cannot be created")
+		logger.Error(nil, fmt.Sprintf("missing TLS config for %s", etcdCluster.Name))
 	}
 
 	logger.Info("Reconciling EtcdCluster", "spec", etcdCluster.Spec)
@@ -110,7 +110,8 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		if errors.IsNotFound(err) {
 			logger.Info("Creating StatefulSet with 0 replica", "expectedSize", etcdCluster.Spec.Size)
 			// Create a new StatefulSet
-			sts, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, 0, r.Scheme)
+
+			sts, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, 0, r.Scheme, true)
 			if err != nil {
 				return ctrl.Result{}, err
 			}
@@ -121,17 +122,6 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			logger.Error(err, "Failed to get StatefulSet. Requesting requeue")
 			return ctrl.Result{RequeueAfter: requeueDuration}, nil
 		}
-	}
-
-	// Create Server and Peer Certificate for etcd-operator to communicate within the members
-	if etcdCluster.Spec.TLS != nil {
-		createServerPeerCertErr := r.checkServerPeerCertificate(etcdCluster, sts, ctx)
-		if createServerPeerCertErr != nil {
-			logger.Error(createServerPeerCertErr, "Error creating Server or Peer Certificate")
-		}
-	} else {
-		// TODO: instead of logging error, set default autoConfig
-		logger.Error(fmt.Errorf("missing TLS config for %s", etcdCluster.Name), "certificates cannot be created")
 	}
 
 	// If the Statefulsets is not controlled by this EtcdCluster resource, we should log
@@ -146,7 +136,7 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if sts.Spec.Replicas != nil && *sts.Spec.Replicas == 0 {
 		logger.Info("StatefulSet has 0 replicas. Trying to create a new cluster with 1 member")
 
-		sts, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, 1, r.Scheme)
+		sts, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, 1, r.Scheme, true)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -176,7 +166,7 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			logger.Info("An etcd member was added into the cluster, but the StatefulSet hasn't scaled out yet")
 			newReplicaCount := targetReplica + 1
 			logger.Info("Increasing StatefulSet replicas to match the etcd cluster member count", "oldReplicaCount", targetReplica, "newReplicaCount", newReplicaCount)
-			_, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, newReplicaCount, r.Scheme)
+			_, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, newReplicaCount, r.Scheme, true)
 			if err != nil {
 				return ctrl.Result{}, err
 			}
@@ -184,7 +174,7 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			logger.Info("An etcd member was removed from the cluster, but the StatefulSet hasn't scaled in yet")
 			newReplicaCount := targetReplica - 1
 			logger.Info("Decreasing StatefulSet replicas to remove the unneeded Pod.", "oldReplicaCount", targetReplica, "newReplicaCount", newReplicaCount)
-			_, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, newReplicaCount, r.Scheme)
+			_, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, newReplicaCount, r.Scheme, false)
 			if err != nil {
 				return ctrl.Result{}, err
 			}
@@ -249,6 +239,11 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		}
 
 		logger.Info("Learner member added successfully", "peerURLs", peerURL)
+
+		sts, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, targetReplica, r.Scheme, true)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
 	} else {
 		// scale in
 		targetReplica--
@@ -261,11 +256,11 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		if err := etcdutils.RemoveMember(eps, memberID); err != nil {
 			return ctrl.Result{}, err
 		}
-	}
 
-	sts, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, targetReplica, r.Scheme)
-	if err != nil {
-		return ctrl.Result{}, err
+		sts, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, targetReplica, r.Scheme, false)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	allMembersHealthy, err := areAllMembersHealthy(sts, logger)

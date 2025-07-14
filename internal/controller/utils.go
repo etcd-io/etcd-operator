@@ -65,7 +65,7 @@ func prepareOwnerReference(ec *ecv1alpha1.EtcdCluster, scheme *runtime.Scheme) (
 	return owners, nil
 }
 
-func reconcileStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1alpha1.EtcdCluster, c client.Client, replicas int32, scheme *runtime.Scheme) (*appsv1.StatefulSet, error) {
+func reconcileStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1alpha1.EtcdCluster, c client.Client, replicas int32, scheme *runtime.Scheme, addMember bool) (*appsv1.StatefulSet, error) {
 
 	// prepare/update configmap for StatefulSet
 	err := applyEtcdClusterState(ctx, ec, int(replicas), c, scheme, logger)
@@ -83,6 +83,26 @@ func reconcileStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1alpha
 	err = waitForStatefulSetReady(ctx, logger, c, ec.Name, ec.Namespace)
 	if err != nil {
 		return nil, err
+	}
+
+	// Add or remove server and peer certificate
+	if addMember {
+		if replicas > 0 {
+			if ec.Spec.TLS != nil {
+				createServerPeerCertErr := createServerPeerCertificate(ec, replicas, ctx, c)
+				if createServerPeerCertErr != nil {
+					logger.Error(createServerPeerCertErr, "Error creating Server or Peer Certificate")
+				}
+			} else {
+				// TODO: instead of logging error, set default autoConfig
+				logger.Error(nil, fmt.Sprintf("missing TLS config for %s", ec.Name))
+			}
+		}
+	} else {
+		deleteServerPeerCertErr := deleteServerPeerCertificate(ec, replicas, ctx, c)
+		if deleteServerPeerCertErr != nil {
+			logger.Error(deleteServerPeerCertErr, "Error deleting Server or Peer Certificate")
+		}
 	}
 
 	// Return latest Stateful set. (This is to ensure that we return the latest statefulset for next operation to act on)
@@ -528,15 +548,6 @@ func healthCheck(sts *appsv1.StatefulSet, lg klog.Logger) (*clientv3.MemberListR
 	return memberlistResp, healthInfos, nil
 }
 
-func (r *EtcdClusterReconciler) getStatefulSetPods(sts *appsv1.StatefulSet, ctx context.Context) (*corev1.PodList, error) {
-	podList := corev1.PodList{}
-	err := r.Client.List(ctx, &podList, client.InNamespace(sts.Namespace), client.MatchingLabels(sts.Spec.Selector.MatchLabels))
-	if err != nil {
-		return nil, err
-	}
-	return &podList, nil
-}
-
 func createCMCertificateConfig(ec *ecv1alpha1.ProviderCertManagerConfig) *certInterface.Config {
 	duration, err := time.ParseDuration(ec.ValidityDuration)
 	if err != nil {
@@ -564,8 +575,8 @@ func createAutoCertificateConfig(ec *ecv1alpha1.ProviderAutoConfig) *certInterfa
 	return config
 }
 
-func (r *EtcdClusterReconciler) createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, certName string) error {
-	cert, certErr := certificate.NewProvider(certificate.ProviderType(ec.Spec.TLS.Provider), r.Client)
+func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client.Client, certName string) error {
+	cert, certErr := certificate.NewProvider(certificate.ProviderType(ec.Spec.TLS.Provider), c)
 	if certErr != nil {
 		// TODO: instead of error, set default autoConfig
 		return certErr
@@ -608,24 +619,51 @@ func (r *EtcdClusterReconciler) createCertificate(ec *ecv1alpha1.EtcdCluster, ct
 	return nil
 }
 
-func (r *EtcdClusterReconciler) checkClientCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context) error {
+func deleteCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client.Client, certName string) error {
+	cert, certErr := certificate.NewProvider(certificate.ProviderType(ec.Spec.TLS.Provider), c)
+	if certErr != nil {
+		// TODO: instead of error, set default autoConfig
+		return certErr
+	}
+	deleteCertErr := cert.DeleteCertificateSecret(ctx, certName, ec.Namespace)
+	if deleteCertErr != nil {
+		log.Printf("Error deleting certificate with name %s: %s", certName, deleteCertErr)
+		return deleteCertErr
+	}
+	log.Printf("Successfully deleted certificate with name %s", certName)
+	return nil
+}
+
+func createClientCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client.Client) error {
 	certName := fmt.Sprintf("%s-%s-tls", ec.Name, "client")
-	createClientCertErr := r.createCertificate(ec, ctx, certName)
+	createClientCertErr := createCertificate(ec, ctx, c, certName)
 	return createClientCertErr
 }
 
-func (r *EtcdClusterReconciler) checkServerPeerCertificate(ec *ecv1alpha1.EtcdCluster, sts *appsv1.StatefulSet, ctx context.Context) error {
-	podList, podListErr := r.getStatefulSetPods(sts, ctx)
-	if podListErr != nil {
-		return podListErr
+func createServerPeerCertificate(ec *ecv1alpha1.EtcdCluster, replicas int32, ctx context.Context, c client.Client) error {
+	serverCertName := fmt.Sprintf("%s-%s-%s-tls", ec.Name, string(replicas-1), "server")
+	peerCertName := fmt.Sprintf("%s-%s-%s-tls", ec.Name, string(replicas-1), "peer")
+	createServerCertErr := createCertificate(ec, ctx, c, serverCertName)
+	if createServerCertErr != nil {
+		return createServerCertErr
 	}
-	for _, pod := range podList.Items {
-		serverCertName := fmt.Sprintf("%s-%s-tls", pod.Name, "server")
-		peerCertName := fmt.Sprintf("%s-%s-tls", pod.Name, "peer")
-		createServerCertErr := r.createCertificate(ec, ctx, serverCertName)
-		log.Println(createServerCertErr)
-		createPeerCertErr := r.createCertificate(ec, ctx, peerCertName)
-		log.Println(createPeerCertErr)
+	createPeerCertErr := createCertificate(ec, ctx, c, peerCertName)
+	if createPeerCertErr != nil {
+		return createPeerCertErr
+	}
+	return nil
+}
+
+func deleteServerPeerCertificate(ec *ecv1alpha1.EtcdCluster, replicas int32, ctx context.Context, c client.Client) error {
+	serverCertName := fmt.Sprintf("%s-%s-%s-tls", ec.Name, string(replicas), "server")
+	peerCertName := fmt.Sprintf("%s-%s-%s-tls", ec.Name, string(replicas), "peer")
+	deleteServerCertErr := deleteCertificate(ec, ctx, c, serverCertName)
+	if deleteServerCertErr != nil {
+		return deleteServerCertErr
+	}
+	deletePeerCertErr := deleteCertificate(ec, ctx, c, peerCertName)
+	if deletePeerCertErr != nil {
+		return deletePeerCertErr
 	}
 	return nil
 }
