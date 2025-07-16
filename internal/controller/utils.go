@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
+	"net"
 	"slices"
 	"strconv"
 	"strings"
@@ -24,9 +26,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
+	clientv3 "go.etcd.io/etcd/client/v3"
+
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 	"go.etcd.io/etcd-operator/internal/etcdutils"
-	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.etcd.io/etcd-operator/pkg/certificate"
+	certInterface "go.etcd.io/etcd-operator/pkg/certificate/interfaces"
 )
 
 const (
@@ -60,7 +65,7 @@ func prepareOwnerReference(ec *ecv1alpha1.EtcdCluster, scheme *runtime.Scheme) (
 	return owners, nil
 }
 
-func reconcileStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1alpha1.EtcdCluster, c client.Client, replicas int32, scheme *runtime.Scheme) (*appsv1.StatefulSet, error) {
+func reconcileStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1alpha1.EtcdCluster, c client.Client, replicas int32, scheme *runtime.Scheme, addMember bool) (*appsv1.StatefulSet, error) {
 
 	// prepare/update configmap for StatefulSet
 	err := applyEtcdClusterState(ctx, ec, int(replicas), c, scheme, logger)
@@ -78,6 +83,26 @@ func reconcileStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1alpha
 	err = waitForStatefulSetReady(ctx, logger, c, ec.Name, ec.Namespace)
 	if err != nil {
 		return nil, err
+	}
+
+	// Add or remove server and peer certificate
+	if addMember {
+		if replicas > 0 {
+			if ec.Spec.TLS != nil {
+				createServerPeerCertErr := createServerPeerCertificate(ec, replicas, ctx, c)
+				if createServerPeerCertErr != nil {
+					logger.Error(createServerPeerCertErr, "Error creating Server or Peer Certificate")
+				}
+			} else {
+				// TODO: instead of logging error, set default autoConfig
+				logger.Error(nil, fmt.Sprintf("missing TLS config for %s", ec.Name))
+			}
+		}
+	} else {
+		deleteServerPeerCertErr := deleteServerPeerCertificate(ec, replicas, ctx, c)
+		if deleteServerPeerCertErr != nil {
+			logger.Error(deleteServerPeerCertErr, "Error deleting Server or Peer Certificate")
+		}
 	}
 
 	// Return latest Stateful set. (This is to ensure that we return the latest statefulset for next operation to act on)
@@ -521,4 +546,124 @@ func healthCheck(sts *appsv1.StatefulSet, lg klog.Logger) (*clientv3.MemberListR
 	}
 
 	return memberlistResp, healthInfos, nil
+}
+
+func createCMCertificateConfig(ec *ecv1alpha1.ProviderCertManagerConfig) *certInterface.Config {
+	duration, err := time.ParseDuration(ec.ValidityDuration)
+	if err != nil {
+		log.Printf("Failed to parse ValidityDuration: %s", err)
+	}
+	config := &certInterface.Config{
+		CommonName:       ec.CommonName,
+		Organization:     ec.Organization,
+		ValidityDuration: duration,
+		AltNames: certInterface.AltNames{
+			DNSNames: ec.AltNames.DNSNames,
+			IPs:      make([]net.IP, len(ec.AltNames.DNSNames)),
+		},
+		ExtraConfig: map[string]any{
+			"issuerName": ec.IssuerName,
+			"issuerKind": ec.IssuerKind,
+		},
+	}
+	return config
+}
+
+func createAutoCertificateConfig(ec *ecv1alpha1.ProviderAutoConfig) *certInterface.Config {
+	// TODO
+	config := &certInterface.Config{}
+	return config
+}
+
+func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client.Client, certName string) error {
+	cert, certErr := certificate.NewProvider(certificate.ProviderType(ec.Spec.TLS.Provider), c)
+	if certErr != nil {
+		// TODO: instead of error, set default autoConfig
+		return certErr
+	}
+	_, getCertError := cert.GetCertificateConfig(ctx, certName, ec.Namespace)
+	if getCertError != nil {
+		if k8serrors.IsNotFound(getCertError) {
+			log.Printf("Creating certificate: %s for etcd-operator: %s\n", certName, ec.Name)
+			switch {
+			case ec.Spec.TLS.ProviderCfg.AutoCfg != nil:
+				cmConfig := createAutoCertificateConfig(ec.Spec.TLS.ProviderCfg.AutoCfg)
+				createCertErr := cert.EnsureCertificateSecret(ctx, certName, ec.Namespace, cmConfig)
+				if createCertErr != nil {
+					log.Printf("Error creating certificate: %s", createCertErr)
+				}
+				return nil
+			case ec.Spec.TLS.ProviderCfg.CertManagerCfg != nil:
+				cmConfig := createCMCertificateConfig(ec.Spec.TLS.ProviderCfg.CertManagerCfg)
+				createCertErr := cert.EnsureCertificateSecret(ctx, certName, ec.Namespace, cmConfig)
+				if createCertErr != nil {
+					log.Printf("Error creating certificate: %s", createCertErr)
+				}
+				return nil
+			default:
+				if ec.Spec.TLS.ProviderCfg.AutoCfg == nil {
+					// TODO: instead of error, set default autoConfig which will be applied if Provider/ProviderConfig is not set
+					return errors.New("default autoCertificate config not defined")
+				}
+				cmConfig := createAutoCertificateConfig(ec.Spec.TLS.ProviderCfg.AutoCfg)
+				createCertErr := cert.EnsureCertificateSecret(ctx, certName, ec.Namespace, cmConfig)
+				log.Printf("Error creating certificate, maybe already present: %s", createCertErr)
+				return nil
+			}
+		} else {
+			log.Printf("Error getting certificate")
+			return getCertError
+		}
+	}
+
+	return nil
+}
+
+func deleteCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client.Client, certName string) error {
+	cert, certErr := certificate.NewProvider(certificate.ProviderType(ec.Spec.TLS.Provider), c)
+	if certErr != nil {
+		// TODO: instead of error, set default autoConfig
+		return certErr
+	}
+	deleteCertErr := cert.DeleteCertificateSecret(ctx, certName, ec.Namespace)
+	if deleteCertErr != nil {
+		log.Printf("Error deleting certificate with name %s: %s", certName, deleteCertErr)
+		return deleteCertErr
+	}
+	log.Printf("Successfully deleted certificate with name %s", certName)
+	return nil
+}
+
+func createClientCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client.Client) error {
+	certName := fmt.Sprintf("%s-%s-tls", ec.Name, "client")
+	createClientCertErr := createCertificate(ec, ctx, c, certName)
+	return createClientCertErr
+}
+
+func createServerPeerCertificate(ec *ecv1alpha1.EtcdCluster, replicas int32, ctx context.Context, c client.Client) error {
+	serverCertName := fmt.Sprintf("%s-%s-%s-tls", ec.Name, string(replicas-1), "server")
+	peerCertName := fmt.Sprintf("%s-%s-%s-tls", ec.Name, string(replicas-1), "peer")
+	createServerCertErr := createCertificate(ec, ctx, c, serverCertName)
+	if createServerCertErr != nil {
+		return createServerCertErr
+	}
+	createPeerCertErr := createCertificate(ec, ctx, c, peerCertName)
+	if createPeerCertErr != nil {
+		return createPeerCertErr
+	}
+	return nil
+}
+
+func deleteServerPeerCertificate(ec *ecv1alpha1.EtcdCluster, replicas int32, ctx context.Context, c client.Client) error {
+	serverCertName := fmt.Sprintf("%s-%s-%s-tls", ec.Name, string(replicas), "server")
+	peerCertName := fmt.Sprintf("%s-%s-%s-tls", ec.Name, string(replicas), "peer")
+	deleteServerCertErr := deleteCertificate(ec, ctx, c, serverCertName)
+	if deleteServerCertErr != nil {
+		return deleteServerCertErr
+	}
+	deletePeerCertErr := deleteCertificate(ec, ctx, c, peerCertName)
+	if deletePeerCertErr != nil {
+		return deletePeerCertErr
+	}
+	return nil
 }
