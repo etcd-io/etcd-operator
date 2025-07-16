@@ -77,8 +77,9 @@ func TestControllerReconcile(t *testing.T) {
 	}()
 
 	reconciler := &EtcdClusterReconciler{
-		Client: k8sClient,
-		Scheme: k8sClient.Scheme(),
+		Client:        k8sClient,
+		Scheme:        k8sClient.Scheme(),
+		ImageRegistry: "gcr.io/etcd-development/etcd",
 	}
 
 	// Reconcile, as it is, returns err since StatefulSet status.ReadyReplicas cannot report its actual status.

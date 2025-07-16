@@ -42,8 +42,9 @@ const (
 // EtcdClusterReconciler reconciles a EtcdCluster object
 type EtcdClusterReconciler struct {
 	client.Client
-	Scheme   *runtime.Scheme
-	Recorder record.EventRecorder
+	Scheme        *runtime.Scheme
+	Recorder      record.EventRecorder
+	ImageRegistry string
 }
 
 // +kubebuilder:rbac:groups=operator.etcd.io,resources=etcdclusters,verbs=get;list;watch;create;update;patch;delete
@@ -78,6 +79,11 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, err
 	}
 
+	// Determine desired etcd image registry
+	if etcdCluster.Spec.ImageRegistry == "" {
+		etcdCluster.Spec.ImageRegistry = r.ImageRegistry
+	}
+
 	logger.Info("Reconciling EtcdCluster", "spec", etcdCluster.Spec)
 
 	// Get the statefulsets which has the same name as the EtcdCluster resource
@@ -86,7 +92,6 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		if errors.IsNotFound(err) {
 			logger.Info("Creating StatefulSet with 0 replica", "expectedSize", etcdCluster.Spec.Size)
 			// Create a new StatefulSet
-
 			sts, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, 0, r.Scheme)
 			if err != nil {
 				return ctrl.Result{}, err
