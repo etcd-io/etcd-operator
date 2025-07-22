@@ -201,6 +201,16 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 		},
 	}
 
+	// Prepare pod template metadata
+	podTemplateMetadata := metav1.ObjectMeta{
+		Labels: labels,
+	}
+
+	// Apply annotations from PodSpec if provided
+	if ec.Spec.PodSpec != nil && len(ec.Spec.PodSpec.Annotations) > 0 {
+		podTemplateMetadata.Annotations = ec.Spec.PodSpec.Annotations
+	}
+
 	stsSpec := appsv1.StatefulSetSpec{
 		Replicas:    &replicas,
 		ServiceName: ec.Name,
@@ -208,10 +218,8 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 			MatchLabels: labels,
 		},
 		Template: corev1.PodTemplateSpec{
-			ObjectMeta: metav1.ObjectMeta{
-				Labels: labels,
-			},
-			Spec: podSpec,
+			ObjectMeta: podTemplateMetadata,
+			Spec:       podSpec,
 		},
 	}
 

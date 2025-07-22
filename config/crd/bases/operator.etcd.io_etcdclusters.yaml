@@ -46,6 +46,15 @@ spec:
                 items:
                   type: string
                 type: array
+              podSpec:
+                description: PodSpec is the pod spec to use for the etcd cluster.
+                properties:
+                  annotations:
+                    additionalProperties:
+                      type: string
+                    description: Annotations is the annotations to add to the pod.
+                    type: object
+                type: object
               size:
                 description: Size is the expected size of the etcd cluster.
                 minimum: 1
