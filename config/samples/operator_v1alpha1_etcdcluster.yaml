@@ -8,3 +8,11 @@ metadata:
 spec:
   version: v3.5.21
   size: 3
+  tls:
+    provider: "cert-manager"
+    providerCfg:
+      certManagerCfg:
+        commonName: "etcd-operator-system"
+        validityDuration: "90h"
+        issuerName: "selfsigned"
+        issuerKind: "ClusterIssuer"

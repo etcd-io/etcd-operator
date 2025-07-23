@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"time"
 
+	certv1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -30,9 +31,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	clientv3 "go.etcd.io/etcd/client/v3"
+
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 	"go.etcd.io/etcd-operator/internal/etcdutils"
-	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 const (
@@ -53,6 +55,11 @@ type EtcdClusterReconciler struct {
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch;get;list;update
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;patch;update;delete
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups="cert-manager.io",resources=certificates,verbs=get;list;watch;create;patch;update;delete
+// +kubebuilder:rbac:groups="cert-manager.io",resources=clusterissuers,verbs=get;list;watch
+// +kubebuilder:rbac:groups="cert-manager.io",resources=issuers,verbs=get;list;watch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -78,6 +85,17 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, err
 	}
 
+	// Create Client Certificate for etcd-operator to communicate with the etcdCluster
+	if etcdCluster.Spec.TLS != nil {
+		clientCertErr := createClientCertificate(etcdCluster, ctx, r.Client)
+		if clientCertErr != nil {
+			logger.Error(clientCertErr, "Failed to create Client Certificate.")
+		}
+	} else {
+		// TODO: instead of logging error, set default autoConfig
+		logger.Error(nil, fmt.Sprintf("missing TLS config for %s", etcdCluster.Name))
+	}
+
 	logger.Info("Reconciling EtcdCluster", "spec", etcdCluster.Spec)
 
 	// Get the statefulsets which has the same name as the EtcdCluster resource
@@ -87,7 +105,7 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			logger.Info("Creating StatefulSet with 0 replica", "expectedSize", etcdCluster.Spec.Size)
 			// Create a new StatefulSet
 
-			sts, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, 0, r.Scheme)
+			sts, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, 0, r.Scheme, true)
 			if err != nil {
 				return ctrl.Result{}, err
 			}
@@ -112,7 +130,7 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if sts.Spec.Replicas != nil && *sts.Spec.Replicas == 0 {
 		logger.Info("StatefulSet has 0 replicas. Trying to create a new cluster with 1 member")
 
-		sts, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, 1, r.Scheme)
+		sts, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, 1, r.Scheme, true)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -142,7 +160,7 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			logger.Info("An etcd member was added into the cluster, but the StatefulSet hasn't scaled out yet")
 			newReplicaCount := targetReplica + 1
 			logger.Info("Increasing StatefulSet replicas to match the etcd cluster member count", "oldReplicaCount", targetReplica, "newReplicaCount", newReplicaCount)
-			_, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, newReplicaCount, r.Scheme)
+			_, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, newReplicaCount, r.Scheme, true)
 			if err != nil {
 				return ctrl.Result{}, err
 			}
@@ -150,7 +168,7 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			logger.Info("An etcd member was removed from the cluster, but the StatefulSet hasn't scaled in yet")
 			newReplicaCount := targetReplica - 1
 			logger.Info("Decreasing StatefulSet replicas to remove the unneeded Pod.", "oldReplicaCount", targetReplica, "newReplicaCount", newReplicaCount)
-			_, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, newReplicaCount, r.Scheme)
+			_, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, newReplicaCount, r.Scheme, false)
 			if err != nil {
 				return ctrl.Result{}, err
 			}
@@ -215,6 +233,11 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		}
 
 		logger.Info("Learner member added successfully", "peerURLs", peerURL)
+
+		sts, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, targetReplica, r.Scheme, true)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
 	} else {
 		// scale in
 		targetReplica--
@@ -227,11 +250,11 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		if err := etcdutils.RemoveMember(eps, memberID); err != nil {
 			return ctrl.Result{}, err
 		}
-	}
 
-	sts, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, targetReplica, r.Scheme)
-	if err != nil {
-		return ctrl.Result{}, err
+		sts, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, targetReplica, r.Scheme, false)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	allMembersHealthy, err := areAllMembersHealthy(sts, logger)
@@ -258,5 +281,6 @@ func (r *EtcdClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&appsv1.StatefulSet{}).
 		Owns(&corev1.Service{}).
 		Owns(&corev1.ConfigMap{}).
+		Owns(&certv1.Certificate{}).
 		Complete(r)
 }
