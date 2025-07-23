@@ -48,8 +48,9 @@ spec:
                 type: array
               imageRegistry:
                 description: |-
-                  ImageRegistry is the name of the registry that hosts etcd container images.
-                  Defaults to controller specified --image-registry="gcr.io/etcd-development/etcd".
+                  ImageRegistry specifies the container registry that hosts the etcd images.
+                  If unset, it defaults to the value provided via the controller's
+                  --image-registry flag, which itself defaults to "gcr.io/etcd-development/etcd".
                 type: string
               size:
                 description: Size is the expected size of the etcd cluster.

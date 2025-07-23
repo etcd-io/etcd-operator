@@ -35,8 +35,9 @@ type EtcdClusterSpec struct {
 	// Size is the expected size of the etcd cluster.
 	// +kubebuilder:validation:Minimum=1
 	Size int `json:"size"`
-	// ImageRegistry is the name of the registry that hosts etcd container images.
-	// Defaults to controller specified --image-registry="gcr.io/etcd-development/etcd".
+	// ImageRegistry specifies the container registry that hosts the etcd images.
+	// If unset, it defaults to the value provided via the controller's
+	// --image-registry flag, which itself defaults to "gcr.io/etcd-development/etcd".
 	ImageRegistry string `json:"imageRegistry,omitempty"`
 	// Version is the expected version of the etcd container image.
 	Version string `json:"version"`
