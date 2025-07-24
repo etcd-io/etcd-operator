@@ -105,7 +105,11 @@ kubectl apply -f https://raw.githubusercontent.com/<org>/etcd-operator/<tag or b
 
 ## Contributing
 
-// TODO(user): Add detailed information on how you would like others to contribute to this project
+See [CONTRIBUTING](CONTRIBUTING.md) for details on setting up your development environment, submitting patches and the contribution workflow.
+
+Please refer to community-membership.md for information on becoming an etcd project member. We welcome and look forward to your contributions to the project!
+
+Please also refer to roadmap to get more details on the priorities for the next few major or minor releases.
 
 **NOTE:** Run `make help` for more information on all potential `make` targets
 
