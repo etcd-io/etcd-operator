@@ -42,8 +42,9 @@ const (
 // EtcdClusterReconciler reconciles a EtcdCluster object
 type EtcdClusterReconciler struct {
 	client.Client
-	Scheme   *runtime.Scheme
-	Recorder record.EventRecorder
+	Scheme        *runtime.Scheme
+	Recorder      record.EventRecorder
+	ImageRegistry string
 }
 
 // reconcileState holds all transient data for a single reconciliation loop.
@@ -102,6 +103,11 @@ func (r *EtcdClusterReconciler) fetchAndValidateState(ctx context.Context, req c
 			return nil, ctrl.Result{}, nil
 		}
 		return nil, ctrl.Result{}, err
+	}
+
+	// Determine desired etcd image registry
+	if ec.Spec.ImageRegistry == "" {
+		ec.Spec.ImageRegistry = r.ImageRegistry
 	}
 
 	logger.Info("Reconciling EtcdCluster", "spec", ec.Spec)
