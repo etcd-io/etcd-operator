@@ -1,9 +1,7 @@
 package controller
 
 import (
-	"strings"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	appsv1 "k8s.io/api/apps/v1"
@@ -15,54 +13,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	clientv3 "go.etcd.io/etcd/client/v3"
-	"go.etcd.io/etcd/server/v3/embed"
-
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 )
 
 // This file provides a high-level test plan for the refactored EtcdCluster
 // reconciler. The tests are outlined using skeleton functions and comments so
 // that the final implementation can be easily filled in later.
-
-// setupEtcdServerAndClient starts an embedded etcd server and returns a connected
-// client. The server and client are closed via t.Cleanup to ensure test
-// isolation.
-func setupEtcdServerAndClient(t *testing.T) (*embed.Etcd, *clientv3.Client) {
-	t.Helper()
-
-	cfg := embed.NewConfig()
-	cfg.Dir = t.TempDir()
-	cfg.Logger = "zap"
-	cfg.LogLevel = "error"
-
-	e, err := embed.StartEtcd(cfg)
-	if err != nil {
-		if strings.Contains(err.Error(), "address already in use") {
-			t.Skipf("etcd ports in use: %v", err)
-		}
-		t.Fatalf("Failed to start etcd server: %v", err)
-	}
-	select {
-	case <-e.Server.ReadyNotify():
-	case <-time.After(60 * time.Second):
-		e.Server.Stop()
-		t.Fatalf("Server took too long to start")
-	}
-
-	cli, err := clientv3.New(clientv3.Config{Endpoints: []string{cfg.ListenClientUrls[0].String()}})
-	if err != nil {
-		e.Close()
-		t.Fatalf("Failed to create etcd client: %v", err)
-	}
-
-	t.Cleanup(func() {
-		_ = cli.Close()
-		e.Close()
-	})
-
-	return e, cli
-}
 
 // // mapHostToLocalhost appends a hosts file entry mapping the provided hostname to
 // // 127.0.0.1. The original hosts file is restored via t.Cleanup.

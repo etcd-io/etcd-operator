@@ -126,106 +126,57 @@ func TestClusterHealthy(t *testing.T) {
 	_ = testEnv.Test(t, feature.Feature())
 }
 
-func TestScaleDownFrom3To1(t *testing.T) {
-	feature := features.New("scale-down")
-	etcdClusterName := "etcd-scale-down"
+func TestScaling(t *testing.T) {
+	testCases := []struct {
+		name            string
+		initialSize     int
+		scaleTo         int
+		expectedMembers int
+	}{
+		{"ScaleDownFrom3To1", 3, 1, 1},
+		{"ScaleUpFrom1To3", 1, 3, 3},
+	}
 
-	feature.Setup(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-		createEtcdCluster(ctx, t, c, etcdClusterName, 3)
-		waitForStsReady(ctx, t, c, etcdClusterName, 3)
-		return ctx
-	})
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			feature := features.New(tc.name)
+			etcdClusterName := fmt.Sprintf("etcd-%s", strings.ToLower(tc.name))
 
-	feature.Assess("scale down to 1", func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-		var etcdCluster ec_v1alpha1.EtcdCluster
-		if err := c.Client().Resources().Get(ctx, etcdClusterName, namespace, &etcdCluster); err != nil {
-			t.Fatalf("Failed to get EtcdCluster: %v", err)
-		}
+			feature.Setup(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+				createEtcdCluster(ctx, t, c, etcdClusterName, tc.initialSize)
+				waitForStsReady(t, c, etcdClusterName, tc.initialSize)
+				return ctx
+			})
 
-		etcdCluster.Spec.Size = 1
-		if err := c.Client().Resources().Update(ctx, &etcdCluster); err != nil {
-			t.Fatalf("Failed to update EtcdCluster: %v", err)
-		}
+			feature.Assess(
+				fmt.Sprintf("scale to %d", tc.scaleTo),
+				func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+					scaleEtcdCluster(ctx, t, c, etcdClusterName, tc.scaleTo)
+					return ctx
+				},
+			)
 
-		waitForStsReady(ctx, t, c, etcdClusterName, 1)
-		return ctx
-	})
+			feature.Assess("verify member list", func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+				podName := fmt.Sprintf("%s-0", etcdClusterName)
+				stdout, stderr, err := execInPod(t, c, podName, namespace, []string{"etcdctl", "member", "list"})
+				if err != nil {
+					t.Fatalf("Failed to exec in pod: %v, stderr: %s", err, stderr)
+				}
 
-	feature.Assess("verify member list", func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-		podName := fmt.Sprintf("%s-0", etcdClusterName)
-		stdout, stderr, err := execInPod(t, c, podName, namespace, []string{"etcdctl", "member", "list"})
-		if err != nil {
-			t.Fatalf("Failed to exec in pod: %v, stderr: %s", err, stderr)
-		}
+				if len(strings.Split(strings.TrimSpace(stdout), "\n")) != tc.expectedMembers {
+					t.Errorf("Expected to find %d members in member list, but got: %s", tc.expectedMembers, stdout)
+				}
+				return ctx
+			})
 
-		if len(strings.Split(strings.TrimSpace(stdout), "\n")) != 1 {
-			t.Errorf("Expected to find 1 member in member list, but got: %s", stdout)
-		}
-		return ctx
-	})
+			feature.Teardown(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+				cleanupEtcdCluster(ctx, t, c, etcdClusterName)
+				return ctx
+			})
 
-	feature.Teardown(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-		var etcdCluster ec_v1alpha1.EtcdCluster
-		if err := c.Client().Resources().Get(ctx, etcdClusterName, namespace, &etcdCluster); err == nil {
-			if err := c.Client().Resources().Delete(ctx, &etcdCluster); err != nil {
-				t.Logf("Failed to delete EtcdCluster: %v", err)
-			}
-		}
-		return ctx
-	})
-
-	_ = testEnv.Test(t, feature.Feature())
-}
-
-func TestScaleUpFrom1To3(t *testing.T) {
-	feature := features.New("scale-up")
-	etcdClusterName := "etcd-scale-up"
-
-	feature.Setup(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-		createEtcdCluster(ctx, t, c, etcdClusterName, 1)
-		waitForStsReady(ctx, t, c, etcdClusterName, 1)
-		return ctx
-	})
-
-	feature.Assess("scale up to 3", func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-		var etcdCluster ec_v1alpha1.EtcdCluster
-		if err := c.Client().Resources().Get(ctx, etcdClusterName, namespace, &etcdCluster); err != nil {
-			t.Fatalf("Failed to get EtcdCluster: %v", err)
-		}
-
-		etcdCluster.Spec.Size = 3
-		if err := c.Client().Resources().Update(ctx, &etcdCluster); err != nil {
-			t.Fatalf("Failed to update EtcdCluster: %v", err)
-		}
-
-		waitForStsReady(ctx, t, c, etcdClusterName, 3)
-		return ctx
-	})
-
-	feature.Assess("verify member list", func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-		podName := fmt.Sprintf("%s-0", etcdClusterName)
-		stdout, stderr, err := execInPod(t, c, podName, namespace, []string{"etcdctl", "member", "list"})
-		if err != nil {
-			t.Fatalf("Failed to exec in pod: %v, stderr: %s", err, stderr)
-		}
-
-		if len(strings.Split(strings.TrimSpace(stdout), "\n")) != 3 {
-			t.Errorf("Expected to find 3 members in member list, but got: %s", stdout)
-		}
-		return ctx
-	})
-
-	feature.Teardown(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-		var etcdCluster ec_v1alpha1.EtcdCluster
-		if err := c.Client().Resources().Get(ctx, etcdClusterName, namespace, &etcdCluster); err == nil {
-			if err := c.Client().Resources().Delete(ctx, &etcdCluster); err != nil {
-				t.Logf("Failed to delete EtcdCluster: %v", err)
-			}
-		}
-		return ctx
-	})
-
-	_ = testEnv.Test(t, feature.Feature())
+			_ = testEnv.Test(t, feature.Feature())
+		})
+	}
 }
 
 func TestPromoteReadyLearner(t *testing.T) {
@@ -234,10 +185,15 @@ func TestPromoteReadyLearner(t *testing.T) {
 
 	feature.Setup(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
 		createEtcdCluster(ctx, t, c, etcdClusterName, 2)
-		waitForStsReady(ctx, t, c, etcdClusterName, 2)
+		waitForStsReady(t, c, etcdClusterName, 2)
 		// Manually add a third member as a learner
 		podName := fmt.Sprintf("%s-0", etcdClusterName)
-		_, stderr, err := execInPod(t, c, podName, namespace, []string{"etcdctl", "member", "add", "etcd-promote-learner-2", "--peer-urls=http://etcd-promote-learner-2.etcd-promote-learner.etcd-operator-system.svc.cluster.local:2380", "--learner"})
+		command := []string{
+			"etcdctl", "member", "add", "etcd-promote-learner-2",
+			"--peer-urls=http://etcd-promote-learner-2.etcd-promote-learner.etcd-operator-system.svc.cluster.local:2380",
+			"--learner",
+		}
+		_, stderr, err := execInPod(t, c, podName, namespace, command)
 		if err != nil {
 			t.Fatalf("Failed to add learner: %v, stderr: %s", err, stderr)
 		}
@@ -245,18 +201,10 @@ func TestPromoteReadyLearner(t *testing.T) {
 	})
 
 	feature.Assess("promote learner", func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-		var etcdCluster ec_v1alpha1.EtcdCluster
-		if err := c.Client().Resources().Get(ctx, etcdClusterName, namespace, &etcdCluster); err != nil {
-			t.Fatalf("Failed to get EtcdCluster: %v", err)
-		}
-
-		etcdCluster.Spec.Size = 3
-		if err := c.Client().Resources().Update(ctx, &etcdCluster); err != nil {
-			t.Fatalf("Failed to update EtcdCluster: %v", err)
-		}
+		scaleEtcdCluster(ctx, t, c, etcdClusterName, 3)
 
 		// Wait for the learner to be promoted.
-		wait.For(func(ctx context.Context) (done bool, err error) {
+		if err := wait.For(func(ctx context.Context) (done bool, err error) {
 			podName := fmt.Sprintf("%s-0", etcdClusterName)
 			command := []string{"etcdctl", "member", "list", "-w", "table"}
 			stdout, _, err := execInPod(t, c, podName, namespace, command)
@@ -264,7 +212,9 @@ func TestPromoteReadyLearner(t *testing.T) {
 				return false, nil
 			}
 			return !strings.Contains(stdout, "true"), nil
-		}, wait.WithTimeout(2*time.Minute), wait.WithInterval(5*time.Second))
+		}, wait.WithTimeout(2*time.Minute), wait.WithInterval(5*time.Second)); err != nil {
+			t.Fatalf("Failed to wait for learner promotion: %v", err)
+		}
 
 		return ctx
 	})
@@ -284,12 +234,7 @@ func TestPromoteReadyLearner(t *testing.T) {
 	})
 
 	feature.Teardown(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-		var etcdCluster ec_v1alpha1.EtcdCluster
-		if err := c.Client().Resources().Get(ctx, etcdClusterName, namespace, &etcdCluster); err == nil {
-			if err := c.Client().Resources().Delete(ctx, &etcdCluster); err != nil {
-				t.Logf("Failed to delete EtcdCluster: %v", err)
-			}
-		}
+		cleanupEtcdCluster(ctx, t, c, etcdClusterName)
 		return ctx
 	})
 

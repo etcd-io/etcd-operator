@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -15,9 +14,11 @@ import (
 	"sigs.k8s.io/e2e-framework/klient/wait"
 	"sigs.k8s.io/e2e-framework/klient/wait/conditions"
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
+
+	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 )
 
-func createEtcdCluster(ctx context.Context, t *testing.T, c *envconf.Config, name string, size int) *ecv1alpha1.EtcdCluster {
+func createEtcdCluster(ctx context.Context, t *testing.T, c *envconf.Config, name string, size int) {
 	t.Helper()
 	etcdCluster := &ecv1alpha1.EtcdCluster{
 		ObjectMeta: metav1.ObjectMeta{
@@ -32,10 +33,9 @@ func createEtcdCluster(ctx context.Context, t *testing.T, c *envconf.Config, nam
 	if err := c.Client().Resources().Create(ctx, etcdCluster); err != nil {
 		t.Fatalf("Failed to create EtcdCluster: %v", err)
 	}
-	return etcdCluster
 }
 
-func waitForStsReady(ctx context.Context, t *testing.T, c *envconf.Config, name string, expectedReplicas int) {
+func waitForStsReady(t *testing.T, c *envconf.Config, name string, expectedReplicas int) {
 	t.Helper()
 	var sts appsv1.StatefulSet
 	err := wait.For(func(ctx context.Context) (done bool, err error) {
@@ -63,14 +63,16 @@ func waitForStsReady(ctx context.Context, t *testing.T, c *envconf.Config, name 
 	}
 }
 
-func execInPod(t *testing.T, cfg *envconf.Config, podName string, namespace string, command []string) (string, string, error) {
+func execInPod(
+	t *testing.T, cfg *envconf.Config, podName string, namespace string, command []string,
+) (string, string, error) {
 	t.Helper()
 	var stdout, stderr bytes.Buffer
 	client := cfg.Client()
 
 	// Find the pod
 	var pod corev1.Pod
-	if err := client.Resources().Get(context.Background(), podName, namespace, &pod); err != nil {
+	if err := client.Resources().Get(t.Context(), podName, namespace, &pod); err != nil {
 		return "", "", fmt.Errorf("failed to get pod %s/%s: %w", namespace, podName, err)
 	}
 
@@ -81,6 +83,31 @@ func execInPod(t *testing.T, cfg *envconf.Config, podName string, namespace stri
 	containerName := pod.Spec.Containers[0].Name
 
 	// Exec command
-	err := client.Resources().ExecInPod(context.Background(), namespace, podName, containerName, command, &stdout, &stderr)
+	err := client.Resources().ExecInPod(t.Context(), namespace, podName, containerName, command, &stdout, &stderr)
 	return stdout.String(), stderr.String(), err
+}
+
+func scaleEtcdCluster(ctx context.Context, t *testing.T, c *envconf.Config, name string, size int) {
+	t.Helper()
+	var etcdCluster ecv1alpha1.EtcdCluster
+	if err := c.Client().Resources().Get(ctx, name, namespace, &etcdCluster); err != nil {
+		t.Fatalf("Failed to get EtcdCluster: %v", err)
+	}
+
+	etcdCluster.Spec.Size = size
+	if err := c.Client().Resources().Update(ctx, &etcdCluster); err != nil {
+		t.Fatalf("Failed to update EtcdCluster: %v", err)
+	}
+
+	waitForStsReady(t, c, name, size)
+}
+
+func cleanupEtcdCluster(ctx context.Context, t *testing.T, c *envconf.Config, name string) {
+	t.Helper()
+	var etcdCluster ecv1alpha1.EtcdCluster
+	if err := c.Client().Resources().Get(ctx, name, namespace, &etcdCluster); err == nil {
+		if err := c.Client().Resources().Delete(ctx, &etcdCluster); err != nil {
+			t.Logf("Failed to delete EtcdCluster: %v", err)
+		}
+	}
 }
