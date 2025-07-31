@@ -65,7 +65,7 @@ func prepareOwnerReference(ec *ecv1alpha1.EtcdCluster, scheme *runtime.Scheme) (
 	return owners, nil
 }
 
-func reconcileStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1alpha1.EtcdCluster, c client.Client, replicas int32, scheme *runtime.Scheme, addMember bool) (*appsv1.StatefulSet, error) {
+func reconcileStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1alpha1.EtcdCluster, c client.Client, replicas int32, scheme *runtime.Scheme) (*appsv1.StatefulSet, error) {
 
 	// prepare/update configmap for StatefulSet
 	err := applyEtcdClusterState(ctx, ec, int(replicas), c, scheme, logger)
@@ -73,31 +73,10 @@ func reconcileStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1alpha
 		return nil, err
 	}
 
-	// Add or remove server and peer certificate
-	if ec.Spec.TLS != nil {
-		if addMember {
-			if replicas > 0 {
-				createServerCertErr := createServerCertificate(ec, replicas, ctx, c)
-				if createServerCertErr != nil {
-					logger.Error(createServerCertErr, "Error creating Server or Peer Certificate")
-
-				}
-				createPeerCertErr := createPeerCertificate(ec, replicas, ctx, c)
-				if createPeerCertErr != nil {
-					logger.Error(createPeerCertErr, "Error creating Server or Peer Certificate")
-
-				}
-			}
-		} else {
-			deleteServerCertErr := deleteServerCertificate(ec, replicas, ctx, c)
-			if deleteServerCertErr != nil {
-				logger.Error(deleteServerCertErr, "Error deleting Server or Peer Certificate")
-			}
-			deletePeerCertErr := deletePeerCertificate(ec, replicas, ctx, c)
-			if deletePeerCertErr != nil {
-				logger.Error(deletePeerCertErr, "Error deleting Server or Peer Certificate")
-			}
-		}
+	// Add server and peer certificate
+	err = applyEtcdMemberCerts(ctx, c, ec, logger)
+	if err != nil {
+		return nil, err
 	}
 
 	// Create Update StatefulSet
@@ -231,6 +210,29 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 				},
 			},
 		},
+	}
+
+	// mount server and peer certificate secret to each pods of the statefulset via PodSpec
+	var certVolume []corev1.Volume
+	serverCertName := fmt.Sprintf("%s-%s-tls", ec.Name, "server")
+	peerCertName := fmt.Sprintf("%s-%s-tls", ec.Name, "peer")
+	if ec.Spec.TLS != nil {
+		serverCertVolume := corev1.Volume{
+			Name: "server-secret",
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{SecretName: serverCertName},
+			},
+		}
+		peerCertVolume := corev1.Volume{
+			Name: "peer-secret",
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{SecretName: peerCertName},
+			},
+		}
+		certVolume = append(certVolume, serverCertVolume, peerCertVolume)
+	}
+	if len(certVolume) != 0 {
+		podSpec.Volumes = certVolume
 	}
 
 	stsSpec := appsv1.StatefulSetSpec{
@@ -650,8 +652,8 @@ func createClientCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c 
 	return createClientCertErr
 }
 
-func createServerCertificate(ec *ecv1alpha1.EtcdCluster, replicas int32, ctx context.Context, c client.Client) error {
-	serverCertName := fmt.Sprintf("%s-%s-%s-tls", ec.Name, string(replicas-1), "server")
+func createServerCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client.Client) error {
+	serverCertName := fmt.Sprintf("%s-%s-tls", ec.Name, "server")
 	createServerCertErr := createCertificate(ec, ctx, c, serverCertName)
 	if createServerCertErr != nil {
 		return createServerCertErr
@@ -659,8 +661,8 @@ func createServerCertificate(ec *ecv1alpha1.EtcdCluster, replicas int32, ctx con
 	return nil
 }
 
-func createPeerCertificate(ec *ecv1alpha1.EtcdCluster, replicas int32, ctx context.Context, c client.Client) error {
-	peerCertName := fmt.Sprintf("%s-%s-%s-tls", ec.Name, string(replicas-1), "peer")
+func createPeerCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client.Client) error {
+	peerCertName := fmt.Sprintf("%s-%s-tls", ec.Name, "peer")
 	createPeerCertErr := createCertificate(ec, ctx, c, peerCertName)
 	if createPeerCertErr != nil {
 		return createPeerCertErr
@@ -668,19 +670,22 @@ func createPeerCertificate(ec *ecv1alpha1.EtcdCluster, replicas int32, ctx conte
 	return nil
 }
 
-func deleteServerCertificate(ec *ecv1alpha1.EtcdCluster, replicas int32, ctx context.Context, c client.Client) error {
-	serverCertName := fmt.Sprintf("%s-%s-%s-tls", ec.Name, string(replicas), "server")
-	deleteServerCertErr := deleteCertificate(ec, ctx, c, serverCertName)
-	if deleteServerCertErr != nil {
-		return deleteServerCertErr
+func applyEtcdMemberCerts(ctx context.Context, c client.Client, ec *ecv1alpha1.EtcdCluster, logger logr.Logger) error {
+	var err error
+	if ec.Spec.TLS != nil {
+		createServerCertErr := createServerCertificate(ec, ctx, c)
+		if createServerCertErr != nil {
+			err = createServerCertErr
+			logger.Error(createServerCertErr, "Error creating Server Certificate")
+
+		}
+		createPeerCertErr := createPeerCertificate(ec, ctx, c)
+		if createPeerCertErr != nil {
+			err = createPeerCertErr
+			logger.Error(createPeerCertErr, "Error creating Peer Certificate")
+
+		}
+
 	}
-	return nil
-}
-func deletePeerCertificate(ec *ecv1alpha1.EtcdCluster, replicas int32, ctx context.Context, c client.Client) error {
-	peerCertName := fmt.Sprintf("%s-%s-%s-tls", ec.Name, string(replicas), "peer")
-	deletePeerCertErr := deleteCertificate(ec, ctx, c, peerCertName)
-	if deletePeerCertErr != nil {
-		return deletePeerCertErr
-	}
-	return nil
+	return err
 }

@@ -111,12 +111,12 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			logger.Info("Creating StatefulSet with 0 replica", "expectedSize", etcdCluster.Spec.Size)
 			// Create a new StatefulSet
 
-			sts, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, 0, r.Scheme, true)
+			sts, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, 0, r.Scheme)
 			if err != nil {
 				return ctrl.Result{}, err
 			}
 		} else {
-			// If an error occurs during Get/Create, we'll requeue the item so we can
+			// If an error occurs during Get/Create, we'll requeue the item, so we can
 			// attempt processing again later. This could have been caused by a
 			// temporary network failure, or any other transient reason.
 			logger.Error(err, "Failed to get StatefulSet. Requesting requeue")
@@ -136,7 +136,7 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if sts.Spec.Replicas != nil && *sts.Spec.Replicas == 0 {
 		logger.Info("StatefulSet has 0 replicas. Trying to create a new cluster with 1 member")
 
-		sts, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, 1, r.Scheme, true)
+		sts, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, 1, r.Scheme)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -160,24 +160,21 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	targetReplica := *sts.Spec.Replicas // Start with the current size of the stateful set
 
 	// The number of replicas in the StatefulSet doesn't match the number of etcd members in the cluster.
-	var scaleOut bool
 	if int(targetReplica) != memberCnt {
 		logger.Info("The expected number of replicas doesn't match the number of etcd members in the cluster", "targetReplica", targetReplica, "memberCnt", memberCnt)
 		if int(targetReplica) < memberCnt {
-			scaleOut = true
 			logger.Info("An etcd member was added into the cluster, but the StatefulSet hasn't scaled out yet")
 			newReplicaCount := targetReplica + 1
 			logger.Info("Increasing StatefulSet replicas to match the etcd cluster member count", "oldReplicaCount", targetReplica, "newReplicaCount", newReplicaCount)
-			_, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, newReplicaCount, r.Scheme, scaleOut)
+			_, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, newReplicaCount, r.Scheme)
 			if err != nil {
 				return ctrl.Result{}, err
 			}
 		} else {
-			scaleOut = false
 			logger.Info("An etcd member was removed from the cluster, but the StatefulSet hasn't scaled in yet")
 			newReplicaCount := targetReplica - 1
 			logger.Info("Decreasing StatefulSet replicas to remove the unneeded Pod.", "oldReplicaCount", targetReplica, "newReplicaCount", newReplicaCount)
-			_, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, newReplicaCount, r.Scheme, scaleOut)
+			_, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, newReplicaCount, r.Scheme)
 			if err != nil {
 				return ctrl.Result{}, err
 			}
@@ -242,11 +239,6 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		}
 
 		logger.Info("Learner member added successfully", "peerURLs", peerURL)
-
-		sts, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, targetReplica, r.Scheme, true)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
 	} else {
 		// scale in
 		targetReplica--
@@ -259,11 +251,11 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		if err := etcdutils.RemoveMember(eps, memberID); err != nil {
 			return ctrl.Result{}, err
 		}
+	}
 
-		sts, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, targetReplica, r.Scheme, false)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
+	sts, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, targetReplica, r.Scheme)
+	if err != nil {
+		return ctrl.Result{}, err
 	}
 
 	allMembersHealthy, err := areAllMembersHealthy(sts, logger)
