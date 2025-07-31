@@ -73,18 +73,6 @@ func reconcileStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1alpha
 		return nil, err
 	}
 
-	// Create Update StatefulSet
-	err = createOrPatchStatefulSet(ctx, logger, ec, c, replicas, scheme)
-	if err != nil {
-		return nil, err
-	}
-
-	// Wait for statefulset to be ready
-	err = waitForStatefulSetReady(ctx, logger, c, ec.Name, ec.Namespace)
-	if err != nil {
-		return nil, err
-	}
-
 	// Add or remove server and peer certificate
 	if ec.Spec.TLS != nil {
 		if addMember {
@@ -110,6 +98,18 @@ func reconcileStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1alpha
 				logger.Error(deletePeerCertErr, "Error deleting Server or Peer Certificate")
 			}
 		}
+	}
+
+	// Create Update StatefulSet
+	err = createOrPatchStatefulSet(ctx, logger, ec, c, replicas, scheme)
+	if err != nil {
+		return nil, err
+	}
+
+	// Wait for statefulset to be ready
+	err = waitForStatefulSetReady(ctx, logger, c, ec.Name, ec.Namespace)
+	if err != nil {
+		return nil, err
 	}
 
 	// Return latest Stateful set. (This is to ensure that we return the latest statefulset for next operation to act on)
@@ -555,28 +555,37 @@ func healthCheck(sts *appsv1.StatefulSet, lg klog.Logger) (*clientv3.MemberListR
 	return memberlistResp, healthInfos, nil
 }
 
-func createCMCertificateConfig(ec *ecv1alpha1.ProviderCertManagerConfig) *certInterface.Config {
-	duration, err := time.ParseDuration(ec.ValidityDuration)
+func createCMCertificateConfig(ec *ecv1alpha1.EtcdCluster) *certInterface.Config {
+	cmConfig := ec.Spec.TLS.ProviderCfg.CertManagerCfg
+	duration, err := time.ParseDuration(cmConfig.ValidityDuration)
 	if err != nil {
 		log.Printf("Failed to parse ValidityDuration: %s", err)
 	}
+
+	var getDNSNames []string
+	if cmConfig.AltNames.DNSNames != nil {
+		getDNSNames = cmConfig.AltNames.DNSNames
+	} else {
+		getDNSNames = []string{fmt.Sprintf("%s.svc.cluster.local", cmConfig.CommonName)}
+	}
+
 	config := &certInterface.Config{
-		CommonName:       ec.CommonName,
-		Organization:     ec.Organization,
+		CommonName:       cmConfig.CommonName,
+		Organization:     cmConfig.Organization,
 		ValidityDuration: duration,
 		AltNames: certInterface.AltNames{
-			DNSNames: ec.AltNames.DNSNames,
-			IPs:      make([]net.IP, len(ec.AltNames.DNSNames)),
+			DNSNames: getDNSNames,
+			IPs:      make([]net.IP, len(getDNSNames)),
 		},
 		ExtraConfig: map[string]any{
-			"issuerName": ec.IssuerName,
-			"issuerKind": ec.IssuerKind,
+			"issuerName": cmConfig.IssuerName,
+			"issuerKind": cmConfig.IssuerKind,
 		},
 	}
 	return config
 }
 
-func createAutoCertificateConfig(ec *ecv1alpha1.ProviderAutoConfig) *certInterface.Config {
+func createAutoCertificateConfig(ec *ecv1alpha1.EtcdCluster) *certInterface.Config {
 	// TODO
 	config := &certInterface.Config{}
 	return config
@@ -594,14 +603,14 @@ func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client
 			log.Printf("Creating certificate: %s for etcd-operator: %s\n", certName, ec.Name)
 			switch {
 			case ec.Spec.TLS.ProviderCfg.AutoCfg != nil:
-				cmConfig := createAutoCertificateConfig(ec.Spec.TLS.ProviderCfg.AutoCfg)
+				cmConfig := createAutoCertificateConfig(ec)
 				createCertErr := cert.EnsureCertificateSecret(ctx, certName, ec.Namespace, cmConfig)
 				if createCertErr != nil {
 					log.Printf("Error creating certificate: %s", createCertErr)
 				}
 				return nil
 			case ec.Spec.TLS.ProviderCfg.CertManagerCfg != nil:
-				cmConfig := createCMCertificateConfig(ec.Spec.TLS.ProviderCfg.CertManagerCfg)
+				cmConfig := createCMCertificateConfig(ec)
 				createCertErr := cert.EnsureCertificateSecret(ctx, certName, ec.Namespace, cmConfig)
 				if createCertErr != nil {
 					log.Printf("Error creating certificate: %s", createCertErr)
@@ -613,8 +622,7 @@ func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client
 				return nil
 			}
 		} else {
-			log.Printf("Error getting certificate")
-			return getCertError
+			return fmt.Errorf("%s:Error getting certificate", getCertError)
 		}
 	}
 
