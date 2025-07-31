@@ -16,11 +16,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	"go.etcd.io/etcd/api/v3/etcdserverpb"
-	clientv3 "go.etcd.io/etcd/client/v3"
-
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 	"go.etcd.io/etcd-operator/internal/etcdutils"
+	"go.etcd.io/etcd/api/v3/etcdserverpb"
+	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 func TestPrepareOwnerReference(t *testing.T) {
@@ -68,7 +67,7 @@ func TestReconcileStatefulSet(t *testing.T) {
 		},
 	}
 
-	_, _ = reconcileStatefulSet(t.Context(), logger, ec, fakeClient, 3, scheme, true)
+	_, _ = reconcileStatefulSet(t.Context(), logger, ec, fakeClient, 3, scheme)
 
 	sts := &appsv1.StatefulSet{}
 	err := fakeClient.Get(t.Context(), client.ObjectKey{Name: "test-etcd", Namespace: "default"}, sts)
