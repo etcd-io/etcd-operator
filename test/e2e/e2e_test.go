@@ -33,7 +33,7 @@ import (
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
 	"sigs.k8s.io/e2e-framework/pkg/features"
 
-	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
+	ec_v1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 )
 
 var etcdVersion = os.Getenv("ETCD_VERSION")
@@ -49,7 +49,7 @@ func TestInvalidClusterSize(t *testing.T) {
 		"with-negative-members": -1,
 	}
 
-	etcdClusterSpec := &ecv1alpha1.EtcdCluster{
+	etcdClusterSpec := &ec_v1alpha1.EtcdCluster{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "operator.etcd.io/v1alpha1",
 			Kind:       "EtcdCluster",
@@ -58,7 +58,7 @@ func TestInvalidClusterSize(t *testing.T) {
 			Name:      etcdClusterName,
 			Namespace: namespace,
 		},
-		Spec: ecv1alpha1.EtcdClusterSpec{
+		Spec: ec_v1alpha1.EtcdClusterSpec{
 			Size:    0,
 			Version: etcdVersion,
 		},
@@ -82,7 +82,7 @@ func TestInvalidClusterSize(t *testing.T) {
 		feature.Assess(fmt.Sprintf("etcdCluster %s should not be created when etcdCluster.Spec.Size is %d", name, size),
 			func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
 
-				var etcdCluster ecv1alpha1.EtcdCluster
+				var etcdCluster ec_v1alpha1.EtcdCluster
 				err := c.Client().Resources().Get(ctx, etcdClusterName, namespace, &etcdCluster)
 				if !errors.IsNotFound(err) {
 					t.Fatalf("found unexpected etcdCluster %s with size %d. Got: %v", name, size, err)
@@ -123,5 +123,120 @@ func TestClusterHealthy(t *testing.T) {
 		})
 
 	// 'testEnv' is the env.Environment you set up in TestMain
+	_ = testEnv.Test(t, feature.Feature())
+}
+
+func TestScaling(t *testing.T) {
+	testCases := []struct {
+		name            string
+		initialSize     int
+		scaleTo         int
+		expectedMembers int
+	}{
+		{"ScaleDownFrom3To1", 3, 1, 1},
+		{"ScaleUpFrom1To3", 1, 3, 3},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			feature := features.New(tc.name)
+			etcdClusterName := fmt.Sprintf("etcd-%s", strings.ToLower(tc.name))
+
+			feature.Setup(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+				createEtcdCluster(ctx, t, c, etcdClusterName, tc.initialSize)
+				waitForStsReady(t, c, etcdClusterName, tc.initialSize)
+				return ctx
+			})
+
+			feature.Assess(
+				fmt.Sprintf("scale to %d", tc.scaleTo),
+				func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+					scaleEtcdCluster(ctx, t, c, etcdClusterName, tc.scaleTo)
+					return ctx
+				},
+			)
+
+			feature.Assess("verify member list", func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+				podName := fmt.Sprintf("%s-0", etcdClusterName)
+				stdout, stderr, err := execInPod(t, c, podName, namespace, []string{"etcdctl", "member", "list"})
+				if err != nil {
+					t.Fatalf("Failed to exec in pod: %v, stderr: %s", err, stderr)
+				}
+
+				if len(strings.Split(strings.TrimSpace(stdout), "\n")) != tc.expectedMembers {
+					t.Errorf("Expected to find %d members in member list, but got: %s", tc.expectedMembers, stdout)
+				}
+				return ctx
+			})
+
+			feature.Teardown(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+				cleanupEtcdCluster(ctx, t, c, etcdClusterName)
+				return ctx
+			})
+
+			_ = testEnv.Test(t, feature.Feature())
+		})
+	}
+}
+
+func TestPromoteReadyLearner(t *testing.T) {
+	feature := features.New("promote-learner")
+	etcdClusterName := "etcd-promote-learner"
+
+	feature.Setup(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+		createEtcdCluster(ctx, t, c, etcdClusterName, 2)
+		waitForStsReady(t, c, etcdClusterName, 2)
+		// Manually add a third member as a learner
+		podName := fmt.Sprintf("%s-0", etcdClusterName)
+		command := []string{
+			"etcdctl", "member", "add", "etcd-promote-learner-2",
+			"--peer-urls=http://etcd-promote-learner-2.etcd-promote-learner.etcd-operator-system.svc.cluster.local:2380",
+			"--learner",
+		}
+		_, stderr, err := execInPod(t, c, podName, namespace, command)
+		if err != nil {
+			t.Fatalf("Failed to add learner: %v, stderr: %s", err, stderr)
+		}
+		return ctx
+	})
+
+	feature.Assess("promote learner", func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+		scaleEtcdCluster(ctx, t, c, etcdClusterName, 3)
+
+		// Wait for the learner to be promoted.
+		if err := wait.For(func(ctx context.Context) (done bool, err error) {
+			podName := fmt.Sprintf("%s-0", etcdClusterName)
+			command := []string{"etcdctl", "member", "list", "-w", "table"}
+			stdout, _, err := execInPod(t, c, podName, namespace, command)
+			if err != nil {
+				return false, nil
+			}
+			return !strings.Contains(stdout, "true"), nil
+		}, wait.WithTimeout(2*time.Minute), wait.WithInterval(5*time.Second)); err != nil {
+			t.Fatalf("Failed to wait for learner promotion: %v", err)
+		}
+
+		return ctx
+	})
+
+	feature.Assess("verify member list", func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+		podName := fmt.Sprintf("%s-0", etcdClusterName)
+		command := []string{"etcdctl", "member", "list", "-w", "table"}
+		stdout, stderr, err := execInPod(t, c, podName, namespace, command)
+		if err != nil {
+			t.Fatalf("Failed to exec in pod: %v, stderr: %s", err, stderr)
+		}
+
+		if strings.Contains(stdout, "true") {
+			t.Errorf("Expected all members not to be learners, but found a learner. Member list:\n%s", stdout)
+		}
+		return ctx
+	})
+
+	feature.Teardown(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+		cleanupEtcdCluster(ctx, t, c, etcdClusterName)
+		return ctx
+	})
+
 	_ = testEnv.Test(t, feature.Feature())
 }
