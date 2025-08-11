@@ -271,3 +271,28 @@ func getClusterEndpointHashKVs(t *testing.T, c *envconf.Config, podName string) 
 	}
 	return out
 }
+
+func verifyDataOperations(t *testing.T, c *envconf.Config, etcdClusterName string) {
+	testKey := "test-key"
+	testValue := "test-value"
+	podName := fmt.Sprintf("%s-0", etcdClusterName)
+
+	// Write key-value data
+	command := []string{"etcdctl", "put", testKey, testValue}
+	_, stderr, err := execInPod(t, c, podName, namespace, command)
+	if err != nil {
+		t.Fatalf("Failed to write data: %v, stderr: %s", err, stderr)
+	}
+
+	// Read key-value data
+	command = []string{"etcdctl", "get", testKey}
+	stdout, stderr, err := execInPod(t, c, podName, namespace, command)
+	if err != nil {
+		t.Fatalf("Failed to read data: %v, stderr: %s", err, stderr)
+	}
+
+	lines := strings.Split(strings.TrimSpace(stdout), "\n")
+	if len(lines) < 2 || lines[0] != testKey || lines[1] != testValue {
+		t.Errorf("Expected key-value pair [%s=%s], but got output: %s", testKey, testValue, stdout)
+	}
+}
