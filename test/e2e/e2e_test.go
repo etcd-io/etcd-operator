@@ -33,7 +33,7 @@ import (
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
 	"sigs.k8s.io/e2e-framework/pkg/features"
 
-	ec_v1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
+	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 )
 
 var etcdVersion = os.Getenv("ETCD_VERSION")
@@ -49,7 +49,7 @@ func TestInvalidClusterSize(t *testing.T) {
 		"with-negative-members": -1,
 	}
 
-	etcdClusterSpec := &ec_v1alpha1.EtcdCluster{
+	etcdClusterSpec := &ecv1alpha1.EtcdCluster{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "operator.etcd.io/v1alpha1",
 			Kind:       "EtcdCluster",
@@ -58,7 +58,7 @@ func TestInvalidClusterSize(t *testing.T) {
 			Name:      etcdClusterName,
 			Namespace: namespace,
 		},
-		Spec: ec_v1alpha1.EtcdClusterSpec{
+		Spec: ecv1alpha1.EtcdClusterSpec{
 			Size:    0,
 			Version: etcdVersion,
 		},
@@ -82,7 +82,7 @@ func TestInvalidClusterSize(t *testing.T) {
 		feature.Assess(fmt.Sprintf("etcdCluster %s should not be created when etcdCluster.Spec.Size is %d", name, size),
 			func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
 
-				var etcdCluster ec_v1alpha1.EtcdCluster
+				var etcdCluster ecv1alpha1.EtcdCluster
 				err := c.Client().Resources().Get(ctx, etcdClusterName, namespace, &etcdCluster)
 				if !errors.IsNotFound(err) {
 					t.Fatalf("found unexpected etcdCluster %s with size %d. Got: %v", name, size, err)
@@ -144,7 +144,7 @@ func TestScaling(t *testing.T) {
 
 			feature.Setup(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
 				createEtcdCluster(ctx, t, c, etcdClusterName, tc.initialSize)
-				waitForStsReady(t, c, etcdClusterName, tc.initialSize)
+				waitForSTSReadiness(t, c, etcdClusterName, tc.initialSize)
 				return ctx
 			})
 
@@ -267,7 +267,7 @@ func TestEtcdClusterFunctionality(t *testing.T) {
 
 	feature.Setup(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
 		createEtcdCluster(ctx, t, c, etcdClusterName, 3)
-		waitForStsReady(t, c, etcdClusterName, 3)
+		waitForSTSReadiness(t, c, etcdClusterName, 3)
 		return ctx
 	})
 
