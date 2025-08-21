@@ -19,23 +19,65 @@ package e2e
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"sigs.k8s.io/e2e-framework/klient/k8s"
 	"sigs.k8s.io/e2e-framework/klient/wait"
-	"sigs.k8s.io/e2e-framework/klient/wait/conditions"
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
 
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 )
 
-func createEtcdCluster(ctx context.Context, t *testing.T, c *envconf.Config, name string, size int) {
+// getAvailableStorageClass returns an available StorageClass name
+func getAvailableStorageClass(ctx context.Context, t *testing.T, c *envconf.Config) string {
 	t.Helper()
+
+	// First check environment variable
+	if storageClass := os.Getenv("ETCD_E2E_STORAGECLASS"); storageClass != "" {
+		return storageClass
+	}
+
+	// Try to find default StorageClass
+	var storageClasses storagev1.StorageClassList
+	if err := c.Client().Resources().List(ctx, &storageClasses); err != nil {
+		t.Skip("Cannot list StorageClasses, skipping PVC test")
+	}
+
+	// Look for default StorageClass
+	for _, sc := range storageClasses.Items {
+		if sc.Annotations["storageclass.kubernetes.io/is-default-class"] == "true" {
+			return sc.Name
+		}
+	}
+
+	// Fallback to common StorageClass names
+	commonNames := []string{"standard", "gp2", "default"}
+	for _, name := range commonNames {
+		for _, sc := range storageClasses.Items {
+			if sc.Name == name {
+				return name
+			}
+		}
+	}
+
+	t.Skip("No suitable StorageClass found for PVC test")
+	return ""
+}
+
+// createEtcdClusterWithPVC creates an EtcdCluster with persistent storage
+func createEtcdClusterWithPVC(ctx context.Context, t *testing.T, c *envconf.Config, name string, size int) {
+	t.Helper()
+	storageClassName := getAvailableStorageClass(ctx, t, c)
+
 	etcdCluster := &ecv1alpha1.EtcdCluster{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
@@ -44,10 +86,17 @@ func createEtcdCluster(ctx context.Context, t *testing.T, c *envconf.Config, nam
 		Spec: ecv1alpha1.EtcdClusterSpec{
 			Size:    size,
 			Version: etcdVersion,
+			StorageSpec: &ecv1alpha1.StorageSpec{
+				AccessModes:       corev1.ReadWriteOnce,
+				StorageClassName:  storageClassName,
+				PVCName:           fmt.Sprintf("%s-pvc", name),
+				VolumeSizeRequest: resource.MustParse("64Mi"),
+				VolumeSizeLimit:   resource.MustParse("64Mi"),
+			},
 		},
 	}
 	if err := c.Client().Resources().Create(ctx, etcdCluster); err != nil {
-		t.Fatalf("Failed to create EtcdCluster: %v", err)
+		t.Fatalf("Failed to create EtcdCluster with PVC: %v", err)
 	}
 }
 
@@ -62,20 +111,9 @@ func waitForSTSReadiness(t *testing.T, c *envconf.Config, name string, expectedR
 			return true, nil
 		}
 		return false, nil
-	}, wait.WithTimeout(3*time.Minute), wait.WithInterval(10*time.Second))
+	}, wait.WithTimeout(5*time.Minute), wait.WithInterval(10*time.Second))
 	if err != nil {
 		t.Fatalf("StatefulSet %s failed to have %d ready replicas: %v", name, expectedReplicas, err)
-	}
-
-	// Additional wait for the StatefulSet to be fully ready
-	if err := wait.For(
-		conditions.New(c.Client().Resources()).ResourceScaled(&sts, func(object k8s.Object) int32 {
-			return sts.Status.ReadyReplicas
-		}, int32(expectedReplicas)),
-		wait.WithTimeout(3*time.Minute),
-		wait.WithInterval(10*time.Second),
-	); err != nil {
-		t.Fatalf("unable to create sts with size %d: %s", int32(expectedReplicas), err)
 	}
 }
 
@@ -125,5 +163,63 @@ func cleanupEtcdCluster(ctx context.Context, t *testing.T, c *envconf.Config, na
 		if err := c.Client().Resources().Delete(ctx, &etcdCluster); err != nil {
 			t.Logf("Failed to delete EtcdCluster: %v", err)
 		}
+	}
+}
+
+// EtcdMember represents an etcd cluster member
+type EtcdMember struct {
+	ID         uint64   `json:"ID"`
+	Name       string   `json:"name"`
+	PeerURLs   []string `json:"peerURLs"`
+	ClientURLs []string `json:"clientURLs"`
+}
+
+// EtcdMemberList represents the output of etcdctl member list -w json
+type EtcdMemberList struct {
+	Members []EtcdMember `json:"members"`
+}
+
+// getEtcdMembers retrieves the etcd cluster member list as structured data
+func getEtcdMembers(t *testing.T, c *envconf.Config, podName string) map[string]string {
+	t.Helper()
+	stdout, stderr, err := execInPod(t, c, podName, namespace, []string{"etcdctl", "member", "list", "-w", "json"})
+	if err != nil {
+		t.Fatalf("Failed to get etcd member list: %v, stderr: %s", err, stderr)
+	}
+
+	var memberList EtcdMemberList
+	if err := json.Unmarshal([]byte(stdout), &memberList); err != nil {
+		t.Fatalf("Failed to parse etcd member list JSON: %v", err)
+	}
+
+	// Create name->ID mapping
+	memberMap := make(map[string]string)
+	for _, member := range memberList.Members {
+		memberMap[member.Name] = fmt.Sprintf("%d", member.ID)
+	}
+	return memberMap
+}
+
+// verifyPodUsesPVC checks that a pod is using PVC for persistent storage
+func verifyPodUsesPVC(t *testing.T, c *envconf.Config, podName string, expectedPVCPrefix string) {
+	t.Helper()
+	var pod corev1.Pod
+	if err := c.Client().Resources().Get(t.Context(), podName, namespace, &pod); err != nil {
+		t.Fatalf("Failed to get pod %s: %v", podName, err)
+	}
+
+	// Check for PVC volumes
+	hasPVC := false
+	for _, volume := range pod.Spec.Volumes {
+		if volume.PersistentVolumeClaim != nil {
+			if strings.HasPrefix(volume.PersistentVolumeClaim.ClaimName, expectedPVCPrefix) {
+				hasPVC = true
+				break
+			}
+		}
+	}
+
+	if !hasPVC {
+		t.Errorf("Pod %s does not use expected PVC with prefix %s", podName, expectedPVCPrefix)
 	}
 }

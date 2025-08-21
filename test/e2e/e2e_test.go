@@ -143,7 +143,7 @@ func TestScaling(t *testing.T) {
 			etcdClusterName := fmt.Sprintf("etcd-%s", strings.ToLower(tc.name))
 
 			feature.Setup(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-				createEtcdCluster(ctx, t, c, etcdClusterName, tc.initialSize)
+				createEtcdClusterWithPVC(ctx, t, c, etcdClusterName, tc.initialSize)
 				waitForSTSReadiness(t, c, etcdClusterName, tc.initialSize)
 				return ctx
 			})
@@ -197,67 +197,104 @@ func TestScaling(t *testing.T) {
 	}
 }
 
-// TODO: TestPodRecovery is commented out - would like maintainer feedback on expected behavior
-//
-// When a Pod is deleted (simulating failure), the current controller behavior is:
-// 1. Detects targetReplicas (3) != memberCnt (2)
-// 2. Reduces StatefulSet replicas from 3 to 2 (lines 144-163 in etcdcluster_controller.go)
-// 3. This prevents Pod recovery since StatefulSet now expects only 2 replicas
-//
-// Question: Is this the intended behavior? Or would we expect:
-// - Pod deletion to be handled by StatefulSet (which recreates the Pod)
-// - Controller to only adjust replicas when EtcdCluster.Spec.Size changes
-//
-// Happy to open an issue for discussion or adjust the test based on design intent
-//
-// func TestPodRecovery(t *testing.T) {
-// 	feature := features.New("pod-recovery")
-// 	etcdClusterName := "etcd-recovery-test"
-//
-// 	feature.Setup(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-// 		createEtcdCluster(ctx, t, c, etcdClusterName, 3)
-// 		waitForStsReady(t, c, etcdClusterName, 3)
-// 		return ctx
-// 	})
-//
-// 	feature.Assess("delete pod and verify controller recovery",
-//		func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-// 		// Delete one pod to simulate failure
-// 		podName := fmt.Sprintf("%s-1", etcdClusterName)
-// 		var pod corev1.Pod
-// 		if err := c.Client().Resources().Get(ctx, podName, namespace, &pod); err != nil {
-// 			t.Fatalf("Failed to get pod: %v", err)
-// 		}
-//
-// 		if err := c.Client().Resources().Delete(ctx, &pod); err != nil {
-// 			t.Fatalf("Failed to delete pod: %v", err)
-// 		}
-//
-// 		// Wait for StatefulSet to recreate the pod
-// 		waitForStsReady(t, c, etcdClusterName, 3)
-//
-// 		// Verify etcd cluster still has 3 healthy members
-// 		podName = fmt.Sprintf("%s-0", etcdClusterName)
-// 		stdout, stderr, err := execInPod(t, c, podName, namespace, []string{"etcdctl", "member", "list"})
-// 		if err != nil {
-// 			t.Fatalf("Failed to list members after pod recovery: %v, stderr: %s", err, stderr)
-// 		}
-//
-// 		memberLines := strings.Split(strings.TrimSpace(stdout), "\n")
-// 		if len(memberLines) != 3 {
-// 			t.Errorf("Expected 3 members after pod recovery, got %d. Output: %s", len(memberLines), stdout)
-// 		}
-//
-// 		return ctx
-// 	})
-//
-// 	feature.Teardown(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-// 		cleanupEtcdCluster(ctx, t, c, etcdClusterName)
-// 		return ctx
-// 	})
-//
-// 	_ = testEnv.Test(t, feature.Feature())
-// }
+func TestPodRecovery(t *testing.T) {
+	feature := features.New("multi-node-pod-recovery")
+	etcdClusterName := "etcd-recovery-test"
+
+	feature.Setup(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+		createEtcdClusterWithPVC(ctx, t, c, etcdClusterName, 3)
+		waitForSTSReadiness(t, c, etcdClusterName, 3)
+		return ctx
+	})
+
+	feature.Assess("verify multi-node cluster recovery after pod deletion",
+		func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+			var sts appsv1.StatefulSet
+			if err := c.Client().Resources().Get(ctx, etcdClusterName, namespace, &sts); err != nil {
+				t.Fatalf("Failed to get StatefulSet: %v", err)
+			}
+
+			initialReplicas := *sts.Spec.Replicas
+			podName := fmt.Sprintf("%s-0", etcdClusterName)
+			targetPodName := fmt.Sprintf("%s-1", etcdClusterName)
+
+			// Verify PVC usage before test
+			verifyPodUsesPVC(t, c, targetPodName, "etcd-data-"+etcdClusterName)
+
+			// Get initial member IDs for consistency verification
+			initialMembers := getEtcdMembers(t, c, podName)
+			initialMemberCount := len(initialMembers)
+
+			// Delete one pod to simulate failure
+			var pod corev1.Pod
+			if err := c.Client().Resources().Get(ctx, targetPodName, namespace, &pod); err != nil {
+				t.Fatalf("Failed to get pod: %v", err)
+			}
+
+			deletedPodUID := pod.UID
+			if err := c.Client().Resources().Delete(ctx, &pod); err != nil {
+				t.Fatalf("Failed to delete pod: %v", err)
+			}
+
+			// Wait for pod recreation
+			if err := wait.For(func(ctx context.Context) (done bool, err error) {
+				var newPod corev1.Pod
+				if err := c.Client().Resources().Get(ctx, targetPodName, namespace, &newPod); err != nil {
+					return false, nil
+				}
+				return newPod.UID != deletedPodUID && newPod.Status.Phase == corev1.PodRunning, nil
+			}, wait.WithTimeout(3*time.Minute), wait.WithInterval(10*time.Second)); err != nil {
+				t.Fatalf("Pod failed to be recreated: %v", err)
+			}
+
+			// Wait for full StatefulSet readiness
+			waitForSTSReadiness(t, c, etcdClusterName, int(initialReplicas))
+
+			// Verify PVC usage after recovery
+			verifyPodUsesPVC(t, c, targetPodName, "etcd-data-"+etcdClusterName)
+
+			// Verify member ID consistency
+			finalMembers := getEtcdMembers(t, c, podName)
+			if len(finalMembers) != initialMemberCount {
+				t.Errorf("Member count changed after recovery: expected %d, got %d", initialMemberCount, len(finalMembers))
+			}
+
+			// Verify the recovered pod maintains the same member ID
+			if targetMemberID, exists := initialMembers[targetPodName]; exists {
+				if finalMemberID, exists := finalMembers[targetPodName]; exists {
+					if targetMemberID != finalMemberID {
+						t.Errorf("Member ID changed for %s: expected %s, got %s", targetPodName, targetMemberID, finalMemberID)
+					}
+				} else {
+					t.Errorf("Member %s not found after recovery", targetPodName)
+				}
+			}
+
+			// Verify cluster replication works across recovered pod
+			_, stderr, err := execInPod(t, c, podName, namespace, []string{"etcdctl", "put", "replication-test", "value"})
+			if err != nil {
+				t.Fatalf("Failed to write data after recovery: %v, stderr: %s", err, stderr)
+			}
+
+			stdout, stderr, err := execInPod(t, c, targetPodName, namespace, []string{"etcdctl", "get", "replication-test"})
+			if err != nil {
+				t.Fatalf("Failed to read data from recovered pod: %v, stderr: %s", err, stderr)
+			}
+
+			if !strings.Contains(stdout, "value") {
+				t.Errorf("Data replication to recovered pod failed. Expected 'value', got: %s", stdout)
+			}
+
+			return ctx
+		})
+
+	feature.Teardown(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+		cleanupEtcdCluster(ctx, t, c, etcdClusterName)
+		return ctx
+	})
+
+	_ = testEnv.Test(t, feature.Feature())
+}
 
 func TestEtcdClusterFunctionality(t *testing.T) {
 	feature := features.New("etcd-cluster-functionality")
@@ -266,7 +303,7 @@ func TestEtcdClusterFunctionality(t *testing.T) {
 	testValue := "test-value"
 
 	feature.Setup(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-		createEtcdCluster(ctx, t, c, etcdClusterName, 3)
+		createEtcdClusterWithPVC(ctx, t, c, etcdClusterName, 3)
 		waitForSTSReadiness(t, c, etcdClusterName, 3)
 		return ctx
 	})
