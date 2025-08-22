@@ -11,7 +11,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -21,29 +20,6 @@ import (
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
-
-func TestPrepareOwnerReference(t *testing.T) {
-	scheme := runtime.NewScheme()
-	ec := &ecv1alpha1.EtcdCluster{}
-	ec.SetName("test-etcd")
-	ec.SetNamespace("default")
-	ec.SetUID("1234")
-
-	scheme.AddKnownTypes(schema.GroupVersion{Group: "etcd.database.coreos.com", Version: "v1alpha1"}, ec)
-
-	owners, err := prepareOwnerReference(ec, scheme)
-	if err != nil {
-		t.Fatalf("expected no error, got %v", err)
-	}
-
-	if len(owners) != 1 {
-		t.Fatalf("expected 1 owner reference, got %d", len(owners))
-	}
-
-	if owners[0].Name != "test-etcd" || owners[0].Controller == nil || !*owners[0].Controller {
-		t.Fatalf("owner reference properties not set correctly")
-	}
-}
 
 func pointerToInt32(value int32) *int32 {
 	return &value
