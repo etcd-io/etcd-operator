@@ -7,7 +7,7 @@ toolchain go1.24.6
 require (
 	github.com/cert-manager/cert-manager v1.18.2
 	github.com/go-logr/logr v1.4.3
-	github.com/stretchr/testify v1.10.0
+	github.com/stretchr/testify v1.11.0
 	go.etcd.io/etcd/api/v3 v3.6.4
 	go.etcd.io/etcd/client/pkg/v3 v3.6.4
 	go.etcd.io/etcd/client/v3 v3.6.4
