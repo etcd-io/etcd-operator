@@ -167,21 +167,17 @@ func TestScaling(t *testing.T) {
 
 			feature.Assess("verify member list", func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
 				podName := fmt.Sprintf("%s-0", etcdClusterName)
-				stdout, stderr, err := execInPod(t, c, podName, namespace, []string{"etcdctl", "member", "list"})
-				if err != nil {
-					t.Fatalf("Failed to exec in pod: %v, stderr: %s", err, stderr)
-				}
+				ml := getEtcdMemberListPB(t, c, podName)
 
-				memberLines := strings.Split(strings.TrimSpace(stdout), "\n")
-				if len(memberLines) != tc.expectedMembers {
-					t.Errorf("Expected to find %d members in member list, but got %d. Output: %s",
-						tc.expectedMembers, len(memberLines), stdout)
+				if len(ml.Members) != tc.expectedMembers {
+					t.Errorf("Expected to find %d members in member list, but got %d",
+						tc.expectedMembers, len(ml.Members))
 				}
 
 				// Verify controller promoted all learners to voting members
-				for _, line := range memberLines {
-					if strings.Contains(line, "isLearner=true") {
-						t.Errorf("Found unpromoted learner after scaling completed: %s", line)
+				for _, m := range ml.Members {
+					if m.IsLearner {
+						t.Errorf("Found unpromoted learner after scaling completed: member %s (%d)", m.Name, m.ID)
 					}
 				}
 				return ctx
@@ -263,7 +259,7 @@ func TestPodRecovery(t *testing.T) {
 			if targetMemberID, exists := initialMembers[targetPodName]; exists {
 				if finalMemberID, exists := finalMembers[targetPodName]; exists {
 					if targetMemberID != finalMemberID {
-						t.Errorf("Member ID changed for %s: expected %s, got %s", targetPodName, targetMemberID, finalMemberID)
+						t.Errorf("Member ID changed for %s: expected %d, got %d", targetPodName, targetMemberID, finalMemberID)
 					}
 				} else {
 					t.Errorf("Member %s not found after recovery", targetPodName)
@@ -324,21 +320,14 @@ func TestEtcdClusterFunctionality(t *testing.T) {
 
 	feature.Assess("verify member list", func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
 		podName := fmt.Sprintf("%s-0", etcdClusterName)
-		command := []string{"etcdctl", "member", "list"}
-		stdout, stderr, err := execInPod(t, c, podName, namespace, command)
-		if err != nil {
-			t.Fatalf("Failed to list members: %v, stderr: %s", err, stderr)
+		ml := getEtcdMemberListPB(t, c, podName)
+		if len(ml.Members) != 3 {
+			t.Errorf("Expected 3 members, but got %d", len(ml.Members))
 		}
-
-		memberLines := strings.Split(strings.TrimSpace(stdout), "\n")
-		if len(memberLines) != 3 {
-			t.Errorf("Expected 3 members, but got %d. Output: %s", len(memberLines), stdout)
-		}
-
 		// Verify all members are voting members (not learners)
-		for _, line := range memberLines {
-			if strings.Contains(line, "isLearner=true") {
-				t.Errorf("Found learner member in healthy cluster: %s", line)
+		for _, m := range ml.Members {
+			if m.IsLearner {
+				t.Errorf("Found learner member in healthy cluster: member %s (%d)", m.Name, m.ID)
 			}
 		}
 		return ctx
@@ -368,25 +357,23 @@ func TestEtcdClusterFunctionality(t *testing.T) {
 		return ctx
 	})
 
-	feature.Assess("verify data replication across members",
+	feature.Assess("verify data consistency with hashkv",
 		func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-			// Read from a different pod to verify data replication
-			podName := fmt.Sprintf("%s-1", etcdClusterName)
-			command := []string{"etcdctl", "get", testKey}
-			stdout, stderr, err := execInPod(t, c, podName, namespace, command)
-			if err != nil {
-				t.Fatalf("Failed to read data from different member: %v, stderr: %s", err, stderr)
+			// Compute hashkv on each member locally and ensure all are equal
+			hashes := make(map[uint32]struct{})
+			for i := 0; i < 3; i++ {
+				podName := fmt.Sprintf("%s-%d", etcdClusterName, i)
+				resp := getLocalEndpointHashKV(t, c, podName)
+				hashes[resp.Hash] = struct{}{}
 			}
-
-			lines := strings.Split(strings.TrimSpace(stdout), "\n")
-			if len(lines) < 2 || lines[0] != testKey || lines[1] != testValue {
-				t.Errorf("Data not replicated properly. Expected [%s=%s], but got: %s", testKey, testValue, stdout)
+			if len(hashes) != 1 {
+				t.Errorf("Expected identical hashkv across all members, but got %d distinct hashes", len(hashes))
 			}
 
 			// Clean up - delete the key
-			podName = fmt.Sprintf("%s-0", etcdClusterName)
-			command = []string{"etcdctl", "del", testKey}
-			_, stderr, err = execInPod(t, c, podName, namespace, command)
+			podName := fmt.Sprintf("%s-0", etcdClusterName)
+			command := []string{"etcdctl", "del", testKey}
+			_, stderr, err := execInPod(t, c, podName, namespace, command)
 			if err != nil {
 				t.Fatalf("Failed to delete data: %v, stderr: %s", err, stderr)
 			}

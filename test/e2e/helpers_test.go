@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -35,6 +36,7 @@ import (
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
 
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
+	etcdserverpb "go.etcd.io/etcd/api/v3/etcdserverpb"
 )
 
 // getAvailableStorageClass returns an available StorageClass name
@@ -89,7 +91,6 @@ func createEtcdClusterWithPVC(ctx context.Context, t *testing.T, c *envconf.Conf
 			StorageSpec: &ecv1alpha1.StorageSpec{
 				AccessModes:       corev1.ReadWriteOnce,
 				StorageClassName:  storageClassName,
-				PVCName:           fmt.Sprintf("%s-pvc", name),
 				VolumeSizeRequest: resource.MustParse("64Mi"),
 				VolumeSizeLimit:   resource.MustParse("64Mi"),
 			},
@@ -166,38 +167,39 @@ func cleanupEtcdCluster(ctx context.Context, t *testing.T, c *envconf.Config, na
 	}
 }
 
-// EtcdMember represents an etcd cluster member
-type EtcdMember struct {
-	ID         uint64   `json:"ID"`
-	Name       string   `json:"name"`
-	PeerURLs   []string `json:"peerURLs"`
-	ClientURLs []string `json:"clientURLs"`
-}
-
-// EtcdMemberList represents the output of etcdctl member list -w json
-type EtcdMemberList struct {
-	Members []EtcdMember `json:"members"`
-}
-
-// getEtcdMembers retrieves the etcd cluster member list as structured data
-func getEtcdMembers(t *testing.T, c *envconf.Config, podName string) map[string]string {
+// getEtcdMembers retrieves the etcd cluster member list as name->ID mapping using etcd's native types
+func getEtcdMembers(t *testing.T, c *envconf.Config, podName string) map[string]uint64 {
 	t.Helper()
 	stdout, stderr, err := execInPod(t, c, podName, namespace, []string{"etcdctl", "member", "list", "-w", "json"})
 	if err != nil {
 		t.Fatalf("Failed to get etcd member list: %v, stderr: %s", err, stderr)
 	}
 
-	var memberList EtcdMemberList
+	var memberList etcdserverpb.MemberListResponse
 	if err := json.Unmarshal([]byte(stdout), &memberList); err != nil {
 		t.Fatalf("Failed to parse etcd member list JSON: %v", err)
 	}
 
 	// Create name->ID mapping
-	memberMap := make(map[string]string)
+	memberMap := make(map[string]uint64)
 	for _, member := range memberList.Members {
-		memberMap[member.Name] = fmt.Sprintf("%d", member.ID)
+		memberMap[member.Name] = member.ID
 	}
 	return memberMap
+}
+
+// getEtcdMemberListPB returns the etcdserverpb.MemberListResponse by calling etcdctl -w json.
+func getEtcdMemberListPB(t *testing.T, c *envconf.Config, podName string) *etcdserverpb.MemberListResponse {
+	t.Helper()
+	stdout, stderr, err := execInPod(t, c, podName, namespace, []string{"etcdctl", "member", "list", "-w", "json"})
+	if err != nil {
+		t.Fatalf("Failed to get etcd member list: %v, stderr: %s", err, stderr)
+	}
+	var memberList etcdserverpb.MemberListResponse
+	if err := json.Unmarshal([]byte(stdout), &memberList); err != nil {
+		t.Fatalf("Failed to parse etcd member list JSON: %v", err)
+	}
+	return &memberList
 }
 
 // verifyPodUsesPVC checks that a pod is using PVC for persistent storage
@@ -222,4 +224,61 @@ func verifyPodUsesPVC(t *testing.T, c *envconf.Config, podName string, expectedP
 	if !hasPVC {
 		t.Errorf("Pod %s does not use expected PVC with prefix %s", podName, expectedPVCPrefix)
 	}
+}
+
+// getLocalEndpointHashKV executes `etcdctl endpoint hashkv -w json` inside the given pod
+// and returns the parsed etcdserverpb.HashKVResponse from the local member.
+//
+// Supported JSON shapes (based on etcdctl versions):
+//  1. Single object: {"header":{...},"hash":...,"compact_revision":...,"hash_revision":...}
+//  2. Array with nested object: [{"Endpoint":"...","HashKV":{...}}]
+//  3. Array with flat fields:
+//     [{"Endpoint":"...", "hash":..., "compact_revision":...,
+//     "hash_revision":..., "header":{...}}]
+func getLocalEndpointHashKV(t *testing.T, c *envconf.Config, podName string) *etcdserverpb.HashKVResponse {
+	t.Helper()
+	stdout, stderr, err := execInPod(t, c, podName, namespace, []string{"etcdctl", "endpoint", "hashkv", "-w", "json"})
+	if err != nil {
+		t.Fatalf("Failed to get endpoint hashkv from %s: %v, stderr: %s", podName, err, stderr)
+	}
+
+	// Case 1: direct single-object response
+	var direct etcdserverpb.HashKVResponse
+	if err := json.Unmarshal([]byte(stdout), &direct); err == nil &&
+		(direct.Hash != 0 || direct.HashRevision != 0 ||
+			direct.CompactRevision != 0 || direct.Header != nil) {
+		return &direct
+	}
+
+	// Case 2/3: array responses
+	var elems []json.RawMessage
+	if err := json.Unmarshal([]byte(stdout), &elems); err == nil && len(elems) > 0 {
+		// 2) Nested HashKV under capitalized key
+		var nested struct {
+			Endpoint string                      `json:"Endpoint"`
+			HashKV   etcdserverpb.HashKVResponse `json:"HashKV"`
+		}
+		if err := json.Unmarshal(elems[0], &nested); err == nil &&
+			(nested.HashKV.Hash != 0 || nested.HashKV.HashRevision != 0 ||
+				nested.HashKV.CompactRevision != 0 || nested.HashKV.Header != nil) {
+			return &nested.HashKV
+		}
+		// 3) Flat fields at element level (unknown keys ignored)
+		var flat etcdserverpb.HashKVResponse
+		if err := json.Unmarshal(elems[0], &flat); err == nil &&
+			(flat.Hash != 0 || flat.HashRevision != 0 ||
+				flat.CompactRevision != 0 || flat.Header != nil) {
+			return &flat
+		}
+	}
+
+	t.Fatalf("Failed to parse endpoint hashkv JSON from %s. Raw: %s", podName, truncate(stdout, 512))
+	return nil
+}
+
+func truncate(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "..." + "(truncated " + strconv.Itoa(len(s)) + " bytes)"
 }
