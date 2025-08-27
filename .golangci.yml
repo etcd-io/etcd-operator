@@ -1,16 +1,23 @@
+version: "2"
+
 run:
   timeout: 5m
   allow-parallel-runners: true
 formatters:
   enable:
     - gci
+    - gofmt
+    - goimports
   settings: # please keep this alphabetized
     gci:
+      skip-generated: true
+      custom-order: true
       sections:
         - standard
         - default
         - prefix(go.etcd.io)
-        - skipGenerated
+    goimports:
+      local-prefixes: go.etcd.io
 issues:
   # don't skip warning about doc comments
   # don't exclude the default set of lint
@@ -33,9 +40,6 @@ linters:
     - errcheck
     - goconst
     - gocyclo
-    - gofmt
-    - goimports
-    - gosimple
     - govet
     - ineffassign
     - lll
@@ -44,22 +48,12 @@ linters:
     - prealloc
     - revive
     - staticcheck
-    - typecheck
     - unconvert
     - unparam
     - unused
     - usetesting
 
 linters-settings:
-  gci:
-    skipGenerated: true
-    preserveComments: true
-    customOrder:
-      - std
-      - default
-      - prefix(go.etcd.io)
-  goimports:
-    local-prefixes: go.etcd.io # Put imports beginning with prefix after 3rd-party packages.
   revive:
     rules:
       - name: comment-spacings
