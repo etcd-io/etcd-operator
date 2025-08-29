@@ -68,7 +68,7 @@ func TestInvalidClusterSize(t *testing.T) {
 		feature.Setup(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
 
 			// update cluster name
-			etcdClusterSpec.ObjectMeta.Name = strings.Join([]string{etcdClusterName, name}, "-")
+			etcdClusterSpec.Name = strings.Join([]string{etcdClusterName, name}, "-")
 			etcdClusterSpec.Spec.Size = size
 
 			err := c.Client().Resources().Create(ctx, etcdClusterSpec)

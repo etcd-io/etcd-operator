@@ -9,12 +9,11 @@ import (
 	certv1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apiextensionsV1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
 	"sigs.k8s.io/e2e-framework/pkg/features"
-
-	apiextensionsV1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 
 	"go.etcd.io/etcd-operator/pkg/certificate/cert_manager"
 	interfaces "go.etcd.io/etcd-operator/pkg/certificate/interfaces"
