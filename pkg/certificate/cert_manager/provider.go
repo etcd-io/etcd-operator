@@ -251,10 +251,10 @@ func (cm *CertManagerProvider) checkCertificateStatus(certificateName, namespace
 				condition.Status, condition.Reason, condition.Message)
 			return nil
 		case certmanagerv1.CertificateConditionIssuing:
-			return fmt.Errorf("certificate Issuing: %v (Reason: %s, Message: %s), error: %w \n",
+			return fmt.Errorf("certificate Issuing: %v (Reason: %s, Message: %s), error: %w",
 				condition.Status, condition.Reason, condition.Message, interfaces.ErrPending)
 		default:
-			return fmt.Errorf("certificate status unknown: %v (Reason: %s, Message: %s), error: %w\n",
+			return fmt.Errorf("certificate status unknown: %v (Reason: %s, Message: %s), error: %w",
 				condition.Status, condition.Reason, condition.Message, interfaces.ErrUnknown)
 		}
 	}
