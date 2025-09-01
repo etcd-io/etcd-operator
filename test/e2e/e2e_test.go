@@ -306,29 +306,31 @@ func TestEtcdClusterFunctionality(t *testing.T) {
 
 	feature.Assess("verify cluster health", func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
 		podName := fmt.Sprintf("%s-0", etcdClusterName)
-		command := []string{"etcdctl", "endpoint", "health"}
+
+		// Wait until all members are promoted to voting members (no learners),
+		// otherwise endpoint health will fail on learners.
+		waitForNoLearners(t, c, podName, 3)
+
+		// Check health for the whole cluster rather than a single member
+		command := []string{"etcdctl", "endpoint", "health", "--cluster"}
 		stdout, stderr, err := execInPod(t, c, podName, namespace, command)
 		if err != nil {
 			t.Fatalf("Failed to check endpoint health: %v, stderr: %s", err, stderr)
 		}
 
-		if !strings.Contains(stdout, "is healthy") {
-			t.Errorf("Expected healthy endpoints, but got: %s", stdout)
-		}
-		return ctx
-	})
-
-	feature.Assess("verify member list", func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-		podName := fmt.Sprintf("%s-0", etcdClusterName)
+		// Determine expected members dynamically from member list
 		ml := getEtcdMemberListPB(t, c, podName)
-		if len(ml.Members) != 3 {
-			t.Errorf("Expected 3 members, but got %d", len(ml.Members))
-		}
-		// Verify all members are voting members (not learners)
-		for _, m := range ml.Members {
-			if m.IsLearner {
-				t.Errorf("Found learner member in healthy cluster: member %s (%d)", m.Name, m.ID)
+		expected := len(ml.Members)
+
+		// Count healthy lines; expect all members are healthy
+		healthy := 0
+		for _, line := range strings.Split(strings.TrimSpace(stdout), "\n") {
+			if strings.Contains(line, "is healthy") {
+				healthy++
 			}
+		}
+		if healthy != expected {
+			t.Errorf("Expected %d healthy endpoints, but got %d. Output: %s", expected, healthy, stdout)
 		}
 		return ctx
 	})
@@ -359,19 +361,22 @@ func TestEtcdClusterFunctionality(t *testing.T) {
 
 	feature.Assess("verify data consistency with hashkv",
 		func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-			// Compute hashkv on each member locally and ensure all are equal
+			// Use --cluster to fetch hashkv from all members in one call
+			podName := fmt.Sprintf("%s-0", etcdClusterName)
+			responses := getClusterEndpointHashKVs(t, c, podName)
+			if len(responses) != 3 {
+				t.Errorf("Expected 3 hashkv responses, got %d", len(responses))
+			}
+
 			hashes := make(map[uint32]struct{})
-			for i := 0; i < 3; i++ {
-				podName := fmt.Sprintf("%s-%d", etcdClusterName, i)
-				resp := getLocalEndpointHashKV(t, c, podName)
-				hashes[resp.Hash] = struct{}{}
+			for _, r := range responses {
+				hashes[r.Hash] = struct{}{}
 			}
 			if len(hashes) != 1 {
 				t.Errorf("Expected identical hashkv across all members, but got %d distinct hashes", len(hashes))
 			}
 
 			// Clean up - delete the key
-			podName := fmt.Sprintf("%s-0", etcdClusterName)
 			command := []string{"etcdctl", "del", testKey}
 			_, stderr, err := execInPod(t, c, podName, namespace, command)
 			if err != nil {

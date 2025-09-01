@@ -202,6 +202,27 @@ func getEtcdMemberListPB(t *testing.T, c *envconf.Config, podName string) *etcds
 	return &memberList
 }
 
+// waitForNoLearners waits until the member list has the expected number of members
+// and all members are voting (i.e., no learners remain).
+func waitForNoLearners(t *testing.T, c *envconf.Config, podName string, expectedMembers int) {
+	t.Helper()
+	err := wait.For(func(ctx context.Context) (bool, error) {
+		ml := getEtcdMemberListPB(t, c, podName)
+		if len(ml.Members) != expectedMembers {
+			return false, nil
+		}
+		for _, m := range ml.Members {
+			if m.IsLearner {
+				return false, nil
+			}
+		}
+		return true, nil
+	}, wait.WithTimeout(3*time.Minute), wait.WithInterval(5*time.Second))
+	if err != nil {
+		t.Fatalf("Timeout waiting for %d voting members with no learners: %v", expectedMembers, err)
+	}
+}
+
 // verifyPodUsesPVC checks that a pod is using PVC for persistent storage
 func verifyPodUsesPVC(t *testing.T, c *envconf.Config, podName string, expectedPVCPrefix string) {
 	t.Helper()
@@ -226,54 +247,29 @@ func verifyPodUsesPVC(t *testing.T, c *envconf.Config, podName string, expectedP
 	}
 }
 
-// getLocalEndpointHashKV executes `etcdctl endpoint hashkv -w json` inside the given pod
-// and returns the parsed etcdserverpb.HashKVResponse from the local member.
-//
-// Supported JSON shapes (based on etcdctl versions):
-//  1. Single object: {"header":{...},"hash":...,"compact_revision":...,"hash_revision":...}
-//  2. Array with nested object: [{"Endpoint":"...","HashKV":{...}}]
-//  3. Array with flat fields:
-//     [{"Endpoint":"...", "hash":..., "compact_revision":...,
-//     "hash_revision":..., "header":{...}}]
-func getLocalEndpointHashKV(t *testing.T, c *envconf.Config, podName string) *etcdserverpb.HashKVResponse {
+// getClusterEndpointHashKVs executes `etcdctl endpoint hashkv --cluster -w json` inside the given pod
+// and returns the parsed HashKV responses from all known endpoints using etcd's native types.
+func getClusterEndpointHashKVs(t *testing.T, c *envconf.Config, podName string) []etcdserverpb.HashKVResponse {
 	t.Helper()
-	stdout, stderr, err := execInPod(t, c, podName, namespace, []string{"etcdctl", "endpoint", "hashkv", "-w", "json"})
+	cmd := []string{"etcdctl", "endpoint", "hashkv", "--cluster", "-w", "json"}
+	stdout, stderr, err := execInPod(t, c, podName, namespace, cmd)
 	if err != nil {
-		t.Fatalf("Failed to get endpoint hashkv from %s: %v, stderr: %s", podName, err, stderr)
+		t.Fatalf("Failed to get cluster endpoint hashkv from %s: %v, stderr: %s", podName, err, stderr)
 	}
 
-	// Case 1: direct single-object response
-	var direct etcdserverpb.HashKVResponse
-	if err := json.Unmarshal([]byte(stdout), &direct); err == nil &&
-		(direct.Hash != 0 || direct.HashRevision != 0 ||
-			direct.CompactRevision != 0 || direct.Header != nil) {
-		return &direct
+	// Expected JSON: array of objects like {"Endpoint":"...","HashKV":{...}}
+	var entries []struct {
+		Endpoint string                      `json:"Endpoint"`
+		HashKV   etcdserverpb.HashKVResponse `json:"HashKV"`
 	}
-
-	// Case 2/3: array responses
-	var elems []json.RawMessage
-	if err := json.Unmarshal([]byte(stdout), &elems); err == nil && len(elems) > 0 {
-		// 2) Nested HashKV under capitalized key
-		var nested struct {
-			Endpoint string                      `json:"Endpoint"`
-			HashKV   etcdserverpb.HashKVResponse `json:"HashKV"`
-		}
-		if err := json.Unmarshal(elems[0], &nested); err == nil &&
-			(nested.HashKV.Hash != 0 || nested.HashKV.HashRevision != 0 ||
-				nested.HashKV.CompactRevision != 0 || nested.HashKV.Header != nil) {
-			return &nested.HashKV
-		}
-		// 3) Flat fields at element level (unknown keys ignored)
-		var flat etcdserverpb.HashKVResponse
-		if err := json.Unmarshal(elems[0], &flat); err == nil &&
-			(flat.Hash != 0 || flat.HashRevision != 0 ||
-				flat.CompactRevision != 0 || flat.Header != nil) {
-			return &flat
-		}
+	if err := json.Unmarshal([]byte(stdout), &entries); err != nil {
+		t.Fatalf("Failed to parse endpoint hashkv JSON: %v. Raw: %s", err, truncate(stdout, 512))
 	}
-
-	t.Fatalf("Failed to parse endpoint hashkv JSON from %s. Raw: %s", podName, truncate(stdout, 512))
-	return nil
+	out := make([]etcdserverpb.HashKVResponse, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, e.HashKV)
+	}
+	return out
 }
 
 func truncate(s string, max int) string {
