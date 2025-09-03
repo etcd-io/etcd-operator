@@ -19,9 +19,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/klog/v2"
-	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
@@ -40,25 +38,6 @@ const (
 	etcdClusterStateNew      etcdClusterState = "new"
 	etcdClusterStateExisting etcdClusterState = "existing"
 )
-
-func prepareOwnerReference(ec *ecv1alpha1.EtcdCluster, scheme *runtime.Scheme) ([]metav1.OwnerReference, error) {
-	gvk, err := apiutil.GVKForObject(ec, scheme)
-	if err != nil {
-		return []metav1.OwnerReference{}, err
-	}
-	ref := metav1.OwnerReference{
-		APIVersion:         gvk.GroupVersion().String(),
-		Kind:               gvk.Kind,
-		Name:               ec.GetName(),
-		UID:                ec.GetUID(),
-		BlockOwnerDeletion: ptr.To(true),
-		Controller:         ptr.To(true),
-	}
-
-	var owners []metav1.OwnerReference
-	owners = append(owners, ref)
-	return owners, nil
-}
 
 func reconcileStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1alpha1.EtcdCluster, c client.Client, replicas int32, scheme *runtime.Scheme) (*appsv1.StatefulSet, error) {
 
@@ -148,18 +127,13 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 		"controller": ec.Name,
 	}
 
-	// Create a new controller ref.
-	owners, err := prepareOwnerReference(ec, scheme)
-	if err != nil {
-		return err
-	}
 	podSpec := corev1.PodSpec{
 		Containers: []corev1.Container{
 			{
 				Name:    "etcd",
 				Command: []string{"/usr/local/bin/etcd"},
 				Args:    createArgs(ec.Name, ec.Spec.EtcdOptions),
-				Image:   fmt.Sprintf("gcr.io/etcd-development/etcd:%s", ec.Spec.Version),
+				Image:   fmt.Sprintf("%s:%s", ec.Spec.ImageRegistry, ec.Spec.Version),
 				Env: []corev1.EnvVar{
 					{
 						Name: "POD_NAME",
@@ -253,11 +227,6 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 			ec.Spec.StorageSpec.VolumeSizeLimit = ec.Spec.StorageSpec.VolumeSizeRequest
 		}
 
-		pvcObjectMeta := metav1.ObjectMeta{
-			Name:            volumeName,
-			OwnerReferences: owners,
-		}
-
 		pvcResources := corev1.VolumeResourceRequirements{
 			Requests: corev1.ResourceList{
 				corev1.ResourceStorage: ec.Spec.StorageSpec.VolumeSizeRequest,
@@ -271,7 +240,7 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 		case corev1.ReadWriteOnce, "":
 			stsSpec.VolumeClaimTemplates = []corev1.PersistentVolumeClaim{
 				{
-					ObjectMeta: pvcObjectMeta,
+					ObjectMeta: metav1.ObjectMeta{Name: volumeName},
 					Spec: corev1.PersistentVolumeClaimSpec{
 						AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
 						Resources:   pvcResources,
@@ -300,14 +269,19 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 	}
 
 	logger.Info("Now creating/updating statefulset", "name", ec.Name, "namespace", ec.Namespace, "replicas", replicas)
-	_, err = controllerutil.CreateOrPatch(ctx, c, sts, func() error {
+	_, err := controllerutil.CreateOrPatch(ctx, c, sts, func() error {
 		// Define or update the desired spec
 		sts.ObjectMeta = metav1.ObjectMeta{
-			Name:            ec.Name,
-			Namespace:       ec.Namespace,
-			OwnerReferences: owners,
+			Name:      ec.Name,
+			Namespace: ec.Namespace,
 		}
 		sts.Spec = stsSpec
+
+		// Set ower reference
+		if err := controllerutil.SetControllerReference(ec, sts, scheme); err != nil {
+			return err
+		}
+
 		return nil
 	})
 	if err != nil {
@@ -360,10 +334,7 @@ func createHeadlessServiceIfNotExist(ctx context.Context, logger logr.Logger, c 
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
 			logger.Info("Headless service does not exist. Creating headless service")
-			owners, err1 := prepareOwnerReference(ec, scheme)
-			if err1 != nil {
-				return err1
-			}
+
 			labels := map[string]string{
 				"app":        ec.Name,
 				"controller": ec.Name,
@@ -371,20 +342,26 @@ func createHeadlessServiceIfNotExist(ctx context.Context, logger logr.Logger, c 
 			// Create the headless service
 			headlessSvc := &corev1.Service{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:            ec.Name,
-					Namespace:       ec.Namespace,
-					Labels:          labels,
-					OwnerReferences: owners,
+					Name:      ec.Name,
+					Namespace: ec.Namespace,
+					Labels:    labels,
 				},
 				Spec: corev1.ServiceSpec{
 					ClusterIP: "None", // Key for headless service
 					Selector:  labels,
 				},
 			}
+
+			// Set owner reference
+			if err := controllerutil.SetControllerReference(ec, headlessSvc, scheme); err != nil {
+				return err
+			}
+
 			if createErr := c.Create(ctx, headlessSvc); createErr != nil {
 				return fmt.Errorf("failed to create headless service: %w", createErr)
 			}
 			logger.Info("Headless service created successfully")
+
 			return nil
 		}
 		return fmt.Errorf("failed to get headless service: %w", err)
@@ -440,16 +417,13 @@ func newEtcdClusterState(ec *ecv1alpha1.EtcdCluster, replica int) *corev1.Config
 func applyEtcdClusterState(ctx context.Context, ec *ecv1alpha1.EtcdCluster, replica int, c client.Client, scheme *runtime.Scheme, logger logr.Logger) error {
 	cm := newEtcdClusterState(ec, replica)
 
-	// Create a new controller ref.
-	owners, err := prepareOwnerReference(ec, scheme)
-	if err != nil {
+	// Set owner reference
+	if err := controllerutil.SetControllerReference(ec, cm, scheme); err != nil {
 		return err
 	}
 
-	cm.OwnerReferences = owners
-
 	logger.Info("Now updating configmap", "name", configMapNameForEtcdCluster(ec), "namespace", ec.Namespace)
-	err = c.Get(ctx, types.NamespacedName{Name: configMapNameForEtcdCluster(ec), Namespace: ec.Namespace}, &corev1.ConfigMap{})
+	err := c.Get(ctx, types.NamespacedName{Name: configMapNameForEtcdCluster(ec), Namespace: ec.Namespace}, &corev1.ConfigMap{})
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
 			createErr := c.Create(ctx, cm)
