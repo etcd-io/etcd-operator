@@ -46,8 +46,8 @@ spec:
                 items:
                   type: string
                 type: array
-              podSpec:
-                description: PodSpec is the pod spec to use for the etcd cluster.
+              podTemplate:
+                description: PodTemplate is the pod template to use for the etcd cluster.
                 properties:
                   annotations:
                     additionalProperties:

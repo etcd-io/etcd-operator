@@ -517,7 +517,7 @@ func TestCreateOrPatchStatefulSetWithPodAnnotations(t *testing.T) {
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
 
 	t.Run("creates statefulset with pod annotations", func(t *testing.T) {
-		// Create an EtcdCluster instance with PodSpec annotations
+		// Create an EtcdCluster instance with PodTemplate annotations
 		ec := &ecv1alpha1.EtcdCluster{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test-etcd",
@@ -526,10 +526,12 @@ func TestCreateOrPatchStatefulSetWithPodAnnotations(t *testing.T) {
 			Spec: ecv1alpha1.EtcdClusterSpec{
 				Size:    3,
 				Version: "3.5.17",
-				PodSpec: &ecv1alpha1.PodSpec{
-					Annotations: map[string]string{
-						"prometheus.io/scrape": "true",
-						"prometheus.io/port":   "2379",
+				PodTemplate: &ecv1alpha1.PodTemplate{
+					Metadata: &ecv1alpha1.PodMetadata{
+						Annotations: map[string]string{
+							"prometheus.io/scrape": "true",
+							"prometheus.io/port":   "2379",
+						},
 					},
 				},
 			},
@@ -551,17 +553,17 @@ func TestCreateOrPatchStatefulSetWithPodAnnotations(t *testing.T) {
 		assert.Equal(t, expectedAnnotations, sts.Spec.Template.Annotations)
 	})
 
-	t.Run("creates statefulset without pod annotations when PodSpec is nil", func(t *testing.T) {
-		// Create an EtcdCluster instance without PodSpec
+	t.Run("creates statefulset without pod annotations when PodTemplate is nil", func(t *testing.T) {
+		// Create an EtcdCluster instance without PodTemplate
 		ec := &ecv1alpha1.EtcdCluster{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      "test-etcd-no-podspec",
+				Name:      "test-etcd-no-podtemplate",
 				Namespace: "default",
 			},
 			Spec: ecv1alpha1.EtcdClusterSpec{
-				Size:    3,
-				Version: "3.5.17",
-				PodSpec: nil,
+				Size:        3,
+				Version:     "3.5.17",
+				PodTemplate: nil,
 			},
 		}
 
@@ -570,7 +572,7 @@ func TestCreateOrPatchStatefulSetWithPodAnnotations(t *testing.T) {
 
 		// Verify that the StatefulSet was created without annotations
 		sts := &appsv1.StatefulSet{}
-		err = fakeClient.Get(ctx, client.ObjectKey{Name: "test-etcd-no-podspec", Namespace: "default"}, sts)
+		err = fakeClient.Get(ctx, client.ObjectKey{Name: "test-etcd-no-podtemplate", Namespace: "default"}, sts)
 		assert.NoError(t, err)
 
 		// Check that pod template has no annotations
@@ -578,7 +580,7 @@ func TestCreateOrPatchStatefulSetWithPodAnnotations(t *testing.T) {
 	})
 
 	t.Run("creates statefulset without pod annotations when annotations are empty", func(t *testing.T) {
-		// Create an EtcdCluster instance with empty PodSpec annotations
+		// Create an EtcdCluster instance with empty PodTemplate annotations
 		ec := &ecv1alpha1.EtcdCluster{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test-etcd-empty-annotations",
@@ -587,8 +589,10 @@ func TestCreateOrPatchStatefulSetWithPodAnnotations(t *testing.T) {
 			Spec: ecv1alpha1.EtcdClusterSpec{
 				Size:    3,
 				Version: "3.5.17",
-				PodSpec: &ecv1alpha1.PodSpec{
-					Annotations: map[string]string{},
+				PodTemplate: &ecv1alpha1.PodTemplate{
+					Metadata: &ecv1alpha1.PodMetadata{
+						Annotations: map[string]string{},
+					},
 				},
 			},
 		}

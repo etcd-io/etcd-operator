@@ -43,13 +43,18 @@ type EtcdClusterSpec struct {
 	TLS *TLSCertificate `json:"tls,omitempty"`
 	// etcd configuration options are passed as command line arguments to the etcd container, refer to etcd documentation for configuration options applicable for the version of etcd being used.
 	EtcdOptions []string `json:"etcdOptions,omitempty"`
-	// PodSpec is the pod spec to use for the etcd cluster.
-	PodSpec *PodSpec `json:"podSpec,omitempty"`
+	// PodTemplate is the pod template to use for the etcd cluster.
+	PodTemplate *PodTemplate `json:"podTemplate,omitempty"`
 }
 
-type PodSpec struct {
-	// Annotations is the annotations to add to the pod.
+type PodTemplate struct {
+	// Metadata is the metadata to add to the pod.
+	Metadata *PodMetadata `json:"metadata,omitempty"`
+}
+
+type PodMetadata struct {
 	Annotations map[string]string `json:"annotations,omitempty"`
+	Labels      map[string]string `json:"labels,omitempty"`
 }
 
 type TLSCertificate struct {
