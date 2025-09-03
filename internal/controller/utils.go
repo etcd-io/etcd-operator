@@ -177,16 +177,14 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 
 	// Prepare pod template metadata
 	podTemplateMetadata := metav1.ObjectMeta{
-		Labels: labels,
+		Labels:      make(map[string]string),
+		Annotations: make(map[string]string),
 	}
 
 	// Apply custom metadata from PodTemplate if provided
 	if ec.Spec.PodTemplate != nil && ec.Spec.PodTemplate.Metadata != nil {
 		// Apply custom labels (merge with default labels)
 		if len(ec.Spec.PodTemplate.Metadata.Labels) > 0 {
-			if podTemplateMetadata.Labels == nil {
-				podTemplateMetadata.Labels = make(map[string]string)
-			}
 			for key, value := range ec.Spec.PodTemplate.Metadata.Labels {
 				podTemplateMetadata.Labels[key] = value
 			}
@@ -196,6 +194,10 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 		if len(ec.Spec.PodTemplate.Metadata.Annotations) > 0 {
 			podTemplateMetadata.Annotations = ec.Spec.PodTemplate.Metadata.Annotations
 		}
+	}
+
+	for key, value := range labels {
+		podTemplateMetadata.Labels[key] = value
 	}
 
 	stsSpec := appsv1.StatefulSetSpec{
