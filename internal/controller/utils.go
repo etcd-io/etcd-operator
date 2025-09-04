@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -183,11 +184,9 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 
 	// Apply custom metadata from PodTemplate if provided
 	if ec.Spec.PodTemplate != nil && ec.Spec.PodTemplate.Metadata != nil {
-		// Apply custom labels (merge with default labels)
+		// Apply custom labels
 		if len(ec.Spec.PodTemplate.Metadata.Labels) > 0 {
-			for key, value := range ec.Spec.PodTemplate.Metadata.Labels {
-				podTemplateMetadata.Labels[key] = value
-			}
+			maps.Copy(podTemplateMetadata.Labels, ec.Spec.PodTemplate.Metadata.Labels)
 		}
 
 		// Apply annotations
@@ -196,9 +195,8 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 		}
 	}
 
-	for key, value := range labels {
-		podTemplateMetadata.Labels[key] = value
-	}
+	// Apply default labels
+	maps.Copy(podTemplateMetadata.Labels, labels)
 
 	stsSpec := appsv1.StatefulSetSpec{
 		Replicas:    &replicas,
