@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -175,6 +176,28 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 		},
 	}
 
+	// Prepare pod template metadata
+	podTemplateMetadata := metav1.ObjectMeta{
+		Labels:      make(map[string]string),
+		Annotations: make(map[string]string),
+	}
+
+	// Apply custom metadata from PodTemplate if provided
+	if ec.Spec.PodTemplate != nil && ec.Spec.PodTemplate.Metadata != nil {
+		// Apply custom labels
+		if len(ec.Spec.PodTemplate.Metadata.Labels) > 0 {
+			maps.Copy(podTemplateMetadata.Labels, ec.Spec.PodTemplate.Metadata.Labels)
+		}
+
+		// Apply annotations
+		if len(ec.Spec.PodTemplate.Metadata.Annotations) > 0 {
+			podTemplateMetadata.Annotations = ec.Spec.PodTemplate.Metadata.Annotations
+		}
+	}
+
+	// Apply default labels
+	maps.Copy(podTemplateMetadata.Labels, labels)
+
 	stsSpec := appsv1.StatefulSetSpec{
 		Replicas:    &replicas,
 		ServiceName: ec.Name,
@@ -182,10 +205,8 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 			MatchLabels: labels,
 		},
 		Template: corev1.PodTemplateSpec{
-			ObjectMeta: metav1.ObjectMeta{
-				Labels: labels,
-			},
-			Spec: podSpec,
+			ObjectMeta: podTemplateMetadata,
+			Spec:       podSpec,
 		},
 	}
 

@@ -479,6 +479,208 @@ func TestApplyEtcdClusterState(t *testing.T) {
 	})
 }
 
+func TestCreateOrPatchStatefulSetWithPodAnnotations(t *testing.T) {
+	ctx := t.Context()
+	logger := log.FromContext(ctx)
+
+	// Create a scheme and register the necessary types
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = ecv1alpha1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+
+	tests := []struct {
+		name                string
+		etcdClusterName     string
+		podTemplate         *ecv1alpha1.PodTemplate
+		expectedAnnotations map[string]string
+		expectNil           bool
+	}{
+		{
+			name:            "creates statefulset with pod annotations",
+			etcdClusterName: "test-etcd",
+			podTemplate: &ecv1alpha1.PodTemplate{
+				Metadata: &ecv1alpha1.PodMetadata{
+					Annotations: map[string]string{
+						"prometheus.io/scrape": "true",
+						"prometheus.io/port":   "2379",
+					},
+				},
+			},
+			expectedAnnotations: map[string]string{
+				"prometheus.io/scrape": "true",
+				"prometheus.io/port":   "2379",
+			},
+			expectNil: false,
+		},
+		{
+			name:                "creates statefulset without pod annotations when PodTemplate is nil",
+			etcdClusterName:     "test-etcd-no-podtemplate",
+			podTemplate:         nil,
+			expectedAnnotations: nil,
+			expectNil:           true,
+		},
+		{
+			name:            "creates statefulset without pod annotations when annotations are empty",
+			etcdClusterName: "test-etcd-empty-annotations",
+			podTemplate: &ecv1alpha1.PodTemplate{
+				Metadata: &ecv1alpha1.PodMetadata{
+					Annotations: map[string]string{},
+				},
+			},
+			expectedAnnotations: nil,
+			expectNil:           true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create a fake client for each test case to avoid interference
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+			// Create an EtcdCluster instance
+			ec := &ecv1alpha1.EtcdCluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      tt.etcdClusterName,
+					Namespace: "default",
+				},
+				Spec: ecv1alpha1.EtcdClusterSpec{
+					Size:        3,
+					Version:     "3.5.17",
+					PodTemplate: tt.podTemplate,
+				},
+			}
+
+			err := createOrPatchStatefulSet(ctx, logger, ec, fakeClient, 3, scheme)
+			assert.NoError(t, err)
+
+			// Verify that the StatefulSet was created
+			sts := &appsv1.StatefulSet{}
+			err = fakeClient.Get(ctx, client.ObjectKey{Name: tt.etcdClusterName, Namespace: "default"}, sts)
+			assert.NoError(t, err)
+
+			// Check annotations
+			if tt.expectNil {
+				assert.Nil(t, sts.Spec.Template.Annotations)
+			} else {
+				assert.Equal(t, tt.expectedAnnotations, sts.Spec.Template.Annotations)
+			}
+		})
+	}
+}
+
+func TestCreateOrPatchStatefulSetWithPodLabels(t *testing.T) {
+	ctx := t.Context()
+	logger := log.FromContext(ctx)
+
+	// Create a scheme and register the necessary types
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = ecv1alpha1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+
+	tests := []struct {
+		name            string
+		etcdClusterName string
+		podTemplate     *ecv1alpha1.PodTemplate
+		expectedLabels  map[string]string
+	}{
+		{
+			name:            "creates statefulset with pod labels merged with default labels",
+			etcdClusterName: "test-etcd",
+			podTemplate: &ecv1alpha1.PodTemplate{
+				Metadata: &ecv1alpha1.PodMetadata{
+					Labels: map[string]string{
+						"environment": "production",
+						"version":     "v1.0.0",
+						"team":        "platform",
+					},
+				},
+			},
+			expectedLabels: map[string]string{
+				// Default labels that should always be present
+				"app":        "test-etcd",
+				"controller": "test-etcd",
+				// Custom labels from PodTemplate
+				"environment": "production",
+				"version":     "v1.0.0",
+				"team":        "platform",
+			},
+		},
+		{
+			name:            "creates statefulset with default labels when PodTemplate is nil",
+			etcdClusterName: "test-etcd-no-podtemplate",
+			podTemplate:     nil,
+			expectedLabels: map[string]string{
+				"app":        "test-etcd-no-podtemplate",
+				"controller": "test-etcd-no-podtemplate",
+			},
+		},
+		{
+			name:            "creates statefulset with default labels when labels are empty",
+			etcdClusterName: "test-etcd-empty-labels",
+			podTemplate: &ecv1alpha1.PodTemplate{
+				Metadata: &ecv1alpha1.PodMetadata{
+					Labels: map[string]string{},
+				},
+			},
+			expectedLabels: map[string]string{
+				"app":        "test-etcd-empty-labels",
+				"controller": "test-etcd-empty-labels",
+			},
+		},
+		{
+			name:            "default labels override custom labels when same key exists",
+			etcdClusterName: "test-etcd-override",
+			podTemplate: &ecv1alpha1.PodTemplate{
+				Metadata: &ecv1alpha1.PodMetadata{
+					Labels: map[string]string{
+						"app":         "custom-app-name",   // Override default app label
+						"controller":  "custom-controller", // Override default controller label
+						"environment": "staging",
+					},
+				},
+			},
+			expectedLabels: map[string]string{
+				"app":         "test-etcd-override", // Default labels are applied last, so they override custom ones
+				"controller":  "test-etcd-override", // Default labels are applied last, so they override custom ones
+				"environment": "staging",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create a fake client for each test case to avoid interference
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+			// Create an EtcdCluster instance
+			ec := &ecv1alpha1.EtcdCluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      tt.etcdClusterName,
+					Namespace: "default",
+				},
+				Spec: ecv1alpha1.EtcdClusterSpec{
+					Size:        3,
+					Version:     "3.5.17",
+					PodTemplate: tt.podTemplate,
+				},
+			}
+
+			err := createOrPatchStatefulSet(ctx, logger, ec, fakeClient, 3, scheme)
+			assert.NoError(t, err)
+
+			// Verify that the StatefulSet was created with correct labels
+			sts := &appsv1.StatefulSet{}
+			err = fakeClient.Get(ctx, client.ObjectKey{Name: tt.etcdClusterName, Namespace: "default"}, sts)
+			assert.NoError(t, err)
+
+			// Check that pod template has the expected labels
+			assert.Equal(t, tt.expectedLabels, sts.Spec.Template.Labels)
+		})
+	}
+}
+
 func TestCreatingArgs(t *testing.T) {
 	tests := []struct {
 		testName       string
