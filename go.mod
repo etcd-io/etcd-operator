@@ -1,8 +1,8 @@
 module go.etcd.io/etcd-operator
 
-go 1.24.0
+go 1.25
 
-toolchain go1.24.6
+toolchain go1.25.1
 
 require (
 	github.com/cert-manager/cert-manager v1.18.2
