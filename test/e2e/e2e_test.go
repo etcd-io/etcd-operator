@@ -152,15 +152,8 @@ func TestScaling(t *testing.T) {
 				fmt.Sprintf("scale to %d", tc.scaleTo),
 				func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
 					scaleEtcdCluster(ctx, t, c, etcdClusterName, tc.scaleTo)
-
-					// Verify controller updated StatefulSet replicas
-					var sts appsv1.StatefulSet
-					if err := c.Client().Resources().Get(ctx, etcdClusterName, namespace, &sts); err != nil {
-						t.Fatalf("Failed to get StatefulSet: %v", err)
-					}
-					if sts.Spec.Replicas == nil || *sts.Spec.Replicas != int32(tc.scaleTo) {
-						t.Errorf("Controller failed to update StatefulSet replicas: expected %d, got %d", tc.scaleTo, *sts.Spec.Replicas)
-					}
+					// Wait until StatefulSet spec/status reflect the scaled size and are ready
+					waitForSTSReadiness(t, c, etcdClusterName, tc.scaleTo)
 					return ctx
 				},
 			)
@@ -218,7 +211,7 @@ func TestPodRecovery(t *testing.T) {
 			verifyPodUsesPVC(t, c, targetPodName, "etcd-data-"+etcdClusterName)
 
 			// Get initial member IDs for consistency verification
-			initialMembers := getEtcdMembers(t, c, podName)
+			initialMembers := getEtcdMembersName2IDMapping(t, c, podName)
 			initialMemberCount := len(initialMembers)
 
 			// Delete one pod to simulate failure
@@ -250,7 +243,7 @@ func TestPodRecovery(t *testing.T) {
 			verifyPodUsesPVC(t, c, targetPodName, "etcd-data-"+etcdClusterName)
 
 			// Verify member ID consistency
-			finalMembers := getEtcdMembers(t, c, podName)
+			finalMembers := getEtcdMembersName2IDMapping(t, c, podName)
 			if len(finalMembers) != initialMemberCount {
 				t.Errorf("Member count changed after recovery: expected %d, got %d", initialMemberCount, len(finalMembers))
 			}

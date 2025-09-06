@@ -108,13 +108,28 @@ func waitForSTSReadiness(t *testing.T, c *envconf.Config, name string, expectedR
 		if err := c.Client().Resources().Get(ctx, name, namespace, &sts); err != nil {
 			return false, err
 		}
-		if sts.Status.ReadyReplicas == int32(expectedReplicas) {
-			return true, nil
+
+		// Ensure spec has been updated by the controller to the expected replica count
+		if sts.Spec.Replicas == nil || *sts.Spec.Replicas != int32(expectedReplicas) {
+			return false, nil
 		}
-		return false, nil
+
+		// Ensure status reflects latest generation
+		if sts.Status.ObservedGeneration < sts.Generation {
+			return false, nil
+		}
+
+		// Ensure the controller created the expected number of replicas and they are ready
+		if sts.Status.Replicas != int32(expectedReplicas) {
+			return false, nil
+		}
+		if sts.Status.ReadyReplicas != int32(expectedReplicas) {
+			return false, nil
+		}
+		return true, nil
 	}, wait.WithTimeout(5*time.Minute), wait.WithInterval(10*time.Second))
 	if err != nil {
-		t.Fatalf("StatefulSet %s failed to have %d ready replicas: %v", name, expectedReplicas, err)
+		t.Fatalf("StatefulSet %s failed to reach spec/status readiness for %d replicas: %v", name, expectedReplicas, err)
 	}
 }
 
@@ -153,8 +168,6 @@ func scaleEtcdCluster(ctx context.Context, t *testing.T, c *envconf.Config, name
 	if err := c.Client().Resources().Update(ctx, &etcdCluster); err != nil {
 		t.Fatalf("Failed to update EtcdCluster: %v", err)
 	}
-
-	waitForSTSReadiness(t, c, name, size)
 }
 
 func cleanupEtcdCluster(ctx context.Context, t *testing.T, c *envconf.Config, name string) {
@@ -167,18 +180,10 @@ func cleanupEtcdCluster(ctx context.Context, t *testing.T, c *envconf.Config, na
 	}
 }
 
-// getEtcdMembers retrieves the etcd cluster member list as name->ID mapping using etcd's native types
-func getEtcdMembers(t *testing.T, c *envconf.Config, podName string) map[string]uint64 {
+// getEtcdMembersName2IDMapping retrieves the etcd cluster member list as name->ID mapping using etcd's native types
+func getEtcdMembersName2IDMapping(t *testing.T, c *envconf.Config, podName string) map[string]uint64 {
 	t.Helper()
-	stdout, stderr, err := execInPod(t, c, podName, namespace, []string{"etcdctl", "member", "list", "-w", "json"})
-	if err != nil {
-		t.Fatalf("Failed to get etcd member list: %v, stderr: %s", err, stderr)
-	}
-
-	var memberList etcdserverpb.MemberListResponse
-	if err := json.Unmarshal([]byte(stdout), &memberList); err != nil {
-		t.Fatalf("Failed to parse etcd member list JSON: %v", err)
-	}
+	memberList := getEtcdMemberListPB(t, c, podName)
 
 	// Create name->ID mapping
 	memberMap := make(map[string]uint64)
