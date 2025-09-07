@@ -198,7 +198,7 @@ KIND ?= $(LOCALBIN)/kind
 KUSTOMIZE_VERSION = $(shell cd tools/mod && go list -m -f {{.Version}} sigs.k8s.io/kustomize/kustomize/v5)
 CONTROLLER_TOOLS_VERSION = $(shell cd tools/mod && go list -m -f {{.Version}} sigs.k8s.io/controller-tools)
 ENVTEST_VERSION = $(shell cd tools/mod && go list -m -f {{.Version}} sigs.k8s.io/controller-runtime/tools/setup-envtest)
-GOLANGCI_LINT_VERSION = $(shell cd tools/mod && go list -m -f {{.Version}} github.com/golangci/golangci-lint)
+GOLANGCI_LINT_VERSION = $(shell cd tools/mod && go list -m -f {{.Version}} github.com/golangci/golangci-lint/v2)
 CRD_REF_DOCS_VERSION = $(shell cd tools/mod && go list -m -f {{.Version}} github.com/elastic/crd-ref-docs)
 KIND_VERSION = $(shell cd tools/mod && go list -m -f {{.Version}} sigs.k8s.io/kind)
 
