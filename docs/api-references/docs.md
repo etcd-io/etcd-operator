@@ -105,16 +105,34 @@ _Appears in:_
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `size` _integer_ | Size is the expected size of the etcd cluster. |  | Minimum: 1 <br /> |
+| `imageRegistry` _string_ | ImageRegistry specifies the container registry that hosts the etcd images.<br />If unset, it defaults to the value provided via the controller's<br />--image-registry flag, which itself defaults to "gcr.io/etcd-development/etcd". |  |  |
 | `version` _string_ | Version is the expected version of the etcd container image. |  |  |
 | `storageSpec` _[StorageSpec](#storagespec)_ | StorageSpec is the name of the StorageSpec to use for the etcd cluster. If not provided, then each POD just uses the temporary storage inside the container. |  |  |
 | `tls` _[TLSCertificate](#tlscertificate)_ | TLS is the TLS certificate configuration to use for the etcd cluster and etcd operator. |  |  |
 | `etcdOptions` _string array_ | etcd configuration options are passed as command line arguments to the etcd container, refer to etcd documentation for configuration options applicable for the version of etcd being used. |  |  |
-| `podSpec` _[PodSpec](#podspec)_ | PodSpec is the pod spec to use for the etcd cluster. |  |  |
+| `podTemplate` _[PodTemplate](#podtemplate)_ | PodTemplate is the pod template to use for the etcd cluster. |  |  |
 
 
 
 
-#### PodSpec
+#### PodMetadata
+
+
+
+
+
+
+
+_Appears in:_
+- [PodTemplate](#podtemplate)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `annotations` _object (keys:string, values:string)_ |  |  |  |
+| `labels` _object (keys:string, values:string)_ |  |  |  |
+
+
+#### PodTemplate
 
 
 
@@ -127,7 +145,7 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `annotations` _object (keys:string, values:string)_ | Annotations is the annotations to add to the pod. |  |  |
+| `metadata` _[PodMetadata](#podmetadata)_ | Refer to Kubernetes API documentation for fields of `metadata`. |  |  |
 
 
 #### ProviderAutoConfig
