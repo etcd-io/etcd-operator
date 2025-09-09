@@ -96,6 +96,19 @@ lint: golangci-lint ## Run golangci-lint linter
 lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes
 	$(GOLANGCI_LINT) run --fix
 
+.PHONY: verify-mod-tidy
+verify-mod-tidy:  ## Ensure that running go mod tidy has a clean exit. 
+	@echo "Verifying go.mod tidy"
+	@out=$$(go mod tidy --diff); \
+	test -z "$$out" || (echo "go.mod is not tidy. Please run 'go mod tidy'"; echo "$$out"; exit 1)
+
+	@echo "Verifying tools/mod/go.mod tidy"
+	@out=$$(cd tools/mod && go mod tidy --diff); \
+	test -z "$$out" || (echo "tools/mod/go.mod is not tidy. Please run 'cd tools/mod && go mod tidy'"; echo "$$out"; exit 1)
+
+.PHONY: verify
+verify: verify-mod-tidy lint ## Run static checks against the code.
+
 ##@ Build
 
 .PHONY: build
