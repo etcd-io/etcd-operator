@@ -188,8 +188,8 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 
 	// mount server and peer certificate secret to each pods of the statefulset via PodSpec
 	var certVolume []corev1.Volume
-	serverCertName := fmt.Sprintf("%s-%s-tls", ec.Name, "server")
-	peerCertName := fmt.Sprintf("%s-%s-tls", ec.Name, "peer")
+	serverCertName := getServerCertName(ec.Name)
+	peerCertName := getPeerCertName(ec.Name)
 	if ec.Spec.TLS != nil {
 		serverCertVolume := corev1.Volume{
 			Name: "server-secret",
@@ -551,6 +551,21 @@ func healthCheck(sts *appsv1.StatefulSet, lg klog.Logger) (*clientv3.MemberListR
 	return memberlistResp, healthInfos, nil
 }
 
+func getClientCertName(etcdClusterName string) string {
+	clientCertName := fmt.Sprintf("%s-%s-tls", etcdClusterName, "client")
+	return clientCertName
+}
+
+func getServerCertName(etcdClusterName string) string {
+	serverCertName := fmt.Sprintf("%s-%s-tls", etcdClusterName, "server")
+	return serverCertName
+}
+
+func getPeerCertName(etcdClusterName string) string {
+	peerCertName := fmt.Sprintf("%s-%s-tls", etcdClusterName, "peer")
+	return peerCertName
+}
+
 func createCMCertificateConfig(ec *ecv1alpha1.EtcdCluster) *certInterface.Config {
 	cmConfig := ec.Spec.TLS.ProviderCfg.CertManagerCfg
 	duration, err := time.ParseDuration(cmConfig.ValidityDuration)
@@ -629,13 +644,13 @@ func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client
 }
 
 func createClientCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client) error {
-	certName := fmt.Sprintf("%s-%s-tls", ec.Name, "client")
+	certName := getClientCertName(ec.Name)
 	createClientCertErr := createCertificate(ec, ctx, c, certName)
 	return createClientCertErr
 }
 
 func createServerCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client) error {
-	serverCertName := fmt.Sprintf("%s-%s-tls", ec.Name, "server")
+	serverCertName := getServerCertName(ec.Name)
 	createServerCertErr := createCertificate(ec, ctx, c, serverCertName)
 	if createServerCertErr != nil {
 		return createServerCertErr
@@ -644,7 +659,7 @@ func createServerCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c 
 }
 
 func createPeerCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client) error {
-	peerCertName := fmt.Sprintf("%s-%s-tls", ec.Name, "peer")
+	peerCertName := getPeerCertName(ec.Name)
 	createPeerCertErr := createCertificate(ec, ctx, c, peerCertName)
 	if createPeerCertErr != nil {
 		return createPeerCertErr
