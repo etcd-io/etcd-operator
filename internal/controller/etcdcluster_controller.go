@@ -91,7 +91,7 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 	// Create Client Certificate for etcd-operator to communicate with the etcdCluster
 	if etcdCluster.Spec.TLS != nil {
-		clientCertErr := createClientCertificate(etcdCluster, ctx, r.Client)
+		clientCertErr := createClientCertificate(ctx, etcdCluster, r.Client)
 		if clientCertErr != nil {
 			logger.Error(clientCertErr, "Failed to create Client Certificate.")
 		}

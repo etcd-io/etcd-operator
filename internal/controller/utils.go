@@ -53,7 +53,7 @@ func reconcileStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1alpha
 	}
 
 	// Add server and peer certificate
-	err = applyEtcdMemberCerts(ctx, c, ec, logger)
+	err = applyEtcdMemberCerts(ctx, ec, c, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -628,13 +628,13 @@ func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client
 	return nil
 }
 
-func createClientCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client.Client) error {
+func createClientCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client) error {
 	certName := fmt.Sprintf("%s-%s-tls", ec.Name, "client")
 	createClientCertErr := createCertificate(ec, ctx, c, certName)
 	return createClientCertErr
 }
 
-func createServerCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client.Client) error {
+func createServerCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client) error {
 	serverCertName := fmt.Sprintf("%s-%s-tls", ec.Name, "server")
 	createServerCertErr := createCertificate(ec, ctx, c, serverCertName)
 	if createServerCertErr != nil {
@@ -643,7 +643,7 @@ func createServerCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c 
 	return nil
 }
 
-func createPeerCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client.Client) error {
+func createPeerCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client) error {
 	peerCertName := fmt.Sprintf("%s-%s-tls", ec.Name, "peer")
 	createPeerCertErr := createCertificate(ec, ctx, c, peerCertName)
 	if createPeerCertErr != nil {
@@ -652,16 +652,16 @@ func createPeerCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c cl
 	return nil
 }
 
-func applyEtcdMemberCerts(ctx context.Context, c client.Client, ec *ecv1alpha1.EtcdCluster, logger logr.Logger) error {
+func applyEtcdMemberCerts(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client, logger logr.Logger) error {
 	var err error
 	if ec.Spec.TLS != nil {
-		createServerCertErr := createServerCertificate(ec, ctx, c)
+		createServerCertErr := createServerCertificate(ctx, ec, c)
 		if createServerCertErr != nil {
 			err = createServerCertErr
 			logger.Error(createServerCertErr, "Error creating Server Certificate")
 
 		}
-		createPeerCertErr := createPeerCertificate(ec, ctx, c)
+		createPeerCertErr := createPeerCertificate(ctx, ec, c)
 		if createPeerCertErr != nil {
 			err = createPeerCertErr
 			logger.Error(createPeerCertErr, "Error creating Peer Certificate")
