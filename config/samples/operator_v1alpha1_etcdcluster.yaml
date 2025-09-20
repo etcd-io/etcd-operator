@@ -8,3 +8,4 @@ metadata:
 spec:
   version: v3.5.21
   size: 3
+  tls:
