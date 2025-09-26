@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"time"
 
+	certv1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -54,6 +55,10 @@ type EtcdClusterReconciler struct {
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch;get;list;update
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;patch;update;delete
+// +kubebuilder:rbac:groups="cert-manager.io",resources=certificates,verbs=get;list;watch;create;patch;update;delete
+// +kubebuilder:rbac:groups="cert-manager.io",resources=clusterissuers,verbs=get;list;watch
+// +kubebuilder:rbac:groups="cert-manager.io",resources=issuers,verbs=get;list;watch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -84,6 +89,18 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		etcdCluster.Spec.ImageRegistry = r.ImageRegistry
 	}
 
+	// Create Client Certificate for etcd-operator to communicate with the etcdCluster
+	if etcdCluster.Spec.TLS != nil {
+		clientCertErr := createClientCertificate(ctx, etcdCluster, r.Client)
+		if clientCertErr != nil {
+			logger.Error(clientCertErr, "Failed to create Client Certificate.")
+		}
+	} else {
+		// TODO: instead of logging error, set default autoConfig
+		logger.Error(nil, fmt.Sprintf("missing TLS config for %s, ", etcdCluster.Name+
+			"\n running etcd-cluster without TLS protection is NOT recommended for production."))
+	}
+
 	logger.Info("Reconciling EtcdCluster", "spec", etcdCluster.Spec)
 
 	// Get the statefulsets which has the same name as the EtcdCluster resource
@@ -92,12 +109,13 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		if errors.IsNotFound(err) {
 			logger.Info("Creating StatefulSet with 0 replica", "expectedSize", etcdCluster.Spec.Size)
 			// Create a new StatefulSet
+
 			sts, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, 0, r.Scheme)
 			if err != nil {
 				return ctrl.Result{}, err
 			}
 		} else {
-			// If an error occurs during Get/Create, we'll requeue the item so we can
+			// If an error occurs during Get/Create, we'll requeue the item, so we can
 			// attempt processing again later. This could have been caused by a
 			// temporary network failure, or any other transient reason.
 			logger.Error(err, "Failed to get StatefulSet. Requesting requeue")
@@ -263,5 +281,6 @@ func (r *EtcdClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&appsv1.StatefulSet{}).
 		Owns(&corev1.Service{}).
 		Owns(&corev1.ConfigMap{}).
+		Owns(&certv1.Certificate{}).
 		Complete(r)
 }
