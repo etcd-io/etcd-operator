@@ -145,6 +145,7 @@ func TestScaling(t *testing.T) {
 			feature.Setup(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
 				createEtcdClusterWithPVC(ctx, t, c, etcdClusterName, tc.initialSize)
 				waitForSTSReadiness(t, c, etcdClusterName, tc.initialSize)
+				waitForClusterHealthyStatus(t, c, etcdClusterName, tc.initialSize)
 				return ctx
 			})
 
@@ -154,6 +155,7 @@ func TestScaling(t *testing.T) {
 					scaleEtcdCluster(ctx, t, c, etcdClusterName, tc.scaleTo)
 					// Wait until StatefulSet spec/status reflect the scaled size and are ready
 					waitForSTSReadiness(t, c, etcdClusterName, tc.scaleTo)
+					waitForClusterHealthyStatus(t, c, etcdClusterName, tc.expectedMembers)
 					return ctx
 				},
 			)
@@ -193,6 +195,7 @@ func TestPodRecovery(t *testing.T) {
 	feature.Setup(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
 		createEtcdClusterWithPVC(ctx, t, c, etcdClusterName, 3)
 		waitForSTSReadiness(t, c, etcdClusterName, 3)
+		waitForClusterHealthyStatus(t, c, etcdClusterName, 3)
 		return ctx
 	})
 
@@ -238,6 +241,7 @@ func TestPodRecovery(t *testing.T) {
 
 			// Wait for full StatefulSet readiness
 			waitForSTSReadiness(t, c, etcdClusterName, int(initialReplicas))
+			waitForClusterHealthyStatus(t, c, etcdClusterName, int(initialReplicas))
 
 			// Verify PVC usage after recovery
 			verifyPodUsesPVC(t, c, targetPodName, "etcd-data-"+etcdClusterName)
@@ -294,6 +298,7 @@ func TestEtcdClusterFunctionality(t *testing.T) {
 	feature.Setup(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
 		createEtcdClusterWithPVC(ctx, t, c, etcdClusterName, 3)
 		waitForSTSReadiness(t, c, etcdClusterName, 3)
+		waitForClusterHealthyStatus(t, c, etcdClusterName, 3)
 		return ctx
 	})
 
@@ -303,6 +308,7 @@ func TestEtcdClusterFunctionality(t *testing.T) {
 		// Wait until all members are promoted to voting members (no learners),
 		// otherwise endpoint health will fail on learners.
 		waitForNoLearners(t, c, podName, 3)
+		waitForClusterHealthyStatus(t, c, etcdClusterName, 3)
 
 		// Check health for the whole cluster rather than a single member
 		command := []string{"etcdctl", "endpoint", "health", "--cluster"}

@@ -114,6 +114,8 @@ func TestDataPersistence(t *testing.T) {
 				t.Fatalf("unable to create sts with size 1: %s", err)
 			}
 
+			waitForClusterHealthyStatus(t, c, etcdClusterName, size)
+
 			return ctx
 		},
 	)
