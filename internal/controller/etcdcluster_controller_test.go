@@ -20,6 +20,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -69,10 +70,9 @@ func TestFetchAndValidateState(t *testing.T) {
 			},
 			req: ctrl.Request{NamespacedName: types.NamespacedName{Name: "etcd", Namespace: "default"}},
 			assert: func(t *testing.T, state *reconcileState, res ctrl.Result, err error, ec *ecv1alpha1.EtcdCluster, _ *appsv1.StatefulSet) {
-				if assert.NotNil(t, state) {
-					assert.Equal(t, ec.Name, state.cluster.Name)
-					assert.Nil(t, state.sts)
-				}
+				require.NotNil(t, state)
+				assert.Equal(t, ec.Name, state.cluster.Name)
+				assert.Nil(t, state.sts)
 				assert.NoError(t, err)
 				assert.Equal(t, ctrl.Result{}, res)
 			},
@@ -104,12 +104,10 @@ func TestFetchAndValidateState(t *testing.T) {
 			},
 			req: ctrl.Request{NamespacedName: types.NamespacedName{Name: "etcd", Namespace: "default"}},
 			assert: func(t *testing.T, state *reconcileState, res ctrl.Result, err error, ec *ecv1alpha1.EtcdCluster, sts *appsv1.StatefulSet) {
-				if assert.NotNil(t, state) {
-					assert.Equal(t, ec.Name, state.cluster.Name)
-					if assert.NotNil(t, state.sts) {
-						assert.Equal(t, sts.Name, state.sts.Name)
-					}
-				}
+				require.NotNil(t, state)
+				assert.Equal(t, ec.Name, state.cluster.Name)
+				require.NotNil(t, state.sts)
+				assert.Equal(t, sts.Name, state.sts.Name)
 				assert.NoError(t, err)
 				assert.Equal(t, ctrl.Result{}, res)
 			},
@@ -166,9 +164,9 @@ func TestFetchAndValidateState(t *testing.T) {
 	}
 }
 
-// TestSyncPrimitives outlines tests for ensuring StatefulSet and Service
+// TestBootstrapStatefulSet outlines tests for ensuring StatefulSet and Service
 // creation and bootstrap logic.
-func TestSyncPrimitives(t *testing.T) {
+func TestBootstrapStatefulSet(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
 	_ = appsv1.AddToScheme(scheme)
@@ -193,13 +191,12 @@ func TestSyncPrimitives(t *testing.T) {
 		r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
 		state := &reconcileState{cluster: ec}
 
-		res, err := r.syncPrimitives(ctx, state)
+		res, err := r.bootstrapStatefulSet(ctx, state)
 		assert.NoError(t, err)
 		assert.Equal(t, ctrl.Result{RequeueAfter: requeueDuration}, res)
-		if assert.NotNil(t, state.sts) {
-			assert.NotNil(t, state.sts.Spec.Replicas)
-			assert.Equal(t, int32(0), *state.sts.Spec.Replicas)
-		}
+		require.NotNil(t, state.sts)
+		assert.NotNil(t, state.sts.Spec.Replicas)
+		assert.Equal(t, int32(0), *state.sts.Spec.Replicas)
 
 		sts := &appsv1.StatefulSet{}
 		err = fakeClient.Get(ctx, client.ObjectKey{Name: ec.Name, Namespace: ec.Namespace}, sts)
@@ -245,7 +242,7 @@ func TestSyncPrimitives(t *testing.T) {
 		state := &reconcileState{cluster: ec, sts: sts}
 
 		oldRV := sts.ResourceVersion
-		res, err := r.syncPrimitives(ctx, state)
+		res, err := r.bootstrapStatefulSet(ctx, state)
 		assert.NoError(t, err)
 		assert.Equal(t, ctrl.Result{RequeueAfter: requeueDuration}, res)
 
@@ -256,9 +253,8 @@ func TestSyncPrimitives(t *testing.T) {
 		assert.Equal(t, int32(1), updatedSTS.Status.ReadyReplicas)
 		assert.NotEqual(t, oldRV, updatedSTS.ResourceVersion)
 
-		if assert.NotNil(t, state.sts) {
-			assert.Equal(t, int32(1), *state.sts.Spec.Replicas)
-		}
+		require.NotNil(t, state.sts)
+		assert.Equal(t, int32(1), *state.sts.Spec.Replicas)
 
 		svc := &corev1.Service{}
 		err = fakeClient.Get(ctx, client.ObjectKey{Name: ec.Name, Namespace: ec.Namespace}, svc)
@@ -309,7 +305,7 @@ func TestSyncPrimitives(t *testing.T) {
 		storedSTS := sts.DeepCopy()
 		storedSvc := svc.DeepCopy()
 		storedCM := cm.DeepCopy()
-		res, err := r.syncPrimitives(ctx, state)
+		res, err := r.bootstrapStatefulSet(ctx, state)
 		assert.NoError(t, err)
 		assert.Equal(t, ctrl.Result{}, res)
 

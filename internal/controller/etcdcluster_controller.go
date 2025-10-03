@@ -55,7 +55,7 @@ type reconcileState struct {
 	cluster        *ecv1alpha1.EtcdCluster      // cluster custom resource currently being reconciled
 	sts            *appsv1.StatefulSet          // associated StatefulSet for the cluster
 	memberListResp *clientv3.MemberListResponse // member list fetched from the etcd cluster
-	healthInfos    []etcdutils.EpHealth         // health information for each etcd member
+	memberHealth   []etcdutils.EpHealth         // health information for each etcd member
 }
 
 // +kubebuilder:rbac:groups=operator.etcd.io,resources=etcdclusters,verbs=get;list;watch;create;update;patch;delete
@@ -79,12 +79,12 @@ type reconcileState struct {
 // https://pkg.go.dev/sigs.k8s.io/controller-runtime/pkg/reconcile
 func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	state, res, err := r.fetchAndValidateState(ctx, req)
-	if state == nil || err != nil || res.RequeueAfter != 0 {
+	if state == nil || err != nil {
 		return res, err
 	}
 
-	if primRes, err := r.syncPrimitives(ctx, state); err != nil || primRes.Requeue || primRes.RequeueAfter != 0 { //nolint:staticcheck
-		return primRes, err
+	if bootstrapRes, err := r.bootstrapStatefulSet(ctx, state); err != nil || !bootstrapRes.IsZero() {
+		return bootstrapRes, err
 	}
 
 	if err = r.performHealthChecks(ctx, state); err != nil {
@@ -150,40 +150,41 @@ func (r *EtcdClusterReconciler) fetchAndValidateState(ctx context.Context, req c
 	return &reconcileState{cluster: ec, sts: sts}, ctrl.Result{}, nil
 }
 
-// syncPrimitives ensures that the foundational Kubernetes objects for a cluster
-// exist and are correctly initialized. It creates the StatefulSet (initially
+// bootstrapStatefulSet ensures that the foundational Kubernetes objects for
+// a cluster exist and are correctly initialized. It creates the StatefulSet (initially
 // with 0 replicas) and the headless Service if necessary. When either resource
 // is created or the StatefulSet is scaled from zero to one replica, the returned
 // ctrl.Result requests a requeue so the next reconciliation loop can observe the
 // new state. The reconcileState is updated with the current StatefulSet.
-func (r *EtcdClusterReconciler) syncPrimitives(ctx context.Context, s *reconcileState) (ctrl.Result, error) {
+func (r *EtcdClusterReconciler) bootstrapStatefulSet(ctx context.Context, s *reconcileState) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
+	requeue := false
 	var err error
 
-	if s.sts == nil {
+	switch {
+	case s.sts == nil:
 		logger.Info("Creating StatefulSet with 0 replica", "expectedSize", s.cluster.Spec.Size)
-		if s.sts, err = reconcileStatefulSet(ctx, logger, s.cluster, r.Client, 0, r.Scheme); err != nil {
+		s.sts, err = reconcileStatefulSet(ctx, logger, s.cluster, r.Client, 0, r.Scheme)
+		if err != nil {
 			return ctrl.Result{}, err
 		}
-		if err = createHeadlessServiceIfNotExist(ctx, logger, r.Client, s.cluster, r.Scheme); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{RequeueAfter: requeueDuration}, nil
-	}
+		requeue = true
 
-	if s.sts.Spec.Replicas != nil && *s.sts.Spec.Replicas == 0 {
+	case s.sts.Spec.Replicas != nil && *s.sts.Spec.Replicas == 0:
 		logger.Info("StatefulSet has 0 replicas. Trying to create a new cluster with 1 member")
-		if s.sts, err = reconcileStatefulSet(ctx, logger, s.cluster, r.Client, 1, r.Scheme); err != nil {
+		s.sts, err = reconcileStatefulSet(ctx, logger, s.cluster, r.Client, 1, r.Scheme)
+		if err != nil {
 			return ctrl.Result{}, err
 		}
-		if err = createHeadlessServiceIfNotExist(ctx, logger, r.Client, s.cluster, r.Scheme); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{RequeueAfter: requeueDuration}, nil
+		requeue = true
 	}
 
 	if err = createHeadlessServiceIfNotExist(ctx, logger, r.Client, s.cluster, r.Scheme); err != nil {
 		return ctrl.Result{}, err
+	}
+
+	if requeue {
+		return ctrl.Result{RequeueAfter: requeueDuration}, nil
 	}
 	return ctrl.Result{}, nil
 }
@@ -195,7 +196,7 @@ func (r *EtcdClusterReconciler) performHealthChecks(ctx context.Context, s *reco
 	logger := log.FromContext(ctx)
 	logger.Info("Now checking health of the cluster members")
 	var err error
-	s.memberListResp, s.healthInfos, err = healthCheck(s.sts, logger)
+	s.memberListResp, s.memberHealth, err = healthCheck(s.sts, logger)
 	if err != nil {
 		return fmt.Errorf("health check failed: %w", err)
 	}
@@ -215,6 +216,7 @@ func (r *EtcdClusterReconciler) reconcileClusterState(ctx context.Context, s *re
 	targetReplica := *s.sts.Spec.Replicas
 	var err error
 
+	// The number of replicas in the StatefulSet doesn't match the number of etcd members in the cluster.
 	if int(targetReplica) != memberCnt {
 		logger.Info("The expected number of replicas doesn't match the number of etcd members in the cluster", "targetReplica", targetReplica, "memberCnt", memberCnt)
 		if int(targetReplica) < memberCnt {
@@ -242,13 +244,16 @@ func (r *EtcdClusterReconciler) reconcileClusterState(ctx context.Context, s *re
 	)
 
 	if memberCnt > 0 {
-		_, leaderStatus = etcdutils.FindLeaderStatus(s.healthInfos, logger)
+		// Find the leader status
+		_, leaderStatus = etcdutils.FindLeaderStatus(s.memberHealth, logger)
 		if leaderStatus == nil {
+			// If the leader is not available, wait for the leader to be elected
 			return ctrl.Result{}, fmt.Errorf("couldn't find leader, memberCnt: %d", memberCnt)
 		}
 
-		learner, learnerStatus = etcdutils.FindLearnerStatus(s.healthInfos, logger)
+		learner, learnerStatus = etcdutils.FindLearnerStatus(s.memberHealth, logger)
 		if learner > 0 {
+			// There is at least one learner. Try to promote it if it's ready; otherwise requeue and wait.
 			logger.Info("Learner found", "learnedID", learner, "learnerStatus", learnerStatus)
 			if etcdutils.IsLearnerReady(leaderStatus, learnerStatus) {
 				logger.Info("Learner is ready to be promoted to voting member", "learnerID", learner)
@@ -256,9 +261,11 @@ func (r *EtcdClusterReconciler) reconcileClusterState(ctx context.Context, s *re
 				eps := clientEndpointsFromStatefulsets(s.sts)
 				eps = eps[:(len(eps) - 1)]
 				if err := etcdutils.PromoteLearner(eps, learner); err != nil {
+					// The member is not promoted yet, so we error out and requeue via the caller.
 					return ctrl.Result{}, err
 				}
 			} else {
+				// Learner is not yet ready. We can't add another learner or proceed further until this one is promoted.
 				logger.Info("The learner member isn't ready to be promoted yet", "learnerID", learner)
 				return ctrl.Result{RequeueAfter: requeueDuration}, nil
 			}
@@ -272,7 +279,10 @@ func (r *EtcdClusterReconciler) reconcileClusterState(ctx context.Context, s *re
 
 	eps := clientEndpointsFromStatefulsets(s.sts)
 
+	// If there are no learners left, we can proceed to scale the cluster towards the desired size.
+	// When there are no members to add, the controller will requeue above and this block won't execute.
 	if targetReplica < int32(s.cluster.Spec.Size) {
+		// scale out
 		_, peerURL := peerEndpointForOrdinalIndex(s.cluster, int(targetReplica))
 		targetReplica++
 		logger.Info("[Scale out] adding a new learner member to etcd cluster", "peerURLs", peerURL)
@@ -290,10 +300,11 @@ func (r *EtcdClusterReconciler) reconcileClusterState(ctx context.Context, s *re
 	}
 
 	if targetReplica > int32(s.cluster.Spec.Size) {
+		// scale in
 		targetReplica--
 		logger = logger.WithValues("targetReplica", targetReplica, "expectedSize", s.cluster.Spec.Size)
 
-		memberID := s.healthInfos[memberCnt-1].Status.Header.MemberId
+		memberID := s.memberHealth[memberCnt-1].Status.Header.MemberId
 
 		logger.Info("[Scale in] removing one member", "memberID", memberID)
 		eps = eps[:targetReplica]
@@ -308,12 +319,14 @@ func (r *EtcdClusterReconciler) reconcileClusterState(ctx context.Context, s *re
 		return ctrl.Result{RequeueAfter: requeueDuration}, nil
 	}
 
+	// Ensure every etcd member reports itself healthy before declaring success.
 	allMembersHealthy, err := areAllMembersHealthy(s.sts, logger)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
 	if !allMembersHealthy {
+		// Requeue until the StatefulSet settles and all members are healthy.
 		return ctrl.Result{RequeueAfter: requeueDuration}, nil
 	}
 
