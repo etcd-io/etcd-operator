@@ -19,91 +19,309 @@ package controller
 import (
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	operatorv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
+	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 )
 
-func TestControllerReconcile(t *testing.T) {
-	ctx := t.Context()
+// TestFetchAndValidateState describes the scenarios for the fetchAndValidateState
+// helper. Each sub-test will set up a fake client with different existing
+// resources and assert on the returned state, result and error.
+func TestFetchAndValidateState(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = ecv1alpha1.AddToScheme(scheme)
 
-	const (
-		resourceName       = "test-etcd-cluster"
-		expectedSize int32 = 1
-	)
-
-	typeNamespacedName := types.NamespacedName{
-		Name:      resourceName,
-		Namespace: "default",
+	cases := []struct {
+		name   string
+		req    ctrl.Request
+		ec     *ecv1alpha1.EtcdCluster
+		sts    *appsv1.StatefulSet
+		assert func(t *testing.T, state *reconcileState, res ctrl.Result, err error, ec *ecv1alpha1.EtcdCluster, sts *appsv1.StatefulSet)
+	}{
+		{
+			name: "EtcdCluster Not Found",
+			req:  ctrl.Request{NamespacedName: types.NamespacedName{Name: "etcd", Namespace: "default"}},
+			assert: func(t *testing.T, state *reconcileState, res ctrl.Result, err error, _ *ecv1alpha1.EtcdCluster, _ *appsv1.StatefulSet) {
+				assert.Nil(t, state)
+				assert.NoError(t, err)
+				assert.Equal(t, ctrl.Result{}, res)
+			},
+		},
+		{
+			name: "StatefulSet Not Found",
+			ec: &ecv1alpha1.EtcdCluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "etcd",
+					Namespace: "default",
+					UID:       "1",
+				},
+				Spec: ecv1alpha1.EtcdClusterSpec{Size: 1, Version: "3.5.17"},
+			},
+			req: ctrl.Request{NamespacedName: types.NamespacedName{Name: "etcd", Namespace: "default"}},
+			assert: func(t *testing.T, state *reconcileState, res ctrl.Result, err error, ec *ecv1alpha1.EtcdCluster, _ *appsv1.StatefulSet) {
+				require.NotNil(t, state)
+				assert.Equal(t, ec.Name, state.cluster.Name)
+				assert.Nil(t, state.sts)
+				assert.NoError(t, err)
+				assert.Equal(t, ctrl.Result{}, res)
+			},
+		},
+		{
+			name: "Resources Exist and Owned",
+			ec: &ecv1alpha1.EtcdCluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "etcd",
+					Namespace: "default",
+					UID:       "2",
+				},
+				Spec: ecv1alpha1.EtcdClusterSpec{Size: 1, Version: "3.5.17"},
+			},
+			sts: &appsv1.StatefulSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "etcd",
+					Namespace: "default",
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: ecv1alpha1.GroupVersion.String(),
+							Kind:       "EtcdCluster",
+							Name:       "etcd",
+							UID:        "2",
+							Controller: pointerToBool(true),
+						},
+					},
+				},
+			},
+			req: ctrl.Request{NamespacedName: types.NamespacedName{Name: "etcd", Namespace: "default"}},
+			assert: func(t *testing.T, state *reconcileState, res ctrl.Result, err error, ec *ecv1alpha1.EtcdCluster, sts *appsv1.StatefulSet) {
+				require.NotNil(t, state)
+				assert.Equal(t, ec.Name, state.cluster.Name)
+				require.NotNil(t, state.sts)
+				assert.Equal(t, sts.Name, state.sts.Name)
+				assert.NoError(t, err)
+				assert.Equal(t, ctrl.Result{}, res)
+			},
+		},
+		{
+			name: "StatefulSet Not Owned",
+			ec: &ecv1alpha1.EtcdCluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "etcd",
+					Namespace: "default",
+					UID:       "3",
+				},
+				Spec: ecv1alpha1.EtcdClusterSpec{Size: 1, Version: "3.5.17"},
+			},
+			sts: &appsv1.StatefulSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "etcd",
+					Namespace: "default",
+				},
+			},
+			req: ctrl.Request{NamespacedName: types.NamespacedName{Name: "etcd", Namespace: "default"}},
+			assert: func(t *testing.T, state *reconcileState, res ctrl.Result, err error, _ *ecv1alpha1.EtcdCluster, _ *appsv1.StatefulSet) {
+				assert.Nil(t, state)
+				assert.Error(t, err)
+				assert.Contains(t, err.Error(), "not controlled")
+				assert.Equal(t, ctrl.Result{}, res)
+			},
+		},
 	}
 
-	etcdcluster := &operatorv1alpha1.EtcdCluster{}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
 
-	t.Log("Checking for EtcdCluster resource")
-	err := k8sClient.Get(ctx, typeNamespacedName, etcdcluster)
-	if err != nil && errors.IsNotFound(err) {
-		t.Log("Creating EtcdCluster resource")
-		resource := &operatorv1alpha1.EtcdCluster{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      resourceName,
-				Namespace: "default",
-			},
-			Spec: operatorv1alpha1.EtcdClusterSpec{
-				Size: int(expectedSize),
-			},
-		}
-		if createErr := k8sClient.Create(ctx, resource); createErr != nil {
-			t.Fatalf("Failed to create EtcdCluster resource: %v", createErr)
-		}
-	} else if err != nil {
-		t.Fatalf("Failed to get EtcdCluster resource: %v", err)
-	}
-
-	// Defer a cleanup function to remove the resource after the test finishes.
-	defer func() {
-		t.Log("Cleaning up the EtcdCluster resource")
-		resource := &operatorv1alpha1.EtcdCluster{}
-		if getErr := k8sClient.Get(ctx, typeNamespacedName, resource); getErr != nil {
-			t.Errorf("Failed to get EtcdCluster resource before deletion: %v", getErr)
-		} else {
-			if deleteErr := k8sClient.Delete(ctx, resource); deleteErr != nil {
-				t.Errorf("Failed to delete EtcdCluster resource: %v", deleteErr)
+			objs := []client.Object{}
+			if tc.ec != nil {
+				objs = append(objs, tc.ec)
 			}
-		}
-	}()
+			if tc.sts != nil {
+				objs = append(objs, tc.sts)
+			}
 
-	reconciler := &EtcdClusterReconciler{
-		Client:        k8sClient,
-		Scheme:        k8sClient.Scheme(),
-		ImageRegistry: "gcr.io/etcd-development/etcd",
+			builder := fake.NewClientBuilder().WithScheme(scheme)
+			if len(objs) > 0 {
+				builder.WithObjects(objs...)
+			}
+			fakeClient := builder.Build()
+
+			r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
+
+			state, res, err := r.fetchAndValidateState(ctx, tc.req)
+			tc.assert(t, state, res, err, tc.ec, tc.sts)
+		})
+	}
+}
+
+// TestBootstrapStatefulSet outlines tests for ensuring StatefulSet and Service
+// creation and bootstrap logic.
+func TestBootstrapStatefulSet(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = ecv1alpha1.AddToScheme(scheme)
+
+	ec := &ecv1alpha1.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "etcd",
+			Namespace: "default",
+			UID:       "1",
+		},
+		Spec: ecv1alpha1.EtcdClusterSpec{
+			Size:    1,
+			Version: "3.5.17",
+		},
 	}
 
-	// Reconcile, as it is, returns err since StatefulSet status.ReadyReplicas cannot report its actual status.
-	// This is due to envtest limitation. Envtest does not include kubelet, making pods to never report its readiness .
-	_, _ = reconciler.Reconcile(ctx, reconcile.Request{
-		NamespacedName: typeNamespacedName,
+	t.Run("Initial Creation", func(t *testing.T) {
+		ctx := t.Context()
+
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ec).Build()
+		r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
+		state := &reconcileState{cluster: ec}
+
+		res, err := r.bootstrapStatefulSet(ctx, state)
+		assert.NoError(t, err)
+		assert.Equal(t, ctrl.Result{RequeueAfter: requeueDuration}, res)
+		require.NotNil(t, state.sts)
+		assert.NotNil(t, state.sts.Spec.Replicas)
+		assert.Equal(t, int32(0), *state.sts.Spec.Replicas)
+
+		sts := &appsv1.StatefulSet{}
+		err = fakeClient.Get(ctx, client.ObjectKey{Name: ec.Name, Namespace: ec.Namespace}, sts)
+		assert.NoError(t, err)
+		assert.NotNil(t, sts.Spec.Replicas)
+		assert.Equal(t, int32(0), *sts.Spec.Replicas)
+
+		svc := &corev1.Service{}
+		err = fakeClient.Get(ctx, client.ObjectKey{Name: ec.Name, Namespace: ec.Namespace}, svc)
+		assert.NoError(t, err)
+		assert.Equal(t, "None", svc.Spec.ClusterIP)
+
+		cm := &corev1.ConfigMap{}
+		err = fakeClient.Get(ctx, client.ObjectKey{Name: configMapNameForEtcdCluster(ec), Namespace: ec.Namespace}, cm)
+		assert.NoError(t, err)
 	})
 
-	// Verify Statefulset has been created with expected replica size
-	etcdClusterSts := &appsv1.StatefulSet{}
-	err = k8sClient.Get(ctx, typeNamespacedName, etcdClusterSts)
-	if err != nil {
-		t.Fatalf("Failed to find corresponding Statefulset for %s: %v", resourceName, err)
-	}
+	t.Run("Bootstrap from Zero", func(t *testing.T) {
+		ctx := t.Context()
 
-	if *etcdClusterSts.Spec.Replicas != expectedSize {
-		t.Fatalf("Unexpected StatefulSet Size: expected %d, got: %d", expectedSize, *etcdClusterSts.Spec.Replicas)
-	}
+		sts := &appsv1.StatefulSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      ec.Name,
+				Namespace: ec.Namespace,
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: ecv1alpha1.GroupVersion.String(),
+					Kind:       "EtcdCluster",
+					Name:       ec.Name,
+					UID:        ec.UID,
+					Controller: pointerToBool(true),
+				}},
+			},
+			Spec: appsv1.StatefulSetSpec{
+				Replicas: pointerToInt32(0),
+			},
+			Status: appsv1.StatefulSetStatus{ReadyReplicas: 1},
+		}
 
-	// TODO: Add more specific checks (e.g., verifying status conditions or created resources).
-	// For example:
-	// updated := &operatorv1alpha1.EtcdCluster{}
-	// if err := k8sClient.Get(ctx, typeNamespacedName, updated); err != nil {
-	//     t.Fatalf("Failed to retrieve updated resource: %v", err)
-	// }
-	// // Validate updated fields or status
+		cm := newEtcdClusterState(ec, 0)
+
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ec, sts, cm).Build()
+		r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
+		state := &reconcileState{cluster: ec, sts: sts}
+
+		oldRV := sts.ResourceVersion
+		res, err := r.bootstrapStatefulSet(ctx, state)
+		assert.NoError(t, err)
+		assert.Equal(t, ctrl.Result{RequeueAfter: requeueDuration}, res)
+
+		updatedSTS := &appsv1.StatefulSet{}
+		err = fakeClient.Get(ctx, client.ObjectKey{Name: ec.Name, Namespace: ec.Namespace}, updatedSTS)
+		assert.NoError(t, err)
+		assert.Equal(t, int32(1), *updatedSTS.Spec.Replicas)
+		assert.Equal(t, int32(1), updatedSTS.Status.ReadyReplicas)
+		assert.NotEqual(t, oldRV, updatedSTS.ResourceVersion)
+
+		require.NotNil(t, state.sts)
+		assert.Equal(t, int32(1), *state.sts.Spec.Replicas)
+
+		svc := &corev1.Service{}
+		err = fakeClient.Get(ctx, client.ObjectKey{Name: ec.Name, Namespace: ec.Namespace}, svc)
+		assert.NoError(t, err)
+		assert.Equal(t, "None", svc.Spec.ClusterIP)
+
+		cmUpdated := &corev1.ConfigMap{}
+		err = fakeClient.Get(ctx, client.ObjectKey{Name: configMapNameForEtcdCluster(ec), Namespace: ec.Namespace}, cmUpdated)
+		assert.NoError(t, err)
+		assert.Equal(t, "new", cmUpdated.Data["ETCD_INITIAL_CLUSTER_STATE"])
+		assert.Contains(t, cmUpdated.Data["ETCD_INITIAL_CLUSTER"], "etcd-0=")
+	})
+
+	t.Run("Resources Already Exist", func(t *testing.T) {
+		ctx := t.Context()
+
+		sts := &appsv1.StatefulSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      ec.Name,
+				Namespace: ec.Namespace,
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: ecv1alpha1.GroupVersion.String(),
+					Kind:       "EtcdCluster",
+					Name:       ec.Name,
+					UID:        ec.UID,
+					Controller: pointerToBool(true),
+				}},
+			},
+			Spec:   appsv1.StatefulSetSpec{Replicas: pointerToInt32(1)},
+			Status: appsv1.StatefulSetStatus{ReadyReplicas: 1},
+		}
+
+		svc := &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      ec.Name,
+				Namespace: ec.Namespace,
+			},
+			Spec: corev1.ServiceSpec{ClusterIP: "None"},
+		}
+
+		cm := newEtcdClusterState(ec, 1)
+
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ec, sts.DeepCopy(), svc.DeepCopy(), cm.DeepCopy()).Build()
+		r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
+		state := &reconcileState{cluster: ec, sts: sts}
+
+		// Capture current objects to verify no updates occur.
+		storedSTS := sts.DeepCopy()
+		storedSvc := svc.DeepCopy()
+		storedCM := cm.DeepCopy()
+		res, err := r.bootstrapStatefulSet(ctx, state)
+		assert.NoError(t, err)
+		assert.Equal(t, ctrl.Result{}, res)
+
+		fetchedSTS := &appsv1.StatefulSet{}
+		err = fakeClient.Get(ctx, client.ObjectKey{Name: ec.Name, Namespace: ec.Namespace}, fetchedSTS)
+		assert.NoError(t, err)
+		assert.Equal(t, storedSTS.Spec, fetchedSTS.Spec)
+
+		fetchedSvc := &corev1.Service{}
+		err = fakeClient.Get(ctx, client.ObjectKey{Name: ec.Name, Namespace: ec.Namespace}, fetchedSvc)
+		assert.NoError(t, err)
+		assert.Equal(t, storedSvc.Spec, fetchedSvc.Spec)
+
+		fetchedCM := &corev1.ConfigMap{}
+		err = fakeClient.Get(ctx, client.ObjectKey{Name: configMapNameForEtcdCluster(ec), Namespace: ec.Namespace}, fetchedCM)
+		assert.NoError(t, err)
+		assert.Equal(t, storedCM.Data, fetchedCM.Data)
+	})
 }

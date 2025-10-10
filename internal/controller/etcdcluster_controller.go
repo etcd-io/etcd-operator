@@ -48,6 +48,16 @@ type EtcdClusterReconciler struct {
 	ImageRegistry string
 }
 
+// reconcileState holds all transient data for a single reconciliation loop.
+// Every phase of Reconcile stores intermediate information here so that
+// subsequent phases can operate without additional lookups.
+type reconcileState struct {
+	cluster        *ecv1alpha1.EtcdCluster      // cluster custom resource currently being reconciled
+	sts            *appsv1.StatefulSet          // associated StatefulSet for the cluster
+	memberListResp *clientv3.MemberListResponse // member list fetched from the etcd cluster
+	memberHealth   []etcdutils.EpHealth         // health information for each etcd member
+}
+
 // +kubebuilder:rbac:groups=operator.etcd.io,resources=etcdclusters,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=operator.etcd.io,resources=etcdclusters/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=operator.etcd.io,resources=etcdclusters/finalizers,verbs=update
@@ -60,103 +70,151 @@ type EtcdClusterReconciler struct {
 // +kubebuilder:rbac:groups="cert-manager.io",resources=clusterissuers,verbs=get;list;watch
 // +kubebuilder:rbac:groups="cert-manager.io",resources=issuers,verbs=get;list;watch
 
-// Reconcile is part of the main kubernetes reconciliation loop which aims to
-// move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the EtcdCluster object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
+// Reconcile orchestrates a single reconciliation cycle for an EtcdCluster. It
+// sequentially fetches resources, ensures primitive objects exist, checks the
+// health of the etcd cluster and then adjusts its state to match the desired
+// specification. Each phase is handled by a dedicated helper method.
 //
-// For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.19.1/pkg/reconcile
+// For more details on the controller-runtime Reconcile contract see:
+// https://pkg.go.dev/sigs.k8s.io/controller-runtime/pkg/reconcile
 func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	state, res, err := r.fetchAndValidateState(ctx, req)
+	if state == nil || err != nil {
+		return res, err
+	}
+
+	if bootstrapRes, err := r.bootstrapStatefulSet(ctx, state); err != nil || !bootstrapRes.IsZero() {
+		return bootstrapRes, err
+	}
+
+	if err = r.performHealthChecks(ctx, state); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	return r.reconcileClusterState(ctx, state)
+}
+
+// fetchAndValidateState retrieves the EtcdCluster and its StatefulSet and ensures
+// the StatefulSet, if present, is owned by the cluster. It returns a populated
+// reconcileState for use in later phases. A non-empty ctrl.Result requests a
+// requeue when transient issues occur.
+func (r *EtcdClusterReconciler) fetchAndValidateState(ctx context.Context, req ctrl.Request) (*reconcileState, ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	// Fetch the EtcdCluster resource
-	etcdCluster := &ecv1alpha1.EtcdCluster{}
-
-	err := r.Get(ctx, req.NamespacedName, etcdCluster)
-	if err != nil {
+	ec := &ecv1alpha1.EtcdCluster{}
+	if err := r.Get(ctx, req.NamespacedName, ec); err != nil {
 		if errors.IsNotFound(err) {
 			logger.Info("EtcdCluster resource not found. Ignoring since object may have been deleted")
-			return ctrl.Result{}, nil
+			return nil, ctrl.Result{}, nil
 		}
-		return ctrl.Result{}, err
+		return nil, ctrl.Result{}, err
 	}
 
 	// Determine desired etcd image registry
-	if etcdCluster.Spec.ImageRegistry == "" {
-		etcdCluster.Spec.ImageRegistry = r.ImageRegistry
+	if ec.Spec.ImageRegistry == "" {
+		ec.Spec.ImageRegistry = r.ImageRegistry
 	}
 
-	// Create Client Certificate for etcd-operator to communicate with the etcdCluster
-	if etcdCluster.Spec.TLS != nil {
-		clientCertErr := createClientCertificate(ctx, etcdCluster, r.Client)
-		if clientCertErr != nil {
-			logger.Error(clientCertErr, "Failed to create Client Certificate.")
+	// Ensure the operator has TLS credentials when the cluster requests TLS.
+	if ec.Spec.TLS != nil {
+		if err := createClientCertificate(ctx, ec, r.Client); err != nil {
+			logger.Error(err, "Failed to create Client Certificate.")
 		}
 	} else {
 		// TODO: instead of logging error, set default autoConfig
-		logger.Error(nil, fmt.Sprintf("missing TLS config for %s, ", etcdCluster.Name+
-			"\n running etcd-cluster without TLS protection is NOT recommended for production."))
+		logger.Error(nil, fmt.Sprintf(
+			"missing TLS config for %s,\n running etcd-cluster without TLS protection is NOT recommended for production.",
+			ec.Name,
+		))
 	}
 
-	logger.Info("Reconciling EtcdCluster", "spec", etcdCluster.Spec)
+	logger.Info("Reconciling EtcdCluster", "spec", ec.Spec)
 
-	// Get the statefulsets which has the same name as the EtcdCluster resource
-	sts, err := getStatefulSet(ctx, r.Client, etcdCluster.Name, etcdCluster.Namespace)
+	sts, err := getStatefulSet(ctx, r.Client, ec.Name, ec.Namespace)
 	if err != nil {
 		if errors.IsNotFound(err) {
-			logger.Info("Creating StatefulSet with 0 replica", "expectedSize", etcdCluster.Spec.Size)
-			// Create a new StatefulSet
-
-			sts, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, 0, r.Scheme)
-			if err != nil {
-				return ctrl.Result{}, err
-			}
+			sts = nil
 		} else {
-			// If an error occurs during Get/Create, we'll requeue the item, so we can
-			// attempt processing again later. This could have been caused by a
-			// temporary network failure, or any other transient reason.
 			logger.Error(err, "Failed to get StatefulSet. Requesting requeue")
-			return ctrl.Result{RequeueAfter: requeueDuration}, nil
+			return nil, ctrl.Result{RequeueAfter: requeueDuration}, nil
 		}
 	}
 
-	// If the Statefulsets is not controlled by this EtcdCluster resource, we should log
-	// a warning to the event recorder and return error msg.
-	err = checkStatefulSetControlledByEtcdOperator(etcdCluster, sts)
-	if err != nil {
-		logger.Error(err, "StatefulSet is not controlled by this EtcdCluster resource")
-		return ctrl.Result{}, err
+	if sts != nil {
+		if err := checkStatefulSetControlledByEtcdOperator(ec, sts); err != nil {
+			logger.Error(err, "StatefulSet is not controlled by this EtcdCluster resource")
+			return nil, ctrl.Result{}, err
+		}
 	}
 
-	// If statefulset size is 0. try to instantiate the cluster with 1 member
-	if sts.Spec.Replicas != nil && *sts.Spec.Replicas == 0 {
-		logger.Info("StatefulSet has 0 replicas. Trying to create a new cluster with 1 member")
+	return &reconcileState{cluster: ec, sts: sts}, ctrl.Result{}, nil
+}
 
-		sts, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, 1, r.Scheme)
+// bootstrapStatefulSet ensures that the foundational Kubernetes objects for
+// a cluster exist and are correctly initialized. It creates the StatefulSet (initially
+// with 0 replicas) and the headless Service if necessary. When either resource
+// is created or the StatefulSet is scaled from zero to one replica, the returned
+// ctrl.Result requests a requeue so the next reconciliation loop can observe the
+// new state. The reconcileState is updated with the current StatefulSet.
+func (r *EtcdClusterReconciler) bootstrapStatefulSet(ctx context.Context, s *reconcileState) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+	requeue := false
+	var err error
+
+	switch {
+	case s.sts == nil:
+		logger.Info("Creating StatefulSet with 0 replica", "expectedSize", s.cluster.Spec.Size)
+		s.sts, err = reconcileStatefulSet(ctx, logger, s.cluster, r.Client, 0, r.Scheme)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
+		requeue = true
+
+	case s.sts.Spec.Replicas != nil && *s.sts.Spec.Replicas == 0:
+		logger.Info("StatefulSet has 0 replicas. Trying to create a new cluster with 1 member")
+		s.sts, err = reconcileStatefulSet(ctx, logger, s.cluster, r.Client, 1, r.Scheme)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		requeue = true
 	}
 
-	err = createHeadlessServiceIfNotExist(ctx, logger, r.Client, etcdCluster, r.Scheme)
-	if err != nil {
+	if err = createHeadlessServiceIfNotExist(ctx, logger, r.Client, s.cluster, r.Scheme); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	logger.Info("Now checking health of the cluster members")
-	memberListResp, healthInfos, err := healthCheck(sts, logger)
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("health check failed: %w", err)
+	if requeue {
+		return ctrl.Result{RequeueAfter: requeueDuration}, nil
 	}
+	return ctrl.Result{}, nil
+}
 
-	memberCnt := 0
-	if memberListResp != nil {
-		memberCnt = len(memberListResp.Members)
+// performHealthChecks obtains the member list and health status from the etcd
+// cluster specified in the StatefulSet. Results are stored on the reconcileState
+// for later reconciliation steps.
+func (r *EtcdClusterReconciler) performHealthChecks(ctx context.Context, s *reconcileState) error {
+	logger := log.FromContext(ctx)
+	logger.Info("Now checking health of the cluster members")
+	var err error
+	s.memberListResp, s.memberHealth, err = healthCheck(s.sts, logger)
+	if err != nil {
+		return fmt.Errorf("health check failed: %w", err)
 	}
-	targetReplica := *sts.Spec.Replicas // Start with the current size of the stateful set
+	return nil
+}
+
+// reconcileClusterState compares the desired cluster size with the observed
+// etcd member list and StatefulSet replica count. It performs scaling actions
+// and handles learner promotion when needed. A ctrl.Result with a requeue
+// instructs the controller to retry after adjustments.
+func (r *EtcdClusterReconciler) reconcileClusterState(ctx context.Context, s *reconcileState) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+	memberCnt := 0
+	if s.memberListResp != nil {
+		memberCnt = len(s.memberListResp.Members)
+	}
+	targetReplica := *s.sts.Spec.Replicas
+	var err error
 
 	// The number of replicas in the StatefulSet doesn't match the number of etcd members in the cluster.
 	if int(targetReplica) != memberCnt {
@@ -165,16 +223,14 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			logger.Info("An etcd member was added into the cluster, but the StatefulSet hasn't scaled out yet")
 			newReplicaCount := targetReplica + 1
 			logger.Info("Increasing StatefulSet replicas to match the etcd cluster member count", "oldReplicaCount", targetReplica, "newReplicaCount", newReplicaCount)
-			_, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, newReplicaCount, r.Scheme)
-			if err != nil {
+			if _, err := reconcileStatefulSet(ctx, logger, s.cluster, r.Client, newReplicaCount, r.Scheme); err != nil {
 				return ctrl.Result{}, err
 			}
 		} else {
 			logger.Info("An etcd member was removed from the cluster, but the StatefulSet hasn't scaled in yet")
 			newReplicaCount := targetReplica - 1
 			logger.Info("Decreasing StatefulSet replicas to remove the unneeded Pod.", "oldReplicaCount", targetReplica, "newReplicaCount", newReplicaCount)
-			_, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, newReplicaCount, r.Scheme)
-			if err != nil {
+			if _, err := reconcileStatefulSet(ctx, logger, s.cluster, r.Client, newReplicaCount, r.Scheme); err != nil {
 				return ctrl.Result{}, err
 			}
 		}
@@ -189,48 +245,45 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 	if memberCnt > 0 {
 		// Find the leader status
-		_, leaderStatus = etcdutils.FindLeaderStatus(healthInfos, logger)
+		_, leaderStatus = etcdutils.FindLeaderStatus(s.memberHealth, logger)
 		if leaderStatus == nil {
-			// If the leader is not available, let's wait for the leader to be elected
+			// If the leader is not available, wait for the leader to be elected
 			return ctrl.Result{}, fmt.Errorf("couldn't find leader, memberCnt: %d", memberCnt)
 		}
 
-		learner, learnerStatus = etcdutils.FindLearnerStatus(healthInfos, logger)
+		learner, learnerStatus = etcdutils.FindLearnerStatus(s.memberHealth, logger)
 		if learner > 0 {
-			// There is at least one learner. Let's try to promote it or wait
-			// Find the learner status
+			// There is at least one learner. Try to promote it if it's ready; otherwise requeue and wait.
 			logger.Info("Learner found", "learnedID", learner, "learnerStatus", learnerStatus)
 			if etcdutils.IsLearnerReady(leaderStatus, learnerStatus) {
 				logger.Info("Learner is ready to be promoted to voting member", "learnerID", learner)
 				logger.Info("Promoting the learner member", "learnerID", learner)
-				eps := clientEndpointsFromStatefulsets(sts)
+				eps := clientEndpointsFromStatefulsets(s.sts)
 				eps = eps[:(len(eps) - 1)]
-				err = etcdutils.PromoteLearner(eps, learner)
-				if err != nil {
-					// The member is not promoted yet, so we error out
+				if err := etcdutils.PromoteLearner(eps, learner); err != nil {
+					// The member is not promoted yet, so we error out and requeue via the caller.
 					return ctrl.Result{}, err
 				}
 			} else {
-				// Learner is not yet ready. We can't add another learner or proceed further until this one is promoted
-				// So let's requeue
+				// Learner is not yet ready. We can't add another learner or proceed further until this one is promoted.
 				logger.Info("The learner member isn't ready to be promoted yet", "learnerID", learner)
 				return ctrl.Result{RequeueAfter: requeueDuration}, nil
 			}
 		}
 	}
 
-	if targetReplica == int32(etcdCluster.Spec.Size) {
+	if targetReplica == int32(s.cluster.Spec.Size) {
 		logger.Info("EtcdCluster is already up-to-date")
 		return ctrl.Result{}, nil
 	}
 
-	eps := clientEndpointsFromStatefulsets(sts)
+	eps := clientEndpointsFromStatefulsets(s.sts)
 
-	// If there is no more learner, then we can proceed to scale the cluster further.
-	// If there is no more member to add, the control will not reach here after the requeue
-	if targetReplica < int32(etcdCluster.Spec.Size) {
+	// If there are no learners left, we can proceed to scale the cluster towards the desired size.
+	// When there are no members to add, the controller will requeue above and this block won't execute.
+	if targetReplica < int32(s.cluster.Spec.Size) {
 		// scale out
-		_, peerURL := peerEndpointForOrdinalIndex(etcdCluster, int(targetReplica)) // The index starts at 0, so we should do this before incrementing targetReplica
+		_, peerURL := peerEndpointForOrdinalIndex(s.cluster, int(targetReplica))
 		targetReplica++
 		logger.Info("[Scale out] adding a new learner member to etcd cluster", "peerURLs", peerURL)
 		if _, err := etcdutils.AddMember(eps, []string{peerURL}, true); err != nil {
@@ -238,39 +291,47 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		}
 
 		logger.Info("Learner member added successfully", "peerURLs", peerURL)
-	} else {
+
+		if s.sts, err = reconcileStatefulSet(ctx, logger, s.cluster, r.Client, targetReplica, r.Scheme); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		return ctrl.Result{RequeueAfter: requeueDuration}, nil
+	}
+
+	if targetReplica > int32(s.cluster.Spec.Size) {
 		// scale in
 		targetReplica--
-		logger = logger.WithValues("targetReplica", targetReplica, "expectedSize", etcdCluster.Spec.Size)
+		logger = logger.WithValues("targetReplica", targetReplica, "expectedSize", s.cluster.Spec.Size)
 
-		memberID := healthInfos[memberCnt-1].Status.Header.MemberId
+		memberID := s.memberHealth[memberCnt-1].Status.Header.MemberId
 
 		logger.Info("[Scale in] removing one member", "memberID", memberID)
 		eps = eps[:targetReplica]
 		if err := etcdutils.RemoveMember(eps, memberID); err != nil {
 			return ctrl.Result{}, err
 		}
+
+		if s.sts, err = reconcileStatefulSet(ctx, logger, s.cluster, r.Client, targetReplica, r.Scheme); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		return ctrl.Result{RequeueAfter: requeueDuration}, nil
 	}
 
-	sts, err = reconcileStatefulSet(ctx, logger, etcdCluster, r.Client, targetReplica, r.Scheme)
+	// Ensure every etcd member reports itself healthy before declaring success.
+	allMembersHealthy, err := areAllMembersHealthy(s.sts, logger)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
-	allMembersHealthy, err := areAllMembersHealthy(sts, logger)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-
-	if *sts.Spec.Replicas != int32(etcdCluster.Spec.Size) || !allMembersHealthy {
-		// Requeue if the statefulset size is not equal to the expected size of ETCD cluster
-		// Or if all members of the cluster are not healthy
+	if !allMembersHealthy {
+		// Requeue until the StatefulSet settles and all members are healthy.
 		return ctrl.Result{RequeueAfter: requeueDuration}, nil
 	}
 
 	logger.Info("EtcdCluster reconciled successfully")
 	return ctrl.Result{}, nil
-
 }
 
 // SetupWithManager sets up the controller with the Manager.
