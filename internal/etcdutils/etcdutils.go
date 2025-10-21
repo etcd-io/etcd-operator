@@ -92,6 +92,9 @@ func FindLeaderStatus(healthInfos []EpHealth, logger logr.Logger) (uint64, *clie
 	// Find the leader status
 	for i := range healthInfos {
 		status := healthInfos[i].Status
+		if status == nil || status.Header == nil {
+			continue
+		}
 		if status.Leader == status.Header.MemberId {
 			leader = status.Header.MemberId
 			leaderStatus = status
@@ -110,9 +113,13 @@ func FindLearnerStatus(healthInfos []EpHealth, logger logr.Logger) (uint64, *cli
 	var learnerStatus *clientv3.StatusResponse
 	logger.Info("Now checking if there is any pending learner member that needs to be promoted")
 	for i := range healthInfos {
-		if healthInfos[i].Status.IsLearner {
-			learner = healthInfos[i].Status.Header.MemberId
-			learnerStatus = healthInfos[i].Status
+		status := healthInfos[i].Status
+		if status == nil || status.Header == nil {
+			continue
+		}
+		if status.IsLearner {
+			learner = status.Header.MemberId
+			learnerStatus = status
 			logger.Info("Learner member found", "memberID", learner)
 			break
 		}

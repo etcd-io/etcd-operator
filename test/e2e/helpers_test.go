@@ -29,12 +29,14 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/e2e-framework/klient/wait"
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
 
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
+	"go.etcd.io/etcd-operator/pkg/status"
 	etcdserverpb "go.etcd.io/etcd/api/v3/etcdserverpb"
 )
 
@@ -295,4 +297,86 @@ func verifyDataOperations(t *testing.T, c *envconf.Config, etcdClusterName strin
 	if len(lines) < 2 || lines[0] != testKey || lines[1] != testValue {
 		t.Errorf("Expected key-value pair [%s=%s], but got output: %s", testKey, testValue, stdout)
 	}
+}
+
+func waitForClusterHealthyStatus(
+	t *testing.T,
+	c *envconf.Config,
+	name string,
+	expectedMembers int,
+) {
+	t.Helper()
+	var cluster ecv1alpha1.EtcdCluster
+	err := wait.For(func(ctx context.Context) (bool, error) {
+		if err := c.Client().Resources().Get(ctx, name, namespace, &cluster); err != nil {
+			return false, err
+		}
+
+		if cluster.Status.ObservedGeneration < cluster.Generation {
+			return false, nil
+		}
+
+		if cluster.Status.CurrentReplicas != int32(expectedMembers) ||
+			cluster.Status.ReadyReplicas != int32(expectedMembers) ||
+			cluster.Status.MemberCount != int32(expectedMembers) ||
+			len(cluster.Status.Members) != expectedMembers {
+			return false, nil
+		}
+
+		leaderCount := 0
+		for _, member := range cluster.Status.Members {
+			if !member.IsHealthy || member.IsLearner {
+				return false, nil
+			}
+			if member.IsLeader {
+				leaderCount++
+			}
+		}
+		if leaderCount != 1 {
+			return false, nil
+		}
+
+		if !conditionEquals(
+			cluster.Status.Conditions,
+			status.ConditionAvailable,
+			metav1.ConditionTrue,
+			status.ReasonClusterReady,
+		) {
+			return false, nil
+		}
+		if !conditionEquals(
+			cluster.Status.Conditions,
+			status.ConditionProgressing,
+			metav1.ConditionFalse,
+			status.ReasonReconcileSuccess,
+		) {
+			return false, nil
+		}
+		if !conditionEquals(
+			cluster.Status.Conditions,
+			status.ConditionDegraded,
+			metav1.ConditionFalse,
+			status.ReasonClusterHealthy,
+		) {
+			return false, nil
+		}
+
+		return true, nil
+	}, wait.WithTimeout(5*time.Minute), wait.WithInterval(5*time.Second))
+	if err != nil {
+		t.Fatalf("EtcdCluster %s did not reach healthy status for %d members: %v", name, expectedMembers, err)
+	}
+}
+
+func conditionEquals(
+	conditions []metav1.Condition,
+	condType string,
+	condStatus metav1.ConditionStatus,
+	condReason string,
+) bool {
+	cond := meta.FindStatusCondition(conditions, condType)
+	if cond == nil {
+		return false
+	}
+	return cond.Status == condStatus && cond.Reason == condReason
 }
