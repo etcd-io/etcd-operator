@@ -76,6 +76,8 @@ func TestDataPersistence(t *testing.T) {
 	feature.Setup(func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
 		client := cfg.Client()
 
+		enableStatusRecording(t, cfg, t.Name(), etcdClusterName)
+
 		// create etcd cluster
 		if err := client.Resources().Create(ctx, etcdCluster); err != nil {
 			t.Fatalf("unable to create etcd cluster: %s", err)

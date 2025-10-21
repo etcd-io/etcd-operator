@@ -19,10 +19,14 @@ package e2e
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -32,6 +36,9 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/e2e-framework/klient/k8s/resources"
+	"sigs.k8s.io/e2e-framework/klient/k8s/watcher"
 	"sigs.k8s.io/e2e-framework/klient/wait"
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
 
@@ -206,6 +213,213 @@ func getEtcdMemberListPB(t *testing.T, c *envconf.Config, podName string) *etcds
 		t.Fatalf("Failed to parse etcd member list JSON: %v", err)
 	}
 	return &memberList
+}
+
+// StatusRecorder observes EtcdCluster status transitions and appends JSON lines to writer.
+type StatusRecorder struct {
+	cancel   context.CancelFunc
+	watcher  *watcher.EventHandlerFuncs
+	done     chan struct{}
+	writer   io.Writer
+	mu       sync.Mutex
+	lastHash string
+}
+
+// StartStatusRecorder begins watching the EtcdCluster identified by nn.
+// Whenever the status (including conditions) changes, a snapshot is written as JSON.
+func StartStatusRecorder(
+	t *testing.T,
+	cfg *envconf.Config,
+	nn types.NamespacedName,
+	writer io.Writer,
+) (*StatusRecorder, error) {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	res := cfg.Client().Resources().WithNamespace(nn.Namespace)
+
+	w := res.Watch(
+		&ecv1alpha1.EtcdClusterList{},
+		resources.WithFieldSelector(fmt.Sprintf("metadata.name=%s", nn.Name)),
+	)
+
+	recorder := &StatusRecorder{
+		cancel:  cancel,
+		watcher: w,
+		done:    make(chan struct{}),
+		writer:  writer,
+	}
+
+	handle := func(event string, obj interface{}) {
+		cluster, ok := obj.(*ecv1alpha1.EtcdCluster)
+		if !ok || cluster == nil {
+			return
+		}
+		recorder.recordSnapshot(t, event, cluster)
+	}
+
+	w.WithAddFunc(func(obj interface{}) { handle("ADDED", obj) }).
+		WithUpdateFunc(func(obj interface{}) { handle("MODIFIED", obj) }).
+		WithDeleteFunc(func(obj interface{}) { handle("DELETED", obj) })
+
+	if err := w.Start(ctx); err != nil {
+		cancel()
+		return nil, fmt.Errorf("failed to start status recorder watch: %w", err)
+	}
+
+	go func() {
+		<-ctx.Done()
+		close(recorder.done)
+	}()
+
+	return recorder, nil
+}
+
+// Stop stops the recorder and waits for the watcher to terminate.
+func (r *StatusRecorder) Stop() {
+	if r == nil {
+		return
+	}
+
+	r.cancel()
+	if r.watcher != nil {
+		r.watcher.Stop()
+	}
+	<-r.done
+}
+
+func (r *StatusRecorder) recordSnapshot(t *testing.T, event string, cluster *ecv1alpha1.EtcdCluster) {
+	statusCopy := ecv1alpha1.EtcdClusterStatus{}
+	cluster.Status.DeepCopyInto(&statusCopy)
+
+	statusBytes, err := json.Marshal(statusCopy)
+	if err != nil {
+		t.Logf("failed to marshal EtcdCluster status for recorder: %v", err)
+		return
+	}
+	hashBytes := sha256.Sum256(statusBytes)
+	hash := fmt.Sprintf("%d|%d|%x", cluster.Generation, statusCopy.ObservedGeneration, hashBytes)
+
+	payload := struct {
+		Timestamp          string                       `json:"timestamp"`
+		Event              string                       `json:"event"`
+		Generation         int64                        `json:"generation"`
+		ObservedGeneration int64                        `json:"observedGeneration"`
+		ResourceVersion    string                       `json:"resourceVersion"`
+		Status             ecv1alpha1.EtcdClusterStatus `json:"status"`
+	}{
+		Timestamp:          time.Now().UTC().Format(time.RFC3339Nano),
+		Event:              event,
+		Generation:         cluster.Generation,
+		ObservedGeneration: statusCopy.ObservedGeneration,
+		ResourceVersion:    cluster.ResourceVersion,
+		Status:             statusCopy,
+	}
+
+	data, err := json.Marshal(payload)
+	if err != nil {
+		t.Logf("failed to marshal recorder payload: %v", err)
+		return
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if hash == r.lastHash {
+		return
+	}
+	if _, err := r.writer.Write(data); err != nil {
+		t.Logf("failed to write status recorder payload: %v", err)
+		return
+	}
+	if _, err := r.writer.Write([]byte("\n")); err != nil {
+		t.Logf("failed to finalize status recorder payload: %v", err)
+		return
+	}
+	r.lastHash = hash
+}
+
+func createStatusHistoryWriter(t *testing.T, testName, clusterName string) io.WriteCloser {
+	t.Helper()
+
+	base := resolveStatusArtifactsBase()
+
+	dir := filepath.Join(base, sanitizeFileComponent(testName))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("failed to create status artifact directory %s: %v", dir, err)
+	}
+
+	filePath := filepath.Join(dir, fmt.Sprintf("%s-status.jsonl", sanitizeFileComponent(clusterName)))
+	file, err := os.Create(filePath)
+	if err != nil {
+		t.Fatalf("failed to create status artifact file %s: %v", filePath, err)
+	}
+
+	t.Logf("recording EtcdCluster status to %s", filePath)
+	return file
+}
+
+func sanitizeFileComponent(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "unnamed"
+	}
+	var b strings.Builder
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') ||
+			(r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') ||
+			r == '-' || r == '_' {
+			b.WriteRune(r)
+		} else {
+			b.WriteRune('-')
+		}
+	}
+	return b.String()
+}
+
+func resolveStatusArtifactsBase() string {
+	if explicit := os.Getenv("ETCD_OPERATOR_E2E_ARTIFACTS_DIR"); explicit != "" {
+		return explicit
+	}
+
+	if prowArtifacts := os.Getenv("ARTIFACTS"); prowArtifacts != "" {
+		return filepath.Join(prowArtifacts, "etcdcluster-status")
+	}
+
+	return filepath.Join(".", "artifacts", "status")
+}
+
+func enableStatusRecording(
+	t *testing.T,
+	c *envconf.Config,
+	testName string,
+	clusterName string,
+) {
+	t.Helper()
+
+	writer := createStatusHistoryWriter(t, testName, clusterName)
+	recorder, err := StartStatusRecorder(
+		t,
+		c,
+		types.NamespacedName{
+			Name:      clusterName,
+			Namespace: namespace,
+		},
+		writer,
+	)
+	if err != nil {
+		if closeErr := writer.Close(); closeErr != nil {
+			t.Logf("failed to close status recorder writer after start error: %v", closeErr)
+		}
+		t.Fatalf("failed to start status recorder: %v", err)
+	}
+
+	t.Cleanup(func() {
+		recorder.Stop()
+		if err := writer.Close(); err != nil {
+			t.Logf("failed to close status recorder writer: %v", err)
+		}
+	})
 }
 
 // waitForNoLearners waits until the member list has the expected number of members

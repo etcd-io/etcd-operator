@@ -143,6 +143,7 @@ func TestScaling(t *testing.T) {
 			etcdClusterName := fmt.Sprintf("etcd-%s", strings.ToLower(tc.name))
 
 			feature.Setup(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+				enableStatusRecording(t, c, t.Name(), etcdClusterName)
 				createEtcdClusterWithPVC(ctx, t, c, etcdClusterName, tc.initialSize)
 				waitForSTSReadiness(t, c, etcdClusterName, tc.initialSize)
 				waitForClusterHealthyStatus(t, c, etcdClusterName, tc.initialSize)
@@ -193,6 +194,7 @@ func TestPodRecovery(t *testing.T) {
 	etcdClusterName := "etcd-recovery-test"
 
 	feature.Setup(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+		enableStatusRecording(t, c, t.Name(), etcdClusterName)
 		createEtcdClusterWithPVC(ctx, t, c, etcdClusterName, 3)
 		waitForSTSReadiness(t, c, etcdClusterName, 3)
 		waitForClusterHealthyStatus(t, c, etcdClusterName, 3)
