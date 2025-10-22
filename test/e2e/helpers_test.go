@@ -225,6 +225,28 @@ type StatusRecorder struct {
 	lastHash string
 }
 
+type statusRecorderHandle struct {
+	recorder *StatusRecorder
+	writer   io.WriteCloser
+	once     sync.Once
+}
+
+func (h *statusRecorderHandle) stop(t *testing.T) {
+	if h == nil {
+		return
+	}
+	h.once.Do(func() {
+		if h.recorder != nil {
+			h.recorder.Stop()
+		}
+		if h.writer != nil {
+			if err := h.writer.Close(); err != nil {
+				t.Logf("failed to close status recorder writer: %v", err)
+			}
+		}
+	})
+}
+
 // StartStatusRecorder begins watching the EtcdCluster identified by nn.
 // Whenever the status (including conditions) changes, a snapshot is written as JSON.
 func StartStatusRecorder(
@@ -389,13 +411,27 @@ func resolveStatusArtifactsBase() string {
 	return filepath.Join(".", "artifacts", "status")
 }
 
+type statusRecorderContextKey struct{}
+
+var statusRecorderKey statusRecorderContextKey
+
 func enableStatusRecording(
+	ctx context.Context,
 	t *testing.T,
 	c *envconf.Config,
 	testName string,
 	clusterName string,
-) {
+) context.Context {
 	t.Helper()
+
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	if existing, ok := ctx.Value(statusRecorderKey).(*statusRecorderHandle); ok && existing != nil {
+		t.Logf("status recording already enabled for test %s", testName)
+		return ctx
+	}
 
 	writer := createStatusHistoryWriter(t, testName, clusterName)
 	recorder, err := StartStatusRecorder(
@@ -414,12 +450,23 @@ func enableStatusRecording(
 		t.Fatalf("failed to start status recorder: %v", err)
 	}
 
-	t.Cleanup(func() {
-		recorder.Stop()
-		if err := writer.Close(); err != nil {
-			t.Logf("failed to close status recorder writer: %v", err)
-		}
-	})
+	handle := &statusRecorderHandle{
+		recorder: recorder,
+		writer:   writer,
+	}
+	return context.WithValue(ctx, statusRecorderKey, handle)
+}
+
+func stopStatusRecording(ctx context.Context, t *testing.T) {
+	t.Helper()
+
+	if ctx == nil {
+		return
+	}
+
+	if handle, ok := ctx.Value(statusRecorderKey).(*statusRecorderHandle); ok && handle != nil {
+		handle.stop(t)
+	}
 }
 
 // waitForNoLearners waits until the member list has the expected number of members

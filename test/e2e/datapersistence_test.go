@@ -76,7 +76,7 @@ func TestDataPersistence(t *testing.T) {
 	feature.Setup(func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
 		client := cfg.Client()
 
-		enableStatusRecording(t, cfg, t.Name(), etcdClusterName)
+		ctx = enableStatusRecording(ctx, t, cfg, t.Name(), etcdClusterName)
 
 		// create etcd cluster
 		if err := client.Resources().Create(ctx, etcdCluster); err != nil {
@@ -201,6 +201,12 @@ func TestDataPersistence(t *testing.T) {
 			return ctx
 		},
 	)
+
+	feature.Teardown(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+		stopStatusRecording(ctx, t)
+		cleanupEtcdCluster(ctx, t, c, etcdClusterName)
+		return ctx
+	})
 
 	_ = testEnv.Test(t, feature.Feature())
 }
