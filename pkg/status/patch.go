@@ -100,8 +100,9 @@ func PatchStatusMutate[T client.Object](
 		}
 
 		// Patch the status subresource using the mutated 'latestFetchedObj' object.
-		// client.MergeFrom(beforeMutateStatusCopy) creates a strategic merge patch or JSON merge patch
-		// based on the difference between 'latestFetchedObj' and 'beforeMutateStatusCopy'.
+		// client.MergeFrom(beforeMutateStatusCopy) generates a JSON merge patch from the diff between the
+		// mutated object and its pre-mutation copy. We intentionally avoid StrategicMerge
+		// because CRDs (like EtcdCluster) don't support it.
 		logger.Info("Status change detected, attempting to patch status subresource.")
 		patchErr := c.Status().Patch(ctx, latestFetchedObj, client.MergeFrom(beforeMutateStatusCopy))
 		if patchErr != nil {
