@@ -260,10 +260,7 @@ func TestPodRecovery(t *testing.T) {
 			}
 
 			// Verify cluster replication works across recovered pod
-			_, stderr, err := execInPod(t, c, podName, namespace, []string{"etcdctl", "put", "replication-test", "value"})
-			if err != nil {
-				t.Fatalf("Failed to write data after recovery: %v, stderr: %s", err, stderr)
-			}
+			verifyDataOperations(t, c, etcdClusterName, "replication-test", "value")
 
 			stdout, stderr, err := execInPod(t, c, targetPodName, namespace, []string{"etcdctl", "get", "replication-test"})
 			if err != nil {
@@ -289,7 +286,6 @@ func TestEtcdClusterFunctionality(t *testing.T) {
 	feature := features.New("etcd-cluster-functionality")
 	etcdClusterName := "etcd-functionality-test"
 	testKey := "test-key"
-	testValue := "test-value"
 
 	feature.Setup(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
 		createEtcdClusterWithPVC(ctx, t, c, etcdClusterName, 3)
@@ -329,26 +325,7 @@ func TestEtcdClusterFunctionality(t *testing.T) {
 	})
 
 	feature.Assess("test data operations", func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-		podName := fmt.Sprintf("%s-0", etcdClusterName)
-
-		// Write key-value data
-		command := []string{"etcdctl", "put", testKey, testValue}
-		_, stderr, err := execInPod(t, c, podName, namespace, command)
-		if err != nil {
-			t.Fatalf("Failed to write data: %v, stderr: %s", err, stderr)
-		}
-
-		// Read key-value data
-		command = []string{"etcdctl", "get", testKey}
-		stdout, stderr, err := execInPod(t, c, podName, namespace, command)
-		if err != nil {
-			t.Fatalf("Failed to read data: %v, stderr: %s", err, stderr)
-		}
-
-		lines := strings.Split(strings.TrimSpace(stdout), "\n")
-		if len(lines) < 2 || lines[0] != testKey || lines[1] != testValue {
-			t.Errorf("Expected key-value pair [%s=%s], but got output: %s", testKey, testValue, stdout)
-		}
+		verifyDataOperations(t, c, etcdClusterName, "test-key", "test-value")
 		return ctx
 	})
 

@@ -35,7 +35,7 @@ import (
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
 
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
-	etcdserverpb "go.etcd.io/etcd/api/v3/etcdserverpb"
+	"go.etcd.io/etcd/api/v3/etcdserverpb"
 )
 
 // getAvailableStorageClass returns an available StorageClass name
@@ -272,9 +272,7 @@ func getClusterEndpointHashKVs(t *testing.T, c *envconf.Config, podName string) 
 	return out
 }
 
-func verifyDataOperations(t *testing.T, c *envconf.Config, etcdClusterName string) {
-	testKey := "test-key"
-	testValue := "test-value"
+func verifyDataOperations(t *testing.T, c *envconf.Config, etcdClusterName, testKey, testValue string) {
 	podName := fmt.Sprintf("%s-0", etcdClusterName)
 
 	// Write key-value data
