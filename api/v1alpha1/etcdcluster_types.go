@@ -98,7 +98,8 @@ type CommonConfig struct {
 	AltNames AltNames `json:"altNames,omitempty"`
 
 	// ValidityDuration is the expected duration until which the certificate will be valid,
-	// expects in human-readable duration: 100d12h, if empty defaults to 90d
+	// expects in human-readable duration: 100d12h, if empty defaults to 90d for cert-manager
+	// and 365d for auto as per: https://github.com/etcd-io/etcd/blob/b87bc1c3a275d7d4904f4d201b963a2de2264f0d/client/pkg/transport/listener.go#L275
 	// +optional
 	ValidityDuration string `json:"validityDuration,omitempty"`
 
