@@ -117,7 +117,7 @@ func (r *EtcdClusterReconciler) fetchAndValidateState(ctx context.Context, req c
 
 	// Ensure the operator has TLS credentials when the cluster requests TLS.
 	if ec.Spec.TLS != nil {
-		if err := createClientCertificate(ctx, ec, r.Client); err != nil {
+		if err := createClientCertificate(ctx, ec, r.Client, r.Scheme); err != nil {
 			logger.Error(err, "Failed to create Client Certificate.")
 		}
 	} else {
