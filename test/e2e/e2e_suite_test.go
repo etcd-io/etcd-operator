@@ -44,6 +44,7 @@ var (
 	imageName     = "etcd-operator:v0.1"
 	namespace     = "etcd-operator-system"
 	containerTool = os.Getenv("CONTAINER_TOOL")
+	deployMethod  = getDeployMethod()
 )
 
 func TestMain(m *testing.M) {
@@ -123,14 +124,10 @@ func TestMain(m *testing.M) {
 			// Deploy components
 			log.Println("Deploying components...")
 
-			log.Println("Deploying controller-manager resources...")
-			cmd = exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", imageName))
-			if _, err := test_utils.Run(cmd); err != nil {
-				log.Printf("Failed to deploy resource configurations: %s", err)
+			if err := deployOperator(deployMethod, imageName, namespace); err != nil {
+				log.Printf("Failed to deploy operator: %s", err)
 				return ctx, err
-			}
-
-			// wait for controller to get ready
+			} // wait for controller to get ready
 			client := cfg.Client()
 
 			log.Println("Waiting for controller-manager deployment to be available...")
@@ -161,14 +158,11 @@ func TestMain(m *testing.M) {
 
 			// undeploy etcd operator
 			log.Println("Undeploy etcd controller...")
-			cmd := exec.Command("make", "undeploy", "ignore-not-found=true")
-			if _, err := test_utils.Run(cmd); err != nil {
+			if err := undeployOperator(deployMethod, namespace); err != nil {
 				log.Printf("Warning: Failed to undeploy controller: %s", err)
-			}
-
-			// uninstall crd
+			} // uninstall crd
 			log.Println("Uninstalling crd...")
-			cmd = exec.Command("make", "uninstall", "ignore-not-found=true")
+			cmd := exec.Command("make", "uninstall", "ignore-not-found=true")
 			if _, err := test_utils.Run(cmd); err != nil {
 				log.Printf("Warning: Failed to install crd: %s", err)
 			}

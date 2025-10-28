@@ -28,3 +28,12 @@ go.work
 
 # macOS
 .DS_Store
+
+# Helm Chart generated directory
+# The .gitignore inside helm/ controls specific ignored files
+helm/Chart.yaml
+helm/values.yaml
+helm/templates/
+helm/crds/
+helm/charts/
+helm/*.tgz

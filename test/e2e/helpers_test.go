@@ -21,7 +21,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -35,7 +37,13 @@ import (
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
 
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
+	test_utils "go.etcd.io/etcd-operator/test/utils"
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
+)
+
+const (
+	deployMethodKustomize = "kustomize"
+	deployMethodHelm      = "helm"
 )
 
 // getAvailableStorageClass returns an available StorageClass name
@@ -293,4 +301,145 @@ func verifyDataOperations(t *testing.T, c *envconf.Config, etcdClusterName, test
 	if len(lines) < 2 || lines[0] != testKey || lines[1] != testValue {
 		t.Errorf("Expected key-value pair [%s=%s], but got output: %s", testKey, testValue, stdout)
 	}
+}
+
+// getDeployMethod retrieves the deployment method from environment variable,
+// defaults to "kustomize" if not set.
+func getDeployMethod() string {
+	method := os.Getenv("DEPLOY_METHOD")
+	if method == "" {
+		return deployMethodKustomize
+	}
+	return method
+}
+
+// deployOperator deploys the operator based on the deployment method.
+// It supports both Kustomize and Helm deployment methods.
+func deployOperator(deployMethod, imageName, namespace string) error {
+	log.Printf("Deploying operator using method: %s", deployMethod)
+
+	switch deployMethod {
+	case deployMethodHelm:
+		return deployWithHelm(imageName, namespace)
+	case deployMethodKustomize:
+		return deployWithKustomize(imageName)
+	default:
+		return fmt.Errorf("unknown DEPLOY_METHOD: %s (supported: %s, %s)",
+			deployMethod, deployMethodKustomize, deployMethodHelm)
+	}
+}
+
+// deployWithKustomize deploys the operator using Kustomize.
+func deployWithKustomize(imageName string) error {
+	log.Println("Deploying controller-manager resources with Kustomize...")
+	cmd := exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", imageName))
+	if _, err := test_utils.Run(cmd); err != nil {
+		return fmt.Errorf("failed to deploy with Kustomize: %w", err)
+	}
+	return nil
+}
+
+// deployWithHelm deploys the operator using Helm Chart.
+func deployWithHelm(imageName, namespace string) error {
+	log.Println("Generating Helm Chart...")
+	cmd := exec.Command("make", "helm")
+	if _, err := test_utils.Run(cmd); err != nil {
+		return fmt.Errorf("failed to generate Helm Chart: %w", err)
+	}
+
+	// Check for custom values file
+	helmValues := os.Getenv("HELM_VALUES")
+	if helmValues == "" {
+		helmValues = "helm/values.yaml"
+	} else {
+		log.Printf("Using custom values file: %s", helmValues)
+	}
+
+	// Verify values file exists
+	if _, err := os.Stat(helmValues); os.IsNotExist(err) {
+		return fmt.Errorf("specified HELM_VALUES file does not exist: %s", helmValues)
+	}
+
+	log.Println("Installing operator with Helm...")
+	args := []string{
+		"install", "etcd-operator", "./helm",
+		"-f", helmValues,
+		"-n", namespace,
+		"--wait",
+		"--timeout", "5m",
+		"--set", fmt.Sprintf("controllerManager.manager.image.repository=%s", getImageRepository(imageName)),
+		"--set", fmt.Sprintf("controllerManager.manager.image.tag=%s", getImageTag(imageName)),
+	}
+
+	cmd = exec.Command("helm", args...)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("helm install failed: %w\nOutput: %s", err, string(output))
+	}
+
+	log.Println("Helm Chart installed successfully")
+	return nil
+}
+
+// undeployOperator undeploys the operator based on the deployment method.
+func undeployOperator(deployMethod, namespace string) error {
+	log.Printf("Undeploying operator using method: %s", deployMethod)
+
+	switch deployMethod {
+	case deployMethodHelm:
+		return undeployWithHelm(namespace)
+	case deployMethodKustomize:
+		return undeployWithKustomize()
+	default:
+		return fmt.Errorf("unknown DEPLOY_METHOD: %s", deployMethod)
+	}
+}
+
+// undeployWithKustomize undeploys the operator using Kustomize.
+func undeployWithKustomize() error {
+	cmd := exec.Command("make", "undeploy", "ignore-not-found=true")
+	if _, err := test_utils.Run(cmd); err != nil {
+		return fmt.Errorf("failed to undeploy with Kustomize: %w", err)
+	}
+	return nil
+}
+
+// undeployWithHelm undeploys the operator using Helm.
+func undeployWithHelm(namespace string) error {
+	log.Println("Uninstalling operator with Helm...")
+	cmd := exec.Command("helm", "uninstall", "etcd-operator", "-n", namespace)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		// Helm uninstall failures should only be logged as warnings during cleanup
+		log.Printf("Warning: helm uninstall failed: %v\nOutput: %s", err, string(output))
+	}
+	return nil
+}
+
+// getImageRepository extracts the repository part from a full image name.
+// Examples:
+//   - "etcd-operator:v0.1" -> "etcd-operator"
+//   - "ghcr.io/etcd-io/etcd-operator:v0.1" -> "ghcr.io/etcd-io/etcd-operator"
+func getImageRepository(imageName string) string {
+	parts := splitImageNameTag(imageName)
+	return parts[0]
+}
+
+// getImageTag extracts the tag from a full image name.
+// Examples:
+//   - "etcd-operator:v0.1" -> "v0.1"
+//   - "etcd-operator" -> "latest"
+func getImageTag(imageName string) string {
+	parts := splitImageNameTag(imageName)
+	if len(parts) > 1 {
+		return parts[1]
+	}
+	return "latest"
+}
+
+// splitImageNameTag splits an image name into repository and tag parts.
+func splitImageNameTag(imageName string) []string {
+	idx := strings.LastIndex(imageName, ":")
+	if idx != -1 {
+		return []string{imageName[:idx], imageName[idx+1:]}
+	}
+	return []string{imageName}
 }

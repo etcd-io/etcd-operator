@@ -1,0 +1,74 @@
+# Helm Values - High Availability Configuration Example
+# 
+# This configuration provides high availability for the operator with:
+# - 3 replicas for redundancy
+# - Leader election enabled (only one replica actively reconciles at a time)
+# - Higher resource limits for production workloads
+# 
+# Note: The Kubernetes scheduler will automatically distribute pods across nodes.
+# For more advanced placement (affinity, topology spread), you need to manually
+# edit the generated Helm templates in helm/templates/deployment.yaml.
+# 
+# Usage:
+#   helm install etcd-operator ./helm -f helm/examples/values-ha.yaml
+#   Or in E2E tests:
+#   DEPLOY_METHOD=helm HELM_VALUES=helm/examples/values-ha.yaml make test-e2e
+
+# Controller Manager Configuration
+controllerManager:
+  # Replica count - HA configuration uses 3 replicas for redundancy
+  # Only one replica will be active (leader) at a time due to leader election
+  replicas: 3
+
+  # Pod security context
+  podSecurityContext:
+    runAsNonRoot: true
+
+  # ServiceAccount configuration
+  serviceAccount:
+    annotations: {}
+
+  # Manager container configuration
+  manager:
+    # Image configuration
+    image:
+      repository: controller
+      tag: latest
+
+    # Container arguments
+    args:
+    - --metrics-bind-address=:8443
+    - --leader-elect
+    - --health-probe-bind-address=:8081
+
+    # Resource configuration - HA environment uses higher resource limits
+    resources:
+      limits:
+        cpu: 1000m      # 1 CPU
+        memory: 512Mi   # 512 MB
+      requests:
+        cpu: 200m       # 0.2 CPU
+        memory: 128Mi   # 128 MB
+
+    # Container security context
+    containerSecurityContext:
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop:
+        - ALL
+
+# Metrics Service Configuration
+metricsService:
+  type: ClusterIP
+  ports:
+  - name: https
+    port: 8443
+    protocol: TCP
+    targetPort: 8443
+
+# Kubernetes cluster domain
+kubernetesClusterDomain: cluster.local
+
+# Image pull secrets (if using private image registry)
+imagePullSecrets: []
+
