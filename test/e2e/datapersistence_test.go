@@ -76,6 +76,8 @@ func TestDataPersistence(t *testing.T) {
 	feature.Setup(func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
 		client := cfg.Client()
 
+		ctx = enableStatusRecording(ctx, t, cfg, t.Name(), etcdClusterName)
+
 		// create etcd cluster
 		if err := client.Resources().Create(ctx, etcdCluster); err != nil {
 			t.Fatalf("unable to create etcd cluster: %s", err)
@@ -113,6 +115,8 @@ func TestDataPersistence(t *testing.T) {
 			); err != nil {
 				t.Fatalf("unable to create sts with size 1: %s", err)
 			}
+
+			waitForClusterHealthyStatus(t, c, etcdClusterName, size)
 
 			return ctx
 		},
@@ -197,6 +201,12 @@ func TestDataPersistence(t *testing.T) {
 			return ctx
 		},
 	)
+
+	feature.Teardown(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+		stopStatusRecording(ctx, t)
+		cleanupEtcdCluster(ctx, t, c, etcdClusterName)
+		return ctx
+	})
 
 	_ = testEnv.Test(t, feature.Feature())
 }
