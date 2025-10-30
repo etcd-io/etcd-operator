@@ -3,6 +3,7 @@ package e2e
 import (
 	"context"
 	"fmt"
+	"log"
 	"reflect"
 	"testing"
 	"time"
@@ -22,6 +23,7 @@ import (
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 	"go.etcd.io/etcd-operator/pkg/certificate/cert_manager"
 	interfaces "go.etcd.io/etcd-operator/pkg/certificate/interfaces"
+	testUtils "go.etcd.io/etcd-operator/test/utils"
 )
 
 const (
@@ -60,6 +62,11 @@ func TestCertManagerProvider(t *testing.T) {
 
 	feature.Setup(
 		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+			log.Println("Installing cert-manager...")
+			if err := testUtils.InstallCertManager(); err != nil {
+				log.Printf("Unable to install Cert Manager: %s", err)
+			}
+
 			client := cfg.Client()
 			_ = appsv1.AddToScheme(client.Resources().GetScheme())
 			_ = corev1.AddToScheme(client.Resources().GetScheme())
@@ -179,6 +186,11 @@ func TestClusterCertCreation(t *testing.T) {
 	}
 
 	feature.Setup(func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+		log.Println("Installing cert-manager...")
+		if err := testUtils.InstallCertManager(); err != nil {
+			log.Printf("Unable to install Cert Manager: %s", err)
+		}
+
 		client := cfg.Client()
 		_ = appsv1.AddToScheme(client.Resources().GetScheme())
 		_ = corev1.AddToScheme(client.Resources().GetScheme())

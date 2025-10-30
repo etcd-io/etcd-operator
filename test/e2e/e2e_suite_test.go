@@ -87,16 +87,11 @@ func TestMain(m *testing.M) {
 			return ctx, nil
 		},
 
-		// install prometheus and cert-manager
+		// install prometheus
 		func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
 			log.Println("Installing prometheus operator...")
 			if err := testUtils.InstallPrometheusOperator(); err != nil {
 				log.Printf("Unable to install Prometheus operator: %s", err)
-			}
-
-			log.Println("Installing cert-manager...")
-			if err := testUtils.InstallCertManager(); err != nil {
-				log.Printf("Unable to install Cert Manager: %s", err)
 			}
 
 			return ctx, nil
