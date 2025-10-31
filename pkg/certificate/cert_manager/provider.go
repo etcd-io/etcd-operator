@@ -328,7 +328,7 @@ func (cm *CertManagerProvider) createCertificate(ctx context.Context, secretName
 			SecretName:  secretName,
 			DNSNames:    cfg.AltNames.DNSNames,
 			IPAddresses: strings.Fields(strings.Trim(fmt.Sprint(cfg.AltNames.IPs), "[]")),
-			IssuerRef: cmmeta.ObjectReference{
+			IssuerRef: cmmeta.IssuerReference{
 				Name: issuerName,
 				Kind: issuerKind,
 			},
