@@ -24,7 +24,25 @@ Participation in the Kubernetes community is governed by the [Kubernetes Code of
 - kubectl version v1.11.3+.
 - Access to a Kubernetes v1.11.3+ cluster.
 
-### To Deploy on the cluster
+### Deployment Methods
+
+The etcd-operator supports two deployment methods:
+
+- **Helm**: Package management with easy configuration via values files
+- **Kustomize**: Simple, GitOps-friendly deployment
+
+📦 **For Helm deployment**, see the [Helm Chart Documentation](helm/README.md) for:
+- Quick start guide
+- How the Chart is auto-generated from Kustomize
+- Customizing values and configuration
+- Example configurations (HA, minimal resources)
+- Upgrade and troubleshooting guides
+
+The instructions below use **Kustomize** for deployment.
+
+---
+
+### To Deploy on the cluster (Kustomize)
 
 **Build and push your image to the location specified by `IMG`:**
 

@@ -1,0 +1,72 @@
+# Helm Values - Minimal Resource Configuration Example
+#
+# This configuration is suitable for development/test environments or resource-constrained scenarios
+# Uses minimal resource configuration to reduce resource consumption
+#
+# Usage:
+#   helm install etcd-operator ./helm -f helm/examples/values-minimal.yaml
+#   Or in E2E tests:
+#   DEPLOY_METHOD=helm HELM_VALUES=helm/examples/values-minimal.yaml make test-e2e
+
+# Controller Manager Configuration
+controllerManager:
+  # Replica count - Minimal configuration uses single replica
+  replicas: 1
+
+  # Pod security context
+  podSecurityContext:
+    runAsNonRoot: true
+
+  # ServiceAccount configuration
+  serviceAccount:
+    annotations: {}
+
+  # Manager container configuration
+  manager:
+    # Image configuration
+    image:
+      repository: controller
+      tag: latest
+
+    # Container arguments
+    args:
+    - --metrics-bind-address=:8443
+    - --leader-elect
+    - --health-probe-bind-address=:8081
+
+    # Resource configuration - Minimal resource limits
+    resources:
+      limits:
+        cpu: 200m       # 0.2 CPU
+        memory: 128Mi   # 128 MB
+      requests:
+        cpu: 50m        # 0.05 CPU
+        memory: 32Mi    # 32 MB
+
+    # Container security context
+    containerSecurityContext:
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop:
+        - ALL
+
+# Metrics Service Configuration
+metricsService:
+  type: ClusterIP
+  ports:
+  - name: https
+    port: 8443
+    protocol: TCP
+    targetPort: 8443
+
+# Kubernetes cluster domain
+kubernetesClusterDomain: cluster.local
+
+# Image pull secrets (if using private image registry)
+imagePullSecrets: []
+
+# Notes:
+# - This configuration uses only a single replica and does not provide high availability
+# - Resource limits are low, suitable for development and testing
+# - Not suitable for production environments
+# - For production deployment, please use values-ha.yaml

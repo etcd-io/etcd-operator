@@ -75,18 +75,48 @@ vet: ## Run go vet against code.
 	go vet ./...
 
 .PHONY: test
-test: manifests generate fmt vet envtest ## Run tests.
+test: manifests generate fmt vet envtest helm-tool ## Run tests.
 	ENVTEST_K8S_VERSION=$(ENVTEST_K8S_VERSION) \
-	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test -v $$(go list ./... | grep -v /e2e) -coverprofile cover.out
+	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" \
+	PATH="$(LOCALBIN):$(PATH)" \
+	go test -v $$(go list ./... | grep -v /e2e) -coverprofile cover.out
+	@echo "==> Validating Helm Chart generation..."
+	$(MAKE) helm
+	@echo "==> Running Helm lint..."
+	$(HELM) lint helm/
+	@echo "==> Testing Helm template rendering..."
+	$(HELM) template test helm/ > /dev/null
+	@echo "✅ All tests passed including Helm validation!"
 
 # TODO(user): To use a different vendor for e2e tests, modify the setup under 'tests/e2e'.
 # The default setup assumes Kind is pre-installed and builds/loads the Manager Docker image locally.
 # Prometheus and CertManager are installed by default; skip with:
 # - PROMETHEUS_INSTALL_SKIP=true
 # - CERT_MANAGER_INSTALL_SKIP=true
+# 
+# DEPLOY_METHOD controls the deployment method for E2E tests:
+# - all (default): Test both deployment methods sequentially
+# - kustomize: Deploy using Kustomize only
+# - helm: Deploy using Helm Chart only
+DEPLOY_METHOD ?= all
+
 .PHONY: test-e2e
-test-e2e: generate fmt vet kind ## Run the e2e tests. Expected an isolated environment using Kind.
-	ETCD_VERSION="$(E2E_ETCD_VERSION)" PATH="$(LOCALBIN):$(PATH)" go test ./test/e2e/ -v
+test-e2e: generate fmt vet kind helm-tool ## Run the e2e tests. Expected an isolated environment using Kind.
+	@if [ "$(DEPLOY_METHOD)" = "all" ]; then \
+		echo "==> Testing all deployment methods..."; \
+		echo ""; \
+		echo "==> [1/2] Testing Kustomize deployment"; \
+		DEPLOY_METHOD=kustomize ETCD_VERSION="$(E2E_ETCD_VERSION)" PATH="$(LOCALBIN):$(PATH)" go test ./test/e2e/ -v || exit 1; \
+		echo ""; \
+		echo "==> [2/2] Testing Helm deployment"; \
+		$(MAKE) helm; \
+		DEPLOY_METHOD=helm ETCD_VERSION="$(E2E_ETCD_VERSION)" PATH="$(LOCALBIN):$(PATH)" go test ./test/e2e/ -v || exit 1; \
+		echo ""; \
+		echo "✅ All deployment methods tested successfully!"; \
+	else \
+		echo "==> Testing with DEPLOY_METHOD=$(DEPLOY_METHOD)"; \
+		ETCD_VERSION="$(E2E_ETCD_VERSION)" PATH="$(LOCALBIN):$(PATH)" go test ./test/e2e/ -v; \
+	fi
 
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter
@@ -157,6 +187,27 @@ build-installer: manifests generate kustomize ## Generate a consolidated YAML wi
 	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
 	$(KUSTOMIZE) build config/default > dist/install$(VERSION_SUFFIX).yaml
 
+##@ Helm
+
+.PHONY: helm
+helm: manifests kustomize helmify yq helm-tool ## Generate Helm Chart from Kustomize manifests.
+	@echo "==> Generating Helm Chart..."
+	@mkdir -p helm
+	$(KUSTOMIZE) build config/default | $(HELMIFY) -crd-dir -image-pull-secrets helm
+	@echo "==> Updating Chart metadata..."
+	$(YQ) -i '.name = "etcd-operator"' helm/Chart.yaml
+	$(YQ) -i '.description = "Official Kubernetes operator for etcd"' helm/Chart.yaml
+	$(YQ) -i '.home = "https://github.com/etcd-io/etcd-operator"' helm/Chart.yaml
+	@echo "==> Validating generated Chart..."
+	@$(HELM) lint helm/ || (echo "❌ Helm Chart validation failed!" && exit 1)
+	@echo "✅ Helm Chart generated and validated at helm/"
+
+.PHONY: helm-lint
+helm-lint: helm ## Lint the generated Helm Chart.
+	@echo "==> Linting Helm Chart..."
+	@$(HELM) lint helm/
+	@echo "✅ Helm Chart validation passed!"
+
 ##@ Deployment
 
 ifndef ignore-not-found
@@ -206,6 +257,9 @@ ENVTEST ?= $(LOCALBIN)/setup-envtest
 GOLANGCI_LINT = $(LOCALBIN)/golangci-lint
 CRD_REF_DOCS ?= $(LOCALBIN)/crd-ref-docs
 KIND ?= $(LOCALBIN)/kind
+HELMIFY ?= $(LOCALBIN)/helmify
+YQ ?= $(LOCALBIN)/yq
+HELM ?= $(LOCALBIN)/helm
 
 ## Tool Versions
 KUSTOMIZE_VERSION = $(shell cd tools/mod && go list -m -f {{.Version}} sigs.k8s.io/kustomize/kustomize/v5)
@@ -214,6 +268,10 @@ ENVTEST_VERSION = $(shell cd tools/mod && go list -m -f {{.Version}} sigs.k8s.io
 GOLANGCI_LINT_VERSION = $(shell cd tools/mod && go list -m -f {{.Version}} github.com/golangci/golangci-lint/v2)
 CRD_REF_DOCS_VERSION = $(shell cd tools/mod && go list -m -f {{.Version}} github.com/elastic/crd-ref-docs)
 KIND_VERSION = $(shell cd tools/mod && go list -m -f {{.Version}} sigs.k8s.io/kind)
+HELMIFY_VERSION = $(shell cd tools/mod && go list -m -f {{.Version}} github.com/arttor/helmify)
+YQ_VERSION = $(shell cd tools/mod && go list -m -f {{.Version}} github.com/mikefarah/yq/v4)
+# Helm is not a Go module, must specify version directly
+HELM_VERSION ?= v3.17.0
 
 .PHONY: kustomize
 kustomize: $(KUSTOMIZE) ## Download kustomize locally if necessary.
@@ -244,6 +302,35 @@ $(KIND): $(LOCALBIN)
 golangci-lint: $(GOLANGCI_LINT) ## Download golangci-lint locally if necessary.
 $(GOLANGCI_LINT): $(LOCALBIN)
 	curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh | sh -s -- -b $(LOCALBIN) $(GOLANGCI_LINT_VERSION)
+
+.PHONY: helmify
+helmify: $(HELMIFY) ## Download helmify locally if necessary.
+$(HELMIFY): $(LOCALBIN)
+	$(call go-install-tool,$(HELMIFY),github.com/arttor/helmify/cmd/helmify,$(HELMIFY_VERSION))
+
+.PHONY: yq
+yq: $(YQ) ## Download yq locally if necessary.
+$(YQ): $(LOCALBIN)
+	$(call go-install-tool,$(YQ),github.com/mikefarah/yq/v4,$(YQ_VERSION))
+
+.PHONY: helm-tool
+helm-tool: $(HELM) ## Download helm locally if necessary.
+$(HELM): $(LOCALBIN)
+	@[ -f "$(HELM)-$(HELM_VERSION)" ] || { \
+	set -e; \
+	echo "Downloading Helm $(HELM_VERSION)"; \
+	rm -f $(HELM) || true; \
+	OS=$$(uname -s | tr '[:upper:]' '[:lower:]'); \
+	ARCH=$$(uname -m); \
+	case $$ARCH in \
+		x86_64) ARCH=amd64 ;; \
+		aarch64) ARCH=arm64 ;; \
+	esac; \
+	curl -sSL https://get.helm.sh/helm-$(HELM_VERSION)-$${OS}-$${ARCH}.tar.gz | \
+		tar xz -C $(LOCALBIN) --strip-components=1 $${OS}-$${ARCH}/helm; \
+	mv $(HELM) $(HELM)-$(HELM_VERSION); \
+	}
+	@ln -sf $(HELM)-$(HELM_VERSION) $(HELM)
 
 # go-install-tool will 'go install' any package with custom target and name of binary, if it doesn't exist
 # $1 - target path with name of binary
