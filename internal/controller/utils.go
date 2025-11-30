@@ -53,7 +53,7 @@ func reconcileStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1alpha
 	}
 
 	// Add server and peer certificate
-	err = applyEtcdMemberCerts(ctx, ec, c, logger)
+	err = applyEtcdMemberCerts(ctx, ec, c, logger, scheme)
 	if err != nil {
 		return nil, err
 	}
@@ -600,13 +600,42 @@ func createCMCertificateConfig(ec *ecv1alpha1.EtcdCluster) *certInterface.Config
 }
 
 func createAutoCertificateConfig(ec *ecv1alpha1.EtcdCluster) *certInterface.Config {
-	// TODO
-	config := &certInterface.Config{}
+	autoConfig := ec.Spec.TLS.ProviderCfg.AutoCfg
+	duration, err := time.ParseDuration(autoConfig.ValidityDuration)
+	if err != nil {
+		log.Printf("Failed to parse ValidityDuration: %s", err)
+	}
+
+	var getAltNames certInterface.AltNames
+	if autoConfig.AltNames.DNSNames != nil {
+		getAltNames = certInterface.AltNames{
+			DNSNames: autoConfig.AltNames.DNSNames,
+			IPs:      make([]net.IP, len(autoConfig.AltNames.DNSNames)),
+		}
+	} else {
+		defaultDNSNames := []string{fmt.Sprintf("%s.svc.cluster.local", autoConfig.CommonName)}
+		getAltNames = certInterface.AltNames{
+			DNSNames: defaultDNSNames,
+		}
+	}
+
+	config := &certInterface.Config{
+		CommonName:       autoConfig.CommonName,
+		Organization:     autoConfig.Organization,
+		ValidityDuration: duration,
+		AltNames:         getAltNames,
+	}
 	return config
 }
 
 func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client.Client, certName string) error {
-	cert, certErr := certificate.NewProvider(certificate.ProviderType(ec.Spec.TLS.Provider), c)
+	// tls field is present but spec is empty
+	providerName := ec.Spec.TLS.Provider
+	if providerName == "" {
+		providerName = string(certificate.Auto)
+	}
+
+	cert, certErr := certificate.NewProvider(certificate.ProviderType(providerName), c)
 	if certErr != nil {
 		// TODO: instead of error, set default autoConfig
 		return certErr
@@ -617,8 +646,8 @@ func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client
 			log.Printf("Creating certificate: %s for etcd-operator: %s\n", certName, ec.Name)
 			switch {
 			case ec.Spec.TLS.ProviderCfg.AutoCfg != nil:
-				cmConfig := createAutoCertificateConfig(ec)
-				createCertErr := cert.EnsureCertificateSecret(ctx, certName, ec.Namespace, cmConfig)
+				autoConfig := createAutoCertificateConfig(ec)
+				createCertErr := cert.EnsureCertificateSecret(ctx, certName, ec.Namespace, autoConfig)
 				if createCertErr != nil {
 					log.Printf("Error creating certificate: %s", createCertErr)
 				}
@@ -643,40 +672,52 @@ func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client
 	return nil
 }
 
-func createClientCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client) error {
+func createClientCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client, scheme *runtime.Scheme) error {
 	certName := getClientCertName(ec.Name)
 	createClientCertErr := createCertificate(ec, ctx, c, certName)
+	patchCertErr := patchCertificateSecret(ctx, ec, c, scheme, certName)
+	if patchCertErr != nil {
+		return fmt.Errorf("patching certificate secret: %s with ownerReference failed: %w", certName, patchCertErr)
+	}
 	return createClientCertErr
 }
 
-func createServerCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client) error {
+func createServerCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client, scheme *runtime.Scheme) error {
 	serverCertName := getServerCertName(ec.Name)
 	createServerCertErr := createCertificate(ec, ctx, c, serverCertName)
 	if createServerCertErr != nil {
 		return createServerCertErr
 	}
+	patchCertErr := patchCertificateSecret(ctx, ec, c, scheme, serverCertName)
+	if patchCertErr != nil {
+		return fmt.Errorf("patching certificate secret: %s with ownerReference failed: %w", serverCertName, patchCertErr)
+	}
 	return nil
 }
 
-func createPeerCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client) error {
+func createPeerCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client, scheme *runtime.Scheme) error {
 	peerCertName := getPeerCertName(ec.Name)
 	createPeerCertErr := createCertificate(ec, ctx, c, peerCertName)
 	if createPeerCertErr != nil {
 		return createPeerCertErr
 	}
+	patchCertErr := patchCertificateSecret(ctx, ec, c, scheme, peerCertName)
+	if patchCertErr != nil {
+		return fmt.Errorf("patching certificate secret: %s with ownerReference failed: %w", peerCertName, patchCertErr)
+	}
 	return nil
 }
 
-func applyEtcdMemberCerts(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client, logger logr.Logger) error {
+func applyEtcdMemberCerts(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client, logger logr.Logger, scheme *runtime.Scheme) error {
 	var err error
 	if ec.Spec.TLS != nil {
-		createServerCertErr := createServerCertificate(ctx, ec, c)
+		createServerCertErr := createServerCertificate(ctx, ec, c, scheme)
 		if createServerCertErr != nil {
 			err = createServerCertErr
 			logger.Error(createServerCertErr, "Error creating Server Certificate")
 
 		}
-		createPeerCertErr := createPeerCertificate(ctx, ec, c)
+		createPeerCertErr := createPeerCertificate(ctx, ec, c, scheme)
 		if createPeerCertErr != nil {
 			err = createPeerCertErr
 			logger.Error(createPeerCertErr, "Error creating Peer Certificate")
@@ -685,4 +726,22 @@ func applyEtcdMemberCerts(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c cli
 
 	}
 	return err
+}
+
+func patchCertificateSecret(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client, scheme *runtime.Scheme, certSecretName string) error {
+	getCertSecret := &corev1.Secret{}
+	getErr := c.Get(ctx, client.ObjectKey{Name: certSecretName, Namespace: ec.Namespace}, getCertSecret)
+	if getErr != nil {
+		return getErr
+	}
+
+	log.Printf("Setting ownerReference for certificate secret: %s", certSecretName)
+	if err := controllerutil.SetControllerReference(ec, getCertSecret, scheme); err != nil {
+		return err
+	}
+	if updateErr := c.Update(ctx, getCertSecret); updateErr != nil {
+		return fmt.Errorf("failed to update certificate secret with ownerReference: %w", updateErr)
+	}
+
+	return nil
 }
