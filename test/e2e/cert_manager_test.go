@@ -30,7 +30,7 @@ const (
 	cmIssuerType           = "ClusterIssuer"
 	cmCertificateName      = "sample-cert"
 	cmCertificateNamespace = "default"
-	cmCertificateValidity  = 24 * time.Hour
+	cmCertificateValidity  = interfaces.DefaultCertManagerValidity
 )
 
 var cmIssuer = &certv1.ClusterIssuer{

@@ -566,11 +566,27 @@ func getPeerCertName(etcdClusterName string) string {
 	return peerCertName
 }
 
-func createCMCertificateConfig(ec *ecv1alpha1.EtcdCluster) *certInterface.Config {
-	cmConfig := ec.Spec.TLS.ProviderCfg.CertManagerCfg
-	duration, err := time.ParseDuration(cmConfig.ValidityDuration)
+// parseValidityDuration parses a duration string and returns the parsed duration.
+// If the customizedDuration is empty, it returns the defaultDuration.
+// Returns an error if the duration string cannot be parsed.
+func parseValidityDuration(customizedDuration string, defaultDuration time.Duration) (time.Duration, error) {
+	if customizedDuration == "" {
+		return defaultDuration, nil
+	}
+	duration, err := time.ParseDuration(customizedDuration)
 	if err != nil {
-		log.Printf("Failed to parse ValidityDuration: %s", err)
+		return 0, fmt.Errorf("failed to parse ValidityDuration: %w", err)
+	}
+	return duration, nil
+}
+
+func createCMCertificateConfig(ec *ecv1alpha1.EtcdCluster) (*certInterface.Config, error) {
+	cmConfig := ec.Spec.TLS.ProviderCfg.CertManagerCfg
+
+	// Set default duration to 90 days for cert-manager if not provided
+	duration, err := parseValidityDuration(cmConfig.ValidityDuration, certInterface.DefaultCertManagerValidity)
+	if err != nil {
+		return nil, err
 	}
 
 	var getAltNames certInterface.AltNames
@@ -596,14 +612,16 @@ func createCMCertificateConfig(ec *ecv1alpha1.EtcdCluster) *certInterface.Config
 			"issuerKind": cmConfig.IssuerKind,
 		},
 	}
-	return config
+	return config, nil
 }
 
 func createAutoCertificateConfig(ec *ecv1alpha1.EtcdCluster) *certInterface.Config {
 	autoConfig := ec.Spec.TLS.ProviderCfg.AutoCfg
-	duration, err := time.ParseDuration(autoConfig.ValidityDuration)
+
+	// Set default duration to 365 days for auto provider if not provided
+	duration, err := parseValidityDuration(autoConfig.ValidityDuration, certInterface.DefaultAutoValidity)
 	if err != nil {
-		log.Printf("Failed to parse ValidityDuration: %s", err)
+		return nil, err
 	}
 
 	var altNames certInterface.AltNames
@@ -647,14 +665,20 @@ func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client
 			secretKey := client.ObjectKey{Name: certName, Namespace: ec.Namespace}
 			switch {
 			case ec.Spec.TLS.ProviderCfg.AutoCfg != nil:
-				autoConfig := createAutoCertificateConfig(ec)
+				autoConfig, err := createAutoCertificateConfig(ec)
+				if err != nil {
+					return fmt.Errorf("error creating auto certificate config: %w", err)
+				}
 				createCertErr := cert.EnsureCertificateSecret(ctx, secretKey, autoConfig)
 				if createCertErr != nil {
 					log.Printf("Error creating certificate: %s", createCertErr)
 				}
 				return nil
 			case ec.Spec.TLS.ProviderCfg.CertManagerCfg != nil:
-				cmConfig := createCMCertificateConfig(ec)
+				cmConfig, err := createCMCertificateConfig(ec)
+				if err != nil {
+					return fmt.Errorf("error creating cert-manager certificate config: %w", err)
+				}
 				createCertErr := cert.EnsureCertificateSecret(ctx, secretKey, cmConfig)
 				if createCertErr != nil {
 					log.Printf("Error creating certificate: %s", createCertErr)
