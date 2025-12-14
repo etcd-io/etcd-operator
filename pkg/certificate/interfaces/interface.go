@@ -28,6 +28,9 @@ var (
 	// ErrCertExpired is returned when certificate has expired
 	ErrCertExpired = errors.New("certificate has expired")
 
+	// ErrCertNotYetValid is returned when certificate is not yet valid
+	ErrCertNotYetValid = errors.New("certificate is not yet valid")
+
 	// ErrRSAKeyPair is returned when private key(RSA) does not match the public key in the Certificate secret
 	ErrRSAKeyPair = errors.New("private key(RSA) does not match the public key in the certificate")
 
