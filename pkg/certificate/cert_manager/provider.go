@@ -142,7 +142,11 @@ func (cm *CertManagerProvider) ValidateCertificateSecret(ctx context.Context, se
 		return fmt.Errorf("failed to parse certificate: %w", err)
 	}
 
-	if parseCert.NotAfter.Before(time.Now()) {
+	now := time.Now()
+	if parseCert.NotBefore.After(now) {
+		return interfaces.ErrCertNotYetValid
+	}
+	if parseCert.NotAfter.Before(now) {
 		return interfaces.ErrCertExpired
 	}
 
