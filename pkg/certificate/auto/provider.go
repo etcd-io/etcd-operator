@@ -54,7 +54,7 @@ func (ac *Provider) EnsureCertificateSecret(ctx context.Context, secretKey clien
 	err := ac.Get(ctx, secretKey, &secret)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
-			err := ac.createNewSecret(ctx, secretKey.Name, secretKey.Namespace, cfg)
+			err := ac.createNewSecret(ctx, secretKey, cfg)
 			if err != nil {
 				return err
 			}
@@ -212,14 +212,14 @@ func checkKeyPair(cert *x509.Certificate, privateKey crypto.PrivateKey) error {
 // fmt.Sprintf("%s-%d.%s.%s.svc.cluster.local", ec.Name, index, ec.Name, ec.Namespace)
 // minimum validityDuration is 365 days
 // https://github.com/etcd-io/etcd/blob/b87bc1c3a275d7d4904f4d201b963a2de2264f0d/client/pkg/transport/listener.go#L275
-func (ac *Provider) createNewSecret(ctx context.Context, secretName, namespace string,
+func (ac *Provider) createNewSecret(ctx context.Context, secretKey client.ObjectKey,
 	cfg *interfaces.Config) error {
 	validity := DefaultValidity
 	if cfg.ValidityDuration != 0 {
 		validity = cfg.ValidityDuration * time.Hour
 	}
 
-	tmpDir, err := os.MkdirTemp("", fmt.Sprintf("etcd-auto-cert-%s-*", secretName))
+	tmpDir, err := os.MkdirTemp("", fmt.Sprintf("etcd-auto-cert-%s-*", secretKey.Name))
 	if err != nil {
 		return fmt.Errorf("failed to create temp dir for certificate generation: %w", err)
 	}
@@ -280,8 +280,8 @@ func (ac *Provider) createNewSecret(ctx context.Context, secretName, namespace s
 
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      secretName,
-			Namespace: namespace,
+			Name:      secretKey.Name,
+			Namespace: secretKey.Namespace,
 		},
 		Type: corev1.SecretTypeTLS,
 		Data: map[string][]byte{
@@ -293,7 +293,7 @@ func (ac *Provider) createNewSecret(ctx context.Context, secretName, namespace s
 
 	// Create or Update certificate Secret
 	var existing corev1.Secret
-	getErr := ac.Get(ctx, client.ObjectKey{Name: secretName, Namespace: namespace}, &existing)
+	getErr := ac.Get(ctx, secretKey, &existing)
 
 	if k8serrors.IsNotFound(getErr) {
 		createErr := ac.Create(ctx, secret)
@@ -301,7 +301,7 @@ func (ac *Provider) createNewSecret(ctx context.Context, secretName, namespace s
 			return fmt.Errorf("failed to create secret: %w", err)
 		}
 	} else if k8serrors.IsAlreadyExists(getErr) {
-		log.Printf("Certificate secret: %s already present, updating...", secretName)
+		log.Printf("Certificate secret: %s already present, updating...", secretKey.Name)
 		existing.Data = secret.Data
 		if updateErr := ac.Update(ctx, &existing); updateErr != nil {
 			return fmt.Errorf("failed to update existing secret: %w", updateErr)

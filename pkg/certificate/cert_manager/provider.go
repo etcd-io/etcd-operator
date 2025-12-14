@@ -53,7 +53,7 @@ func (cm *CertManagerProvider) EnsureCertificateSecret(ctx context.Context, secr
 			if valErr != nil {
 				return valErr
 			}
-			err := cm.createCertificate(ctx, secretKey.Name, secretKey.Namespace, cfg)
+			err := cm.createCertificate(ctx, secretKey, cfg)
 			if err != nil {
 				return err
 			}
@@ -306,7 +306,7 @@ func (cm *CertManagerProvider) validateCertificateConfig(ctx context.Context, na
 // DNSNames and IPAddresses if not user-defined, will be set to default value in runtime:
 // fmt.Sprintf("%s-%d.%s.%s.svc.cluster.local", ec.Name, index, ec.Name, ec.Namespace)
 // returns an error if the Certificate resource cannot be created.
-func (cm *CertManagerProvider) createCertificate(ctx context.Context, secretName, namespace string,
+func (cm *CertManagerProvider) createCertificate(ctx context.Context, secretKey client.ObjectKey,
 	cfg *interfaces.Config) error {
 	issuerName, isValid := cfg.ExtraConfig[IssuerNameKey].(string)
 	if !isValid {
@@ -319,15 +319,15 @@ func (cm *CertManagerProvider) createCertificate(ctx context.Context, secretName
 
 	certificateResource := &certmanagerv1.Certificate{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      secretName,
-			Namespace: namespace,
+			Name:      secretKey.Name,
+			Namespace: secretKey.Namespace,
 		},
 		Spec: certmanagerv1.CertificateSpec{
 			CommonName: cfg.CommonName,
 			Subject: &certmanagerv1.X509Subject{
 				Organizations: cfg.Organization,
 			},
-			SecretName:  secretName,
+			SecretName:  secretKey.Name,
 			DNSNames:    cfg.AltNames.DNSNames,
 			IPAddresses: strings.Fields(strings.Trim(fmt.Sprint(cfg.AltNames.IPs), "[]")),
 			IssuerRef: cmmeta.IssuerReference{
