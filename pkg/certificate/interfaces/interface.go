@@ -118,10 +118,10 @@ type Provider interface {
 	// GetCertificateConfig returns the certificate configuration from the provider.
 	//
 	// Parameters:
-	// - secretName: Name of the Secret containing the certificate.
-	// - namespace: Namespace where the Secret resides.
+	// - ctx: Context for cancellation and deadlines.
+	// - secretKey: ObjectKey containing the name and namespace of the Secret containing the certificate.
 	//
 	// Returns:
 	// - Config if the Secret exists and is valid, or an error otherwise.
-	GetCertificateConfig(ctx context.Context, secretName string, namespace string) (*Config, error)
+	GetCertificateConfig(ctx context.Context, secretKey client.ObjectKey) (*Config, error)
 }

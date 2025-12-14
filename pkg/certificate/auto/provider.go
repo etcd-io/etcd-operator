@@ -151,9 +151,9 @@ func (ac *Provider) RevokeCertificate(ctx context.Context, secretKey client.Obje
 }
 
 func (ac *Provider) GetCertificateConfig(ctx context.Context,
-	secretName, namespace string) (*interfaces.Config, error) {
+	secretKey client.ObjectKey) (*interfaces.Config, error) {
 	var autoCertSecret corev1.Secret
-	err := ac.Get(ctx, client.ObjectKey{Name: secretName, Namespace: namespace}, &autoCertSecret)
+	err := ac.Get(ctx, secretKey, &autoCertSecret)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get certificate: %w", err)
 	}

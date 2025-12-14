@@ -77,9 +77,10 @@ func TestAutoProvider(t *testing.T) {
 
 	feature.Assess("Get certificate config",
 		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
-			client := cfg.Client()
-			acProvider := auto.New(client.Resources().GetControllerRuntimeClient())
-			config, err := acProvider.GetCertificateConfig(ctx, cmCertificateName, cmCertificateNamespace)
+			cl := cfg.Client()
+			acProvider := auto.New(cl.Resources().GetControllerRuntimeClient())
+			secretKey := client.ObjectKey{Name: cmCertificateName, Namespace: cmCertificateNamespace}
+			config, err := acProvider.GetCertificateConfig(ctx, secretKey)
 			if err != nil {
 				t.Fatalf("Auto Certificate not found: %v", err)
 			}
@@ -103,9 +104,10 @@ func TestAutoProvider(t *testing.T) {
 
 	feature.Assess("Verify Delete certificate",
 		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
-			client := cfg.Client()
-			acProvider := auto.New(client.Resources().GetControllerRuntimeClient())
-			_, err := acProvider.GetCertificateConfig(ctx, autoCertificateName, autoCertificateNamespace)
+			cl := cfg.Client()
+			acProvider := auto.New(cl.Resources().GetControllerRuntimeClient())
+			secretKey := client.ObjectKey{Name: autoCertificateName, Namespace: autoCertificateNamespace}
+			_, err := acProvider.GetCertificateConfig(ctx, secretKey)
 			if err == nil {
 				t.Fatalf("Auto Provider Certificate found, deletion failed: %v", err)
 			}

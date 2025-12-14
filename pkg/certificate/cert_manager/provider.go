@@ -207,9 +207,9 @@ func (cm *CertManagerProvider) RevokeCertificate(ctx context.Context, secretKey 
 }
 
 func (cm *CertManagerProvider) GetCertificateConfig(ctx context.Context,
-	secretName, namespace string) (*interfaces.Config, error) {
+	secretKey client.ObjectKey) (*interfaces.Config, error) {
 	cmCertificate := &certmanagerv1.Certificate{}
-	err := cm.Get(ctx, client.ObjectKey{Name: secretName, Namespace: namespace}, cmCertificate)
+	err := cm.Get(ctx, secretKey, cmCertificate)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get certificate: %w", err)
 	}

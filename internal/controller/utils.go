@@ -640,7 +640,7 @@ func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client
 		// TODO: instead of error, set default autoConfig
 		return certErr
 	}
-	_, getCertError := cert.GetCertificateConfig(ctx, certName, ec.Namespace)
+	_, getCertError := cert.GetCertificateConfig(ctx, client.ObjectKey{Name: certName, Namespace: ec.Namespace})
 	if getCertError != nil {
 		if k8serrors.IsNotFound(getCertError) {
 			log.Printf("Creating certificate: %s for etcd-operator: %s\n", certName, ec.Name)

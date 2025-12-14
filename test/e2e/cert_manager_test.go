@@ -110,9 +110,10 @@ func TestCertManagerProvider(t *testing.T) {
 
 	feature.Assess("Get certificate config",
 		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
-			client := cfg.Client()
-			cmProvider := cert_manager.New(client.Resources().GetControllerRuntimeClient())
-			config, err := cmProvider.GetCertificateConfig(ctx, cmCertificateName, cmCertificateNamespace)
+			cl := cfg.Client()
+			cmProvider := cert_manager.New(cl.Resources().GetControllerRuntimeClient())
+			secretKey := client.ObjectKey{Name: cmCertificateName, Namespace: cmCertificateNamespace}
+			config, err := cmProvider.GetCertificateConfig(ctx, secretKey)
 			if err != nil {
 				t.Fatalf("Cert-Manager Certificate not found: %v", err)
 			}
@@ -136,9 +137,10 @@ func TestCertManagerProvider(t *testing.T) {
 
 	feature.Assess("Verify Delete certificate",
 		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
-			client := cfg.Client()
-			cmProvider := cert_manager.New(client.Resources().GetControllerRuntimeClient())
-			_, err := cmProvider.GetCertificateConfig(ctx, cmCertificateName, cmCertificateNamespace)
+			cl := cfg.Client()
+			cmProvider := cert_manager.New(cl.Resources().GetControllerRuntimeClient())
+			secretKey := client.ObjectKey{Name: cmCertificateName, Namespace: cmCertificateNamespace}
+			_, err := cmProvider.GetCertificateConfig(ctx, secretKey)
 			if err == nil {
 				t.Fatalf("Cert-Manager Certificate found, deletion failed: %v", err)
 			}
