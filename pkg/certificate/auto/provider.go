@@ -135,9 +135,9 @@ func (ac *Provider) ValidateCertificateSecret(ctx context.Context, secretKey cli
 	return nil
 }
 
-func (ac *Provider) DeleteCertificateSecret(ctx context.Context, secretName, namespace string) error {
+func (ac *Provider) DeleteCertificateSecret(ctx context.Context, secretKey client.ObjectKey) error {
 	var secret corev1.Secret
-	if err := ac.Get(ctx, client.ObjectKey{Name: secretName, Namespace: namespace}, &secret); err != nil {
+	if err := ac.Get(ctx, secretKey, &secret); err != nil {
 		if k8serrors.IsNotFound(err) {
 			return nil
 		}
@@ -147,7 +147,7 @@ func (ac *Provider) DeleteCertificateSecret(ctx context.Context, secretName, nam
 }
 
 func (ac *Provider) RevokeCertificate(ctx context.Context, secretName string, namespace string) error {
-	return ac.DeleteCertificateSecret(ctx, secretName, namespace)
+	return ac.DeleteCertificateSecret(ctx, client.ObjectKey{Name: secretName, Namespace: namespace})
 }
 
 func (ac *Provider) GetCertificateConfig(ctx context.Context,

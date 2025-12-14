@@ -99,12 +99,11 @@ type Provider interface {
 	//
 	// Parameters:
 	// - ctx: Context for cancellation and deadlines.
-	// - secretName: Name of the Secret to delete.
-	// - namespace: Namespace where the Secret resides.
+	// - secretKey: ObjectKey containing the name and namespace of the Secret to delete.
 	//
 	// Returns:
 	// - nil if the operation succeeds, or an error otherwise.
-	DeleteCertificateSecret(ctx context.Context, secretName string, namespace string) error
+	DeleteCertificateSecret(ctx context.Context, secretKey client.ObjectKey) error
 
 	// RevokeCertificate revokes a certificate if supported by the provider.
 	//

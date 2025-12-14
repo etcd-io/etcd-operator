@@ -91,9 +91,10 @@ func TestAutoProvider(t *testing.T) {
 
 	feature.Assess("Delete certificate secret",
 		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
-			client := cfg.Client()
-			acProvider := auto.New(client.Resources().GetControllerRuntimeClient())
-			err := acProvider.DeleteCertificateSecret(ctx, autoCertificateName, autoCertificateNamespace)
+			cl := cfg.Client()
+			acProvider := auto.New(cl.Resources().GetControllerRuntimeClient())
+			secretKey := client.ObjectKey{Name: autoCertificateName, Namespace: autoCertificateNamespace}
+			err := acProvider.DeleteCertificateSecret(ctx, secretKey)
 			if err != nil {
 				t.Fatalf("Failed to delete Certificate secret: %v", err)
 			}

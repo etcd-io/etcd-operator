@@ -124,9 +124,10 @@ func TestCertManagerProvider(t *testing.T) {
 
 	feature.Assess("Delete certificate secret",
 		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
-			client := cfg.Client()
-			cmProvider := cert_manager.New(client.Resources().GetControllerRuntimeClient())
-			err := cmProvider.DeleteCertificateSecret(ctx, cmCertificateName, cmCertificateNamespace)
+			cl := cfg.Client()
+			cmProvider := cert_manager.New(cl.Resources().GetControllerRuntimeClient())
+			secretKey := client.ObjectKey{Name: cmCertificateName, Namespace: cmCertificateNamespace}
+			err := cmProvider.DeleteCertificateSecret(ctx, secretKey)
 			if err != nil {
 				t.Fatalf("Failed to delete Certificate secret: %v", err)
 			}

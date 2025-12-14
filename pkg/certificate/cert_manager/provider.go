@@ -160,14 +160,14 @@ func (cm *CertManagerProvider) ValidateCertificateSecret(ctx context.Context, se
 	return nil
 }
 
-func (cm *CertManagerProvider) DeleteCertificateSecret(ctx context.Context, secretName, namespace string) error {
+func (cm *CertManagerProvider) DeleteCertificateSecret(ctx context.Context, secretKey client.ObjectKey) error {
 	cmCertificate := &certmanagerv1.Certificate{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      secretName,
-			Namespace: namespace,
+			Name:      secretKey.Name,
+			Namespace: secretKey.Namespace,
 		},
 	}
-	certStatusErr := cm.checkCertificateStatus(secretName, namespace, ctx)
+	certStatusErr := cm.checkCertificateStatus(secretKey.Name, secretKey.Namespace, ctx)
 	if certStatusErr != nil {
 		log.Printf("Certificate associated not ready yet, try again later.")
 		return certStatusErr
@@ -183,8 +183,8 @@ func (cm *CertManagerProvider) DeleteCertificateSecret(ctx context.Context, secr
 	// More info: https://cert-manager.io/docs/usage/certificate/#cleaning-up-secrets-when-certificates-are-deleted
 	cmSecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      secretName,
-			Namespace: namespace,
+			Name:      secretKey.Name,
+			Namespace: secretKey.Namespace,
 		},
 	}
 	dSecretErr := cm.Delete(ctx, cmSecret)
