@@ -98,9 +98,10 @@ func TestCertManagerProvider(t *testing.T) {
 
 	feature.Assess("Validate certificate secret",
 		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
-			client := cfg.Client()
-			cmProvider := cert_manager.New(client.Resources().GetControllerRuntimeClient())
-			err := cmProvider.ValidateCertificateSecret(ctx, cmCertificateName, cmCertificateNamespace, cmConfig)
+			cl := cfg.Client()
+			cmProvider := cert_manager.New(cl.Resources().GetControllerRuntimeClient())
+			secretKey := client.ObjectKey{Name: cmCertificateName, Namespace: cmCertificateNamespace}
+			err := cmProvider.ValidateCertificateSecret(ctx, secretKey, cmConfig)
 			if err != nil {
 				t.Fatalf("Failed to validate Cert-Manager Certificate secret: %v", err)
 			}

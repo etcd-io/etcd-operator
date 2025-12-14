@@ -63,7 +63,7 @@ func (ac *Provider) EnsureCertificateSecret(ctx context.Context, secretKey clien
 		}
 	}
 
-	err = ac.ValidateCertificateSecret(ctx, secretKey.Name, secretKey.Namespace, cfg)
+	err = ac.ValidateCertificateSecret(ctx, secretKey, cfg)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
 			return err
@@ -77,17 +77,17 @@ func (ac *Provider) EnsureCertificateSecret(ctx context.Context, secretKey clien
 	return nil
 }
 
-func (ac *Provider) ValidateCertificateSecret(ctx context.Context, secretName, namespace string,
+func (ac *Provider) ValidateCertificateSecret(ctx context.Context, secretKey client.ObjectKey,
 	_ *interfaces.Config) error {
 	var err error
 	secret := &corev1.Secret{}
-	err = ac.Get(ctx, client.ObjectKey{Name: secretName, Namespace: namespace}, secret)
+	err = ac.Get(ctx, secretKey, secret)
 	if err != nil && k8serrors.IsNotFound(err) {
 		for try := range interfaces.MaxRetries {
 			// Wait for the certificate secret to get created
 			log.Printf("Valid certificate secret: retry attempt %v, after %v, error: %v", try+1, interfaces.RetryInterval, err)
 			time.Sleep(interfaces.RetryInterval)
-			err = ac.Get(ctx, client.ObjectKey{Name: secretName, Namespace: namespace}, secret)
+			err = ac.Get(ctx, secretKey, secret)
 			if err == nil {
 				break
 			}

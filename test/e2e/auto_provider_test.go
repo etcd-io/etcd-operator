@@ -65,9 +65,10 @@ func TestAutoProvider(t *testing.T) {
 
 	feature.Assess("Validate certificate secret",
 		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
-			client := cfg.Client()
-			acProvider := auto.New(client.Resources().GetControllerRuntimeClient())
-			err := acProvider.ValidateCertificateSecret(ctx, autoCertificateName, autoCertificateNamespace, cmConfig)
+			cl := cfg.Client()
+			acProvider := auto.New(cl.Resources().GetControllerRuntimeClient())
+			secretKey := client.ObjectKey{Name: autoCertificateName, Namespace: autoCertificateNamespace}
+			err := acProvider.ValidateCertificateSecret(ctx, secretKey, cmConfig)
 			if err != nil {
 				t.Fatalf("Failed to validate Auto Provider Certificate secret: %v", err)
 			}

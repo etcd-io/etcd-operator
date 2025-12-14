@@ -85,14 +85,13 @@ type Provider interface {
 	//
 	// Parameters:
 	// - ctx: Context for cancellation and deadlines.
-	// - secretName: Name of the Secret to validate.
-	// - namespace: Namespace where the Secret resides.
+	// - secretKey: ObjectKey containing the name and namespace of the Secret to validate.
 	// - cfg: Configuration to validate against.
 	//
 	// Returns:
 	// - nil if the Secret is valid, otherwise returns
 	//   an error if validation fails.
-	ValidateCertificateSecret(ctx context.Context, secretName string, namespace string, cfg *Config) error
+	ValidateCertificateSecret(ctx context.Context, secretKey client.ObjectKey, cfg *Config) error
 
 	// DeleteCertificateSecret explicitly deletes the Secret containing
 	// the certificate. This should only be used if the certificate

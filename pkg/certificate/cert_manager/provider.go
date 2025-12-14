@@ -87,7 +87,7 @@ func (cm *CertManagerProvider) EnsureCertificateSecret(ctx context.Context, secr
 	log.Printf("Certificate Status: %s ready in namespace: %s, validating associated secret...",
 		secretKey.Name, secretKey.Namespace)
 
-	err = cm.ValidateCertificateSecret(ctx, secretKey.Name, secretKey.Namespace, cfg)
+	err = cm.ValidateCertificateSecret(ctx, secretKey, cfg)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
 			return err
@@ -101,18 +101,18 @@ func (cm *CertManagerProvider) EnsureCertificateSecret(ctx context.Context, secr
 	return nil
 }
 
-func (cm *CertManagerProvider) ValidateCertificateSecret(ctx context.Context, secretName, namespace string,
+func (cm *CertManagerProvider) ValidateCertificateSecret(ctx context.Context, secretKey client.ObjectKey,
 	_ *interfaces.Config) error {
 	var err error
 	secret := &corev1.Secret{}
-	err = cm.Get(ctx, client.ObjectKey{Name: secretName, Namespace: namespace}, secret)
+	err = cm.Get(ctx, secretKey, secret)
 	if err != nil && k8serrors.IsNotFound(err) {
 		for try := range interfaces.MaxRetries {
 			// Wait for cert-manager reconciler to create the associated certificate secret
 			// Reference: https://cert-manager.io/docs/usage/certificate/#inner-workings-diagram-for-developers
 			log.Printf("Valid certificate secret: retry attempt %v, after %v, error: %v", try+1, interfaces.RetryInterval, err)
 			time.Sleep(interfaces.RetryInterval)
-			err = cm.Get(ctx, client.ObjectKey{Name: secretName, Namespace: namespace}, secret)
+			err = cm.Get(ctx, secretKey, secret)
 			if err == nil {
 				break
 			}
