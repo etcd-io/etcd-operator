@@ -5,6 +5,8 @@ import (
 	"errors"
 	"net"
 	"time"
+
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 var (
@@ -70,13 +72,12 @@ type Provider interface {
 	//
 	// Parameters:
 	// - ctx: Context for cancellation and deadlines.
-	// - secretName: Name of the Secret to ensure.
-	// - namespace: Namespace where the Secret should reside.
+	// - secretKey: ObjectKey containing the name and namespace of the Secret to ensure.
 	// - cfg: Configuration for the certificate.
 	//
 	// Returns:
 	// - nil if the operation succeeds, or an error otherwise.
-	EnsureCertificateSecret(ctx context.Context, secretName string, namespace string, cfg *Config) error
+	EnsureCertificateSecret(ctx context.Context, secretKey client.ObjectKey, cfg *Config) error
 
 	// ValidateCertificateSecret validates the certificate stored
 	// in the specified Secret. This checks if the certificate is
@@ -84,14 +85,13 @@ type Provider interface {
 	//
 	// Parameters:
 	// - ctx: Context for cancellation and deadlines.
-	// - secretName: Name of the Secret to validate.
-	// - namespace: Namespace where the Secret resides.
+	// - secretKey: ObjectKey containing the name and namespace of the Secret to validate.
 	// - cfg: Configuration to validate against.
 	//
 	// Returns:
 	// - nil if the Secret is valid, otherwise returns
 	//   an error if validation fails.
-	ValidateCertificateSecret(ctx context.Context, secretName string, namespace string, cfg *Config) error
+	ValidateCertificateSecret(ctx context.Context, secretKey client.ObjectKey, cfg *Config) error
 
 	// DeleteCertificateSecret explicitly deletes the Secret containing
 	// the certificate. This should only be used if the certificate
@@ -99,31 +99,29 @@ type Provider interface {
 	//
 	// Parameters:
 	// - ctx: Context for cancellation and deadlines.
-	// - secretName: Name of the Secret to delete.
-	// - namespace: Namespace where the Secret resides.
+	// - secretKey: ObjectKey containing the name and namespace of the Secret to delete.
 	//
 	// Returns:
 	// - nil if the operation succeeds, or an error otherwise.
-	DeleteCertificateSecret(ctx context.Context, secretName string, namespace string) error
+	DeleteCertificateSecret(ctx context.Context, secretKey client.ObjectKey) error
 
 	// RevokeCertificate revokes a certificate if supported by the provider.
 	//
 	// Parameters:
 	// - ctx: Context for cancellation and deadlines.
-	// - secretName: Name of the Secret containing the certificate to revoke.
-	// - namespace: Namespace where the Secret resides.
+	// - secretKey: ObjectKey containing the name and namespace of the Secret containing the certificate to revoke.
 	//
 	// Returns:
 	// - nil if the revocation succeeds, or an error otherwise.
-	RevokeCertificate(ctx context.Context, secretName string, namespace string) error
+	RevokeCertificate(ctx context.Context, secretKey client.ObjectKey) error
 
 	// GetCertificateConfig returns the certificate configuration from the provider.
 	//
 	// Parameters:
-	// - secretName: Name of the Secret containing the certificate.
-	// - namespace: Namespace where the Secret resides.
+	// - ctx: Context for cancellation and deadlines.
+	// - secretKey: ObjectKey containing the name and namespace of the Secret containing the certificate.
 	//
 	// Returns:
 	// - Config if the Secret exists and is valid, or an error otherwise.
-	GetCertificateConfig(ctx context.Context, secretName string, namespace string) (*Config, error)
+	GetCertificateConfig(ctx context.Context, secretKey client.ObjectKey) (*Config, error)
 }

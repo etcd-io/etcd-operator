@@ -13,6 +13,7 @@ import (
 	apiextensionsV1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/e2e-framework/klient"
 	"sigs.k8s.io/e2e-framework/klient/k8s"
 	"sigs.k8s.io/e2e-framework/klient/wait"
@@ -85,9 +86,10 @@ func TestCertManagerProvider(t *testing.T) {
 
 	feature.Assess("Ensure certificate",
 		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
-			client := cfg.Client()
-			cmProvider := cert_manager.New(client.Resources().GetControllerRuntimeClient())
-			err := cmProvider.EnsureCertificateSecret(ctx, cmCertificateName, cmCertificateNamespace, cmConfig)
+			cl := cfg.Client()
+			cmProvider := cert_manager.New(cl.Resources().GetControllerRuntimeClient())
+			secretKey := client.ObjectKey{Name: cmCertificateName, Namespace: cmCertificateNamespace}
+			err := cmProvider.EnsureCertificateSecret(ctx, secretKey, cmConfig)
 			if err != nil {
 				t.Fatalf("Cert-Manager Certificate could not be created: %v", err)
 			}
@@ -96,9 +98,10 @@ func TestCertManagerProvider(t *testing.T) {
 
 	feature.Assess("Validate certificate secret",
 		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
-			client := cfg.Client()
-			cmProvider := cert_manager.New(client.Resources().GetControllerRuntimeClient())
-			err := cmProvider.ValidateCertificateSecret(ctx, cmCertificateName, cmCertificateNamespace, cmConfig)
+			cl := cfg.Client()
+			cmProvider := cert_manager.New(cl.Resources().GetControllerRuntimeClient())
+			secretKey := client.ObjectKey{Name: cmCertificateName, Namespace: cmCertificateNamespace}
+			err := cmProvider.ValidateCertificateSecret(ctx, secretKey, cmConfig)
 			if err != nil {
 				t.Fatalf("Failed to validate Cert-Manager Certificate secret: %v", err)
 			}
@@ -107,9 +110,10 @@ func TestCertManagerProvider(t *testing.T) {
 
 	feature.Assess("Get certificate config",
 		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
-			client := cfg.Client()
-			cmProvider := cert_manager.New(client.Resources().GetControllerRuntimeClient())
-			config, err := cmProvider.GetCertificateConfig(ctx, cmCertificateName, cmCertificateNamespace)
+			cl := cfg.Client()
+			cmProvider := cert_manager.New(cl.Resources().GetControllerRuntimeClient())
+			secretKey := client.ObjectKey{Name: cmCertificateName, Namespace: cmCertificateNamespace}
+			config, err := cmProvider.GetCertificateConfig(ctx, secretKey)
 			if err != nil {
 				t.Fatalf("Cert-Manager Certificate not found: %v", err)
 			}
@@ -121,9 +125,10 @@ func TestCertManagerProvider(t *testing.T) {
 
 	feature.Assess("Delete certificate secret",
 		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
-			client := cfg.Client()
-			cmProvider := cert_manager.New(client.Resources().GetControllerRuntimeClient())
-			err := cmProvider.DeleteCertificateSecret(ctx, cmCertificateName, cmCertificateNamespace)
+			cl := cfg.Client()
+			cmProvider := cert_manager.New(cl.Resources().GetControllerRuntimeClient())
+			secretKey := client.ObjectKey{Name: cmCertificateName, Namespace: cmCertificateNamespace}
+			err := cmProvider.DeleteCertificateSecret(ctx, secretKey)
 			if err != nil {
 				t.Fatalf("Failed to delete Certificate secret: %v", err)
 			}
@@ -132,9 +137,10 @@ func TestCertManagerProvider(t *testing.T) {
 
 	feature.Assess("Verify Delete certificate",
 		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
-			client := cfg.Client()
-			cmProvider := cert_manager.New(client.Resources().GetControllerRuntimeClient())
-			_, err := cmProvider.GetCertificateConfig(ctx, cmCertificateName, cmCertificateNamespace)
+			cl := cfg.Client()
+			cmProvider := cert_manager.New(cl.Resources().GetControllerRuntimeClient())
+			secretKey := client.ObjectKey{Name: cmCertificateName, Namespace: cmCertificateNamespace}
+			_, err := cmProvider.GetCertificateConfig(ctx, secretKey)
 			if err == nil {
 				t.Fatalf("Cert-Manager Certificate found, deletion failed: %v", err)
 			}

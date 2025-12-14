@@ -43,17 +43,17 @@ func New(c client.Client) interfaces.Provider {
 	}
 }
 
-func (cm *CertManagerProvider) EnsureCertificateSecret(ctx context.Context, secretName, namespace string,
+func (cm *CertManagerProvider) EnsureCertificateSecret(ctx context.Context, secretKey client.ObjectKey,
 	cfg *interfaces.Config) error {
 	cmCertificate := &certmanagerv1.Certificate{}
-	err := cm.Get(ctx, client.ObjectKey{Name: secretName, Namespace: namespace}, cmCertificate)
+	err := cm.Get(ctx, secretKey, cmCertificate)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
-			valErr := cm.validateCertificateConfig(ctx, namespace, cfg)
+			valErr := cm.validateCertificateConfig(ctx, secretKey.Namespace, cfg)
 			if valErr != nil {
 				return valErr
 			}
-			err := cm.createCertificate(ctx, secretName, namespace, cfg)
+			err := cm.createCertificate(ctx, secretKey, cfg)
 			if err != nil {
 				return err
 			}
@@ -62,16 +62,17 @@ func (cm *CertManagerProvider) EnsureCertificateSecret(ctx context.Context, secr
 		}
 	}
 
-	log.Printf("Valid certificate: %s present in namespace: %s, checking certificate status...", secretName, namespace)
+	log.Printf("Valid certificate: %s present in namespace: %s, checking certificate status...",
+		secretKey.Name, secretKey.Namespace)
 
-	err = cm.checkCertificateStatus(secretName, namespace, ctx)
+	err = cm.checkCertificateStatus(secretKey.Name, secretKey.Namespace, ctx)
 	if err != nil && !errors.Is(err, interfaces.ErrUnknown) {
 		for try := range interfaces.MaxRetries {
 			// Wait for the certificate to be in "Ready" state
 			// Reference: https://cert-manager.io/docs/usage/certificate/#inner-workings-diagram-for-developers
 			log.Printf("Certificate Status: retry attempt %v, after %v, error: %v", try, interfaces.RetryInterval, err)
 			time.Sleep(interfaces.RetryInterval)
-			err = cm.checkCertificateStatus(secretName, namespace, ctx)
+			err = cm.checkCertificateStatus(secretKey.Name, secretKey.Namespace, ctx)
 			if err == nil {
 				break
 			}
@@ -83,34 +84,35 @@ func (cm *CertManagerProvider) EnsureCertificateSecret(ctx context.Context, secr
 		return err
 	}
 
-	log.Printf("Certificate Status: %s ready in namespace: %s, validating associated secret...", secretName, namespace)
+	log.Printf("Certificate Status: %s ready in namespace: %s, validating associated secret...",
+		secretKey.Name, secretKey.Namespace)
 
-	err = cm.ValidateCertificateSecret(ctx, secretName, namespace, cfg)
+	err = cm.ValidateCertificateSecret(ctx, secretKey, cfg)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
 			return err
 		} else {
 			return fmt.Errorf("invalid certificate secret: %s present in namespace: %s, please delete and try again.\nError: %s",
-				secretName, namespace, err)
+				secretKey.Name, secretKey.Namespace, err)
 		}
 	}
 
-	log.Printf("Valid certificate secret: %s already present in namespace: %s", secretName, namespace)
+	log.Printf("Valid certificate secret: %s already present in namespace: %s", secretKey.Name, secretKey.Namespace)
 	return nil
 }
 
-func (cm *CertManagerProvider) ValidateCertificateSecret(ctx context.Context, secretName, namespace string,
+func (cm *CertManagerProvider) ValidateCertificateSecret(ctx context.Context, secretKey client.ObjectKey,
 	_ *interfaces.Config) error {
 	var err error
 	secret := &corev1.Secret{}
-	err = cm.Get(ctx, client.ObjectKey{Name: secretName, Namespace: namespace}, secret)
+	err = cm.Get(ctx, secretKey, secret)
 	if err != nil && k8serrors.IsNotFound(err) {
 		for try := range interfaces.MaxRetries {
 			// Wait for cert-manager reconciler to create the associated certificate secret
 			// Reference: https://cert-manager.io/docs/usage/certificate/#inner-workings-diagram-for-developers
 			log.Printf("Valid certificate secret: retry attempt %v, after %v, error: %v", try+1, interfaces.RetryInterval, err)
 			time.Sleep(interfaces.RetryInterval)
-			err = cm.Get(ctx, client.ObjectKey{Name: secretName, Namespace: namespace}, secret)
+			err = cm.Get(ctx, secretKey, secret)
 			if err == nil {
 				break
 			}
@@ -158,14 +160,14 @@ func (cm *CertManagerProvider) ValidateCertificateSecret(ctx context.Context, se
 	return nil
 }
 
-func (cm *CertManagerProvider) DeleteCertificateSecret(ctx context.Context, secretName, namespace string) error {
+func (cm *CertManagerProvider) DeleteCertificateSecret(ctx context.Context, secretKey client.ObjectKey) error {
 	cmCertificate := &certmanagerv1.Certificate{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      secretName,
-			Namespace: namespace,
+			Name:      secretKey.Name,
+			Namespace: secretKey.Namespace,
 		},
 	}
-	certStatusErr := cm.checkCertificateStatus(secretName, namespace, ctx)
+	certStatusErr := cm.checkCertificateStatus(secretKey.Name, secretKey.Namespace, ctx)
 	if certStatusErr != nil {
 		log.Printf("Certificate associated not ready yet, try again later.")
 		return certStatusErr
@@ -181,8 +183,8 @@ func (cm *CertManagerProvider) DeleteCertificateSecret(ctx context.Context, secr
 	// More info: https://cert-manager.io/docs/usage/certificate/#cleaning-up-secrets-when-certificates-are-deleted
 	cmSecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      secretName,
-			Namespace: namespace,
+			Name:      secretKey.Name,
+			Namespace: secretKey.Namespace,
 		},
 	}
 	dSecretErr := cm.Delete(ctx, cmSecret)
@@ -200,14 +202,14 @@ func (cm *CertManagerProvider) DeleteCertificateSecret(ctx context.Context, secr
 
 // RevokeCertificate is not supported, certificates can only be deleted which is handled by DeleteCertificateSecret
 // as per official documentation: https://cert-manager.io/docs/usage/certificate/#inner-workings-diagram-for-developers
-func (cm *CertManagerProvider) RevokeCertificate(ctx context.Context, secretName string, namespace string) error {
+func (cm *CertManagerProvider) RevokeCertificate(ctx context.Context, secretKey client.ObjectKey) error {
 	return nil
 }
 
 func (cm *CertManagerProvider) GetCertificateConfig(ctx context.Context,
-	secretName, namespace string) (*interfaces.Config, error) {
+	secretKey client.ObjectKey) (*interfaces.Config, error) {
 	cmCertificate := &certmanagerv1.Certificate{}
-	err := cm.Get(ctx, client.ObjectKey{Name: secretName, Namespace: namespace}, cmCertificate)
+	err := cm.Get(ctx, secretKey, cmCertificate)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get certificate: %w", err)
 	}
@@ -304,7 +306,7 @@ func (cm *CertManagerProvider) validateCertificateConfig(ctx context.Context, na
 // DNSNames and IPAddresses if not user-defined, will be set to default value in runtime:
 // fmt.Sprintf("%s-%d.%s.%s.svc.cluster.local", ec.Name, index, ec.Name, ec.Namespace)
 // returns an error if the Certificate resource cannot be created.
-func (cm *CertManagerProvider) createCertificate(ctx context.Context, secretName, namespace string,
+func (cm *CertManagerProvider) createCertificate(ctx context.Context, secretKey client.ObjectKey,
 	cfg *interfaces.Config) error {
 	issuerName, isValid := cfg.ExtraConfig[IssuerNameKey].(string)
 	if !isValid {
@@ -317,15 +319,15 @@ func (cm *CertManagerProvider) createCertificate(ctx context.Context, secretName
 
 	certificateResource := &certmanagerv1.Certificate{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      secretName,
-			Namespace: namespace,
+			Name:      secretKey.Name,
+			Namespace: secretKey.Namespace,
 		},
 		Spec: certmanagerv1.CertificateSpec{
 			CommonName: cfg.CommonName,
 			Subject: &certmanagerv1.X509Subject{
 				Organizations: cfg.Organization,
 			},
-			SecretName:  secretName,
+			SecretName:  secretKey.Name,
 			DNSNames:    cfg.AltNames.DNSNames,
 			IPAddresses: strings.Fields(strings.Trim(fmt.Sprint(cfg.AltNames.IPs), "[]")),
 			IssuerRef: cmmeta.IssuerReference{

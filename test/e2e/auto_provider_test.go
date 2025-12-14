@@ -13,6 +13,7 @@ import (
 	apiextensionsV1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/e2e-framework/klient"
 	"sigs.k8s.io/e2e-framework/klient/k8s"
 	"sigs.k8s.io/e2e-framework/klient/wait"
@@ -52,9 +53,10 @@ func TestAutoProvider(t *testing.T) {
 
 	feature.Assess("Ensure certificate",
 		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
-			client := cfg.Client()
-			acProvider := auto.New(client.Resources().GetControllerRuntimeClient())
-			err := acProvider.EnsureCertificateSecret(ctx, autoCertificateName, autoCertificateNamespace, cmConfig)
+			cl := cfg.Client()
+			acProvider := auto.New(cl.Resources().GetControllerRuntimeClient())
+			secretKey := client.ObjectKey{Name: autoCertificateName, Namespace: autoCertificateNamespace}
+			err := acProvider.EnsureCertificateSecret(ctx, secretKey, cmConfig)
 			if err != nil {
 				t.Fatalf("Auto Provider Certificate could not be created: %v", err)
 			}
@@ -63,9 +65,10 @@ func TestAutoProvider(t *testing.T) {
 
 	feature.Assess("Validate certificate secret",
 		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
-			client := cfg.Client()
-			acProvider := auto.New(client.Resources().GetControllerRuntimeClient())
-			err := acProvider.ValidateCertificateSecret(ctx, autoCertificateName, autoCertificateNamespace, cmConfig)
+			cl := cfg.Client()
+			acProvider := auto.New(cl.Resources().GetControllerRuntimeClient())
+			secretKey := client.ObjectKey{Name: autoCertificateName, Namespace: autoCertificateNamespace}
+			err := acProvider.ValidateCertificateSecret(ctx, secretKey, cmConfig)
 			if err != nil {
 				t.Fatalf("Failed to validate Auto Provider Certificate secret: %v", err)
 			}
@@ -74,9 +77,10 @@ func TestAutoProvider(t *testing.T) {
 
 	feature.Assess("Get certificate config",
 		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
-			client := cfg.Client()
-			acProvider := auto.New(client.Resources().GetControllerRuntimeClient())
-			config, err := acProvider.GetCertificateConfig(ctx, cmCertificateName, cmCertificateNamespace)
+			cl := cfg.Client()
+			acProvider := auto.New(cl.Resources().GetControllerRuntimeClient())
+			secretKey := client.ObjectKey{Name: cmCertificateName, Namespace: cmCertificateNamespace}
+			config, err := acProvider.GetCertificateConfig(ctx, secretKey)
 			if err != nil {
 				t.Fatalf("Auto Certificate not found: %v", err)
 			}
@@ -88,9 +92,10 @@ func TestAutoProvider(t *testing.T) {
 
 	feature.Assess("Delete certificate secret",
 		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
-			client := cfg.Client()
-			acProvider := auto.New(client.Resources().GetControllerRuntimeClient())
-			err := acProvider.DeleteCertificateSecret(ctx, autoCertificateName, autoCertificateNamespace)
+			cl := cfg.Client()
+			acProvider := auto.New(cl.Resources().GetControllerRuntimeClient())
+			secretKey := client.ObjectKey{Name: autoCertificateName, Namespace: autoCertificateNamespace}
+			err := acProvider.DeleteCertificateSecret(ctx, secretKey)
 			if err != nil {
 				t.Fatalf("Failed to delete Certificate secret: %v", err)
 			}
@@ -99,9 +104,10 @@ func TestAutoProvider(t *testing.T) {
 
 	feature.Assess("Verify Delete certificate",
 		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
-			client := cfg.Client()
-			acProvider := auto.New(client.Resources().GetControllerRuntimeClient())
-			_, err := acProvider.GetCertificateConfig(ctx, autoCertificateName, autoCertificateNamespace)
+			cl := cfg.Client()
+			acProvider := auto.New(cl.Resources().GetControllerRuntimeClient())
+			secretKey := client.ObjectKey{Name: autoCertificateName, Namespace: autoCertificateNamespace}
+			_, err := acProvider.GetCertificateConfig(ctx, secretKey)
 			if err == nil {
 				t.Fatalf("Auto Provider Certificate found, deletion failed: %v", err)
 			}
