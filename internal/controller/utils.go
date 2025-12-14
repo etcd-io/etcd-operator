@@ -615,7 +615,7 @@ func createCMCertificateConfig(ec *ecv1alpha1.EtcdCluster) (*certInterface.Confi
 	return config, nil
 }
 
-func createAutoCertificateConfig(ec *ecv1alpha1.EtcdCluster) *certInterface.Config {
+func createAutoCertificateConfig(ec *ecv1alpha1.EtcdCluster) (*certInterface.Config, error) {
 	autoConfig := ec.Spec.TLS.ProviderCfg.AutoCfg
 
 	// Set default duration to 365 days for auto provider if not provided
@@ -643,7 +643,7 @@ func createAutoCertificateConfig(ec *ecv1alpha1.EtcdCluster) *certInterface.Conf
 		ValidityDuration: duration,
 		AltNames:         altNames,
 	}
-	return config
+	return config, nil
 }
 
 func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client.Client, certName string) error {
@@ -671,7 +671,7 @@ func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client
 				}
 				createCertErr := cert.EnsureCertificateSecret(ctx, secretKey, autoConfig)
 				if createCertErr != nil {
-					log.Printf("Error creating certificate: %s", createCertErr)
+					return fmt.Errorf("error creating auto certificate: %w", createCertErr)
 				}
 				return nil
 			case ec.Spec.TLS.ProviderCfg.CertManagerCfg != nil:
@@ -681,7 +681,7 @@ func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client
 				}
 				createCertErr := cert.EnsureCertificateSecret(ctx, secretKey, cmConfig)
 				if createCertErr != nil {
-					log.Printf("Error creating certificate: %s", createCertErr)
+					return fmt.Errorf("error creating cert-manager certificate: %w", createCertErr)
 				}
 				return nil
 			default:
