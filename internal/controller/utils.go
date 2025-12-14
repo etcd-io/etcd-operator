@@ -566,11 +566,19 @@ func getPeerCertName(etcdClusterName string) string {
 	return peerCertName
 }
 
-func createCMCertificateConfig(ec *ecv1alpha1.EtcdCluster) *certInterface.Config {
+func createCMCertificateConfig(ec *ecv1alpha1.EtcdCluster) (*certInterface.Config, error) {
 	cmConfig := ec.Spec.TLS.ProviderCfg.CertManagerCfg
-	duration, err := time.ParseDuration(cmConfig.ValidityDuration)
-	if err != nil {
-		log.Printf("Failed to parse ValidityDuration: %s", err)
+
+	// Set default duration to 90 days for cert-manager if not provided
+	var duration time.Duration
+	if cmConfig.ValidityDuration == "" {
+		duration = certInterface.DefaultCertManagerValidity
+	} else {
+		var err error
+		duration, err = time.ParseDuration(cmConfig.ValidityDuration)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse ValidityDuration: %w", err)
+		}
 	}
 
 	var getAltNames certInterface.AltNames
@@ -596,7 +604,7 @@ func createCMCertificateConfig(ec *ecv1alpha1.EtcdCluster) *certInterface.Config
 			"issuerKind": cmConfig.IssuerKind,
 		},
 	}
-	return config
+	return config, nil
 }
 
 func createAutoCertificateConfig(ec *ecv1alpha1.EtcdCluster) *certInterface.Config {
@@ -647,14 +655,20 @@ func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client
 			secretKey := client.ObjectKey{Name: certName, Namespace: ec.Namespace}
 			switch {
 			case ec.Spec.TLS.ProviderCfg.AutoCfg != nil:
-				autoConfig := createAutoCertificateConfig(ec)
+				autoConfig, err := createAutoCertificateConfig(ec)
+				if err != nil {
+					return fmt.Errorf("error creating auto certificate config: %w", err)
+				}
 				createCertErr := cert.EnsureCertificateSecret(ctx, secretKey, autoConfig)
 				if createCertErr != nil {
 					log.Printf("Error creating certificate: %s", createCertErr)
 				}
 				return nil
 			case ec.Spec.TLS.ProviderCfg.CertManagerCfg != nil:
-				cmConfig := createCMCertificateConfig(ec)
+				cmConfig, err := createCMCertificateConfig(ec)
+				if err != nil {
+					return fmt.Errorf("error creating cert-manager certificate config: %w", err)
+				}
 				createCertErr := cert.EnsureCertificateSecret(ctx, secretKey, cmConfig)
 				if createCertErr != nil {
 					log.Printf("Error creating certificate: %s", createCertErr)
