@@ -5,6 +5,8 @@ import (
 	"errors"
 	"net"
 	"time"
+
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 var (
@@ -70,13 +72,12 @@ type Provider interface {
 	//
 	// Parameters:
 	// - ctx: Context for cancellation and deadlines.
-	// - secretName: Name of the Secret to ensure.
-	// - namespace: Namespace where the Secret should reside.
+	// - secretKey: ObjectKey containing the name and namespace of the Secret to ensure.
 	// - cfg: Configuration for the certificate.
 	//
 	// Returns:
 	// - nil if the operation succeeds, or an error otherwise.
-	EnsureCertificateSecret(ctx context.Context, secretName string, namespace string, cfg *Config) error
+	EnsureCertificateSecret(ctx context.Context, secretKey client.ObjectKey, cfg *Config) error
 
 	// ValidateCertificateSecret validates the certificate stored
 	// in the specified Secret. This checks if the certificate is

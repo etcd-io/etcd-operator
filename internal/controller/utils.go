@@ -644,17 +644,18 @@ func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client
 	if getCertError != nil {
 		if k8serrors.IsNotFound(getCertError) {
 			log.Printf("Creating certificate: %s for etcd-operator: %s\n", certName, ec.Name)
+			secretKey := client.ObjectKey{Name: certName, Namespace: ec.Namespace}
 			switch {
 			case ec.Spec.TLS.ProviderCfg.AutoCfg != nil:
 				autoConfig := createAutoCertificateConfig(ec)
-				createCertErr := cert.EnsureCertificateSecret(ctx, certName, ec.Namespace, autoConfig)
+				createCertErr := cert.EnsureCertificateSecret(ctx, secretKey, autoConfig)
 				if createCertErr != nil {
 					log.Printf("Error creating certificate: %s", createCertErr)
 				}
 				return nil
 			case ec.Spec.TLS.ProviderCfg.CertManagerCfg != nil:
 				cmConfig := createCMCertificateConfig(ec)
-				createCertErr := cert.EnsureCertificateSecret(ctx, certName, ec.Namespace, cmConfig)
+				createCertErr := cert.EnsureCertificateSecret(ctx, secretKey, cmConfig)
 				if createCertErr != nil {
 					log.Printf("Error creating certificate: %s", createCertErr)
 				}

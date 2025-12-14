@@ -45,16 +45,16 @@ func New(c client.Client) interfaces.Provider {
 
 var userAutoConfig *interfaces.Config
 
-func (ac *Provider) EnsureCertificateSecret(ctx context.Context, secretName, namespace string,
+func (ac *Provider) EnsureCertificateSecret(ctx context.Context, secretKey client.ObjectKey,
 	cfg *interfaces.Config) error {
 	// Save the user defined AutoConfig so that it can be returned from GetCertificateConfig
 	userAutoConfig = cfg
 
 	var secret corev1.Secret
-	err := ac.Get(ctx, client.ObjectKey{Name: secretName, Namespace: namespace}, &secret)
+	err := ac.Get(ctx, secretKey, &secret)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
-			err := ac.createNewSecret(ctx, secretName, namespace, cfg)
+			err := ac.createNewSecret(ctx, secretKey.Name, secretKey.Namespace, cfg)
 			if err != nil {
 				return err
 			}
@@ -63,17 +63,17 @@ func (ac *Provider) EnsureCertificateSecret(ctx context.Context, secretName, nam
 		}
 	}
 
-	err = ac.ValidateCertificateSecret(ctx, secretName, namespace, cfg)
+	err = ac.ValidateCertificateSecret(ctx, secretKey.Name, secretKey.Namespace, cfg)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
 			return err
 		} else {
 			return fmt.Errorf("invalid certificate secret: %s present in namespace: %s, please delete and try again.\nError: %w",
-				secretName, namespace, err)
+				secretKey.Name, secretKey.Namespace, err)
 		}
 	}
 
-	log.Printf("Valid certificate secret: %s already present in namespace: %s", secretName, namespace)
+	log.Printf("Valid certificate secret: %s already present in namespace: %s", secretKey.Name, secretKey.Namespace)
 	return nil
 }
 

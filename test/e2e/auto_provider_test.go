@@ -13,6 +13,7 @@ import (
 	apiextensionsV1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/e2e-framework/klient"
 	"sigs.k8s.io/e2e-framework/klient/k8s"
 	"sigs.k8s.io/e2e-framework/klient/wait"
@@ -52,9 +53,10 @@ func TestAutoProvider(t *testing.T) {
 
 	feature.Assess("Ensure certificate",
 		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
-			client := cfg.Client()
-			acProvider := auto.New(client.Resources().GetControllerRuntimeClient())
-			err := acProvider.EnsureCertificateSecret(ctx, autoCertificateName, autoCertificateNamespace, cmConfig)
+			cl := cfg.Client()
+			acProvider := auto.New(cl.Resources().GetControllerRuntimeClient())
+			secretKey := client.ObjectKey{Name: autoCertificateName, Namespace: autoCertificateNamespace}
+			err := acProvider.EnsureCertificateSecret(ctx, secretKey, cmConfig)
 			if err != nil {
 				t.Fatalf("Auto Provider Certificate could not be created: %v", err)
 			}
