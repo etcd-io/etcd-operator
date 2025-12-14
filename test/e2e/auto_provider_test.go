@@ -29,7 +29,7 @@ import (
 const (
 	autoCertificateName      = "sample-cert"
 	autoCertificateNamespace = "default"
-	autoCertificateValidity  = auto.DefaultValidity
+	autoCertificateValidity  = interfaces.DefaultAutoValidity
 )
 
 func TestAutoProvider(t *testing.T) {

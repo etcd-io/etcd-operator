@@ -607,11 +607,19 @@ func createCMCertificateConfig(ec *ecv1alpha1.EtcdCluster) (*certInterface.Confi
 	return config, nil
 }
 
-func createAutoCertificateConfig(ec *ecv1alpha1.EtcdCluster) *certInterface.Config {
+func createAutoCertificateConfig(ec *ecv1alpha1.EtcdCluster) (*certInterface.Config, error) {
 	autoConfig := ec.Spec.TLS.ProviderCfg.AutoCfg
-	duration, err := time.ParseDuration(autoConfig.ValidityDuration)
-	if err != nil {
-		log.Printf("Failed to parse ValidityDuration: %s", err)
+
+	// Set default duration to 365 days for auto provider if not provided
+	var duration time.Duration
+	if autoConfig.ValidityDuration == "" {
+		duration = certInterface.DefaultAutoValidity
+	} else {
+		var err error
+		duration, err = time.ParseDuration(autoConfig.ValidityDuration)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse ValidityDuration: %w", err)
+		}
 	}
 
 	var altNames certInterface.AltNames
@@ -633,7 +641,7 @@ func createAutoCertificateConfig(ec *ecv1alpha1.EtcdCluster) *certInterface.Conf
 		ValidityDuration: duration,
 		AltNames:         altNames,
 	}
-	return config
+	return config, nil
 }
 
 func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client.Client, certName string) error {
