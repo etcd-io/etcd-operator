@@ -80,6 +80,10 @@ func TestAutoProvider(t *testing.T) {
 			cl := cfg.Client()
 			acProvider := auto.New(cl.Resources().GetControllerRuntimeClient())
 			secretKey := client.ObjectKey{Name: cmCertificateName, Namespace: cmCertificateNamespace}
+			err := acProvider.EnsureCertificateSecret(ctx, secretKey, cmConfig)
+			if err != nil {
+				t.Fatalf("Auto Provider Certificate could not be created: %v", err)
+			}
 			config, err := acProvider.GetCertificateConfig(ctx, secretKey)
 			if err != nil {
 				t.Fatalf("Auto Certificate not found: %v", err)
@@ -183,6 +187,14 @@ func TestClusterAutoCertCreation(t *testing.T) {
 			); err != nil {
 				t.Fatalf("timed out waiting for certificate: %s", err)
 			}
+
+			return ctx
+		},
+	)
+
+	feature.Assess("Wait for StatefulSet readiness",
+		func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+			waitForSTSReadiness(t, c, etcdClusterName, size)
 			return ctx
 		},
 	)
