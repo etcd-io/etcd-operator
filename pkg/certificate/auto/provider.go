@@ -146,8 +146,8 @@ func (ac *Provider) DeleteCertificateSecret(ctx context.Context, secretKey clien
 	return ac.Delete(ctx, &secret)
 }
 
-func (ac *Provider) RevokeCertificate(ctx context.Context, secretName string, namespace string) error {
-	return ac.DeleteCertificateSecret(ctx, client.ObjectKey{Name: secretName, Namespace: namespace})
+func (ac *Provider) RevokeCertificate(ctx context.Context, secretKey client.ObjectKey) error {
+	return ac.DeleteCertificateSecret(ctx, secretKey)
 }
 
 func (ac *Provider) GetCertificateConfig(ctx context.Context,

@@ -202,7 +202,7 @@ func (cm *CertManagerProvider) DeleteCertificateSecret(ctx context.Context, secr
 
 // RevokeCertificate is not supported, certificates can only be deleted which is handled by DeleteCertificateSecret
 // as per official documentation: https://cert-manager.io/docs/usage/certificate/#inner-workings-diagram-for-developers
-func (cm *CertManagerProvider) RevokeCertificate(ctx context.Context, secretName string, namespace string) error {
+func (cm *CertManagerProvider) RevokeCertificate(ctx context.Context, secretKey client.ObjectKey) error {
 	return nil
 }
 

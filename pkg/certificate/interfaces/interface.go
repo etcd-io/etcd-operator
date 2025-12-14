@@ -109,12 +109,11 @@ type Provider interface {
 	//
 	// Parameters:
 	// - ctx: Context for cancellation and deadlines.
-	// - secretName: Name of the Secret containing the certificate to revoke.
-	// - namespace: Namespace where the Secret resides.
+	// - secretKey: ObjectKey containing the name and namespace of the Secret containing the certificate to revoke.
 	//
 	// Returns:
 	// - nil if the revocation succeeds, or an error otherwise.
-	RevokeCertificate(ctx context.Context, secretName string, namespace string) error
+	RevokeCertificate(ctx context.Context, secretKey client.ObjectKey) error
 
 	// GetCertificateConfig returns the certificate configuration from the provider.
 	//
