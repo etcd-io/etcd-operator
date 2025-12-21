@@ -44,6 +44,7 @@ var (
 	imageName     = "etcd-operator:v0.1"
 	namespace     = "etcd-operator-system"
 	containerTool = os.Getenv("CONTAINER_TOOL")
+	skipTeardown  = os.Getenv("ETCD_E2E_SKIP_TEARDOWN") == "true"
 )
 
 func TestMain(m *testing.M) {
@@ -157,6 +158,10 @@ func TestMain(m *testing.M) {
 	testEnv.Finish(
 		// cleanup environment
 		func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
+			if skipTeardown {
+				log.Println("ETCD_E2E_SKIP_TEARDOWN=true, skipping environment cleanup")
+				return ctx, nil
+			}
 			log.Println("Finishing tests, cleaning cluster ...")
 
 			// undeploy etcd operator
@@ -186,6 +191,10 @@ func TestMain(m *testing.M) {
 
 		// remove the installed dependencies
 		func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
+			if skipTeardown {
+				log.Println("Skipping dependency cleanup")
+				return ctx, nil
+			}
 			log.Println("Removing dependencies...")
 
 			// remove prometheus
@@ -199,6 +208,10 @@ func TestMain(m *testing.M) {
 
 		// Destroy environment
 		func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
+			if skipTeardown {
+				log.Println("Skipping KinD cluster destruction")
+				return ctx, nil
+			}
 			var err error
 
 			log.Println("Destroying cluster...")
