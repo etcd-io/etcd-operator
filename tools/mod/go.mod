@@ -9,7 +9,7 @@ require (
 	github.com/golangci/golangci-lint/v2 v2.7.2
 	sigs.k8s.io/controller-runtime/tools/setup-envtest v0.0.0-20250106171007-7436275c4311 // @release-0.19
 	sigs.k8s.io/controller-tools v0.19.0
-	sigs.k8s.io/kind v0.30.0
+	sigs.k8s.io/kind v0.31.0
 	sigs.k8s.io/kustomize/kustomize/v5 v5.8.0
 )
 
