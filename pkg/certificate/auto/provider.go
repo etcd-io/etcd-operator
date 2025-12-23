@@ -27,10 +27,6 @@ import (
 	"go.etcd.io/etcd/client/pkg/v3/transport"
 )
 
-const (
-	DefaultValidity = 365 * 24 * time.Hour
-)
-
 type Provider struct {
 	client.Client
 }
@@ -218,9 +214,9 @@ func checkKeyPair(cert *x509.Certificate, privateKey crypto.PrivateKey) error {
 // https://github.com/etcd-io/etcd/blob/b87bc1c3a275d7d4904f4d201b963a2de2264f0d/client/pkg/transport/listener.go#L275
 func (ac *Provider) createNewSecret(ctx context.Context, secretKey client.ObjectKey,
 	cfg *interfaces.Config) error {
-	validity := DefaultValidity
+	validity := interfaces.DefaultAutoValidity
 	if cfg.ValidityDuration != 0 {
-		validity = cfg.ValidityDuration * time.Hour
+		validity = cfg.ValidityDuration
 	}
 
 	tmpDir, err := os.MkdirTemp("", fmt.Sprintf("etcd-auto-cert-%s-*", secretKey.Name))
@@ -252,7 +248,7 @@ func (ac *Provider) createNewSecret(ctx context.Context, secretKey client.Object
 
 	log.Printf("calling SelfCert with hosts: %v", hosts)
 
-	tlsInfo, selfCertErr := transport.SelfCert(zap.NewNop(), tmpDir, hosts, uint(validity/DefaultValidity))
+	tlsInfo, selfCertErr := transport.SelfCert(zap.NewNop(), tmpDir, hosts, uint(validity/interfaces.DefaultAutoValidity))
 	if selfCertErr != nil {
 		return fmt.Errorf("certificate creation via transport.SelfCert failed: %w", selfCertErr)
 	}
