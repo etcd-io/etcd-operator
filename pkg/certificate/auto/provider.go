@@ -33,22 +33,22 @@ const (
 
 type Provider struct {
 	client.Client
+	config *interfaces.Config
 }
 
 var _ interfaces.Provider = (*Provider)(nil)
 
 func New(c client.Client) interfaces.Provider {
 	return &Provider{
-		c,
+		Client: c,
+		config: nil,
 	}
 }
-
-var userAutoConfig *interfaces.Config
 
 func (ac *Provider) EnsureCertificateSecret(ctx context.Context, secretKey client.ObjectKey,
 	cfg *interfaces.Config) error {
 	// Save the user defined AutoConfig so that it can be returned from GetCertificateConfig
-	userAutoConfig = cfg
+	ac.config = cfg
 
 	var secret corev1.Secret
 	err := ac.Get(ctx, secretKey, &secret)
@@ -162,8 +162,8 @@ func (ac *Provider) GetCertificateConfig(ctx context.Context,
 		return nil, fmt.Errorf("failed to get certificate: %w", err)
 	}
 
-	if userAutoConfig != nil {
-		return userAutoConfig, nil
+	if ac.config != nil {
+		return ac.config, nil
 	}
 
 	return nil, fmt.Errorf("failed to get user-defined autoConfig")
