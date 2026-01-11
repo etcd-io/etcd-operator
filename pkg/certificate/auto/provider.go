@@ -28,7 +28,9 @@ import (
 )
 
 const (
-	DefaultValidity = 365 * 24 * time.Hour
+	// oneYearInHours is used to convert validity duration to years for transport.SelfCert.
+	// transport.SelfCert expects the validity parameter to be in years (uint).
+	oneYearInHours = 365 * 24 * time.Hour
 )
 
 type Provider struct {
@@ -218,9 +220,14 @@ func checkKeyPair(cert *x509.Certificate, privateKey crypto.PrivateKey) error {
 // https://github.com/etcd-io/etcd/blob/b87bc1c3a275d7d4904f4d201b963a2de2264f0d/client/pkg/transport/listener.go#L275
 func (ac *Provider) createNewSecret(ctx context.Context, secretKey client.ObjectKey,
 	cfg *interfaces.Config) error {
-	validity := DefaultValidity
+	validity := interfaces.DefaultAutoValidity
 	if cfg.ValidityDuration != 0 {
-		validity = cfg.ValidityDuration * time.Hour
+		validity = cfg.ValidityDuration
+	}
+
+	// Validate validity duration: minimum is 1 year as required by etcd
+	if validity < oneYearInHours {
+		return fmt.Errorf("validity duration must be at least 1 year (365 days), got: %v", validity)
 	}
 
 	tmpDir, err := os.MkdirTemp("", fmt.Sprintf("etcd-auto-cert-%s-*", secretKey.Name))
@@ -252,7 +259,15 @@ func (ac *Provider) createNewSecret(ctx context.Context, secretKey client.Object
 
 	log.Printf("calling SelfCert with hosts: %v", hosts)
 
-	tlsInfo, selfCertErr := transport.SelfCert(zap.NewNop(), tmpDir, hosts, uint(validity/DefaultValidity))
+	// Convert validity duration to years for transport.SelfCert
+	// transport.SelfCert expects the validity parameter to be in years (uint)
+	validityYears := uint(validity / oneYearInHours)
+	if validityYears == 0 {
+		// This should not happen due to the earlier check, but adding as a safeguard
+		return fmt.Errorf("validity duration converts to 0 years, must be at least 1 year")
+	}
+
+	tlsInfo, selfCertErr := transport.SelfCert(zap.NewNop(), tmpDir, hosts, validityYears)
 	if selfCertErr != nil {
 		return fmt.Errorf("certificate creation via transport.SelfCert failed: %w", selfCertErr)
 	}
