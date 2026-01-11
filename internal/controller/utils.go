@@ -596,7 +596,12 @@ func createCMCertificateConfig(ec *ecv1alpha1.EtcdCluster) (*certInterface.Confi
 			IPs:      make([]net.IP, len(cmConfig.AltNames.DNSNames)),
 		}
 	} else {
-		defaultDNSNames := []string{fmt.Sprintf("%s.svc.cluster.local", cmConfig.CommonName)}
+		// Use wildcard DNS for the cluster's headless service to cover all pods
+		// This allows the certificate to work for pod-0, pod-1, etc.
+		defaultDNSNames := []string{
+			fmt.Sprintf("*.%s.%s.svc.cluster.local", ec.Name, ec.Namespace),
+			fmt.Sprintf("%s.%s.svc.cluster.local", ec.Name, ec.Namespace),
+		}
 		getAltNames = certInterface.AltNames{
 			DNSNames: defaultDNSNames,
 		}
@@ -631,7 +636,12 @@ func createAutoCertificateConfig(ec *ecv1alpha1.EtcdCluster) (*certInterface.Con
 			IPs:      make([]net.IP, len(autoConfig.AltNames.DNSNames)),
 		}
 	} else {
-		defaultDNSNames := []string{fmt.Sprintf("%s.svc.cluster.local", autoConfig.CommonName)}
+		// Use wildcard DNS for the cluster's headless service to cover all pods
+		// This allows the certificate to work for pod-0, pod-1, etc.
+		defaultDNSNames := []string{
+			fmt.Sprintf("*.%s.%s.svc.cluster.local", ec.Name, ec.Namespace),
+			fmt.Sprintf("%s.%s.svc.cluster.local", ec.Name, ec.Namespace),
+		}
 		altNames = certInterface.AltNames{
 			DNSNames: defaultDNSNames,
 		}
