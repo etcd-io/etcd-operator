@@ -46,6 +46,12 @@ const (
 	// with a delay of RetryInterval between consecutive retries
 	MaxRetries    = 36
 	RetryInterval = 5 * time.Second
+
+	// DefaultAutoValidity is the default validity duration for auto-generated certificates (365 days)
+	DefaultAutoValidity = 365 * 24 * time.Hour
+
+	// DefaultCertManagerValidity is the default validity duration for cert-manager certificates (90 days)
+	DefaultCertManagerValidity = 90 * 24 * time.Hour
 )
 
 // AltNames contains the domain names and IP addresses that will be added
