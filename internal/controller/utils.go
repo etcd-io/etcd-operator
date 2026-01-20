@@ -53,7 +53,7 @@ func reconcileStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1alpha
 	}
 
 	// Add server and peer certificate
-	err = applyEtcdMemberCerts(ctx, ec, c)
+	err = applyEtcdMemberCerts(ctx, ec, c, scheme)
 	if err != nil {
 		return nil, err
 	}
@@ -656,14 +656,14 @@ func createAutoCertificateConfig(ec *ecv1alpha1.EtcdCluster) (*certInterface.Con
 	return config, nil
 }
 
-func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client.Client, certName string) error {
+func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client.Client, scheme *runtime.Scheme, certName string) error {
 	// The TLS field is present but spec is empty
 	providerName := ec.Spec.TLS.Provider
 	if providerName == "" {
 		providerName = string(certificate.Auto)
 	}
 
-	cert, certErr := certificate.NewProvider(certificate.ProviderType(providerName), c)
+	cert, certErr := certificate.NewProvider(certificate.ProviderType(providerName), c, scheme)
 	if certErr != nil {
 		// TODO: instead of error, set default autoConfig
 		return certErr
@@ -707,9 +707,9 @@ func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client
 	return nil
 }
 
-func createClientCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client) error {
+func createClientCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client, scheme *runtime.Scheme) error {
 	certName := getClientCertName(ec.Name)
-	err := createCertificate(ec, ctx, c, certName)
+	err := createCertificate(ec, ctx, c, scheme, certName)
 	if err != nil {
 		return err
 	}
@@ -720,9 +720,9 @@ func createClientCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c 
 	return err
 }
 
-func createServerCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client) error {
+func createServerCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client, scheme *runtime.Scheme) error {
 	serverCertName := getServerCertName(ec.Name)
-	err := createCertificate(ec, ctx, c, serverCertName)
+	err := createCertificate(ec, ctx, c, scheme, serverCertName)
 	if err != nil {
 		return err
 	}
@@ -733,9 +733,9 @@ func createServerCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c 
 	return nil
 }
 
-func createPeerCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client) error {
+func createPeerCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client, scheme *runtime.Scheme) error {
 	peerCertName := getPeerCertName(ec.Name)
-	err := createCertificate(ec, ctx, c, peerCertName)
+	err := createCertificate(ec, ctx, c, scheme, peerCertName)
 	if err != nil {
 		return err
 	}
@@ -746,13 +746,13 @@ func createPeerCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c cl
 	return nil
 }
 
-func applyEtcdMemberCerts(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client) error {
+func applyEtcdMemberCerts(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client, scheme *runtime.Scheme) error {
 	if ec.Spec.TLS != nil {
-		err := createServerCertificate(ctx, ec, c)
+		err := createServerCertificate(ctx, ec, c, scheme)
 		if err != nil {
 			return err
 		}
-		err = createPeerCertificate(ctx, ec, c)
+		err = createPeerCertificate(ctx, ec, c, scheme)
 		if err != nil {
 			return err
 		}

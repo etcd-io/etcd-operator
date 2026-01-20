@@ -117,7 +117,7 @@ func (r *EtcdClusterReconciler) fetchAndValidateState(ctx context.Context, req c
 
 	// Ensure the operator has TLS credentials when the cluster requests TLS.
 	if ec.Spec.TLS != nil {
-		if err := createClientCertificate(ctx, ec, r.Client); err != nil {
+		if err := createClientCertificate(ctx, ec, r.Client, r.Scheme); err != nil {
 			logger.Error(err, "Failed to create Client Certificate.")
 		}
 	} else {
@@ -337,11 +337,25 @@ func (r *EtcdClusterReconciler) reconcileClusterState(ctx context.Context, s *re
 // SetupWithManager sets up the controller with the Manager.
 func (r *EtcdClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.Recorder = mgr.GetEventRecorderFor("etcdcluster-controller")
-	return ctrl.NewControllerManagedBy(mgr).
+	setupLog := ctrl.Log.WithName("setup")
+
+	builder := ctrl.NewControllerManagedBy(mgr).
 		For(&ecv1alpha1.EtcdCluster{}).
 		Owns(&appsv1.StatefulSet{}).
 		Owns(&corev1.Service{}).
-		Owns(&corev1.ConfigMap{}).
-		Owns(&certv1.Certificate{}).
-		Complete(r)
+		Owns(&corev1.ConfigMap{})
+
+	// Conditionally watch cert-manager Certificate resources if CRDs are installed
+	// This allows the controller to react to Certificate status changes when using cert-manager provider
+	certList := &certv1.CertificateList{}
+	if err := mgr.GetClient().List(context.Background(), certList); err == nil {
+		// cert-manager CRDs are installed, add Certificate watch
+		builder = builder.Owns(&certv1.Certificate{})
+		setupLog.Info("cert-manager CRDs detected, enabling Certificate watches")
+	} else {
+		// cert-manager CRDs not installed, skip Certificate watch
+		setupLog.Info("cert-manager CRDs not detected, only auto provider will be available. Restart the controller after cert-manager CRDs are installed")
+	}
+
+	return builder.Complete(r)
 }
