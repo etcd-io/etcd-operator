@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	certv1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsV1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
@@ -45,7 +44,6 @@ func TestAutoProvider(t *testing.T) {
 			client := cfg.Client()
 			_ = appsv1.AddToScheme(client.Resources().GetScheme())
 			_ = corev1.AddToScheme(client.Resources().GetScheme())
-			_ = certv1.AddToScheme(client.Resources().GetScheme())
 			_ = apiextensionsV1.AddToScheme(client.Resources().GetScheme())
 
 			return ctx
@@ -54,7 +52,7 @@ func TestAutoProvider(t *testing.T) {
 	feature.Assess("Ensure certificate",
 		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
 			cl := cfg.Client()
-			acProvider := auto.New(cl.Resources().GetControllerRuntimeClient())
+			acProvider := auto.New(cl.Resources().GetControllerRuntimeClient(), cl.Resources().GetScheme())
 			secretKey := client.ObjectKey{Name: autoCertificateName, Namespace: autoCertificateNamespace}
 			err := acProvider.EnsureCertificateSecret(ctx, secretKey, cmConfig)
 			if err != nil {
@@ -66,7 +64,7 @@ func TestAutoProvider(t *testing.T) {
 	feature.Assess("Validate certificate secret",
 		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
 			cl := cfg.Client()
-			acProvider := auto.New(cl.Resources().GetControllerRuntimeClient())
+			acProvider := auto.New(cl.Resources().GetControllerRuntimeClient(), cl.Resources().GetScheme())
 			secretKey := client.ObjectKey{Name: autoCertificateName, Namespace: autoCertificateNamespace}
 			err := acProvider.ValidateCertificateSecret(ctx, secretKey, cmConfig)
 			if err != nil {
@@ -78,7 +76,7 @@ func TestAutoProvider(t *testing.T) {
 	feature.Assess("Get certificate config",
 		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
 			cl := cfg.Client()
-			acProvider := auto.New(cl.Resources().GetControllerRuntimeClient())
+			acProvider := auto.New(cl.Resources().GetControllerRuntimeClient(), cl.Resources().GetScheme())
 			secretKey := client.ObjectKey{Name: cmCertificateName, Namespace: cmCertificateNamespace}
 			err := acProvider.EnsureCertificateSecret(ctx, secretKey, cmConfig)
 			if err != nil {
@@ -97,7 +95,7 @@ func TestAutoProvider(t *testing.T) {
 	feature.Assess("Delete certificate secret",
 		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
 			cl := cfg.Client()
-			acProvider := auto.New(cl.Resources().GetControllerRuntimeClient())
+			acProvider := auto.New(cl.Resources().GetControllerRuntimeClient(), cl.Resources().GetScheme())
 			secretKey := client.ObjectKey{Name: autoCertificateName, Namespace: autoCertificateNamespace}
 			err := acProvider.DeleteCertificateSecret(ctx, secretKey)
 			if err != nil {
@@ -109,7 +107,7 @@ func TestAutoProvider(t *testing.T) {
 	feature.Assess("Verify Delete certificate",
 		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
 			cl := cfg.Client()
-			acProvider := auto.New(cl.Resources().GetControllerRuntimeClient())
+			acProvider := auto.New(cl.Resources().GetControllerRuntimeClient(), cl.Resources().GetScheme())
 			secretKey := client.ObjectKey{Name: autoCertificateName, Namespace: autoCertificateNamespace}
 			_, err := acProvider.GetCertificateConfig(ctx, secretKey)
 			if err == nil {
@@ -157,7 +155,6 @@ func TestClusterAutoCertCreation(t *testing.T) {
 		client := cfg.Client()
 		_ = appsv1.AddToScheme(client.Resources().GetScheme())
 		_ = corev1.AddToScheme(client.Resources().GetScheme())
-		_ = certv1.AddToScheme(client.Resources().GetScheme())
 		_ = apiextensionsV1.AddToScheme(client.Resources().GetScheme())
 
 		// create etcd cluster

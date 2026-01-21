@@ -21,6 +21,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	interfaces "go.etcd.io/etcd-operator/pkg/certificate/interfaces"
@@ -40,7 +41,8 @@ type Provider struct {
 
 var _ interfaces.Provider = (*Provider)(nil)
 
-func New(c client.Client) interfaces.Provider {
+func New(c client.Client, scheme *runtime.Scheme) interfaces.Provider {
+	// Auto provider doesn't need any additional scheme registration
 	return &Provider{
 		Client: c,
 		config: nil,
@@ -101,24 +103,14 @@ func (ac *Provider) ValidateCertificateSecret(ctx context.Context, secretKey cli
 		return err
 	}
 
-	certificateData, exists := secret.Data["tls.crt"]
-	if !exists {
-		return interfaces.ErrTLSCert
-	}
-
-	decodeCertificatePem, _ := pem.Decode(certificateData)
-	if decodeCertificatePem == nil {
-		return interfaces.ErrDecodeCert
+	parseCert, err := parseCertificateFromSecret(secret)
+	if err != nil {
+		return err
 	}
 
 	privateKeyData, keyExists := secret.Data["tls.key"]
 	if !keyExists {
 		return interfaces.ErrTLSKey
-	}
-
-	parseCert, err := x509.ParseCertificate(decodeCertificatePem.Bytes)
-	if err != nil {
-		return fmt.Errorf("failed to parse certificate: %w", err)
 	}
 
 	now := time.Now()
@@ -164,11 +156,48 @@ func (ac *Provider) GetCertificateConfig(ctx context.Context,
 		return nil, fmt.Errorf("failed to get certificate: %w", err)
 	}
 
+	// If config was set during creation, return it
 	if ac.config != nil {
 		return ac.config, nil
 	}
 
-	return nil, fmt.Errorf("failed to get user-defined autoConfig")
+	// For existing secrets, parse the certificate to extract the config
+	cert, err := parseCertificateFromSecret(&autoCertSecret)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse certificate from secret: %w", err)
+	}
+
+	// Extract config from the certificate
+	config := &interfaces.Config{
+		CommonName:   cert.Subject.CommonName,
+		Organization: cert.Subject.Organization,
+		AltNames: interfaces.AltNames{
+			DNSNames: cert.DNSNames,
+			IPs:      cert.IPAddresses,
+		},
+	}
+
+	return config, nil
+}
+
+// parseCertificateFromSecret extracts and parses the x509 certificate from a Kubernetes secret.
+func parseCertificateFromSecret(secret *corev1.Secret) (*x509.Certificate, error) {
+	certData, ok := secret.Data[corev1.TLSCertKey]
+	if !ok {
+		return nil, interfaces.ErrTLSCert
+	}
+
+	block, _ := pem.Decode(certData)
+	if block == nil {
+		return nil, interfaces.ErrDecodeCert
+	}
+
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse certificate: %w", err)
+	}
+
+	return cert, nil
 }
 
 // parsePrivateKey parses the private key from the PEM-encoded data.

@@ -36,7 +36,7 @@ import (
 	"sigs.k8s.io/e2e-framework/support/kind"
 
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
-	test_utils "go.etcd.io/etcd-operator/test/utils"
+	testUtils "go.etcd.io/etcd-operator/test/utils"
 )
 
 var (
@@ -73,12 +73,12 @@ func TestMain(m *testing.M) {
 			// Build docker image
 			log.Println("Building docker image...")
 			cmd := exec.Command("make", "docker-build", fmt.Sprintf("IMG=%s", imageName))
-			if _, err := test_utils.Run(cmd); err != nil {
+			if _, err := testUtils.Run(cmd); err != nil {
 				log.Printf("Failed to build docker image: %s", err)
 				return ctx, err
 			}
 
-			if err := test_utils.LoadContainerImageToKindCluster(ctx,
+			if err := testUtils.LoadContainerImageToKindCluster(ctx,
 				kindCluster,
 				imageName, containerTool); err != nil {
 				log.Println(err)
@@ -88,16 +88,11 @@ func TestMain(m *testing.M) {
 			return ctx, nil
 		},
 
-		// install prometheus and cert-manager
+		// install prometheus
 		func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
 			log.Println("Installing prometheus operator...")
-			if err := test_utils.InstallPrometheusOperator(); err != nil {
+			if err := testUtils.InstallPrometheusOperator(); err != nil {
 				log.Printf("Unable to install Prometheus operator: %s", err)
-			}
-
-			log.Println("Installing cert-manager...")
-			if err := test_utils.InstallCertManager(); err != nil {
-				log.Printf("Unable to install Cert Manager: %s", err)
 			}
 
 			return ctx, nil
@@ -116,7 +111,7 @@ func TestMain(m *testing.M) {
 			// install crd
 			log.Println("Install crd...")
 			cmd := exec.Command("make", "install")
-			if _, err := test_utils.Run(cmd); err != nil {
+			if _, err := testUtils.Run(cmd); err != nil {
 				log.Printf("Failed to install crd: %s", err)
 				return ctx, err
 			}
@@ -126,7 +121,7 @@ func TestMain(m *testing.M) {
 
 			log.Println("Deploying controller-manager resources...")
 			cmd = exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", imageName))
-			if _, err := test_utils.Run(cmd); err != nil {
+			if _, err := testUtils.Run(cmd); err != nil {
 				log.Printf("Failed to deploy resource configurations: %s", err)
 				return ctx, err
 			}
@@ -167,14 +162,14 @@ func TestMain(m *testing.M) {
 			// undeploy etcd operator
 			log.Println("Undeploy etcd controller...")
 			cmd := exec.Command("make", "undeploy", "ignore-not-found=true")
-			if _, err := test_utils.Run(cmd); err != nil {
+			if _, err := testUtils.Run(cmd); err != nil {
 				log.Printf("Warning: Failed to undeploy controller: %s", err)
 			}
 
 			// uninstall crd
 			log.Println("Uninstalling crd...")
 			cmd = exec.Command("make", "uninstall", "ignore-not-found=true")
-			if _, err := test_utils.Run(cmd); err != nil {
+			if _, err := testUtils.Run(cmd); err != nil {
 				log.Printf("Warning: Failed to install crd: %s", err)
 			}
 
@@ -198,10 +193,10 @@ func TestMain(m *testing.M) {
 			log.Println("Removing dependencies...")
 
 			// remove prometheus
-			test_utils.UninstallPrometheusOperator()
+			testUtils.UninstallPrometheusOperator()
 
 			// remove cert-manager
-			test_utils.UninstallCertManager()
+			testUtils.UninstallCertManager()
 
 			return ctx, nil
 		},

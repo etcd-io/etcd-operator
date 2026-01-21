@@ -21,6 +21,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	interfaces "go.etcd.io/etcd-operator/pkg/certificate/interfaces"
@@ -37,7 +38,10 @@ type CertManagerProvider struct {
 
 var _ interfaces.Provider = (*CertManagerProvider)(nil)
 
-func New(c client.Client) interfaces.Provider {
+func New(c client.Client, scheme *runtime.Scheme) interfaces.Provider {
+	// Note: cert-manager scheme is registered at startup in main.go to enable
+	// CRD detection and optional watches. The scheme parameter is kept for
+	// interface compatibility but not used here.
 	return &CertManagerProvider{
 		c,
 	}

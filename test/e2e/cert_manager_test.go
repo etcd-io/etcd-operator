@@ -3,6 +3,7 @@ package e2e
 import (
 	"context"
 	"fmt"
+	"log"
 	"reflect"
 	"testing"
 	"time"
@@ -23,6 +24,7 @@ import (
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 	"go.etcd.io/etcd-operator/pkg/certificate/cert_manager"
 	interfaces "go.etcd.io/etcd-operator/pkg/certificate/interfaces"
+	testUtils "go.etcd.io/etcd-operator/test/utils"
 )
 
 const (
@@ -61,6 +63,11 @@ func TestCertManagerProvider(t *testing.T) {
 
 	feature.Setup(
 		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+			log.Println("Installing cert-manager...")
+			if err := testUtils.InstallCertManager(); err != nil {
+				log.Printf("Unable to install Cert Manager: %s", err)
+			}
+
 			client := cfg.Client()
 			_ = appsv1.AddToScheme(client.Resources().GetScheme())
 			_ = corev1.AddToScheme(client.Resources().GetScheme())
@@ -87,7 +94,7 @@ func TestCertManagerProvider(t *testing.T) {
 	feature.Assess("Ensure certificate",
 		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
 			cl := cfg.Client()
-			cmProvider := cert_manager.New(cl.Resources().GetControllerRuntimeClient())
+			cmProvider := cert_manager.New(cl.Resources().GetControllerRuntimeClient(), cl.Resources().GetScheme())
 			secretKey := client.ObjectKey{Name: cmCertificateName, Namespace: cmCertificateNamespace}
 			err := cmProvider.EnsureCertificateSecret(ctx, secretKey, cmConfig)
 			if err != nil {
@@ -99,7 +106,7 @@ func TestCertManagerProvider(t *testing.T) {
 	feature.Assess("Validate certificate secret",
 		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
 			cl := cfg.Client()
-			cmProvider := cert_manager.New(cl.Resources().GetControllerRuntimeClient())
+			cmProvider := cert_manager.New(cl.Resources().GetControllerRuntimeClient(), cl.Resources().GetScheme())
 			secretKey := client.ObjectKey{Name: cmCertificateName, Namespace: cmCertificateNamespace}
 			err := cmProvider.ValidateCertificateSecret(ctx, secretKey, cmConfig)
 			if err != nil {
@@ -111,7 +118,7 @@ func TestCertManagerProvider(t *testing.T) {
 	feature.Assess("Get certificate config",
 		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
 			cl := cfg.Client()
-			cmProvider := cert_manager.New(cl.Resources().GetControllerRuntimeClient())
+			cmProvider := cert_manager.New(cl.Resources().GetControllerRuntimeClient(), cl.Resources().GetScheme())
 			secretKey := client.ObjectKey{Name: cmCertificateName, Namespace: cmCertificateNamespace}
 			config, err := cmProvider.GetCertificateConfig(ctx, secretKey)
 			if err != nil {
@@ -126,7 +133,7 @@ func TestCertManagerProvider(t *testing.T) {
 	feature.Assess("Delete certificate secret",
 		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
 			cl := cfg.Client()
-			cmProvider := cert_manager.New(cl.Resources().GetControllerRuntimeClient())
+			cmProvider := cert_manager.New(cl.Resources().GetControllerRuntimeClient(), cl.Resources().GetScheme())
 			secretKey := client.ObjectKey{Name: cmCertificateName, Namespace: cmCertificateNamespace}
 			err := cmProvider.DeleteCertificateSecret(ctx, secretKey)
 			if err != nil {
@@ -138,7 +145,7 @@ func TestCertManagerProvider(t *testing.T) {
 	feature.Assess("Verify Delete certificate",
 		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
 			cl := cfg.Client()
-			cmProvider := cert_manager.New(cl.Resources().GetControllerRuntimeClient())
+			cmProvider := cert_manager.New(cl.Resources().GetControllerRuntimeClient(), cl.Resources().GetScheme())
 			secretKey := client.ObjectKey{Name: cmCertificateName, Namespace: cmCertificateNamespace}
 			_, err := cmProvider.GetCertificateConfig(ctx, secretKey)
 			if err == nil {
@@ -185,6 +192,11 @@ func TestClusterCertCreation(t *testing.T) {
 	}
 
 	feature.Setup(func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+		log.Println("Installing cert-manager...")
+		if err := testUtils.InstallCertManager(); err != nil {
+			log.Printf("Unable to install Cert Manager: %s", err)
+		}
+
 		client := cfg.Client()
 		_ = appsv1.AddToScheme(client.Resources().GetScheme())
 		_ = corev1.AddToScheme(client.Resources().GetScheme())

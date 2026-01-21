@@ -49,6 +49,10 @@ func init() {
 
 	utilruntime.Must(operatorv1alpha1.AddToScheme(scheme))
 
+	// Register cert-manager scheme to enable CRD detection and optional watches
+	// Note: cert-manager CRDs don't need to be installed if only using auto provider.
+	// The controller will detect at startup whether cert-manager CRDs exist and
+	// conditionally enable Certificate watches only if they are present.
 	utilruntime.Must(certv1.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
 }
