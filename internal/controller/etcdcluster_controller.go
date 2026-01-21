@@ -26,7 +26,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -44,7 +44,7 @@ const (
 type EtcdClusterReconciler struct {
 	client.Client
 	Scheme        *runtime.Scheme
-	Recorder      record.EventRecorder
+	Recorder      events.EventRecorder
 	ImageRegistry string
 }
 
@@ -336,7 +336,7 @@ func (r *EtcdClusterReconciler) reconcileClusterState(ctx context.Context, s *re
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *EtcdClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	r.Recorder = mgr.GetEventRecorderFor("etcdcluster-controller")
+	r.Recorder = mgr.GetEventRecorder("etcdcluster-controller")
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&ecv1alpha1.EtcdCluster{}).
 		Owns(&appsv1.StatefulSet{}).
