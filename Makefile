@@ -85,8 +85,19 @@ test: manifests generate fmt vet envtest ## Run tests.
 # - PROMETHEUS_INSTALL_SKIP=true
 # - CERT_MANAGER_INSTALL_SKIP=true
 .PHONY: test-e2e
-test-e2e: generate fmt vet kind ## Run the e2e tests. Expected an isolated environment using Kind.
+test-e2e: generate fmt vet kind gofail-enable ## Run the e2e tests. Expected an isolated environment using Kind.
 	ETCD_VERSION="$(E2E_ETCD_VERSION)" PATH="$(LOCALBIN):$(PATH)" go test ./test/e2e/ -v
+	$(MAKE) gofail-disable
+
+.PHONY: gofail-enable
+gofail-enable: gofail
+	$(GOFAIL) enable ./internal/controller/
+	go mod tidy
+
+.PHONY: gofail-disable
+gofail-disable: gofail
+	$(GOFAIL) disable ./internal/controller/
+	go mod tidy
 
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter
@@ -206,6 +217,7 @@ ENVTEST ?= $(LOCALBIN)/setup-envtest
 GOLANGCI_LINT = $(LOCALBIN)/golangci-lint
 CRD_REF_DOCS ?= $(LOCALBIN)/crd-ref-docs
 KIND ?= $(LOCALBIN)/kind
+GOFAIL ?= $(LOCALBIN)/gofail
 
 ## Tool Versions
 KUSTOMIZE_VERSION = $(shell cd tools/mod && go list -m -f {{.Version}} sigs.k8s.io/kustomize/kustomize/v5)
@@ -214,6 +226,7 @@ ENVTEST_VERSION = $(shell cd tools/mod && go list -m -f {{.Version}} sigs.k8s.io
 GOLANGCI_LINT_VERSION = $(shell cd tools/mod && go list -m -f {{.Version}} github.com/golangci/golangci-lint/v2)
 CRD_REF_DOCS_VERSION = $(shell cd tools/mod && go list -m -f {{.Version}} github.com/elastic/crd-ref-docs)
 KIND_VERSION = $(shell cd tools/mod && go list -m -f {{.Version}} sigs.k8s.io/kind)
+GOFAIL_VERSION = $(shell cd tools/mod && go list -m -f {{.Version}} go.etcd.io/gofail)
 
 .PHONY: kustomize
 kustomize: $(KUSTOMIZE) ## Download kustomize locally if necessary.
@@ -244,6 +257,11 @@ $(KIND): $(LOCALBIN)
 golangci-lint: $(GOLANGCI_LINT) ## Download golangci-lint locally if necessary.
 $(GOLANGCI_LINT): $(LOCALBIN)
 	curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh | sh -s -- -b $(LOCALBIN) $(GOLANGCI_LINT_VERSION)
+
+.PHONY: gofail
+gofail: $(GOFAIL) ## Download gofail locally if necessary.
+$(GOFAIL): $(LOCALBIN)
+	$(call go-install-tool,$(GOFAIL),go.etcd.io/gofail,$(GOFAIL_VERSION))
 
 # go-install-tool will 'go install' any package with custom target and name of binary, if it doesn't exist
 # $1 - target path with name of binary

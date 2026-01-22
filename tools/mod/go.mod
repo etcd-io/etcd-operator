@@ -7,6 +7,7 @@ toolchain go1.25.5
 require (
 	github.com/elastic/crd-ref-docs v0.2.0
 	github.com/golangci/golangci-lint/v2 v2.7.2
+	go.etcd.io/gofail v0.2.0
 	sigs.k8s.io/controller-runtime/tools/setup-envtest v0.0.0-20250106171007-7436275c4311 // @release-0.19
 	sigs.k8s.io/controller-tools v0.20.0
 	sigs.k8s.io/kind v0.31.0
