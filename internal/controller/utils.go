@@ -20,6 +20,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -540,15 +541,16 @@ func healthCheck(sts *appsv1.StatefulSet, lg klog.Logger) (*clientv3.MemberListR
 		return memberlistResp, nil, err
 	}
 
+	var memberErrors []error
 	for _, healthInfo := range healthInfos {
 		if !healthInfo.Health {
 			// TODO: also update metrics?
-			return memberlistResp, healthInfos, errors.New(healthInfo.String())
+			memberErrors = append(memberErrors, errors.New(healthInfo.String()))
 		}
 		lg.Info(healthInfo.String())
 	}
 
-	return memberlistResp, healthInfos, nil
+	return memberlistResp, healthInfos, utilerrors.NewAggregate(memberErrors)
 }
 
 func getClientCertName(etcdClusterName string) string {
