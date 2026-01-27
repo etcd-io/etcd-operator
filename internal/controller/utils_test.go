@@ -7,6 +7,7 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -168,6 +169,9 @@ func TestCreateHeadlessServiceIfNotExist(t *testing.T) {
 			"app":        "test-etcd",
 			"controller": "test-etcd",
 		}, service.Spec.Selector)
+		// Verify service is controlled by EtcdCluster
+		require.Len(t, service.OwnerReferences, 1)
+		require.Equal(t, service.OwnerReferences[0].Name, ec.Name)
 	})
 
 	t.Run("does not create service if it already exists", func(t *testing.T) {
@@ -449,15 +453,19 @@ func TestApplyEtcdClusterState(t *testing.T) {
 	t.Run("creates configmap if it does not exist", func(t *testing.T) {
 		err := applyEtcdClusterState(ctx, ec, 3, fakeClient, scheme, logger)
 		assert.NoError(t, err)
-
 		// Verify that the configmap was created
 		configMap := &corev1.ConfigMap{}
 		err = fakeClient.Get(ctx, client.ObjectKey{Name: configMapNameForEtcdCluster(ec), Namespace: "default"}, configMap)
+		t.Cleanup(func() {
+			err = fakeClient.Delete(ctx, configMap) // Delete the configmap to avoid conflicts in future tests
+			assert.NoError(t, err)
+		})
 		assert.NoError(t, err)
 		assert.Equal(t, "existing", configMap.Data["ETCD_INITIAL_CLUSTER_STATE"])
 		assert.Contains(t, configMap.Data["ETCD_INITIAL_CLUSTER"], "test-etcd-0=http://test-etcd-0.test-etcd.default.svc.cluster.local:2380")
-		err = fakeClient.Delete(ctx, configMap) // Delete the configmap to avoid conflicts in future tests
-		assert.NoError(t, err)
+		// Verify configmap is controlled by EtcdCluster
+		require.Len(t, configMap.OwnerReferences, 1)
+		require.Equal(t, configMap.OwnerReferences[0].Name, ec.Name)
 	})
 
 	t.Run("updates configmap if it already exists", func(t *testing.T) {
@@ -476,6 +484,9 @@ func TestApplyEtcdClusterState(t *testing.T) {
 		assert.NoError(t, err)
 		assert.Equal(t, "existing", updatedConfigMap.Data["ETCD_INITIAL_CLUSTER_STATE"])
 		assert.Contains(t, updatedConfigMap.Data["ETCD_INITIAL_CLUSTER"], "test-etcd-0=http://test-etcd-0.test-etcd.default.svc.cluster.local:2380")
+		// Verify configmap is controlled by EtcdCluster
+		require.Len(t, updatedConfigMap.OwnerReferences, 1)
+		require.Equal(t, updatedConfigMap.OwnerReferences[0].Name, ec.Name)
 	})
 }
 
@@ -558,13 +569,15 @@ func TestCreateOrPatchStatefulSetWithPodAnnotations(t *testing.T) {
 			sts := &appsv1.StatefulSet{}
 			err = fakeClient.Get(ctx, client.ObjectKey{Name: tt.etcdClusterName, Namespace: "default"}, sts)
 			assert.NoError(t, err)
-
 			// Check annotations
 			if tt.expectNil {
 				assert.Nil(t, sts.Spec.Template.Annotations)
 			} else {
 				assert.Equal(t, tt.expectedAnnotations, sts.Spec.Template.Annotations)
 			}
+			// Verify statefulset is controlled by EtcdCluster
+			require.Len(t, sts.OwnerReferences, 1)
+			require.Equal(t, sts.OwnerReferences[0].Name, ec.Name)
 		})
 	}
 }
@@ -674,9 +687,11 @@ func TestCreateOrPatchStatefulSetWithPodLabels(t *testing.T) {
 			sts := &appsv1.StatefulSet{}
 			err = fakeClient.Get(ctx, client.ObjectKey{Name: tt.etcdClusterName, Namespace: "default"}, sts)
 			assert.NoError(t, err)
-
 			// Check that pod template has the expected labels
 			assert.Equal(t, tt.expectedLabels, sts.Spec.Template.Labels)
+			// Verify statefulset is controlled by EtcdCluster
+			require.Len(t, sts.OwnerReferences, 1)
+			require.Equal(t, sts.OwnerReferences[0].Name, ec.Name)
 		})
 	}
 }
