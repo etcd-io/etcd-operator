@@ -334,14 +334,34 @@ func (r *EtcdClusterReconciler) reconcileClusterState(ctx context.Context, s *re
 	return ctrl.Result{}, nil
 }
 
+// isCertManagerCRDPresent checks if cert-manager CRDs are installed in the cluster
+func isCertManagerCRDPresent(mgr ctrl.Manager) bool {
+	gvk := certv1.SchemeGroupVersion.WithKind("Certificate")
+	_, err := mgr.GetRESTMapper().RESTMapping(gvk.GroupKind(), gvk.Version)
+	return err == nil
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *EtcdClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.Recorder = mgr.GetEventRecorder("etcdcluster-controller")
-	return ctrl.NewControllerManagedBy(mgr).
+	setupLog := ctrl.Log.WithName("setup")
+
+	builder := ctrl.NewControllerManagedBy(mgr).
 		For(&ecv1alpha1.EtcdCluster{}).
 		Owns(&appsv1.StatefulSet{}).
 		Owns(&corev1.Service{}).
-		Owns(&corev1.ConfigMap{}).
-		Owns(&certv1.Certificate{}).
-		Complete(r)
+		Owns(&corev1.ConfigMap{})
+
+	// Conditionally watch cert-manager Certificate resources if CRDs are installed
+	// This allows the controller to react to Certificate status changes when using cert-manager provider
+	if isCertManagerCRDPresent(mgr) {
+		// cert-manager CRDs are installed, add Certificate watch
+		builder = builder.Owns(&certv1.Certificate{})
+		setupLog.Info("cert-manager CRDs detected, enabling Certificate watches")
+	} else {
+		// cert-manager CRDs not installed, skip Certificate watch
+		setupLog.Info("cert-manager CRDs not detected, only auto provider will be available. Restart the controller after cert-manager CRDs are installed")
+	}
+
+	return builder.Complete(r)
 }
