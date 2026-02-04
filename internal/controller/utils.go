@@ -540,15 +540,16 @@ func healthCheck(sts *appsv1.StatefulSet, lg klog.Logger) (*clientv3.MemberListR
 		return memberlistResp, nil, err
 	}
 
+	var memberErrors = make([]error, 3)
 	for _, healthInfo := range healthInfos {
 		if !healthInfo.Health {
 			// TODO: also update metrics?
-			return memberlistResp, healthInfos, errors.New(healthInfo.String())
+			memberErrors = append(memberErrors, errors.New(healthInfo.String()))
 		}
 		lg.Info(healthInfo.String())
 	}
 
-	return memberlistResp, healthInfos, nil
+	return memberlistResp, healthInfos, errors.Join(memberErrors...)
 }
 
 func getClientCertName(etcdClusterName string) string {
