@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/coreos/go-semver/semver"
 	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -788,4 +789,115 @@ func TestCreatingArgs(t *testing.T) {
 		})
 	}
 
+}
+
+func TestValidateEtcdUpgradePath(t *testing.T) {
+	etcdVersions := []semver.Version{
+		{Major: 3, Minor: 0},
+		{Major: 3, Minor: 1},
+		{Major: 3, Minor: 2},
+		{Major: 3, Minor: 3},
+		{Major: 3, Minor: 4},
+		{Major: 3, Minor: 5},
+		{Major: 3, Minor: 6},
+		{Major: 3, Minor: 7},
+		{Major: 4, Minor: 0},
+	}
+
+	tests := []struct {
+		name      string
+		current   string
+		target    string
+		canParse  bool
+		expectErr bool
+	}{
+		{
+			name:      "equal versions",
+			current:   "3.2.0",
+			target:    "3.2.0",
+			canParse:  true,
+			expectErr: false,
+		},
+		{
+			name:      "valid minor level upgrade",
+			current:   "3.4.0",
+			target:    "3.5.0",
+			canParse:  true,
+			expectErr: false,
+		},
+		{
+			name:      "valid patch level upgrade",
+			current:   "3.4.0",
+			target:    "3.4.1",
+			canParse:  true,
+			expectErr: false,
+		},
+		{
+			name:      "invalid current version",
+			current:   "invalid",
+			target:    "3.1.0",
+			canParse:  false,
+			expectErr: true,
+		},
+		{
+			name:      "invalid target version",
+			current:   "3.1.0",
+			target:    "invalid",
+			canParse:  false,
+			expectErr: true,
+		},
+		{
+			name:      "minor downgrade not allowed",
+			current:   "3.2.0",
+			target:    "3.1.0",
+			canParse:  true,
+			expectErr: true,
+		},
+		{
+			name:      "patch downgrade not allowed",
+			current:   "3.5.1",
+			target:    "3.5.0",
+			canParse:  true,
+			expectErr: true,
+		},
+		{
+			name:      "unknown current version",
+			current:   "3.9.0",
+			target:    "4.0.0",
+			canParse:  true,
+			expectErr: true,
+		},
+		{
+			name:      "unknown target version",
+			current:   "4.0.0",
+			target:    "4.1.0",
+			canParse:  true,
+			expectErr: true,
+		},
+		{
+			name:      "invalid upgrade skipping minor",
+			current:   "3.4.0",
+			target:    "3.6.0",
+			canParse:  true,
+			expectErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			canParse, err := validateEtcdUpgradePath(etcdVersions, tt.current, tt.target)
+
+			if canParse != tt.canParse {
+				t.Fatalf("expected canParse=%v, got %v", tt.canParse, canParse)
+			}
+
+			if tt.expectErr && err == nil {
+				t.Fatalf("expected error, got nil")
+			}
+
+			if !tt.expectErr && err != nil {
+				t.Fatalf("did not expect error, got %v", err)
+			}
+		})
+	}
 }

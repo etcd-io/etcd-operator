@@ -136,6 +136,252 @@ func TestFetchAndValidateState(t *testing.T) {
 				assert.Equal(t, ctrl.Result{}, res)
 			},
 		},
+		{
+			name: "Valid upgrade path",
+			ec: &ecv1alpha1.EtcdCluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "etcd",
+					Namespace: "default",
+					UID:       "2",
+				},
+				Spec: ecv1alpha1.EtcdClusterSpec{Size: 1, Version: "3.6.17"},
+			},
+			sts: &appsv1.StatefulSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "etcd",
+					Namespace: "default",
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: ecv1alpha1.GroupVersion.String(),
+							Kind:       "EtcdCluster",
+							Name:       "etcd",
+							UID:        "2",
+							Controller: pointerToBool(true),
+						},
+					},
+				},
+				Spec: appsv1.StatefulSetSpec{
+					Template: corev1.PodTemplateSpec{
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{
+								{Image: "gcr.io/etcd-development/etcd:3.5.17"},
+							},
+						},
+					},
+				},
+			},
+			req: ctrl.Request{NamespacedName: types.NamespacedName{Name: "etcd", Namespace: "default"}},
+			assert: func(t *testing.T, state *reconcileState, res ctrl.Result, err error, ec *ecv1alpha1.EtcdCluster, sts *appsv1.StatefulSet) {
+				require.NotNil(t, state)
+				assert.NoError(t, err)
+				assert.Equal(t, ctrl.Result{}, res)
+			},
+		},
+		{
+			name: "Cannot parse StatefulSet image tag",
+			ec: &ecv1alpha1.EtcdCluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "etcd",
+					Namespace: "default",
+					UID:       "2",
+				},
+				Spec: ecv1alpha1.EtcdClusterSpec{Size: 1, Version: "3.6.17"},
+			},
+			sts: &appsv1.StatefulSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "etcd",
+					Namespace: "default",
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: ecv1alpha1.GroupVersion.String(),
+							Kind:       "EtcdCluster",
+							Name:       "etcd",
+							UID:        "2",
+							Controller: pointerToBool(true),
+						},
+					},
+				},
+				Spec: appsv1.StatefulSetSpec{
+					Template: corev1.PodTemplateSpec{
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{
+								{Image: "gcr.io/etcd-development/etcd#notag"},
+							},
+						},
+					},
+				},
+			},
+			req: ctrl.Request{NamespacedName: types.NamespacedName{Name: "etcd", Namespace: "default"}},
+			assert: func(t *testing.T, state *reconcileState, res ctrl.Result, err error, ec *ecv1alpha1.EtcdCluster, sts *appsv1.StatefulSet) {
+				require.NotNil(t, state)
+				assert.NoError(t, err)
+				assert.Equal(t, ctrl.Result{}, res)
+			},
+		},
+		{
+			name: "Invalid upgrade path",
+			ec: &ecv1alpha1.EtcdCluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "etcd",
+					Namespace: "default",
+					UID:       "2",
+				},
+				Spec: ecv1alpha1.EtcdClusterSpec{Size: 1, Version: "3.7.1"},
+			},
+			sts: &appsv1.StatefulSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "etcd",
+					Namespace: "default",
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: ecv1alpha1.GroupVersion.String(),
+							Kind:       "EtcdCluster",
+							Name:       "etcd",
+							UID:        "2",
+							Controller: pointerToBool(true),
+						},
+					},
+				},
+				Spec: appsv1.StatefulSetSpec{
+					Template: corev1.PodTemplateSpec{
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{
+								{Image: "gcr.io/etcd-development/etcd:3.5.17"},
+							},
+						},
+					},
+				},
+			},
+			req: ctrl.Request{NamespacedName: types.NamespacedName{Name: "etcd", Namespace: "default"}},
+			assert: func(t *testing.T, state *reconcileState, res ctrl.Result, err error, ec *ecv1alpha1.EtcdCluster, sts *appsv1.StatefulSet) {
+				require.Nil(t, state)
+				assert.Error(t, err)
+				assert.Equal(t, ctrl.Result{}, res)
+			},
+		},
+		{
+			name: "Downgrades are unsupported",
+			ec: &ecv1alpha1.EtcdCluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "etcd",
+					Namespace: "default",
+					UID:       "2",
+				},
+				Spec: ecv1alpha1.EtcdClusterSpec{Size: 1, Version: "3.5.1"},
+			},
+			sts: &appsv1.StatefulSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "etcd",
+					Namespace: "default",
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: ecv1alpha1.GroupVersion.String(),
+							Kind:       "EtcdCluster",
+							Name:       "etcd",
+							UID:        "2",
+							Controller: pointerToBool(true),
+						},
+					},
+				},
+				Spec: appsv1.StatefulSetSpec{
+					Template: corev1.PodTemplateSpec{
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{
+								{Image: "gcr.io/etcd-development/etcd:3.6.10"},
+							},
+						},
+					},
+				},
+			},
+			req: ctrl.Request{NamespacedName: types.NamespacedName{Name: "etcd", Namespace: "default"}},
+			assert: func(t *testing.T, state *reconcileState, res ctrl.Result, err error, ec *ecv1alpha1.EtcdCluster, sts *appsv1.StatefulSet) {
+				require.Nil(t, state)
+				assert.Error(t, err)
+				assert.Equal(t, ctrl.Result{}, res)
+			},
+		},
+		{
+			name: "Upgrade with non-semver versions",
+			ec: &ecv1alpha1.EtcdCluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "etcd",
+					Namespace: "default",
+					UID:       "2",
+				},
+				Spec: ecv1alpha1.EtcdClusterSpec{Size: 1, Version: "foo"},
+			},
+			sts: &appsv1.StatefulSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "etcd",
+					Namespace: "default",
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: ecv1alpha1.GroupVersion.String(),
+							Kind:       "EtcdCluster",
+							Name:       "etcd",
+							UID:        "2",
+							Controller: pointerToBool(true),
+						},
+					},
+				},
+				Spec: appsv1.StatefulSetSpec{
+					Template: corev1.PodTemplateSpec{
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{
+								{Image: "gcr.io/etcd-development/etcd:bar"},
+							},
+						},
+					},
+				},
+			},
+			req: ctrl.Request{NamespacedName: types.NamespacedName{Name: "etcd", Namespace: "default"}},
+			assert: func(t *testing.T, state *reconcileState, res ctrl.Result, err error, ec *ecv1alpha1.EtcdCluster, sts *appsv1.StatefulSet) {
+				require.NotNil(t, state)
+				assert.NoError(t, err)
+				assert.Equal(t, ctrl.Result{}, res)
+			},
+		},
+		{
+			name: "Equal tags are a no-op even if they are not semver",
+			ec: &ecv1alpha1.EtcdCluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "etcd",
+					Namespace: "default",
+					UID:       "2",
+				},
+				Spec: ecv1alpha1.EtcdClusterSpec{Size: 1, Version: "bar"},
+			},
+			sts: &appsv1.StatefulSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "etcd",
+					Namespace: "default",
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: ecv1alpha1.GroupVersion.String(),
+							Kind:       "EtcdCluster",
+							Name:       "etcd",
+							UID:        "2",
+							Controller: pointerToBool(true),
+						},
+					},
+				},
+				Spec: appsv1.StatefulSetSpec{
+					Template: corev1.PodTemplateSpec{
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{
+								{Image: "gcr.io/etcd-development/etcd:bar"},
+							},
+						},
+					},
+				},
+			},
+			req: ctrl.Request{NamespacedName: types.NamespacedName{Name: "etcd", Namespace: "default"}},
+			assert: func(t *testing.T, state *reconcileState, res ctrl.Result, err error, ec *ecv1alpha1.EtcdCluster, sts *appsv1.StatefulSet) {
+				require.NotNil(t, state)
+				assert.NoError(t, err)
+				assert.Equal(t, ctrl.Result{}, res)
+			},
+		},
 	}
 
 	for _, tc := range cases {

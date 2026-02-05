@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/coreos/go-semver/semver"
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -775,4 +776,55 @@ func patchCertificateSecret(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c c
 	}
 
 	return nil
+}
+
+// validateEtcdUpgradePat can be used to check if the current and target versions align
+// with the official upgrade paths for etcd. If one of the versions cannot be parsed
+// canParse is false. If the versions are equal the function will not return an error
+// but that should be handled on the call site.
+func validateEtcdUpgradePath(etcdVersions []semver.Version, current, target string) (canParse bool, err error) {
+	var (
+		currentVer            *semver.Version
+		targetVer             *semver.Version
+		currentIdx, targetIdx = -1, -1
+	)
+
+	currentVer, err = semver.NewVersion(current)
+	if err != nil {
+		return false, fmt.Errorf("failed to parse current version %s: %w", current, err)
+	}
+	targetVer, err = semver.NewVersion(target)
+	if err != nil {
+		return false, fmt.Errorf("failed to parse target version %s: %w", target, err)
+	}
+
+	for idx, v := range etcdVersions {
+		if v.Major == currentVer.Major && v.Minor == currentVer.Minor {
+			currentIdx = idx
+		}
+		if v.Major == targetVer.Major && v.Minor == targetVer.Minor {
+			targetIdx = idx
+		}
+		if currentIdx != -1 && targetIdx != -1 {
+			break
+		}
+	}
+
+	switch {
+	case currentIdx == -1:
+		return true, fmt.Errorf("unknown current version %s", currentVer)
+
+	case targetIdx == -1:
+		return true, fmt.Errorf("unknown target version %s", targetVer)
+
+	case currentIdx > targetIdx || (currentIdx == targetIdx && currentVer.Patch > targetVer.Patch):
+		return true, fmt.Errorf("downgrading from version %s to version %s is not allowed",
+			currentVer, targetVer)
+
+	case targetIdx > currentIdx+1:
+		return true, fmt.Errorf("upgrading from version %s to version %s is not allowed",
+			currentVer, targetVer)
+	}
+
+	return true, nil
 }
