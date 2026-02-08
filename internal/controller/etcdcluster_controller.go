@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	certv1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
@@ -33,6 +34,7 @@ import (
 
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 	"go.etcd.io/etcd-operator/internal/etcdutils"
+	etcdversions "go.etcd.io/etcd/api/v3/version"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
@@ -144,6 +146,52 @@ func (r *EtcdClusterReconciler) fetchAndValidateState(ctx context.Context, req c
 		if err := checkStatefulSetControlledByEtcdOperator(ec, sts); err != nil {
 			logger.Error(err, "StatefulSet is not controlled by this EtcdCluster resource")
 			return nil, ctrl.Result{}, err
+		}
+
+		// If the version to be reconciled is unsupported, throw an error.
+		if len(sts.Spec.Template.Spec.Containers) == 0 {
+			logger.Error(err, "StatefulSet has no containers yet")
+			return &reconcileState{cluster: ec, sts: sts}, ctrl.Result{}, nil
+		}
+		stsImage := sts.Spec.Template.Spec.Containers[0].Image
+		// Note: createOrPatchStatefulSet() only supports the "registry-path:image" format.
+		// TODO: switch to using the version from ec.Status eventually.
+		//   https://github.com/etcd-io/etcd-operator/pull/278/changes#r2764796805
+		idx := strings.Index(stsImage, ":")
+		if idx == -1 {
+			logger.Error(err, "could not extract image version from StatefulSet image",
+				"image", stsImage)
+			return &reconcileState{cluster: ec, sts: sts}, ctrl.Result{}, nil
+		}
+		currentVersion := stsImage[idx+1:]
+		targetVersion := ec.Spec.Version
+
+		// Only handle cases when there is a version change.
+		if currentVersion != targetVersion {
+			// TODO: consider adding an option in the CRD called allowCustomImageUpgrade to make
+			// the behavior here optional:
+			//   https://github.com/etcd-io/etcd-operator/pull/278/changes#r2764717418
+			canParse, err := validateEtcdUpgradePath(etcdversions.AllVersions, currentVersion, targetVersion)
+			if !canParse {
+				logger.Info("error when parsing reconcile versions; it is your responsibility "+
+					"to validate if the upgrade path is supported",
+					"current", currentVersion,
+					"target", targetVersion,
+					"error", err,
+				)
+				return &reconcileState{cluster: ec, sts: sts}, ctrl.Result{}, nil
+			} else {
+				if err != nil {
+					logger.Error(err, "unsupported upgrade path between current and target versions",
+						"current", currentVersion,
+						"target", targetVersion,
+					)
+					return nil, ctrl.Result{}, err
+				}
+				logger.Info("upgrade path between current and target versions is supported",
+					"current", currentVersion,
+					"target", targetVersion)
+			}
 		}
 	}
 
