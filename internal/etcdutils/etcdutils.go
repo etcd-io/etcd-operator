@@ -169,7 +169,7 @@ func ClusterHealth(eps []string) ([]EpHealth, error) {
 				epStatus, err := cli.Status(ctx, ep)
 				if err != nil {
 					eh.Health = false
-					eh.Error = "Unable to fetch the status"
+					eh.Error = fmt.Sprintf("Unable to fetch the status :%s", err.Error())
 				} else {
 					eh.Status = epStatus
 					if len(epStatus.Errors) > 0 {
