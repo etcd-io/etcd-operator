@@ -4,6 +4,8 @@ IMG ?= controller:latest
 ENVTEST_K8S_VERSION = 1.31.0
 # The version of ETCD to run e2e tests against
 E2E_ETCD_VERSION ?= $(shell go list -m -f {{.Version}} go.etcd.io/etcd/api/v3)
+# Deployment mode
+DEPLOY_MODE ?= default
 
 # Adapted from k/k, simplified to use the go.mod and the Makefile:
 # https://github.com/kubernetes/kubernetes/blob/17854f0e0a153b06f9d0db096e2cd8ab2fa89c11/hack/lib/golang.sh#L510-L520
@@ -185,11 +187,11 @@ uninstall: manifests kustomize ## Uninstall CRDs from the K8s cluster specified 
 .PHONY: deploy
 deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config.
 	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
-	$(KUSTOMIZE) build config/default | $(KUBECTL) apply -f -
+	$(KUSTOMIZE) build config/$(DEPLOY_MODE) | $(KUBECTL) apply -f -
 
 .PHONY: undeploy
 undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
-	$(KUSTOMIZE) build config/default | $(KUBECTL) delete --ignore-not-found=$(ignore-not-found) -f -
+	$(KUSTOMIZE) build config/$(DEPLOY_MODE) | $(KUBECTL) delete --ignore-not-found=$(ignore-not-found) -f -
 
 ##@ Documentation
 

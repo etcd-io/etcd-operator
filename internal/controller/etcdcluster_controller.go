@@ -340,6 +340,8 @@ func (r *EtcdClusterReconciler) reconcileClusterState(ctx context.Context, s *re
 
 		logger.Info("Learner member added successfully", "peerURLs", peerURL)
 
+		// gofail: var exceptionAfterMemberAdd struct{}
+
 		if s.sts, err = reconcileStatefulSet(ctx, logger, s.cluster, r.Client, targetReplica, r.Scheme); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -359,6 +361,8 @@ func (r *EtcdClusterReconciler) reconcileClusterState(ctx context.Context, s *re
 		if err := etcdutils.RemoveMember(eps, memberID); err != nil {
 			return ctrl.Result{}, err
 		}
+
+		// gofail: var exceptionAfterMemberDelete struct{}
 
 		if s.sts, err = reconcileStatefulSet(ctx, logger, s.cluster, r.Client, targetReplica, r.Scheme); err != nil {
 			return ctrl.Result{}, err
