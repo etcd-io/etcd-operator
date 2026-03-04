@@ -67,9 +67,9 @@ func (r healthReport) Less(i, j int) bool {
 
 func (eh EpHealth) String() string {
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("endpoint: %s, health: %t, took: %s", eh.Ep, eh.Health, eh.Took))
+	fmt.Fprintf(&sb, "endpoint: %s, health: %t, took: %s", eh.Ep, eh.Health, eh.Took)
 	if eh.Status != nil {
-		sb.WriteString(fmt.Sprintf(", isLearner: %t", eh.Status.IsLearner))
+		fmt.Fprintf(&sb, ", isLearner: %t", eh.Status.IsLearner)
 	}
 	if len(eh.Error) > 0 {
 		sb.WriteString("error: ")
