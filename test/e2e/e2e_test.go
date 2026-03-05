@@ -66,7 +66,6 @@ func TestInvalidClusterSize(t *testing.T) {
 
 	for name, size := range tt {
 		feature.Setup(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-
 			// update cluster name
 			etcdClusterSpec.Name = strings.Join([]string{etcdClusterName, name}, "-")
 			etcdClusterSpec.Spec.Size = size
@@ -81,7 +80,6 @@ func TestInvalidClusterSize(t *testing.T) {
 
 		feature.Assess(fmt.Sprintf("etcdCluster %s should not be created when etcdCluster.Spec.Size is %d", name, size),
 			func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-
 				var etcdCluster ecv1alpha1.EtcdCluster
 				err := c.Client().Resources().Get(ctx, etcdClusterName, namespace, &etcdCluster)
 				if !errors.IsNotFound(err) {
@@ -132,9 +130,20 @@ func TestScaling(t *testing.T) {
 		initialSize     int
 		scaleTo         int
 		expectedMembers int
+		failpoint, term string
 	}{
 		{name: "ScaleInFrom3To1", initialSize: 3, scaleTo: 1, expectedMembers: 1},
+		{
+			name:        "ScaleInFrom3To1WithPanicFailpoint",
+			initialSize: 3, scaleTo: 1, expectedMembers: 1,
+			failpoint: "exceptionAfterMemberDelete", term: "panic",
+		},
 		{name: "ScaleOutFrom1To3", initialSize: 1, scaleTo: 3, expectedMembers: 3},
+		{
+			name:        "ScaleOutFrom1To3WithPanicFailpoint",
+			initialSize: 1, scaleTo: 3, expectedMembers: 3,
+			failpoint: "exceptionAfterMemberAdd", term: "panic",
+		},
 	}
 
 	for _, tc := range testCases {
@@ -143,6 +152,15 @@ func TestScaling(t *testing.T) {
 			etcdClusterName := fmt.Sprintf("etcd-%s", strings.ToLower(tc.name))
 
 			feature.Setup(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+				if tc.failpoint != "" {
+					etcdOperator, err := getEtcdOperatorPod(t, c.Client())
+					if err != nil {
+						t.Errorf("Unable to get the etcd-operator pod: %s", err)
+					}
+					if err := enableGoFailPoint(t, c, etcdOperator, tc.failpoint, tc.term); err != nil {
+						t.Errorf("Unable to enable the go failpoint %s on pod %s: %s", tc.failpoint, etcdOperator.Name, err)
+					}
+				}
 				createEtcdClusterWithPVC(ctx, t, c, etcdClusterName, tc.initialSize)
 				waitForSTSReadiness(t, c, etcdClusterName, tc.initialSize)
 				return ctx
@@ -167,6 +185,8 @@ func TestScaling(t *testing.T) {
 						tc.expectedMembers, len(ml.Members))
 				}
 
+				waitForNoLearners(t, c, podName, tc.expectedMembers, 3*time.Minute)
+
 				// Verify controller promoted all learners to voting members
 				for _, m := range ml.Members {
 					if m.IsLearner {
@@ -177,6 +197,15 @@ func TestScaling(t *testing.T) {
 			})
 
 			feature.Teardown(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+				if tc.failpoint != "" {
+					etcdOperator, err := getEtcdOperatorPod(t, c.Client())
+					if err != nil {
+						t.Errorf("Unable to get the etcd-operator pod: %s", err)
+					}
+					if err := disableGoFailPoint(t, c, etcdOperator, tc.failpoint); err != nil {
+						t.Errorf("Unable to disable to go failpoint %s: %s", tc.failpoint, err)
+					}
+				}
 				cleanupEtcdCluster(ctx, t, c, etcdClusterName)
 				return ctx
 			})
@@ -298,7 +327,7 @@ func TestEtcdClusterFunctionality(t *testing.T) {
 
 		// Wait until all members are promoted to voting members (no learners),
 		// otherwise endpoint health will fail on learners.
-		waitForNoLearners(t, c, podName, 3)
+		waitForNoLearners(t, c, podName, 3, 3*time.Minute)
 
 		// Check health for the whole cluster rather than a single member
 		command := []string{"etcdctl", "endpoint", "health", "--cluster"}

@@ -120,7 +120,7 @@ func TestMain(m *testing.M) {
 			log.Println("Deploying components...")
 
 			log.Println("Deploying controller-manager resources...")
-			cmd = exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", imageName))
+			cmd = exec.Command("make", "deploy", "DEPLOY_MODE=e2e", fmt.Sprintf("IMG=%s", imageName))
 			if _, err := test_utils.Run(cmd); err != nil {
 				log.Printf("Failed to deploy resource configurations: %s", err)
 				return ctx, err
@@ -161,7 +161,7 @@ func TestMain(m *testing.M) {
 
 			// undeploy etcd operator
 			log.Println("Undeploy etcd controller...")
-			cmd := exec.Command("make", "undeploy", "ignore-not-found=true")
+			cmd := exec.Command("make", "undeploy", "DEPLOY_MODE=e2e", "ignore-not-found=true")
 			if _, err := test_utils.Run(cmd); err != nil {
 				log.Printf("Warning: Failed to undeploy controller: %s", err)
 			}

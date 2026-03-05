@@ -31,6 +31,10 @@ import (
 	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	rest "k8s.io/client-go/rest"
+	"sigs.k8s.io/e2e-framework/klient"
+	"sigs.k8s.io/e2e-framework/klient/k8s/resources"
 	"sigs.k8s.io/e2e-framework/klient/wait"
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
 
@@ -208,7 +212,7 @@ func getEtcdMemberListPB(t *testing.T, c *envconf.Config, podName string) *etcds
 
 // waitForNoLearners waits until the member list has the expected number of members
 // and all members are voting (i.e., no learners remain).
-func waitForNoLearners(t *testing.T, c *envconf.Config, podName string, expectedMembers int) {
+func waitForNoLearners(t *testing.T, c *envconf.Config, podName string, expectedMembers int, waitFor time.Duration) {
 	t.Helper()
 	err := wait.For(func(ctx context.Context) (bool, error) {
 		ml := getEtcdMemberListPB(t, c, podName)
@@ -221,7 +225,7 @@ func waitForNoLearners(t *testing.T, c *envconf.Config, podName string, expected
 			}
 		}
 		return true, nil
-	}, wait.WithTimeout(3*time.Minute), wait.WithInterval(5*time.Second))
+	}, wait.WithTimeout(waitFor), wait.WithInterval(5*time.Second))
 	if err != nil {
 		t.Fatalf("Timeout waiting for %d voting members with no learners: %v", expectedMembers, err)
 	}
@@ -293,4 +297,44 @@ func verifyDataOperations(t *testing.T, c *envconf.Config, etcdClusterName, test
 	if len(lines) < 2 || lines[0] != testKey || lines[1] != testValue {
 		t.Errorf("Expected key-value pair [%s=%s], but got output: %s", testKey, testValue, stdout)
 	}
+}
+
+const (
+	gofailPort    = "22381"                            // from config/e2e/patch-env.yaml
+	labelSelector = "control-plane=controller-manager" // from config/manager/manager.yaml,
+)
+
+// enableGoFailPoint enables the specified gofail failpoint on the specified pod via HTTP
+func enableGoFailPoint(t *testing.T, cfg *envconf.Config, pod corev1.Pod, failpoint, term string) error {
+	client := kubernetes.NewForConfigOrDie(cfg.Client().RESTConfig())
+	r := client.CoreV1().RESTClient().Put()
+	return httpViaProxy(t.Context(), r, pod, failpoint, term)
+}
+
+// disableGoFailPoint disables the specified gofail failpoint on the specified pod via HTTP
+func disableGoFailPoint(t *testing.T, cfg *envconf.Config, pod corev1.Pod, failpoint string) error {
+	client := kubernetes.NewForConfigOrDie(cfg.Client().RESTConfig())
+	r := client.CoreV1().RESTClient().Delete()
+	return httpViaProxy(t.Context(), r, pod, failpoint, "")
+}
+
+func getEtcdOperatorPod(t *testing.T, client klient.Client) (corev1.Pod, error) {
+	var pods corev1.PodList
+	err := client.Resources(namespace).List(t.Context(), &pods,
+		resources.WithLabelSelector(labelSelector))
+	if err != nil {
+		return corev1.Pod{}, err
+	}
+	return pods.Items[0], nil
+}
+
+func httpViaProxy(ctx context.Context, r *rest.Request, pod corev1.Pod, failpoint, term string) error {
+	result := r.Namespace(pod.Namespace).
+		Resource("pods").
+		SubResource("proxy").
+		Name(fmt.Sprintf("%s:%s", pod.Name, gofailPort)).
+		Suffix(failpoint).
+		Body(strings.NewReader(term)).
+		Do(ctx)
+	return result.Error()
 }
