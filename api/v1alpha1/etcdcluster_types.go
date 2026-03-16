@@ -54,6 +54,13 @@ type EtcdClusterSpec struct {
 type PodTemplate struct {
 	// Metadata is the metadata to add to the pod.
 	Metadata *PodMetadata `json:"metadata,omitempty"`
+	Spec     *PodSpec     `json:"spec,omitempty"`
+}
+
+type PodSpec struct {
+	Affinity     *corev1.Affinity    `json:"affinity,omitempty"`
+	NodeSelector map[string]string   `json:"nodeSelector,omitempty"`
+	Tolerations  []corev1.Toleration `json:"tolerations,omitempty"`
 }
 
 type PodMetadata struct {
