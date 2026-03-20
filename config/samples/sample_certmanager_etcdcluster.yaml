@@ -1,0 +1,27 @@
+# creating and managing the Issuer/ClusterIssuer is the users’ responsibility, while etcd-operator only needs to know which Issuer/ClusterIssuer to use.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: selfsigned
+spec:
+  selfSigned: {}
+
+---
+apiVersion: operator.etcd.io/v1alpha1
+kind: EtcdCluster
+metadata:
+  labels:
+    app.kubernetes.io/name: etcd-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: etcdcluster-sample-cert
+spec:
+  version: v3.5.21
+  size: 3
+  tls:
+    provider: "cert-manager"
+    providerCfg:
+      certManagerCfg:
+        commonName: "etcd-operator-system"
+        validityDuration: "365d"
+        issuerKind: "ClusterIssuer"
+        issuerName: "selfsigned"
