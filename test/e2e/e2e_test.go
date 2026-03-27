@@ -188,6 +188,7 @@ func TestScaling(t *testing.T) {
 				waitForNoLearners(t, c, podName, tc.expectedMembers, 3*time.Minute)
 
 				// Verify controller promoted all learners to voting members
+				ml = getEtcdMemberListPB(t, c, podName)
 				for _, m := range ml.Members {
 					if m.IsLearner {
 						t.Errorf("Found unpromoted learner after scaling completed: member %s (%d)", m.Name, m.ID)
