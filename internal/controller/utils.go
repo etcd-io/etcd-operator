@@ -188,6 +188,26 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 		},
 	}
 
+	// Add TLS volume mounts to the etcd container if TLS is enabled
+	if ec.Spec.TLS != nil {
+		serverCertName := getServerCertName(ec.Name)
+		peerCertName := getPeerCertName(ec.Name)
+
+		// Add server and peer TLS volume mounts
+		podSpec.Containers[0].VolumeMounts = append(podSpec.Containers[0].VolumeMounts,
+			corev1.VolumeMount{
+				Name:      "server-secret",
+				MountPath: "/etc/etcd/server-secret",
+				ReadOnly:  true,
+			},
+			corev1.VolumeMount{
+				Name:      "peer-secret",
+				MountPath: "/etc/etcd/peer-secret",
+				ReadOnly:  true,
+			},
+		)
+	}
+
 	// mount server and peer certificate secret to each pods of the statefulset via PodSpec
 	var certVolume []corev1.Volume
 	serverCertName := getServerCertName(ec.Name)
@@ -254,11 +274,15 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 
 	if ec.Spec.StorageSpec != nil {
 
-		stsSpec.Template.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{
-			Name:        volumeName,
-			MountPath:   etcdDataDir,
-			SubPathExpr: "$(POD_NAME)",
-		}}
+		// Append storage volume mount to existing volume mounts (e.g., TLS mounts)
+		stsSpec.Template.Spec.Containers[0].VolumeMounts = append(
+			stsSpec.Template.Spec.Containers[0].VolumeMounts,
+			corev1.VolumeMount{
+				Name:        volumeName,
+				MountPath:   etcdDataDir,
+				SubPathExpr: "$(POD_NAME)",
+			},
+		)
 		// Create a new volume claim template
 		if ec.Spec.StorageSpec.VolumeSizeRequest.Cmp(resource.MustParse("1Mi")) < 0 {
 			return fmt.Errorf("VolumeSizeRequest must be at least 1Mi")
