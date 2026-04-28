@@ -3,7 +3,9 @@ package controller
 import (
 	"errors"
 	"fmt"
+	"net"
 	"testing"
+	"time"
 
 	"github.com/coreos/go-semver/semver"
 	"github.com/go-logr/logr"
@@ -19,6 +21,8 @@ import (
 
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 	"go.etcd.io/etcd-operator/internal/etcdutils"
+	"go.etcd.io/etcd-operator/pkg/certificate"
+	certInterface "go.etcd.io/etcd-operator/pkg/certificate/interfaces"
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
@@ -897,6 +901,191 @@ func TestValidateEtcdUpgradePath(t *testing.T) {
 
 			if !tt.expectErr && err != nil {
 				t.Fatalf("did not expect error, got %v", err)
+			}
+		})
+	}
+}
+
+func TestCreateAutoCertificateConfig(t *testing.T) {
+	tests := []struct {
+		name     string
+		ec       *ecv1alpha1.EtcdCluster
+		expected *certInterface.Config
+		wantErr  bool
+	}{
+		{
+			name: "auto config with all fields set",
+			ec: &ecv1alpha1.EtcdCluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-cluster",
+					Namespace: "test-namespace",
+				},
+				Spec: ecv1alpha1.EtcdClusterSpec{
+					TLS: &ecv1alpha1.TLSCertificate{
+						Provider: string(certificate.Auto),
+						ProviderCfg: ecv1alpha1.ProviderConfig{
+							AutoCfg: &ecv1alpha1.ProviderAutoConfig{
+								CommonConfig: ecv1alpha1.CommonConfig{
+									CommonName:       "custom.example.com",
+									Organization:     []string{"Test Org"},
+									ValidityDuration: "720h", // 30 days
+									AltNames: ecv1alpha1.AltNames{
+										DNSNames: []string{"custom1.example.com", "custom2.example.com"},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: &certInterface.Config{
+				CommonName:       "custom.example.com",
+				Organization:     []string{"Test Org"},
+				ValidityDuration: 720 * time.Hour, // 30 days
+				AltNames: certInterface.AltNames{
+					DNSNames: []string{"custom1.example.com", "custom2.example.com"},
+					IPs:      make([]net.IP, 2),
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "auto config with nil AutoCfg - should use defaults",
+			ec: &ecv1alpha1.EtcdCluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-cluster",
+					Namespace: "test-namespace",
+				},
+				Spec: ecv1alpha1.EtcdClusterSpec{
+					TLS: &ecv1alpha1.TLSCertificate{
+						Provider: string(certificate.Auto),
+						ProviderCfg: ecv1alpha1.ProviderConfig{
+							AutoCfg: nil,
+						},
+					},
+				},
+			},
+			expected: &certInterface.Config{
+				CommonName:       "test-cluster.test-namespace.svc.cluster.local",
+				Organization:     nil,
+				ValidityDuration: certInterface.DefaultAutoValidity,
+				AltNames: certInterface.AltNames{
+					DNSNames: []string{
+						"*.test-cluster.test-namespace.svc.cluster.local",
+						"test-cluster.test-namespace.svc.cluster.local",
+					},
+				},
+			},
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := createAutoCertificateConfig(tt.ec)
+
+			if tt.wantErr {
+				require.Error(t, err)
+				assert.Nil(t, result)
+			} else {
+				require.NoError(t, err)
+				require.NotNil(t, result)
+				assert.Equal(t, tt.expected.CommonName, result.CommonName)
+				assert.Equal(t, tt.expected.Organization, result.Organization)
+				assert.Equal(t, tt.expected.ValidityDuration, result.ValidityDuration)
+				assert.Equal(t, tt.expected.AltNames.DNSNames, result.AltNames.DNSNames)
+				assert.Equal(t, tt.expected.AltNames.IPs, result.AltNames.IPs)
+			}
+		})
+	}
+}
+
+func TestCreateCMCertificateConfig(t *testing.T) {
+	tests := []struct {
+		name     string
+		ec       *ecv1alpha1.EtcdCluster
+		expected *certInterface.Config
+		wantErr  bool
+	}{
+		{
+			name: "cert-manager config with all fields set",
+			ec: &ecv1alpha1.EtcdCluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-cluster",
+					Namespace: "test-namespace",
+				},
+				Spec: ecv1alpha1.EtcdClusterSpec{
+					TLS: &ecv1alpha1.TLSCertificate{
+						Provider: string(certificate.CertManager),
+						ProviderCfg: ecv1alpha1.ProviderConfig{
+							CertManagerCfg: &ecv1alpha1.ProviderCertManagerConfig{
+								CommonConfig: ecv1alpha1.CommonConfig{
+									CommonName:       "cm.example.com",
+									Organization:     []string{"CM Org"},
+									ValidityDuration: "1440h", // 60 days
+									AltNames: ecv1alpha1.AltNames{
+										DNSNames: []string{"cm1.example.com", "cm2.example.com"},
+									},
+								},
+								IssuerName: "test-issuer",
+								IssuerKind: "ClusterIssuer",
+							},
+						},
+					},
+				},
+			},
+			expected: &certInterface.Config{
+				CommonName:       "cm.example.com",
+				Organization:     []string{"CM Org"},
+				ValidityDuration: 1440 * time.Hour, // 60 days
+				AltNames: certInterface.AltNames{
+					DNSNames: []string{"cm1.example.com", "cm2.example.com"},
+					IPs:      make([]net.IP, 2),
+				},
+				ExtraConfig: map[string]any{
+					"issuerName": "test-issuer",
+					"issuerKind": "ClusterIssuer",
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "cert-manager config with nil CertManagerCfg",
+			ec: &ecv1alpha1.EtcdCluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-cluster",
+					Namespace: "test-namespace",
+				},
+				Spec: ecv1alpha1.EtcdClusterSpec{
+					TLS: &ecv1alpha1.TLSCertificate{
+						Provider: string(certificate.CertManager),
+						ProviderCfg: ecv1alpha1.ProviderConfig{
+							CertManagerCfg: nil,
+						},
+					},
+				},
+			},
+			expected: nil,
+			wantErr:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := createCMCertificateConfig(tt.ec)
+
+			if tt.wantErr {
+				require.Error(t, err)
+				assert.Nil(t, result)
+			} else {
+				require.NoError(t, err)
+				require.NotNil(t, result)
+				assert.Equal(t, tt.expected.CommonName, result.CommonName)
+				assert.Equal(t, tt.expected.Organization, result.Organization)
+				assert.Equal(t, tt.expected.ValidityDuration, result.ValidityDuration)
+				assert.Equal(t, tt.expected.AltNames.DNSNames, result.AltNames.DNSNames)
+				assert.Equal(t, tt.expected.AltNames.IPs, result.AltNames.IPs)
+				assert.Equal(t, tt.expected.ExtraConfig, result.ExtraConfig)
 			}
 		})
 	}
