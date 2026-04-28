@@ -592,6 +592,9 @@ func parseValidityDuration(customizedDuration string, defaultDuration time.Durat
 
 func createCMCertificateConfig(ec *ecv1alpha1.EtcdCluster) (*certInterface.Config, error) {
 	cmConfig := ec.Spec.TLS.ProviderCfg.CertManagerCfg
+	if cmConfig == nil {
+		return nil, fmt.Errorf("cert-manager configuration is not present")
+	}
 
 	// Set default duration to 90 days for cert-manager if not provided
 	duration, err := parseValidityDuration(cmConfig.ValidityDuration, certInterface.DefaultCertManagerValidity)
@@ -609,8 +612,8 @@ func createCMCertificateConfig(ec *ecv1alpha1.EtcdCluster) (*certInterface.Confi
 		// Use wildcard DNS for the cluster's headless service to cover all pods
 		// This allows the certificate to work for pod-0, pod-1, etc.
 		defaultDNSNames := []string{
-			fmt.Sprintf("*.%s.%s.svc.cluster.local", ec.Name, ec.Namespace),
-			fmt.Sprintf("%s.%s.svc.cluster.local", ec.Name, ec.Namespace),
+			fmt.Sprintf("*.%s.%s.%s", ec.Name, ec.Namespace, certInterface.DefaultDomainName),
+			fmt.Sprintf("%s.%s.%s", ec.Name, ec.Namespace, certInterface.DefaultDomainName),
 		}
 		getAltNames = certInterface.AltNames{
 			DNSNames: defaultDNSNames,
@@ -632,6 +635,15 @@ func createCMCertificateConfig(ec *ecv1alpha1.EtcdCluster) (*certInterface.Confi
 
 func createAutoCertificateConfig(ec *ecv1alpha1.EtcdCluster) (*certInterface.Config, error) {
 	autoConfig := ec.Spec.TLS.ProviderCfg.AutoCfg
+	// Set default values for auto configuration if not present
+	if autoConfig == nil {
+		autoConfig = &ecv1alpha1.ProviderAutoConfig{
+			CommonConfig: ecv1alpha1.CommonConfig{
+				CommonName:       fmt.Sprintf("%s.%s.%s", ec.Name, ec.Namespace, certInterface.DefaultDomainName),
+				ValidityDuration: certInterface.DefaultAutoValidity.String(),
+			},
+		}
+	}
 
 	// Set default duration to 365 days for auto provider if not provided
 	duration, err := parseValidityDuration(autoConfig.ValidityDuration, certInterface.DefaultAutoValidity)
@@ -649,8 +661,8 @@ func createAutoCertificateConfig(ec *ecv1alpha1.EtcdCluster) (*certInterface.Con
 		// Use wildcard DNS for the cluster's headless service to cover all pods
 		// This allows the certificate to work for pod-0, pod-1, etc.
 		defaultDNSNames := []string{
-			fmt.Sprintf("*.%s.%s.svc.cluster.local", ec.Name, ec.Namespace),
-			fmt.Sprintf("%s.%s.svc.cluster.local", ec.Name, ec.Namespace),
+			fmt.Sprintf("*.%s.%s.%s", ec.Name, ec.Namespace, certInterface.DefaultDomainName),
+			fmt.Sprintf("%s.%s.%s", ec.Name, ec.Namespace, certInterface.DefaultDomainName),
 		}
 		altNames = certInterface.AltNames{
 			DNSNames: defaultDNSNames,
@@ -683,8 +695,9 @@ func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client
 		if k8serrors.IsNotFound(getCertError) {
 			log.Printf("Creating certificate: %s for etcd-operator: %s\n", certName, ec.Name)
 			secretKey := client.ObjectKey{Name: certName, Namespace: ec.Namespace}
-			switch {
-			case ec.Spec.TLS.ProviderCfg.AutoCfg != nil:
+
+			switch certificate.ProviderType(providerName) {
+			case certificate.Auto:
 				autoConfig, err := createAutoCertificateConfig(ec)
 				if err != nil {
 					return fmt.Errorf("error creating auto certificate config: %w", err)
@@ -694,7 +707,7 @@ func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client
 					return fmt.Errorf("error creating auto certificate: %w", createCertErr)
 				}
 				return nil
-			case ec.Spec.TLS.ProviderCfg.CertManagerCfg != nil:
+			case certificate.CertManager:
 				cmConfig, err := createCMCertificateConfig(ec)
 				if err != nil {
 					return fmt.Errorf("error creating cert-manager certificate config: %w", err)
@@ -704,7 +717,7 @@ func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client
 					return fmt.Errorf("error creating cert-manager certificate: %w", createCertErr)
 				}
 				return nil
-			default:
+			default: // This should never happen
 				// TODO: Use AuthProvider, since both AutoCfg and CertManagerCfg is not present
 				log.Printf("Error creating certificate, valid certificate provider not defined.")
 				return nil

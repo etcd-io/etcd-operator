@@ -52,6 +52,9 @@ const (
 
 	// DefaultCertManagerValidity is the default validity duration for cert-manager certificates (90 days)
 	DefaultCertManagerValidity = 90 * 24 * time.Hour
+
+	// DefaultDomainName is the default domain name for creating certificates
+	DefaultDomainName = "svc.cluster.local"
 )
 
 // AltNames contains the domain names and IP addresses that will be added
