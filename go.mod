@@ -8,10 +8,10 @@ require (
 	github.com/cert-manager/cert-manager v1.20.2
 	github.com/go-logr/logr v1.4.3
 	github.com/stretchr/testify v1.11.1
-	go.etcd.io/etcd/api/v3 v3.6.10
-	go.etcd.io/etcd/client/pkg/v3 v3.6.10
-	go.etcd.io/etcd/client/v3 v3.6.10
-	go.etcd.io/etcd/server/v3 v3.6.10
+	go.etcd.io/etcd/api/v3 v3.6.11
+	go.etcd.io/etcd/client/pkg/v3 v3.6.11
+	go.etcd.io/etcd/client/v3 v3.6.11
+	go.etcd.io/etcd/server/v3 v3.6.11
 	go.uber.org/zap v1.27.1
 	k8s.io/api v0.35.4
 	k8s.io/apimachinery v0.35.4
@@ -90,7 +90,7 @@ require (
 	github.com/x448/float16 v0.8.4 // indirect
 	github.com/xiang90/probing v0.0.0-20221125231312-a49e3df8f510 // indirect
 	go.etcd.io/bbolt v1.4.3 // indirect
-	go.etcd.io/etcd/pkg/v3 v3.6.10 // indirect
+	go.etcd.io/etcd/pkg/v3 v3.6.11 // indirect
 	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.61.0 // indirect
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.61.0 // indirect
 	go.opentelemetry.io/otel v1.43.0 // indirect
@@ -108,7 +108,7 @@ require (
 	golang.org/x/sync v0.20.0 // indirect
 	golang.org/x/sys v0.42.0 // indirect
 	golang.org/x/term v0.41.0 // indirect
-	golang.org/x/text v0.35.0 // indirect
+	golang.org/x/text v0.36.0 // indirect
 	golang.org/x/time v0.14.0 // indirect
 	gomodules.xyz/jsonpatch/v2 v2.5.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260128011058-8636f8732409 // indirect
