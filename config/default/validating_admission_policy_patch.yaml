@@ -1,0 +1,8 @@
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: secondary-resource-protection
+spec:
+  validations:
+  - expression: |
+      request.userInfo.username == "system:serviceaccount:$(NAMESPACE):$(SERVICE_ACCOUNT_NAME)"
