@@ -8,7 +8,7 @@ require (
 	github.com/elastic/crd-ref-docs v0.3.0
 	github.com/golangci/golangci-lint/v2 v2.11.4
 	go.etcd.io/gofail v0.2.0
-	sigs.k8s.io/controller-runtime/tools/setup-envtest v0.24.0 // @release-0.19
+	sigs.k8s.io/controller-runtime/tools/setup-envtest v0.24.1 // @release-0.19
 	sigs.k8s.io/controller-tools v0.20.1
 	sigs.k8s.io/kind v0.31.0
 	sigs.k8s.io/kustomize/kustomize/v5 v5.8.1
