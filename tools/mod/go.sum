@@ -756,8 +756,8 @@ mvdan.cc/unparam v0.0.0-20251027182757-5beb8c8f8f15 h1:ssMzja7PDPJV8FStj7hq9IKiu
 mvdan.cc/unparam v0.0.0-20251027182757-5beb8c8f8f15/go.mod h1:4M5MMXl2kW6fivUT6yRGpLLPNfuGtU2Z0cPvFquGDYU=
 sigs.k8s.io/apiserver-network-proxy/konnectivity-client v0.31.2 h1:jpcvIRr3GLoUoEKRkHKSmGjxb6lWwrBlJsXc+eUYQHM=
 sigs.k8s.io/apiserver-network-proxy/konnectivity-client v0.31.2/go.mod h1:Ve9uj1L+deCXFrPOk1LpFXqTg7LCFzFso6PA48q/XZw=
-sigs.k8s.io/controller-runtime/tools/setup-envtest v0.24.0 h1:Sssc/CW7qqJz3sksU8HWTOzbqCUR8FC4LCKvS5OVuOo=
-sigs.k8s.io/controller-runtime/tools/setup-envtest v0.24.0/go.mod h1:wpkYufRHTSw9ABET21/PkEL7kdGnmiZJ6o72t9p/1I8=
+sigs.k8s.io/controller-runtime/tools/setup-envtest v0.24.1 h1:l2AjyGE/PWub6EB165ij4/bpCK0TlY5NlhzIHfmGvmg=
+sigs.k8s.io/controller-runtime/tools/setup-envtest v0.24.1/go.mod h1:wpkYufRHTSw9ABET21/PkEL7kdGnmiZJ6o72t9p/1I8=
 sigs.k8s.io/controller-tools v0.20.1 h1:gkfMt9YodI0K85oT8rVi80NTXO/kDmabKR5Ajn5GYxs=
 sigs.k8s.io/controller-tools v0.20.1/go.mod h1:b4qPmjGU3iZwqn34alUU5tILhNa9+VXK+J3QV0fT/uU=
 sigs.k8s.io/json v0.0.0-20250730193827-2d320260d730 h1:IpInykpT6ceI+QxKBbEflcR5EXP7sU1kvOlxwZh5txg=
