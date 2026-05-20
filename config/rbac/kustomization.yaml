@@ -24,4 +24,8 @@ resources:
 # if you do not want those helpers be installed with your Project.
 - etcdcluster_editor_role.yaml
 - etcdcluster_viewer_role.yaml
+# ValidatingAdmissionPolicy to protect operator-managed resources
+# from being modified or deleted by users other than the operator
+- validating_admission_policy.yaml
+- validating_admission_policy_binding.yaml
 
