@@ -578,12 +578,54 @@ func getPeerCertName(etcdClusterName string) string {
 
 // parseValidityDuration parses a duration string and returns the parsed duration.
 // If the customizedDuration is empty, it returns the defaultDuration.
+// Supports day units (d) by converting them to hours (e.g., "365d" -> "8760h").
 // Returns an error if the duration string cannot be parsed.
 func parseValidityDuration(customizedDuration string, defaultDuration time.Duration) (time.Duration, error) {
 	if customizedDuration == "" {
 		return defaultDuration, nil
 	}
-	duration, err := time.ParseDuration(customizedDuration)
+
+	// Convert days to hours since time.ParseDuration doesn't support 'd' unit
+	// Replace 'd' with 'h' after multiplying the number by 24
+	durationStr := customizedDuration
+	if strings.Contains(durationStr, "d") {
+		// Parse and convert day units to hours
+		// Example: "365d" -> "8760h", "100d12h" -> "2412h"
+		var result strings.Builder
+		var numStr strings.Builder
+
+		for i := 0; i < len(durationStr); i++ {
+			ch := durationStr[i]
+			if ch >= '0' && ch <= '9' || ch == '.' {
+				numStr.WriteByte(ch)
+			} else if ch == 'd' {
+				// Convert days to hours
+				if numStr.Len() > 0 {
+					days, err := strconv.ParseFloat(numStr.String(), 64)
+					if err != nil {
+						return 0, fmt.Errorf("failed to parse day value in ValidityDuration: %w", err)
+					}
+					hours := days * 24
+					result.WriteString(fmt.Sprintf("%gh", hours))
+					numStr.Reset()
+				}
+			} else {
+				// Other unit (h, m, s, etc.)
+				if numStr.Len() > 0 {
+					result.WriteString(numStr.String())
+					numStr.Reset()
+				}
+				result.WriteByte(ch)
+			}
+		}
+		// Append any remaining number
+		if numStr.Len() > 0 {
+			result.WriteString(numStr.String())
+		}
+		durationStr = result.String()
+	}
+
+	duration, err := time.ParseDuration(durationStr)
 	if err != nil {
 		return 0, fmt.Errorf("failed to parse ValidityDuration: %w", err)
 	}
@@ -783,10 +825,25 @@ func applyEtcdMemberCerts(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c cli
 	return nil
 }
 
+func hasControllerOwnerReference(obj client.Object) bool {
+	for _, ownerRef := range obj.GetOwnerReferences() {
+		if ownerRef.Controller != nil && *ownerRef.Controller {
+			return true
+		}
+	}
+	return false
+}
+
 func patchCertificateSecret(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client, certSecretName string) error {
 	getCertSecret := &corev1.Secret{}
 	if err := c.Get(ctx, client.ObjectKey{Name: certSecretName, Namespace: ec.Namespace}, getCertSecret); err != nil {
 		return err
+	}
+
+	// Skip setting owner reference if Secret already has a controller owner (e.g., cert-manager Certificate)
+	if hasControllerOwnerReference(getCertSecret) {
+		log.Printf("Secret %s already has a controller owner reference, skipping ownership patch", certSecretName)
+		return nil
 	}
 
 	log.Printf("Setting ownerReference for certificate secret: %s", certSecretName)
