@@ -10,7 +10,7 @@ require (
 	go.etcd.io/gofail v0.2.0
 	sigs.k8s.io/controller-runtime/tools/setup-envtest v0.24.1 // @release-0.19
 	sigs.k8s.io/controller-tools v0.21.0
-	sigs.k8s.io/kind v0.31.0
+	sigs.k8s.io/kind v0.32.0
 	sigs.k8s.io/kustomize/kustomize/v5 v5.8.1
 )
 
