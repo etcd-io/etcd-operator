@@ -153,10 +153,17 @@ func ClusterHealth(eps []string) ([]EpHealth, error) {
 				healthCh <- EpHealth{Ep: ep, Health: false, Error: err.Error()}
 				return
 			}
+			defer func() {
+				err := cli.Close()
+				if err != nil {
+					lg.Warn("failed to close etcd client", zap.String("endpoint", ep), zap.Error(err))
+				}
+			}()
 			startTs := time.Now()
 			// get a random key. As long as we can get the response
 			// without an error, the endpoint is health.
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
 			_, err = cli.Get(ctx, "health", clientv3.WithSerializable())
 			eh := EpHealth{Ep: ep, Health: false, Took: time.Since(startTs).String()}
 			if err == nil || errors.Is(err, rpctypes.ErrPermissionDenied) {
@@ -178,7 +185,6 @@ func ClusterHealth(eps []string) ([]EpHealth, error) {
 					}
 				}
 			}
-			cancel()
 			healthCh <- eh
 		}(cfg)
 	}
