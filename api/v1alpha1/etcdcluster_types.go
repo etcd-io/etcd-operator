@@ -244,7 +244,3 @@ type StorageSpec struct {
 	VolumeSizeRequest resource.Quantity                 `json:"volumeSizeRequest"`          // required.
 	VolumeSizeLimit   resource.Quantity                 `json:"volumeSizeLimit,omitempty"`  // optional
 }
-
-func init() {
-	SchemeBuilder.Register(&EtcdCluster{}, &EtcdClusterList{})
-}
