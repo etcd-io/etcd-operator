@@ -326,3 +326,41 @@ func GetContainerByName(containers []corev1.Container, name string) (corev1.Cont
 	}
 	return container, fmt.Errorf("container named %s not found", name)
 }
+
+// NamespaceExists checks if a namespace exists in the cluster
+func NamespaceExists(namespace string) bool {
+	cmd := exec.Command("kubectl", "get", "namespace", namespace)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Printf("Namespace check failed: %s", err)
+		return false
+	}
+
+	// If command succeeds and output contains the namespace name, it exists
+	exists := strings.Contains(string(output), namespace)
+	return exists
+}
+
+// IsImageLoadedInKindCluster checks if a Docker image is already loaded in a Kind cluster.
+func IsImageLoadedInKindCluster(clusterName, imageName string) bool {
+	// Extract image name and tag (e.g., "etcd-operator:v0.1" -> ["etcd-operator", "v0.1"])
+	imageParts := strings.Split(imageName, ":")
+	imageNameOnly := imageParts[0]
+	imageTag := "latest"
+	if len(imageParts) > 1 {
+		imageTag = imageParts[1]
+	}
+
+	nodeContainerName := fmt.Sprintf("%s-control-plane", clusterName)
+	cmd := exec.Command("docker", "exec", nodeContainerName, "crictl", "images", "|", "grep", "-E", fmt.Sprintf("%s|%s", imageNameOnly, imageTag))
+	err := cmd.Run()
+	imageFound := err == nil
+
+	if imageFound {
+		log.Printf("✓ Image '%s:%s' found in cluster", imageNameOnly, imageTag)
+	} else {
+		log.Printf("✗ Image '%s:%s' not found in cluster", imageNameOnly, imageTag)
+	}
+
+	return imageFound
+}

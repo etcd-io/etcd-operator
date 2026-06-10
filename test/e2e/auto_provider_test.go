@@ -157,6 +157,21 @@ func TestClusterAutoCertCreation(t *testing.T) {
 		_ = corev1.AddToScheme(client.Resources().GetScheme())
 		_ = apiextensionsV1.AddToScheme(client.Resources().GetScheme())
 
+		// Clean up existing EtcdCluster resource if it exists (for test idempotency)
+		var existingCluster ecv1alpha1.EtcdCluster
+		err := client.Resources().Get(ctx, etcdClusterName, namespace, &existingCluster)
+		if err == nil {
+			// Cluster exists, delete it first
+			t.Logf("Found existing EtcdCluster '%s', cleaning up before test", etcdClusterName)
+			if err := client.Resources().Delete(ctx, &existingCluster); err != nil && !k8serrors.IsNotFound(err) {
+				t.Logf("Warning: Failed to delete existing cluster: %v", err)
+			}
+			// Wait for deletion to complete
+			time.Sleep(10 * time.Second)
+		} else if !k8serrors.IsNotFound(err) {
+			t.Logf("Warning: Error checking for existing cluster: %v", err)
+		}
+
 		// create etcd cluster
 		if err := client.Resources().Create(ctx, etcdCluster); err != nil {
 			t.Fatalf("unable to create etcd cluster: %s", err)
