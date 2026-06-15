@@ -18,17 +18,17 @@ package e2e
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"reflect"
 	"testing"
 	"time"
 
-	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	runtimeClient "sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/e2e-framework/klient/k8s"
+	"sigs.k8s.io/e2e-framework/klient/k8s/resources"
 	"sigs.k8s.io/e2e-framework/klient/wait"
-	"sigs.k8s.io/e2e-framework/klient/wait/conditions"
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
 	"sigs.k8s.io/e2e-framework/pkg/envfuncs"
 	"sigs.k8s.io/e2e-framework/pkg/features"
@@ -42,7 +42,7 @@ func TestEtcdOptions(t *testing.T) {
 
 	const etcdClusterName = "example"
 	const namespace = "etcd-test"
-	var expectedArgs = []string{
+	expectedArgs := []string{
 		"--name=$(POD_NAME)",
 		"--listen-peer-urls=http://0.0.0.0:2380",
 		"--listen-client-urls=http://0.0.0.0:2379",
@@ -72,7 +72,6 @@ func TestEtcdOptions(t *testing.T) {
 	objKey := runtimeClient.ObjectKeyFromObject(etcdCluster)
 
 	feature.Setup(func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
-
 		client := cfg.Client()
 
 		ctx, err := envfuncs.CreateNamespace(etcdCluster.Namespace)(ctx, cfg)
@@ -99,18 +98,9 @@ func TestEtcdOptions(t *testing.T) {
 		return ctx
 	})
 
-	feature.Assess("Check if resource created",
+	feature.Assess("Check if the etcd pod is created and the cluster has the desired replicas",
 		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
-
-			client := cfg.Client()
-			var sts appsv1.StatefulSet
-
-			ops := []wait.Option{
-				wait.WithTimeout(2 * time.Minute),
-				wait.WithInterval(5 * time.Second),
-			}
-
-			if err := utils.GetKubernetesResource(ctx, client, objKey, &sts, ops...); err != nil {
+			if err := waitForPodReadiness(t, cfg, etcdCluster.Name, etcdCluster.Spec.Size); err != nil {
 				t.Fatal(err)
 			}
 			return ctx
@@ -119,45 +109,19 @@ func TestEtcdOptions(t *testing.T) {
 
 	feature.Assess("Check etcd options are configured",
 		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
-
 			client := cfg.Client()
-			var sts appsv1.StatefulSet
-
-			if err := utils.GetKubernetesResource(ctx, client, objKey, &sts); err != nil {
+			var pods corev1.PodList
+			if err := client.Resources().List(
+				ctx,
+				&pods,
+				resources.WithLabelSelector(fmt.Sprintf("app=%s", etcdClusterName))); err != nil {
 				t.Fatal(err)
 			}
-
-			etcdContainer, err := utils.GetContainerByName(sts.Spec.Template.Spec.Containers, "etcd")
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			if !reflect.DeepEqual(expectedArgs, etcdContainer.Args) {
-				t.Fatalf("Expecting args to be %v got %v", expectedArgs, etcdContainer.Args)
-			}
-			return ctx
-		},
-	)
-
-	feature.Assess("Check if sts has desired replicas",
-		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
-
-			client := cfg.Client()
-			var sts appsv1.StatefulSet
-
-			if err := utils.GetKubernetesResource(ctx, client, objKey, &sts); err != nil {
-				t.Fatal(err)
-			}
-
-			desiredReplicas := int32(etcdCluster.Spec.Size)
-			if err := wait.For(
-				conditions.New(client.Resources()).ResourceScaled(&sts, func(object k8s.Object) int32 {
-					return sts.Status.ReadyReplicas
-				}, desiredReplicas),
-				wait.WithTimeout(3*time.Minute),
-				wait.WithInterval(10*time.Second),
-			); err != nil {
-				t.Fatalf("unable to create sts with size %d: %s", desiredReplicas, err)
+			for _, p := range pods.Items {
+				podContainerArgs := p.Spec.Containers[0].Args
+				if !reflect.DeepEqual(expectedArgs, podContainerArgs) {
+					t.Fatalf("Expecting args to be %v got %v", expectedArgs, podContainerArgs)
+				}
 			}
 			return ctx
 		},

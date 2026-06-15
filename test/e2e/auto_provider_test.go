@@ -189,9 +189,11 @@ func TestClusterAutoCertCreation(t *testing.T) {
 		},
 	)
 
-	feature.Assess("Wait for StatefulSet readiness",
+	feature.Assess("Wait for etcd pods readiness",
 		func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-			waitForSTSReadiness(t, c, etcdClusterName, size)
+			if err := waitForPodReadiness(t, c, etcdClusterName, size); err != nil {
+				t.Fatalf("etcd pods of cluster %s failed to reach readiness for %d replicas: %v", etcdClusterName, size, err)
+			}
 			return ctx
 		},
 	)
@@ -208,7 +210,8 @@ func TestClusterAutoCertCreation(t *testing.T) {
 }
 
 func validateSecretExists(ctx context.Context, client klient.Client,
-	etcdClusterName, etcdClusterNamespace, resourceType string) (bool, error) {
+	etcdClusterName, etcdClusterNamespace, resourceType string,
+) (bool, error) {
 	clientCertName := fmt.Sprintf("%s-client-tls", etcdClusterName)
 	serverCertName := fmt.Sprintf("%s-server-tls", etcdClusterName)
 	peerCertName := fmt.Sprintf("%s-peer-tls", etcdClusterName)
