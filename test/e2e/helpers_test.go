@@ -26,7 +26,6 @@ import (
 	"testing"
 	"time"
 
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -104,36 +103,35 @@ func createEtcdClusterWithPVC(ctx context.Context, t *testing.T, c *envconf.Conf
 	}
 }
 
-func waitForSTSReadiness(t *testing.T, c *envconf.Config, name string, expectedReplicas int) {
+func waitForPodReadiness(t *testing.T, c *envconf.Config, name string, expectedReplicas int) error {
 	t.Helper()
-	var sts appsv1.StatefulSet
-	err := wait.For(func(ctx context.Context) (done bool, err error) {
-		if err := c.Client().Resources().Get(ctx, name, namespace, &sts); err != nil {
-			return false, err
-		}
-
-		// Ensure spec has been updated by the controller to the expected replica count
-		if sts.Spec.Replicas == nil || *sts.Spec.Replicas != int32(expectedReplicas) {
+	label := fmt.Sprintf("app=%s", name)
+	var pods corev1.PodList
+	return wait.For(func(ctx context.Context) (bool, error) {
+		if err := c.Client().Resources().List(ctx, &pods, resources.WithLabelSelector(label)); err != nil {
 			return false, nil
 		}
 
-		// Ensure status reflects latest generation
-		if sts.Status.ObservedGeneration < sts.Generation {
+		if len(pods.Items) != expectedReplicas {
 			return false, nil
 		}
 
-		// Ensure the controller created the expected number of replicas and they are ready
-		if sts.Status.Replicas != int32(expectedReplicas) {
-			return false, nil
-		}
-		if sts.Status.ReadyReplicas != int32(expectedReplicas) {
-			return false, nil
+		for _, pod := range pods.Items {
+			if !podReady(&pod) {
+				return false, nil
+			}
 		}
 		return true, nil
 	}, wait.WithTimeout(5*time.Minute), wait.WithInterval(10*time.Second))
-	if err != nil {
-		t.Fatalf("StatefulSet %s failed to reach spec/status readiness for %d replicas: %v", name, expectedReplicas, err)
+}
+
+func podReady(pod *corev1.Pod) bool {
+	for _, cond := range pod.Status.Conditions {
+		if cond.Type == corev1.PodReady {
+			return cond.Status == corev1.ConditionTrue
+		}
 	}
+	return false
 }
 
 func execInPod(

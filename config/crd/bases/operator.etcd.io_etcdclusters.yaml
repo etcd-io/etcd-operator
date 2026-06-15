@@ -3,7 +3,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.20.1
+    controller-gen.kubebuilder.io/version: v0.21.0
   name: etcdclusters.operator.etcd.io
 spec:
   group: operator.etcd.io
@@ -1256,9 +1256,8 @@ spec:
                 - type
                 x-kubernetes-list-type: map
               currentReplicas:
-                description: |-
-                  CurrentReplicas is the number of etcd pods managed by the StatefulSet for this cluster.
-                  This reflects the .spec.replicas of the underlying StatefulSet.
+                description: CurrentReplicas is the number of etcd member pods currently
+                  owned by this cluster.
                 format: int32
                 type: integer
               currentVersion:
@@ -1327,9 +1326,8 @@ spec:
                 format: int64
                 type: integer
               readyReplicas:
-                description: |-
-                  ReadyReplicas is the number of etcd pods managed by the StatefulSet that are currently ready.
-                  This reflects the .status.readyReplicas of the underlying StatefulSet.
+                description: ReadyReplicas is the number of etcd member pods that
+                  are currently Ready.
                 format: int32
                 type: integer
             type: object

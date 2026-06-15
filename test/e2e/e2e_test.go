@@ -28,6 +28,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/e2e-framework/klient/k8s/resources"
 	"sigs.k8s.io/e2e-framework/klient/wait"
 	"sigs.k8s.io/e2e-framework/klient/wait/conditions"
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
@@ -162,7 +163,10 @@ func TestScaling(t *testing.T) {
 					}
 				}
 				createEtcdClusterWithPVC(ctx, t, c, etcdClusterName, tc.initialSize)
-				waitForSTSReadiness(t, c, etcdClusterName, tc.initialSize)
+				if err := waitForPodReadiness(t, c, etcdClusterName, tc.initialSize); err != nil {
+					t.Fatalf("etcd pods of cluster %s failed to reach readiness for %d replicas: %v",
+						etcdClusterName, tc.initialSize, err)
+				}
 				return ctx
 			})
 
@@ -170,8 +174,10 @@ func TestScaling(t *testing.T) {
 				fmt.Sprintf("scale to %d", tc.scaleTo),
 				func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
 					scaleEtcdCluster(ctx, t, c, etcdClusterName, tc.scaleTo)
-					// Wait until StatefulSet spec/status reflect the scaled size and are ready
-					waitForSTSReadiness(t, c, etcdClusterName, tc.scaleTo)
+					// Wait until pod spec/status reflect the scaled replicas are ready
+					if err := waitForPodReadiness(t, c, etcdClusterName, tc.scaleTo); err != nil {
+						t.Fatalf("could not scale the cluster to %d replicas: %s", tc.scaleTo, err)
+					}
 					return ctx
 				},
 			)
@@ -221,19 +227,28 @@ func TestPodRecovery(t *testing.T) {
 	etcdClusterName := "etcd-recovery-test"
 
 	feature.Setup(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-		createEtcdClusterWithPVC(ctx, t, c, etcdClusterName, 3)
-		waitForSTSReadiness(t, c, etcdClusterName, 3)
+		clusterSize := 3
+		createEtcdClusterWithPVC(ctx, t, c, etcdClusterName, clusterSize)
+		if err := waitForPodReadiness(t, c, etcdClusterName, clusterSize); err != nil {
+			t.Fatalf("etcd pods of cluster %s failed to reach readiness for %d replicas: %v", etcdClusterName, clusterSize, err)
+		}
 		return ctx
 	})
 
 	feature.Assess("verify multi-node cluster recovery after pod deletion",
 		func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-			var sts appsv1.StatefulSet
-			if err := c.Client().Resources().Get(ctx, etcdClusterName, namespace, &sts); err != nil {
-				t.Fatalf("Failed to get StatefulSet: %v", err)
+			client := c.Client()
+			var pods corev1.PodList
+			if err := client.Resources().List(
+				ctx,
+				&pods,
+				resources.WithLabelSelector(
+					fmt.Sprintf("app=%s", etcdClusterName)),
+			); err != nil {
+				t.Fatalf("Failed to get etcd PodList: %v", err)
 			}
 
-			initialReplicas := *sts.Spec.Replicas
+			initialReplicas := len(pods.Items)
 			podName := fmt.Sprintf("%s-0", etcdClusterName)
 			targetPodName := fmt.Sprintf("%s-1", etcdClusterName)
 
@@ -266,8 +281,11 @@ func TestPodRecovery(t *testing.T) {
 				t.Fatalf("Pod failed to be recreated: %v", err)
 			}
 
-			// Wait for full StatefulSet readiness
-			waitForSTSReadiness(t, c, etcdClusterName, int(initialReplicas))
+			// Wait for all pod readiness
+			if err := waitForPodReadiness(t, c, etcdClusterName, initialReplicas); err != nil {
+				t.Fatalf("etcd pods of cluster %s failed to reach readiness for %d replicas: %v",
+					etcdClusterName, initialReplicas, err)
+			}
 
 			// Verify PVC usage after recovery
 			verifyPodUsesPVC(t, c, targetPodName, "etcd-data-"+etcdClusterName)
@@ -318,8 +336,11 @@ func TestEtcdClusterFunctionality(t *testing.T) {
 	testKey := "test-key"
 
 	feature.Setup(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-		createEtcdClusterWithPVC(ctx, t, c, etcdClusterName, 3)
-		waitForSTSReadiness(t, c, etcdClusterName, 3)
+		clusterSize := 3
+		createEtcdClusterWithPVC(ctx, t, c, etcdClusterName, clusterSize)
+		if err := waitForPodReadiness(t, c, etcdClusterName, clusterSize); err != nil {
+			t.Fatalf("etcd pods of cluster %s failed to reach readiness for %d replicas: %v", etcdClusterName, clusterSize, err)
+		}
 		return ctx
 	})
 
