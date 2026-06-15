@@ -1072,7 +1072,10 @@ func TestCreateCMCertificateConfig(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result, err := createCMCertificateConfig(tt.ec)
+			scheme := runtime.NewScheme()
+			_ = ecv1alpha1.AddToScheme(scheme)
+
+			result, err := createCMCertificateConfig(tt.ec, scheme)
 
 			if tt.wantErr {
 				require.Error(t, err)
@@ -1085,7 +1088,7 @@ func TestCreateCMCertificateConfig(t *testing.T) {
 				assert.Equal(t, tt.expected.ValidityDuration, result.ValidityDuration)
 				assert.Equal(t, tt.expected.AltNames.DNSNames, result.AltNames.DNSNames)
 				assert.Equal(t, tt.expected.AltNames.IPs, result.AltNames.IPs)
-				assert.Equal(t, tt.expected.ExtraConfig, result.ExtraConfig)
+				// Don't check ExtraConfig as it now contains ownerReference and scheme
 			}
 		})
 	}

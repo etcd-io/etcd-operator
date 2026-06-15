@@ -7,6 +7,7 @@ import (
 	"log"
 	"maps"
 	"net"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -55,7 +56,7 @@ func reconcileStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1alpha
 	}
 
 	// Add server and peer certificate
-	err = applyEtcdMemberCerts(ctx, ec, c)
+	err = applyEtcdMemberCerts(ctx, ec, c, scheme)
 	if err != nil {
 		return nil, err
 	}
@@ -585,45 +586,21 @@ func parseValidityDuration(customizedDuration string, defaultDuration time.Durat
 		return defaultDuration, nil
 	}
 
-	// Convert days to hours since time.ParseDuration doesn't support 'd' unit
-	// Replace 'd' with 'h' after multiplying the number by 24
-	durationStr := customizedDuration
-	if strings.Contains(durationStr, "d") {
-		// Parse and convert day units to hours
-		// Example: "365d" -> "8760h", "100d12h" -> "2412h"
-		var result strings.Builder
-		var numStr strings.Builder
-
-		for i := 0; i < len(durationStr); i++ {
-			ch := durationStr[i]
-			if ch >= '0' && ch <= '9' || ch == '.' {
-				numStr.WriteByte(ch)
-			} else if ch == 'd' {
-				// Convert days to hours
-				if numStr.Len() > 0 {
-					days, err := strconv.ParseFloat(numStr.String(), 64)
-					if err != nil {
-						return 0, fmt.Errorf("failed to parse day value in ValidityDuration: %w", err)
-					}
-					hours := days * 24
-					result.WriteString(fmt.Sprintf("%gh", hours))
-					numStr.Reset()
-				}
-			} else {
-				// Other unit (h, m, s, etc.)
-				if numStr.Len() > 0 {
-					result.WriteString(numStr.String())
-					numStr.Reset()
-				}
-				result.WriteByte(ch)
-			}
+	// Convert days to hours using regex since time.ParseDuration doesn't support 'd' unit
+	// Matches patterns like "365d", "100.5d", etc. and converts them to hours
+	// Example: "365d" -> "8760h", "100d12h" -> "2400h12h" (which time.ParseDuration sums to 2412h)
+	dayRegex := regexp.MustCompile(`([0-9.]+)d`)
+	durationStr := dayRegex.ReplaceAllStringFunc(customizedDuration, func(match string) string {
+		// Extract the numeric part (remove 'd')
+		daysStr := match[:len(match)-1]
+		days, err := strconv.ParseFloat(daysStr, 64)
+		if err != nil {
+			// Return original if parsing fails, will be caught by time.ParseDuration
+			return match
 		}
-		// Append any remaining number
-		if numStr.Len() > 0 {
-			result.WriteString(numStr.String())
-		}
-		durationStr = result.String()
-	}
+		hours := days * 24
+		return fmt.Sprintf("%.0fh", hours)
+	})
 
 	duration, err := time.ParseDuration(durationStr)
 	if err != nil {
@@ -632,7 +609,7 @@ func parseValidityDuration(customizedDuration string, defaultDuration time.Durat
 	return duration, nil
 }
 
-func createCMCertificateConfig(ec *ecv1alpha1.EtcdCluster) (*certInterface.Config, error) {
+func createCMCertificateConfig(ec *ecv1alpha1.EtcdCluster, scheme *runtime.Scheme) (*certInterface.Config, error) {
 	cmConfig := ec.Spec.TLS.ProviderCfg.CertManagerCfg
 	if cmConfig == nil {
 		return nil, fmt.Errorf("cert-manager configuration is not present")
@@ -668,8 +645,10 @@ func createCMCertificateConfig(ec *ecv1alpha1.EtcdCluster) (*certInterface.Confi
 		ValidityDuration: duration,
 		AltNames:         getAltNames,
 		ExtraConfig: map[string]any{
-			"issuerName": cmConfig.IssuerName,
-			"issuerKind": cmConfig.IssuerKind,
+			"ownerReference": ec,
+			"scheme":         scheme,
+			"issuerName":     cmConfig.IssuerName,
+			"issuerKind":     cmConfig.IssuerKind,
 		},
 	}
 	return config, nil
@@ -720,7 +699,7 @@ func createAutoCertificateConfig(ec *ecv1alpha1.EtcdCluster) (*certInterface.Con
 	return config, nil
 }
 
-func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client.Client, certName string) error {
+func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client.Client, scheme *runtime.Scheme, certName string) error {
 	// The TLS field is present but spec is empty
 	providerName := ec.Spec.TLS.Provider
 	if providerName == "" {
@@ -750,7 +729,7 @@ func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client
 				}
 				return nil
 			case certificate.CertManager:
-				cmConfig, err := createCMCertificateConfig(ec)
+				cmConfig, err := createCMCertificateConfig(ec, scheme)
 				if err != nil {
 					return fmt.Errorf("error creating cert-manager certificate config: %w", err)
 				}
@@ -772,9 +751,9 @@ func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client
 	return nil
 }
 
-func createClientCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client) error {
+func createClientCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client, scheme *runtime.Scheme) error {
 	certName := getClientCertName(ec.Name)
-	err := createCertificate(ec, ctx, c, certName)
+	err := createCertificate(ec, ctx, c, scheme, certName)
 	if err != nil {
 		return err
 	}
@@ -785,9 +764,9 @@ func createClientCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c 
 	return err
 }
 
-func createServerCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client) error {
+func createServerCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client, scheme *runtime.Scheme) error {
 	serverCertName := getServerCertName(ec.Name)
-	err := createCertificate(ec, ctx, c, serverCertName)
+	err := createCertificate(ec, ctx, c, scheme, serverCertName)
 	if err != nil {
 		return err
 	}
@@ -798,9 +777,9 @@ func createServerCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c 
 	return nil
 }
 
-func createPeerCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client) error {
+func createPeerCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client, scheme *runtime.Scheme) error {
 	peerCertName := getPeerCertName(ec.Name)
-	err := createCertificate(ec, ctx, c, peerCertName)
+	err := createCertificate(ec, ctx, c, scheme, peerCertName)
 	if err != nil {
 		return err
 	}
@@ -811,13 +790,13 @@ func createPeerCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c cl
 	return nil
 }
 
-func applyEtcdMemberCerts(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client) error {
+func applyEtcdMemberCerts(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client, scheme *runtime.Scheme) error {
 	if ec.Spec.TLS != nil {
-		err := createServerCertificate(ctx, ec, c)
+		err := createServerCertificate(ctx, ec, c, scheme)
 		if err != nil {
 			return err
 		}
-		err = createPeerCertificate(ctx, ec, c)
+		err = createPeerCertificate(ctx, ec, c, scheme)
 		if err != nil {
 			return err
 		}
