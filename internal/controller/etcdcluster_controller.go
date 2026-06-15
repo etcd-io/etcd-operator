@@ -26,6 +26,8 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -80,13 +82,27 @@ type reconcileState struct {
 // For more details on the controller-runtime Reconcile contract see:
 // https://pkg.go.dev/sigs.k8s.io/controller-runtime/pkg/reconcile
 func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	state, res, err := r.fetchAndValidateState(ctx, req)
+	var state *reconcileState
+	var res ctrl.Result
+	var err error
+
+	// Defer status update to ensure it's called regardless of return path
+	defer func() {
+		if state != nil {
+			if statusErr := r.updateStatus(ctx, state); statusErr != nil {
+				// Log but don't override the main reconciliation error
+				log.FromContext(ctx).Error(statusErr, "Failed to update status")
+			}
+		}
+	}()
+
+	state, res, err = r.fetchAndValidateState(ctx, req)
 	if state == nil || err != nil {
 		return res, err
 	}
 
-	if bootstrapRes, err := r.bootstrapStatefulSet(ctx, state); err != nil || !bootstrapRes.IsZero() {
-		return bootstrapRes, err
+	if res, err = r.bootstrapStatefulSet(ctx, state); err != nil || !res.IsZero() {
+		return res, err
 	}
 
 	if err = r.performHealthChecks(ctx, state); err != nil {
@@ -384,6 +400,174 @@ func (r *EtcdClusterReconciler) reconcileClusterState(ctx context.Context, s *re
 
 	logger.Info("EtcdCluster reconciled successfully")
 	return ctrl.Result{}, nil
+}
+
+// updateStatus updates the EtcdCluster status based on observed state.
+// It is called at the end of each reconciliation cycle.
+func (r *EtcdClusterReconciler) updateStatus(ctx context.Context, s *reconcileState) error {
+	logger := log.FromContext(ctx)
+
+	// Update ObservedGeneration
+	s.cluster.Status.ObservedGeneration = s.cluster.Generation
+
+	// Update replica counts from StatefulSet
+	if s.sts != nil {
+		if s.sts.Spec.Replicas != nil {
+			s.cluster.Status.CurrentReplicas = *s.sts.Spec.Replicas
+		}
+		s.cluster.Status.ReadyReplicas = s.sts.Status.ReadyReplicas
+	}
+
+	// Update member count from etcd cluster
+	if s.memberListResp != nil {
+		s.cluster.Status.MemberCount = int32(len(s.memberListResp.Members))
+
+		// Update individual member statuses
+		s.cluster.Status.Members = make([]ecv1alpha1.MemberStatus, 0, len(s.memberListResp.Members))
+		for i, member := range s.memberListResp.Members {
+			memberStatus := ecv1alpha1.MemberStatus{
+				ID:   fmt.Sprintf("%x", member.ID),
+				Name: member.Name,
+			}
+
+			// Find health info for this member
+			if i < len(s.memberHealth) {
+				health := s.memberHealth[i]
+				memberStatus.IsHealthy = health.Health
+				if health.Status != nil {
+					memberStatus.Version = health.Status.Version
+					memberStatus.IsLeader = health.Status.Header.MemberId == health.Status.Leader
+				}
+			}
+
+			memberStatus.IsLearner = member.IsLearner
+			s.cluster.Status.Members = append(s.cluster.Status.Members, memberStatus)
+		}
+
+		// Update leader ID
+		_, leaderStatus := etcdutils.FindLeaderStatus(s.memberHealth, logger)
+		if leaderStatus != nil {
+			s.cluster.Status.LeaderID = fmt.Sprintf("%x", leaderStatus.Leader)
+		}
+
+		// Update current version from leader or first healthy member
+		if leaderStatus != nil {
+			s.cluster.Status.CurrentVersion = leaderStatus.Version
+		} else if len(s.memberHealth) > 0 && s.memberHealth[0].Status != nil {
+			s.cluster.Status.CurrentVersion = s.memberHealth[0].Status.Version
+		}
+	}
+
+	// Update conditions
+	r.updateConditions(s)
+
+	// Persist status update
+	if err := r.Status().Update(ctx, s.cluster); err != nil {
+		logger.Error(err, "Failed to update EtcdCluster status")
+		return err
+	}
+
+	return nil
+}
+
+// updateConditions sets the standard Kubernetes conditions based on observed state
+func (r *EtcdClusterReconciler) updateConditions(s *reconcileState) {
+	now := metav1.Now()
+
+	// Determine if cluster is available (has quorum and healthy members)
+	availableCondition := metav1.Condition{
+		Type:               "Available",
+		Status:             metav1.ConditionFalse,
+		ObservedGeneration: s.cluster.Generation,
+		LastTransitionTime: now,
+		Reason:             "ClusterNotReady",
+		Message:            "Etcd cluster is not yet available",
+	}
+
+	if s.memberListResp != nil && len(s.memberListResp.Members) > 0 {
+		healthyCount := 0
+		for _, health := range s.memberHealth {
+			if health.Health {
+				healthyCount++
+			}
+		}
+
+		quorum := (len(s.memberListResp.Members) / 2) + 1
+		if healthyCount >= quorum {
+			availableCondition.Status = metav1.ConditionTrue
+			availableCondition.Reason = "ClusterAvailable"
+			availableCondition.Message = fmt.Sprintf("Etcd cluster has %d/%d healthy members with quorum", healthyCount, len(s.memberListResp.Members))
+		} else {
+			availableCondition.Message = fmt.Sprintf("Etcd cluster has %d/%d healthy members, quorum requires %d", healthyCount, len(s.memberListResp.Members), quorum)
+		}
+	}
+
+	// Determine if cluster is progressing (scaling or upgrading)
+	progressingCondition := metav1.Condition{
+		Type:               "Progressing",
+		Status:             metav1.ConditionFalse,
+		ObservedGeneration: s.cluster.Generation,
+		LastTransitionTime: now,
+		Reason:             "ClusterStable",
+		Message:            "Etcd cluster is stable",
+	}
+
+	if s.sts != nil && s.sts.Spec.Replicas != nil {
+		currentReplicas := *s.sts.Spec.Replicas
+		desiredSize := int32(s.cluster.Spec.Size)
+
+		if currentReplicas != desiredSize {
+			progressingCondition.Status = metav1.ConditionTrue
+			progressingCondition.Reason = "ScalingInProgress"
+			progressingCondition.Message = fmt.Sprintf("Scaling from %d to %d replicas", currentReplicas, desiredSize)
+		} else if s.memberListResp != nil && int32(len(s.memberListResp.Members)) != desiredSize {
+			progressingCondition.Status = metav1.ConditionTrue
+			progressingCondition.Reason = "MembershipChanging"
+			progressingCondition.Message = fmt.Sprintf("Etcd membership changing: %d members, target %d", len(s.memberListResp.Members), desiredSize)
+		}
+
+		// Check for learners (indicates scaling in progress)
+		if s.memberListResp != nil {
+			for _, member := range s.memberListResp.Members {
+				if member.IsLearner {
+					progressingCondition.Status = metav1.ConditionTrue
+					progressingCondition.Reason = "LearnerPromotion"
+					progressingCondition.Message = "Waiting for learner member to be promoted"
+					break
+				}
+			}
+		}
+	}
+
+	// Determine if cluster is degraded
+	degradedCondition := metav1.Condition{
+		Type:               "Degraded",
+		Status:             metav1.ConditionFalse,
+		ObservedGeneration: s.cluster.Generation,
+		LastTransitionTime: now,
+		Reason:             "ClusterHealthy",
+		Message:            "All etcd members are healthy",
+	}
+
+	if s.memberListResp != nil && len(s.memberHealth) > 0 {
+		unhealthyMembers := []string{}
+		for _, health := range s.memberHealth {
+			if !health.Health && health.Status != nil {
+				unhealthyMembers = append(unhealthyMembers, fmt.Sprintf("%x", health.Status.Header.MemberId))
+			}
+		}
+
+		if len(unhealthyMembers) > 0 {
+			degradedCondition.Status = metav1.ConditionTrue
+			degradedCondition.Reason = "UnhealthyMembers"
+			degradedCondition.Message = fmt.Sprintf("Unhealthy members: %s", strings.Join(unhealthyMembers, ", "))
+		}
+	}
+
+	// Update or append conditions
+	meta.SetStatusCondition(&s.cluster.Status.Conditions, availableCondition)
+	meta.SetStatusCondition(&s.cluster.Status.Conditions, progressingCondition)
+	meta.SetStatusCondition(&s.cluster.Status.Conditions, degradedCondition)
 }
 
 // isCertManagerCRDPresent checks if cert-manager CRDs are installed in the cluster
