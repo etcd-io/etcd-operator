@@ -23,22 +23,15 @@ import (
 	"log"
 	"strings"
 	"testing"
-	"time"
 
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	runtimeClient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/e2e-framework/klient"
-	"sigs.k8s.io/e2e-framework/klient/k8s"
-	"sigs.k8s.io/e2e-framework/klient/wait"
-	"sigs.k8s.io/e2e-framework/klient/wait/conditions"
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
 	"sigs.k8s.io/e2e-framework/pkg/features"
 
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
-	"go.etcd.io/etcd-operator/test/utils"
 )
 
 func TestDataPersistence(t *testing.T) {
@@ -71,17 +64,15 @@ func TestDataPersistence(t *testing.T) {
 		},
 	}
 
-	objKey := runtimeClient.ObjectKeyFromObject(etcdCluster)
-
 	feature.Setup(func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
 		client := cfg.Client()
 
-		// create etcd cluster
+		// create the etcd cluster
 		if err := client.Resources().Create(ctx, etcdCluster); err != nil {
 			t.Fatalf("unable to create etcd cluster: %s", err)
 		}
 
-		// get etcd cluster object
+		// get the etcd cluster object
 		var ec ecv1alpha1.EtcdCluster
 		if err := client.Resources().Get(ctx, etcdClusterName, namespace, &ec); err != nil {
 			t.Fatalf("unable to fetch etcd cluster: %s", err)
@@ -90,42 +81,23 @@ func TestDataPersistence(t *testing.T) {
 		return ctx
 	})
 
-	feature.Assess("Check if sts exists with size 1",
+	feature.Assess("Check if there exists one replica of the etcd pod",
 		func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-			client := c.Client()
-
-			var sts appsv1.StatefulSet
-
-			ops := []wait.Option{
-				wait.WithTimeout(3 * time.Minute),
-				wait.WithInterval(10 * time.Second),
+			if err := waitForPodReadiness(t, c, etcdClusterName, 1); err != nil {
+				t.Fatalf("unable to find the replica of the etcd pod: %s", err)
 			}
-
-			if err := utils.GetKubernetesResource(ctx, client, objKey, &sts, ops...); err != nil {
-				t.Fatalf("unable to get sts: %s", err)
-			}
-
-			if err := wait.For(
-				conditions.New(client.Resources()).ResourceScaled(&sts, func(object k8s.Object) int32 {
-					return sts.Status.ReadyReplicas
-				}, 1),
-				ops...,
-			); err != nil {
-				t.Fatalf("unable to create sts with size 1: %s", err)
-			}
-
 			return ctx
 		},
 	)
 
-	feature.Assess("Write data to the sts pod",
+	feature.Assess("Write data to the etcd pod",
 		func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
 			client := c.Client()
 
-			// get sts pod
+			// get the etcd pod
 			var pod corev1.Pod
 			if err := client.Resources().Get(ctx, fmt.Sprintf("%s-%d", etcdClusterName, 0), namespace, &pod); err != nil {
-				log.Fatalf("unable to get sts pod: %s", err)
+				log.Fatalf("unable to get the etcd pod: %s", err)
 			}
 
 			// write data to the pod
@@ -137,14 +109,14 @@ func TestDataPersistence(t *testing.T) {
 		},
 	)
 
-	feature.Assess("Delete the sts pod",
+	feature.Assess("Delete the etcd pod",
 		func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
 			client := c.Client()
 
-			// get sts pod
+			// get the etcd pod
 			var pod corev1.Pod
 			if err := client.Resources().Get(ctx, fmt.Sprintf("%s-%d", etcdClusterName, 0), namespace, &pod); err != nil {
-				log.Fatalf("unable to get sts pod: %s", err)
+				log.Fatalf("unable to get the etcd pod: %s", err)
 			}
 
 			// delete the pod
@@ -160,25 +132,14 @@ func TestDataPersistence(t *testing.T) {
 		func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
 			client := c.Client()
 
-			// wait until sts's ReadyReplicas turn to 1
-			var sts appsv1.StatefulSet
-			if err := utils.GetKubernetesResource(ctx, client, objKey, &sts); err != nil {
-				t.Fatalf("unable to get sts post pod deletion: %s", err)
+			if err := waitForPodReadiness(t, c, etcdClusterName, 1); err != nil {
+				t.Fatalf("unable to scale the etcd pod back post pod deletion: %s", err)
 			}
 
-			if err := wait.For(
-				conditions.New(client.Resources()).ResourceScaled(&sts, func(object k8s.Object) int32 {
-					return sts.Status.ReadyReplicas
-				}, 1),
-				wait.WithTimeout(3*time.Minute),
-			); err != nil {
-				t.Fatalf("unable to scale sts post pod deletion: %s", err)
-			}
-
-			// get sts pod
+			// get the etcd pod
 			var pod corev1.Pod
 			if err := client.Resources().Get(ctx, fmt.Sprintf("%s-%d", etcdClusterName, 0), namespace, &pod); err != nil {
-				log.Fatalf("unable to get sts pod: %s", err)
+				log.Fatalf("unable to get the etcd pod: %s", err)
 			}
 
 			// read data from pod
@@ -186,12 +147,13 @@ func TestDataPersistence(t *testing.T) {
 			var val string
 			if val, err = readDataFromPod(ctx, &pod, client, key); err != nil {
 				t.Logf("value: %s", val)
-				t.Fatalf("unable to fetch data from sts pod: %s", err)
+				t.Fatalf("unable to fetch data from the etcd pod: %s", err)
 			}
 
 			// compare the value read against the value written
 			if val != input_value {
-				t.Fatalf("value fetched does not match the input value...input value=%s, fetched value=%s", input_value, val)
+				t.Fatalf("value fetched does not match the waitForPodReadinessinput value...input value=%s, fetched value=%s",
+					input_value, val)
 			}
 
 			return ctx
