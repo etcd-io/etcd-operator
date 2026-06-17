@@ -64,6 +64,37 @@ func endpointHealthAllHealthy(t *testing.T, c *envconf.Config, podName string) (
 	return healthy, total, total > 0 && healthy == total
 }
 
+// endpointHealthQuorum reports whether the cluster reachable through podName
+// currently has quorum, by running `etcdctl endpoint health` against podName's
+// *local* endpoint only (no --cluster). A healthy result means etcd committed a
+// proposal through Raft, which requires a quorum of voting members; so this is a
+// true quorum signal.
+//
+// This is deliberately NOT the same as endpointHealthAllHealthy (which uses
+// --cluster and requires *every* member to be healthy). During scale churn a
+// member that is mid-join (a not-yet-serving learner) or mid-removal will
+// transiently report unhealthy under --cluster even though quorum is fully
+// intact; counting those as quorum loss is a false positive. The quorum watcher
+// must only flag genuine inability to commit, which is exactly what the local
+// endpoint health check measures.
+func endpointHealthQuorum(t *testing.T, c *envconf.Config, podName string) bool {
+	t.Helper()
+	cmd := []string{"etcdctl", "endpoint", "health"}
+	stdout, _, err := execInPod(t, c, podName, namespace, cmd)
+	if err != nil {
+		// An exec/etcdctl error means the local endpoint could not commit a
+		// proposal right now: treat as (transiently) no-quorum, to be smoothed
+		// by the watcher's consecutive-streak tolerance.
+		return false
+	}
+	for _, line := range strings.Split(strings.TrimSpace(stdout), "\n") {
+		if strings.Contains(line, "is healthy") {
+			return true
+		}
+	}
+	return false
+}
+
 // waitForClusterHealthy blocks until the cluster reachable through podName has
 // exactly `size` voting members (no learners) AND every endpoint reports
 // healthy, or the timeout elapses.
@@ -178,11 +209,16 @@ func assertHashKVConsistent(t *testing.T, c *envconf.Config, podName string) {
 	}
 }
 
-// quorumWatcher polls endpoint health every ~2s in the background and records
-// any window during which the cluster was not fully healthy (a proxy for
-// quorum-loss / write-stall). Call the returned stop func when the churn under
-// test is complete; it stops the watcher and fails the test if any unhealthy
-// window was observed.
+// quorumWatcher polls quorum health every ~2s in the background and records any
+// window during which the cluster could not commit through Raft (i.e. lost
+// quorum / write-stalled). Call the returned stop func when the churn under test
+// is complete; it stops the watcher and fails the test if any such window was
+// observed.
+//
+// It checks quorum via podName's local endpoint (endpointHealthQuorum), NOT
+// whole-cluster all-healthy: during scale churn a mid-join learner or a member
+// being removed transiently reports unhealthy under --cluster while quorum is
+// fully intact, and counting that as quorum loss is a false positive.
 //
 // The watcher tolerates a single transient unhealthy poll (one pod momentarily
 // restarting is normal during scale steps); it only fails on a *sustained*
@@ -216,7 +252,7 @@ func quorumWatcher(ctx context.Context, t *testing.T, c *envconf.Config, podName
 			case <-wctx.Done():
 				return
 			case <-ticker.C:
-				_, _, ok := endpointHealthAllHealthy(t, c, podName)
+				ok := endpointHealthQuorum(t, c, podName)
 				mu.Lock()
 				if ok {
 					streak = 0
