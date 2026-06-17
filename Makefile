@@ -91,6 +91,15 @@ test-e2e: generate fmt vet kind gofail-enable ## Run the e2e tests. Expected an 
 	ETCD_VERSION="$(E2E_ETCD_VERSION)" PATH="$(LOCALBIN):$(PATH)" go test ./test/e2e/ -v
 	$(MAKE) gofail-disable
 
+# The stress suite is build-tagged (//go:build stress) so the fast e2e suite
+# above never compiles or runs it. It reuses the same Kind bootstrap + deployed
+# operator, but exercises larger clusters (1/3/7 members) under churn, so it
+# needs a longer timeout.
+.PHONY: test-stress
+test-stress: generate fmt vet kind gofail-enable ## Run the stress tests. Expected an isolated environment using Kind.
+	ETCD_VERSION="$(E2E_ETCD_VERSION)" PATH="$(LOCALBIN):$(PATH)" go test ./test/e2e/ -tags stress -run 'TestStress' -timeout 40m -v
+	$(MAKE) gofail-disable
+
 .PHONY: gofail-enable
 gofail-enable: gofail
 	$(GOFAIL) enable ./internal/controller/
