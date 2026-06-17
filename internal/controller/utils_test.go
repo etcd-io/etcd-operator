@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -1086,6 +1087,106 @@ func TestCreateCMCertificateConfig(t *testing.T) {
 				assert.Equal(t, tt.expected.AltNames.DNSNames, result.AltNames.DNSNames)
 				assert.Equal(t, tt.expected.AltNames.IPs, result.AltNames.IPs)
 				assert.Equal(t, tt.expected.ExtraConfig, result.ExtraConfig)
+			}
+		})
+	}
+}
+
+// findVolumeMount returns the VolumeMount with the given name, or false if absent.
+func findVolumeMount(mounts []corev1.VolumeMount, name string) (corev1.VolumeMount, bool) {
+	for _, m := range mounts {
+		if m.Name == name {
+			return m, true
+		}
+	}
+	return corev1.VolumeMount{}, false
+}
+
+func TestCreateOrPatchStatefulSetTLSCertMounts(t *testing.T) {
+	ctx := t.Context()
+	logger := log.FromContext(ctx)
+
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = ecv1alpha1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+
+	tests := []struct {
+		name        string
+		tls         *ecv1alpha1.TLSCertificate
+		storageSpec *ecv1alpha1.StorageSpec
+		expectMount bool
+	}{
+		{
+			name:        "TLS configured mounts server and peer cert secrets",
+			tls:         &ecv1alpha1.TLSCertificate{},
+			expectMount: true,
+		},
+		{
+			name:        "TLS configured without storage still mounts cert secrets",
+			tls:         &ecv1alpha1.TLSCertificate{},
+			storageSpec: nil,
+			expectMount: true,
+		},
+		{
+			name: "TLS configured alongside storage keeps both data dir and cert mounts",
+			tls:  &ecv1alpha1.TLSCertificate{},
+			storageSpec: &ecv1alpha1.StorageSpec{
+				VolumeSizeRequest: resource.MustParse("1Gi"),
+			},
+			expectMount: true,
+		},
+		{
+			name:        "TLS nil adds no cert mounts",
+			tls:         nil,
+			expectMount: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+			ec := &ecv1alpha1.EtcdCluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-etcd-tls",
+					Namespace: "default",
+				},
+				Spec: ecv1alpha1.EtcdClusterSpec{
+					Size:        3,
+					Version:     "3.5.17",
+					TLS:         tt.tls,
+					StorageSpec: tt.storageSpec,
+				},
+			}
+
+			err := createOrPatchStatefulSet(ctx, logger, ec, fakeClient, 3, scheme)
+			require.NoError(t, err)
+
+			sts := &appsv1.StatefulSet{}
+			err = fakeClient.Get(ctx, client.ObjectKey{Name: ec.Name, Namespace: "default"}, sts)
+			require.NoError(t, err)
+
+			require.Len(t, sts.Spec.Template.Spec.Containers, 1)
+			mounts := sts.Spec.Template.Spec.Containers[0].VolumeMounts
+
+			serverMount, serverOK := findVolumeMount(mounts, "server-secret")
+			peerMount, peerOK := findVolumeMount(mounts, "peer-secret")
+
+			if tt.expectMount {
+				require.True(t, serverOK, "expected server-secret VolumeMount to be present")
+				require.True(t, peerOK, "expected peer-secret VolumeMount to be present")
+				assert.Equal(t, "/etc/etcd/server-tls/", serverMount.MountPath)
+				assert.Equal(t, "/etc/etcd/peer-tls/", peerMount.MountPath)
+			} else {
+				assert.False(t, serverOK, "did not expect server-secret VolumeMount when TLS is nil")
+				assert.False(t, peerOK, "did not expect peer-secret VolumeMount when TLS is nil")
+			}
+
+			// When storage is requested, the data-dir mount must coexist with the cert mounts.
+			if tt.storageSpec != nil {
+				_, dataOK := findVolumeMount(mounts, volumeName)
+				assert.True(t, dataOK, "expected data-dir VolumeMount to be present alongside cert mounts")
 			}
 		})
 	}

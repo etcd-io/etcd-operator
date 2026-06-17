@@ -37,6 +37,14 @@ import (
 const (
 	etcdDataDir = "/var/lib/etcd"
 	volumeName  = "etcd-data"
+
+	// TLS cert secret volume names and mount paths. The volume names must match
+	// the cert Volumes added in createOrPatchStatefulSet; the mount paths are the
+	// locations the etcd TLS flags will reference once those flags land.
+	serverCertVolumeName = "server-secret"
+	peerCertVolumeName   = "peer-secret"
+	serverCertMountPath  = "/etc/etcd/server-tls/"
+	peerCertMountPath    = "/etc/etcd/peer-tls/"
 )
 
 type etcdClusterState string
@@ -194,18 +202,33 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 	peerCertName := getPeerCertName(ec.Name)
 	if ec.Spec.TLS != nil {
 		serverCertVolume := corev1.Volume{
-			Name: "server-secret",
+			Name: serverCertVolumeName,
 			VolumeSource: corev1.VolumeSource{
 				Secret: &corev1.SecretVolumeSource{SecretName: serverCertName},
 			},
 		}
 		peerCertVolume := corev1.Volume{
-			Name: "peer-secret",
+			Name: peerCertVolumeName,
 			VolumeSource: corev1.VolumeSource{
 				Secret: &corev1.SecretVolumeSource{SecretName: peerCertName},
 			},
 		}
 		certVolume = append(certVolume, serverCertVolume, peerCertVolume)
+
+		// Mount the cert secrets into the etcd container so etcd can read them.
+		// Gated on TLS (not StorageSpec): a TLS cluster without persistent
+		// storage must still receive the cert mounts. The flags that consume
+		// these paths land in a follow-up; the mounts alone are a safe no-op.
+		podSpec.Containers[0].VolumeMounts = append(podSpec.Containers[0].VolumeMounts,
+			corev1.VolumeMount{
+				Name:      serverCertVolumeName,
+				MountPath: serverCertMountPath,
+			},
+			corev1.VolumeMount{
+				Name:      peerCertVolumeName,
+				MountPath: peerCertMountPath,
+			},
+		)
 	}
 	if len(certVolume) != 0 {
 		podSpec.Volumes = certVolume
@@ -254,11 +277,14 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 
 	if ec.Spec.StorageSpec != nil {
 
-		stsSpec.Template.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{
-			Name:        volumeName,
-			MountPath:   etcdDataDir,
-			SubPathExpr: "$(POD_NAME)",
-		}}
+		// Append (not assign) so any TLS cert mounts added above are preserved.
+		stsSpec.Template.Spec.Containers[0].VolumeMounts = append(
+			stsSpec.Template.Spec.Containers[0].VolumeMounts,
+			corev1.VolumeMount{
+				Name:        volumeName,
+				MountPath:   etcdDataDir,
+				SubPathExpr: "$(POD_NAME)",
+			})
 		// Create a new volume claim template
 		if ec.Spec.StorageSpec.VolumeSizeRequest.Cmp(resource.MustParse("1Mi")) < 0 {
 			return fmt.Errorf("VolumeSizeRequest must be at least 1Mi")
