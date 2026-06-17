@@ -410,6 +410,50 @@ func TestFetchAndValidateState(t *testing.T) {
 	}
 }
 
+// TestFetchAndValidateStateClientCertificateError verifies that when the cluster
+// requests TLS but the client certificate cannot be provisioned,
+// fetchAndValidateState requeues with backoff instead of swallowing the error and
+// proceeding. The fake client's scheme intentionally omits the cert-manager
+// types, so the certificate lookup performed by createClientCertificate fails
+// with a non-NotFound error, exercising the provisioning failure path.
+func TestFetchAndValidateStateClientCertificateError(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = ecv1alpha1.AddToScheme(scheme)
+	// Note: cert-manager's certv1 scheme is deliberately NOT registered.
+
+	ec := &ecv1alpha1.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "etcd",
+			Namespace: "default",
+			UID:       "1",
+		},
+		Spec: ecv1alpha1.EtcdClusterSpec{
+			Size:    1,
+			Version: "3.5.17",
+			TLS: &ecv1alpha1.TLSCertificate{
+				Provider: "cert-manager",
+			},
+		},
+	}
+
+	ctx := t.Context()
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ec).Build()
+	r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
+
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "etcd", Namespace: "default"}}
+	state, res, err := r.fetchAndValidateState(ctx, req)
+
+	// Reconciliation must not proceed past cert provisioning: no state is
+	// returned, and the result is a requeue with the standard backoff.
+	assert.Nil(t, state, "reconcile should not proceed past client-certificate provisioning")
+	assert.NoError(t, err, "the failure should be surfaced via requeue, not a returned error")
+	assert.Equal(t, ctrl.Result{RequeueAfter: requeueDuration}, res, "expected a requeue with backoff")
+	assert.NotZero(t, res.RequeueAfter, "RequeueAfter must be non-zero")
+}
+
 // TestBootstrapStatefulSet outlines tests for ensuring StatefulSet and Service
 // creation and bootstrap logic.
 func TestBootstrapStatefulSet(t *testing.T) {

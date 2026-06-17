@@ -136,7 +136,11 @@ func (r *EtcdClusterReconciler) fetchAndValidateState(ctx context.Context, req c
 	// Ensure the operator has TLS credentials when the cluster requests TLS.
 	if ec.Spec.TLS != nil {
 		if err := createClientCertificate(ctx, ec, r.Client); err != nil {
-			logger.Error(err, "Failed to create Client Certificate.")
+			// The data path relies on this client certificate existing; do not
+			// proceed with reconciliation when it cannot be provisioned.
+			// Requeue with backoff so the failure is retried instead of swallowed.
+			logger.Error(err, "Failed to create Client Certificate. Requesting requeue")
+			return nil, ctrl.Result{RequeueAfter: requeueDuration}, nil
 		}
 	} else {
 		// TODO: instead of logging error, set default autoConfig
