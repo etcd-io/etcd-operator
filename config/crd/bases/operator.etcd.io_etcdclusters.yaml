@@ -3,7 +3,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.20.1
+    controller-gen.kubebuilder.io/version: v0.21.0
   name: etcdclusters.operator.etcd.io
 spec:
   group: operator.etcd.io
@@ -52,6 +52,46 @@ spec:
                   If unset, it defaults to the value provided via the controller's
                   --image-registry flag, which itself defaults to "gcr.io/etcd-development/etcd".
                 type: string
+              metrics:
+                description: |-
+                  Metrics configures Prometheus observability for this cluster. When unset,
+                  the operator still exports its own per-cluster domain metrics on its
+                  /metrics endpoint, but does not create a PodMonitor for the etcd member
+                  pods. See MetricsSpec for the available knobs.
+                properties:
+                  enabled:
+                    description: |-
+                      Enabled toggles emission of the operator's per-cluster domain metrics
+                      (member counts, quorum, leader changes, reconcile timings, etc.) for this
+                      cluster. When nil it defaults to true: metrics are exported unless
+                      explicitly disabled. Disabling drops the cluster's series from the
+                      operator's /metrics endpoint.
+                    type: boolean
+                  podMonitor:
+                    description: |-
+                      PodMonitor, when set and enabled, instructs the operator to create and
+                      maintain a prometheus-operator PodMonitor selecting this cluster's etcd
+                      member pods so that Prometheus scrapes etcd's own /metrics endpoint.
+                      This requires the prometheus-operator PodMonitor CRD to be installed in
+                      the cluster; if it is absent the operator logs and skips PodMonitor
+                      reconciliation without failing the rest of the reconcile.
+                    properties:
+                      enabled:
+                        description: Enabled toggles creation of the PodMonitor. Defaults
+                          to false.
+                        type: boolean
+                      interval:
+                        description: |-
+                          Interval at which Prometheus scrapes the etcd member pods, e.g. "30s".
+                          When empty the prometheus-operator default is used.
+                        type: string
+                      port:
+                        description: |-
+                          Port is the name of the pod port exposing etcd's /metrics endpoint.
+                          Defaults to "client" when empty.
+                        type: string
+                    type: object
+                type: object
               podTemplate:
                 description: PodTemplate is the pod template to use for the etcd cluster.
                 properties:

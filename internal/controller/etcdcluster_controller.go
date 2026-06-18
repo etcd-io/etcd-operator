@@ -36,6 +36,7 @@ import (
 
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 	"go.etcd.io/etcd-operator/internal/etcdutils"
+	"go.etcd.io/etcd-operator/internal/metrics"
 	etcdversions "go.etcd.io/etcd/api/v3/version"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
@@ -73,6 +74,7 @@ type reconcileState struct {
 // +kubebuilder:rbac:groups="cert-manager.io",resources=certificates,verbs=get;list;watch;create;patch;update;delete
 // +kubebuilder:rbac:groups="cert-manager.io",resources=clusterissuers,verbs=get;list;watch
 // +kubebuilder:rbac:groups="cert-manager.io",resources=issuers,verbs=get;list;watch
+// +kubebuilder:rbac:groups="monitoring.coreos.com",resources=podmonitors,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile orchestrates a single reconciliation cycle for an EtcdCluster. It
 // sequentially fetches resources, ensures primitive objects exist, checks the
@@ -86,8 +88,13 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	var res ctrl.Result
 	var err error
 
-	// Defer status update to ensure it's called regardless of return path
+	start := time.Now()
+
+	// Defer status update to ensure it's called regardless of return path.
+	// Reconcile timing/error metrics are always recorded; per-cluster gauges are
+	// refreshed inside updateStatus once observed state is available.
 	defer func() {
+		metrics.ObserveReconcile(req.Namespace, req.Name, time.Since(start).Seconds(), err)
 		if state != nil {
 			if statusErr := r.updateStatus(ctx, state); statusErr != nil {
 				// Log but don't override the main reconciliation error
@@ -123,6 +130,8 @@ func (r *EtcdClusterReconciler) fetchAndValidateState(ctx context.Context, req c
 	if err := r.Get(ctx, req.NamespacedName, ec); err != nil {
 		if errors.IsNotFound(err) {
 			logger.Info("EtcdCluster resource not found. Ignoring since object may have been deleted")
+			// Drop any metric series for the deleted cluster to bound cardinality.
+			metrics.DeleteClusterMetrics(req.Namespace, req.Name)
 			return nil, ctrl.Result{}, nil
 		}
 		return nil, ctrl.Result{}, err
@@ -460,6 +469,18 @@ func (r *EtcdClusterReconciler) updateStatus(ctx context.Context, s *reconcileSt
 
 	// Update conditions
 	r.updateConditions(s)
+
+	// Refresh per-cluster Prometheus domain metrics from the freshly computed
+	// status. Metrics are on by default; an operator can opt a cluster out via
+	// spec.metrics.enabled=false, in which case any stale series are dropped.
+	if s.cluster.Spec.MetricsEnabled() {
+		metrics.RecordClusterMetrics(s.cluster)
+	} else {
+		metrics.DeleteClusterMetrics(s.cluster.Namespace, s.cluster.Name)
+	}
+
+	// Reconcile an optional PodMonitor for the etcd member pods.
+	r.reconcilePodMonitor(ctx, s.cluster)
 
 	// Persist status update
 	if err := r.Status().Update(ctx, s.cluster); err != nil {
