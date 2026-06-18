@@ -175,18 +175,9 @@ func TestClusterCertCreation(t *testing.T) {
 		Spec: ecv1alpha1.EtcdClusterSpec{
 			Size:    size,
 			Version: etcdVersion,
-			TLS: &ecv1alpha1.TLSCertificate{
-				Provider: "cert-manager",
-				ProviderCfg: ecv1alpha1.ProviderConfig{
-					CertManagerCfg: &ecv1alpha1.ProviderCertManagerConfig{
-						CommonConfig: ecv1alpha1.CommonConfig{
-							CommonName:       "etcd-operator-system",
-							ValidityDuration: "90h",
-						},
-						IssuerKind: cmIssuerType,
-						IssuerName: cmIssuerName,
-					},
-				},
+			TLS: &ecv1alpha1.EtcdClusterTLS{
+				Peer:   certManagerSurface(cmIssuerType, cmIssuerName),
+				Client: certManagerSurface(cmIssuerType, cmIssuerName),
 			},
 		},
 	}

@@ -1,6 +1,14 @@
 package etcdutils
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	crand "crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"math/big"
+	"net"
 	"testing"
 	"time"
 
@@ -60,7 +68,7 @@ func TestMemberList(t *testing.T) {
 		assert.NoError(t, err)
 
 		eps := []string{"http://localhost:2379"}
-		resp, err := MemberList(eps)
+		resp, err := MemberList(eps, nil)
 		assert.NoError(t, err)
 		assert.NotNil(t, resp)
 		assert.Greater(t, len(resp.Members), 0)
@@ -68,10 +76,82 @@ func TestMemberList(t *testing.T) {
 
 	t.Run("ReturnsErrorForInvalidEndpoint", func(t *testing.T) {
 		eps := []string{"http://invalid:2379"}
-		resp, err := MemberList(eps)
+		resp, err := MemberList(eps, nil)
 		assert.Error(t, err)
 		assert.Nil(t, resp)
 	})
+
+	// The optional *tls.Config must actually be threaded onto clientv3.Config.TLS,
+	// not dropped. Point the client at a raw TLS listener over an https:// endpoint:
+	// a non-nil config drives a TLS handshake against the listener (which records
+	// it), proving the parameter reaches the dialer.
+	t.Run("NonNilTLSConfigIsApplied", func(t *testing.T) {
+		ln, err := tls.Listen("tcp", "127.0.0.1:0", selfSignedServerTLS(t))
+		assert.NoError(t, err)
+		defer ln.Close()
+
+		handshakeSeen := make(chan struct{}, 1)
+		go func() {
+			for {
+				conn, aerr := ln.Accept()
+				if aerr != nil {
+					return
+				}
+				if tc, ok := conn.(*tls.Conn); ok {
+					// A successful handshake means the client dialed TLS.
+					if tc.Handshake() == nil {
+						select {
+						case handshakeSeen <- struct{}{}:
+						default:
+						}
+					}
+				}
+				_ = conn.Close()
+			}
+		}()
+
+		eps := []string{"https://" + ln.Addr().String()}
+		// The gRPC dial is lazy, so MemberList will error (the listener is not etcd),
+		// but the dial itself must perform a TLS handshake when a config is supplied.
+		// Run it in the background so the test returns as soon as the handshake lands
+		// rather than waiting out the client's dial-retry timeout.
+		go func() {
+			_, _ = MemberList(eps, &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12})
+		}()
+
+		select {
+		case <-handshakeSeen:
+			// good: the *tls.Config drove a real TLS handshake.
+		case <-time.After(10 * time.Second):
+			t.Fatal("expected a TLS handshake from the threaded *tls.Config, saw none")
+		}
+	})
+}
+
+// selfSignedServerTLS returns a *tls.Config with a self-signed server cert for the
+// raw TLS listener used to prove the client-side *tls.Config is applied.
+func selfSignedServerTLS(t *testing.T) *tls.Config {
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), crand.Reader)
+	if err != nil {
+		t.Fatalf("genkey: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "127.0.0.1"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	der, err := x509.CreateCertificate(crand.Reader, tmpl, tmpl, &priv.PublicKey, priv)
+	if err != nil {
+		t.Fatalf("createcert: %v", err)
+	}
+	return &tls.Config{
+		Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: priv}},
+		MinVersion:   tls.VersionTLS12,
+	}
 }
 
 func TestClusterHealth(t *testing.T) {
@@ -80,7 +160,7 @@ func TestClusterHealth(t *testing.T) {
 
 	t.Run("ReturnsHealthStatus", func(t *testing.T) {
 		eps := []string{"http://localhost:2379"}
-		health, err := ClusterHealth(eps)
+		health, err := ClusterHealth(eps, nil)
 		assert.NoError(t, err)
 		assert.NotNil(t, health)
 		assert.Greater(t, len(health), 0)
@@ -89,7 +169,7 @@ func TestClusterHealth(t *testing.T) {
 
 	t.Run("ReturnsErrorForInvalidEndpoint", func(t *testing.T) {
 		eps := []string{"http://invalid:2379"}
-		health, err := ClusterHealth(eps)
+		health, err := ClusterHealth(eps, nil)
 		assert.NoError(t, err)
 		assert.Equal(t, "http://invalid:2379", health[0].Ep)
 		assert.Equal(t, false, health[0].Health)
@@ -104,7 +184,7 @@ func TestAddMember(t *testing.T) {
 	t.Run("AddsNewMember", func(t *testing.T) {
 		eps := []string{"http://localhost:2379"}
 		peerURLs := []string{"http://127.0.0.1:2380"}
-		resp, err := AddMember(eps, peerURLs, false)
+		resp, err := AddMember(eps, peerURLs, false, nil)
 		assert.NoError(t, err)
 		assert.NotNil(t, resp)
 		assert.Greater(t, len(resp.Members), 0)
@@ -113,7 +193,7 @@ func TestAddMember(t *testing.T) {
 	t.Run("ReturnsErrorForInvalidEndpoint", func(t *testing.T) {
 		eps := []string{"http://invalid:2379"}
 		peerURLs := []string{"http://127.0.0.1:2380"}
-		resp, err := AddMember(eps, peerURLs, false)
+		resp, err := AddMember(eps, peerURLs, false, nil)
 		assert.Error(t, err)
 		assert.Nil(t, resp)
 	})
@@ -126,17 +206,17 @@ func TestPromoteLearner(t *testing.T) {
 	t.Run("PromotesMember", func(t *testing.T) {
 		eps := []string{"http://localhost:2379"}
 		peerURLs := []string{"http://test123:2380"}
-		addResp, err := AddMember(eps, peerURLs, true)
+		addResp, err := AddMember(eps, peerURLs, true, nil)
 		assert.NoError(t, err)
 
-		err = PromoteLearner(eps, addResp.Member.ID)
+		err = PromoteLearner(eps, addResp.Member.ID, nil)
 		assert.Error(t, err)
 		assert.Equal(t, err.Error(), "etcdserver: can only promote a learner member which is in sync with leader")
 	})
 
 	t.Run("ReturnsErrorForInvalidEndpoint", func(t *testing.T) {
 		eps := []string{"http://invalid:2379"}
-		err := PromoteLearner(eps, 12345)
+		err := PromoteLearner(eps, 12345, nil)
 		assert.Error(t, err)
 	})
 }
@@ -147,7 +227,7 @@ func TestRemoveMember(t *testing.T) {
 
 	t.Run("ReturnsErrorForInvalidEndpoint", func(t *testing.T) {
 		eps := []string{"http://invalid:2379"}
-		err := RemoveMember(eps, 12345)
+		err := RemoveMember(eps, 12345, nil)
 		assert.Error(t, err)
 	})
 }

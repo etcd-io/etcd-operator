@@ -2,9 +2,10 @@ package controller
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
-	"log"
 	"maps"
 	"net"
 	"slices"
@@ -22,10 +23,12 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 	"go.etcd.io/etcd-operator/internal/etcdutils"
@@ -37,7 +40,123 @@ import (
 const (
 	etcdDataDir = "/var/lib/etcd"
 	volumeName  = "etcd-data"
+
+	// Cert mount points inside the etcd container. The server (client-surface) and
+	// peer secrets are mounted independently so a single-surface cluster only mounts
+	// the secret it actually needs.
+	serverCertVolumeName = "server-secret"
+	peerCertVolumeName   = "peer-secret"
+	serverCertMountPath  = "/etc/etcd/server-tls"
+	peerCertMountPath    = "/etc/etcd/peer-tls"
+
+	// Standard cert-secret keys (cert-manager and the auto provider both write these).
+	tlsCertFile = "tls.crt"
+	tlsKeyFile  = "tls.key"
+	tlsCAFile   = "ca.crt"
+
+	schemeHTTP  = "http"
+	schemeHTTPS = "https"
 )
+
+// peerScheme returns the URL scheme etcd serves/dials on its peer port. It is
+// "https" iff the peer TLS surface is configured, otherwise "http". This is the
+// single source of truth for the peer scheme: peer args and every peer-endpoint
+// generator derive from it so the operator can never compute a peer URL with a
+// scheme etcd does not serve.
+func peerScheme(ec *ecv1alpha1.EtcdCluster) string {
+	if ec.Spec.TLS != nil && ec.Spec.TLS.Peer != nil {
+		return schemeHTTPS
+	}
+	return schemeHTTP
+}
+
+// clientScheme returns the URL scheme etcd serves/dials on its client port. It is
+// "https" iff the client TLS surface is configured, otherwise "http". Single source
+// of truth for the client scheme (client args, client endpoints, and the operator's
+// own dial scheme all derive from it).
+func clientScheme(ec *ecv1alpha1.EtcdCluster) string {
+	if ec.Spec.TLS != nil && ec.Spec.TLS.Client != nil {
+		return schemeHTTPS
+	}
+	return schemeHTTP
+}
+
+// peerTLSEnabled reports whether the peer TLS surface is configured.
+func peerTLSEnabled(ec *ecv1alpha1.EtcdCluster) bool {
+	return ec.Spec.TLS != nil && ec.Spec.TLS.Peer != nil
+}
+
+// clientTLSEnabled reports whether the client TLS surface is configured.
+func clientTLSEnabled(ec *ecv1alpha1.EtcdCluster) bool {
+	return ec.Spec.TLS != nil && ec.Spec.TLS.Client != nil
+}
+
+// clientCertAuthEnabled resolves a surface's ClientCertAuth toggle, defaulting to
+// true (mTLS) when unset, matching the CRD default. A nil surface returns false.
+func clientCertAuthEnabled(s *ecv1alpha1.TLSSurface) bool {
+	if s == nil {
+		return false
+	}
+	if s.ClientCertAuth == nil {
+		return true
+	}
+	return *s.ClientCertAuth
+}
+
+// validateTLS is the reconcile-time anti-misconfiguration backstop for the two TLS
+// surfaces. It re-checks the spec-only coherence rules that are *also* expressed as
+// CEL XValidation markers on TLSSurface (api/v1alpha1/etcdcluster_types.go), so the
+// operator still rejects an invalid spec on an apiserver that does not enforce CEL
+// (e.g. pre-1.25, CEL feature-gated off, or a CR written directly to a fake client
+// in tests). These are the spec-derivable rules ONLY:
+//
+//   - provider 'cert-manager'  => providerCfg.certManagerCfg must be set
+//   - provider auto/empty      => providerCfg.certManagerCfg must NOT be set
+//   - clientCertAuth (mTLS) with cert-manager => issuerName must be set (a CA source)
+//
+// Rules that require reading cluster objects are intentionally NOT here: issuer
+// existence and kind are enforced when the cert is provisioned (the cert-manager
+// provider's validateCertificateConfig -> checkIssuerExists returns an error that
+// requeues), and peer CA-capability / client-server CA equality live on the
+// cert-manager Issuer and secret objects, not on this spec, so they cannot be
+// checked purely from the EtcdCluster (plan Decision 2.5-2.7 / Decision 3). For the
+// client surface specifically, the operator-client cert and the server cert both
+// flow through the SINGLE client surface's issuer, so they share a CA by
+// construction -- the cheap form of the client/server CA-match rule is satisfied
+// without a runtime compare.
+func validateTLS(ec *ecv1alpha1.EtcdCluster) field.ErrorList {
+	var errs field.ErrorList
+	if ec.Spec.TLS == nil {
+		return errs
+	}
+	base := field.NewPath("spec", "tls")
+	errs = append(errs, validateTLSSurface(base.Child("peer"), ec.Spec.TLS.Peer)...)
+	errs = append(errs, validateTLSSurface(base.Child("client"), ec.Spec.TLS.Client)...)
+	return errs
+}
+
+func validateTLSSurface(path *field.Path, s *ecv1alpha1.TLSSurface) field.ErrorList {
+	var errs field.ErrorList
+	if s == nil {
+		return errs
+	}
+	hasCM := s.ProviderCfg.CertManagerCfg != nil
+	isCertManager := s.Provider == string(certificate.CertManager)
+	switch {
+	case isCertManager && !hasCM:
+		errs = append(errs, field.Required(path.Child("providerCfg", "certManagerCfg"),
+			"provider 'cert-manager' requires providerCfg.certManagerCfg"))
+	case !isCertManager && hasCM:
+		errs = append(errs, field.Invalid(path.Child("providerCfg", "certManagerCfg"), "<set>",
+			"providerCfg.certManagerCfg may only be set when provider is 'cert-manager'"))
+	}
+	// mTLS requires a resolvable CA. With cert-manager that means an issuerName.
+	if clientCertAuthEnabled(s) && isCertManager && hasCM && s.ProviderCfg.CertManagerCfg.IssuerName == "" {
+		errs = append(errs, field.Required(path.Child("providerCfg", "certManagerCfg", "issuerName"),
+			"clientCertAuth requires a trusted CA: set providerCfg.certManagerCfg.issuerName"))
+	}
+	return errs
+}
 
 type etcdClusterState string
 
@@ -76,14 +195,73 @@ func reconcileStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1alpha
 	return getStatefulSet(ctx, c, ec.Name, ec.Namespace)
 }
 
-func defaultArgs(name string) []string {
-	return []string{
-		"--name=$(POD_NAME)",
-		"--listen-peer-urls=http://0.0.0.0:2380",   // TODO: only listen on 127.0.0.1 and host IP
-		"--listen-client-urls=http://0.0.0.0:2379", // TODO: only listen on 127.0.0.1 and host IP
-		fmt.Sprintf("--initial-advertise-peer-urls=http://$(POD_NAME).%s.$(POD_NAMESPACE).svc.cluster.local:2380", name),
-		fmt.Sprintf("--advertise-client-urls=http://$(POD_NAME).%s.$(POD_NAMESPACE).svc.cluster.local:2379", name),
+// tlsArgs captures the per-surface TLS decisions that drive defaultArgs. Each
+// surface is independent: the peer flag group and peer https scheme are gated on
+// peerEnabled, the server flag group and client https scheme on clientEnabled, and
+// each --*client-cert-auth flag on its own *CertAuth toggle. The zero value
+// (everything false) yields byte-identical cleartext output to the pre-TLS args.
+type tlsArgs struct {
+	peerEnabled    bool
+	clientEnabled  bool
+	peerCertAuth   bool
+	clientCertAuth bool
+}
+
+// tlsArgsFor derives tlsArgs from an EtcdCluster's two TLS surfaces.
+func tlsArgsFor(ec *ecv1alpha1.EtcdCluster) tlsArgs {
+	var a tlsArgs
+	if ec.Spec.TLS != nil {
+		a.peerEnabled = ec.Spec.TLS.Peer != nil
+		a.clientEnabled = ec.Spec.TLS.Client != nil
+		a.peerCertAuth = clientCertAuthEnabled(ec.Spec.TLS.Peer)
+		a.clientCertAuth = clientCertAuthEnabled(ec.Spec.TLS.Client)
 	}
+	return a
+}
+
+func defaultArgs(name string, tls tlsArgs) []string {
+	peerScheme := schemeHTTP
+	if tls.peerEnabled {
+		peerScheme = schemeHTTPS
+	}
+	clientScheme := schemeHTTP
+	if tls.clientEnabled {
+		clientScheme = schemeHTTPS
+	}
+
+	args := []string{
+		"--name=$(POD_NAME)",
+		fmt.Sprintf("--listen-peer-urls=%s://0.0.0.0:2380", peerScheme),     // TODO: only listen on 127.0.0.1 and host IP
+		fmt.Sprintf("--listen-client-urls=%s://0.0.0.0:2379", clientScheme), // TODO: only listen on 127.0.0.1 and host IP
+		fmt.Sprintf("--initial-advertise-peer-urls=%s://$(POD_NAME).%s.$(POD_NAMESPACE).svc.cluster.local:2380", peerScheme, name),
+		fmt.Sprintf("--advertise-client-urls=%s://$(POD_NAME).%s.$(POD_NAMESPACE).svc.cluster.local:2379", clientScheme, name),
+	}
+
+	// Server (client-surface) TLS flag group: emitted iff the client surface is set.
+	if tls.clientEnabled {
+		args = append(args,
+			fmt.Sprintf("--cert-file=%s/%s", serverCertMountPath, tlsCertFile),
+			fmt.Sprintf("--key-file=%s/%s", serverCertMountPath, tlsKeyFile),
+			fmt.Sprintf("--trusted-ca-file=%s/%s", serverCertMountPath, tlsCAFile),
+		)
+		if tls.clientCertAuth {
+			args = append(args, "--client-cert-auth")
+		}
+	}
+
+	// Peer TLS flag group: emitted iff the peer surface is set.
+	if tls.peerEnabled {
+		args = append(args,
+			fmt.Sprintf("--peer-cert-file=%s/%s", peerCertMountPath, tlsCertFile),
+			fmt.Sprintf("--peer-key-file=%s/%s", peerCertMountPath, tlsKeyFile),
+			fmt.Sprintf("--peer-trusted-ca-file=%s/%s", peerCertMountPath, tlsCAFile),
+		)
+		if tls.peerCertAuth {
+			args = append(args, "--peer-client-cert-auth")
+		}
+	}
+
+	return args
 }
 
 func RemoveStringFromSlice(s []string, str string) []string {
@@ -113,8 +291,8 @@ func getArgName(s string) string {
 	return strings.TrimSpace(s)
 }
 
-func createArgs(name string, etcdOptions []string) []string {
-	defaultArgs := defaultArgs(name)
+func createArgs(name string, etcdOptions []string, tls tlsArgs) []string {
+	defaultArgs := defaultArgs(name, tls)
 	if len(etcdOptions) > 0 {
 		var argName string
 		// Remove default arguments if conflicts with user supplied
@@ -145,7 +323,7 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 			{
 				Name:    "etcd",
 				Command: []string{"/usr/local/bin/etcd"},
-				Args:    createArgs(ec.Name, ec.Spec.EtcdOptions),
+				Args:    createArgs(ec.Name, ec.Spec.EtcdOptions, tlsArgsFor(ec)),
 				Image:   fmt.Sprintf("%s:%s", ec.Spec.ImageRegistry, ec.Spec.Version),
 				Env: []corev1.EnvVar{
 					{
@@ -188,27 +366,44 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 		},
 	}
 
-	// mount server and peer certificate secret to each pods of the statefulset via PodSpec
+	// Mount the server and peer certificate secrets per surface, independently: the
+	// server (client-surface) secret iff the client surface is configured, the peer
+	// secret iff the peer surface is configured. A single-surface cluster only mounts
+	// the secret it needs. VolumeMounts are appended (not assigned) so they coexist
+	// with the storage data-dir mount added later.
 	var certVolume []corev1.Volume
-	serverCertName := getServerCertName(ec.Name)
-	peerCertName := getPeerCertName(ec.Name)
-	if ec.Spec.TLS != nil {
-		serverCertVolume := corev1.Volume{
-			Name: "server-secret",
+	var certMounts []corev1.VolumeMount
+	if clientTLSEnabled(ec) {
+		certVolume = append(certVolume, corev1.Volume{
+			Name: serverCertVolumeName,
 			VolumeSource: corev1.VolumeSource{
-				Secret: &corev1.SecretVolumeSource{SecretName: serverCertName},
+				Secret: &corev1.SecretVolumeSource{SecretName: getServerCertName(ec.Name)},
 			},
-		}
-		peerCertVolume := corev1.Volume{
-			Name: "peer-secret",
+		})
+		certMounts = append(certMounts, corev1.VolumeMount{
+			Name:      serverCertVolumeName,
+			MountPath: serverCertMountPath,
+			ReadOnly:  true,
+		})
+	}
+	if peerTLSEnabled(ec) {
+		certVolume = append(certVolume, corev1.Volume{
+			Name: peerCertVolumeName,
 			VolumeSource: corev1.VolumeSource{
-				Secret: &corev1.SecretVolumeSource{SecretName: peerCertName},
+				Secret: &corev1.SecretVolumeSource{SecretName: getPeerCertName(ec.Name)},
 			},
-		}
-		certVolume = append(certVolume, serverCertVolume, peerCertVolume)
+		})
+		certMounts = append(certMounts, corev1.VolumeMount{
+			Name:      peerCertVolumeName,
+			MountPath: peerCertMountPath,
+			ReadOnly:  true,
+		})
 	}
 	if len(certVolume) != 0 {
 		podSpec.Volumes = certVolume
+	}
+	if len(certMounts) != 0 {
+		podSpec.Containers[0].VolumeMounts = append(podSpec.Containers[0].VolumeMounts, certMounts...)
 	}
 
 	// Prepare pod template metadata
@@ -254,11 +449,15 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 
 	if ec.Spec.StorageSpec != nil {
 
-		stsSpec.Template.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{
-			Name:        volumeName,
-			MountPath:   etcdDataDir,
-			SubPathExpr: "$(POD_NAME)",
-		}}
+		// Append the storage data-dir mount so it coexists with any TLS cert mounts
+		// added above (assigning here would clobber them).
+		stsSpec.Template.Spec.Containers[0].VolumeMounts = append(
+			stsSpec.Template.Spec.Containers[0].VolumeMounts,
+			corev1.VolumeMount{
+				Name:        volumeName,
+				MountPath:   etcdDataDir,
+				SubPathExpr: "$(POD_NAME)",
+			})
 		// Create a new volume claim template
 		if ec.Spec.StorageSpec.VolumeSizeRequest.Cmp(resource.MustParse("1Mi")) < 0 {
 			return fmt.Errorf("VolumeSizeRequest must be at least 1Mi")
@@ -424,8 +623,8 @@ func configMapNameForEtcdCluster(ec *ecv1alpha1.EtcdCluster) string {
 
 func peerEndpointForOrdinalIndex(ec *ecv1alpha1.EtcdCluster, index int) (string, string) {
 	name := fmt.Sprintf("%s-%d", ec.Name, index)
-	return name, fmt.Sprintf("http://%s-%d.%s.%s.svc.cluster.local:2380",
-		ec.Name, index, ec.Name, ec.Namespace)
+	return name, fmt.Sprintf("%s://%s-%d.%s.%s.svc.cluster.local:2380",
+		peerScheme(ec), ec.Name, index, ec.Name, ec.Namespace)
 }
 
 func newEtcdClusterState(ec *ecv1alpha1.EtcdCluster, replica int) *corev1.ConfigMap {
@@ -478,9 +677,12 @@ func applyEtcdClusterState(ctx context.Context, ec *ecv1alpha1.EtcdCluster, repl
 	return updateErr
 }
 
-func clientEndpointForOrdinalIndex(sts *appsv1.StatefulSet, index int) string {
-	return fmt.Sprintf("http://%s-%d.%s.%s.svc.cluster.local:2379",
-		sts.Name, index, sts.Name, sts.Namespace)
+// clientEndpointForOrdinalIndex builds the operator-facing client URL for one
+// member. scheme ("http"/"https") MUST be the client surface's scheme (clientScheme)
+// so the operator dials the same scheme etcd serves on its client port.
+func clientEndpointForOrdinalIndex(sts *appsv1.StatefulSet, index int, scheme string) string {
+	return fmt.Sprintf("%s://%s-%d.%s.%s.svc.cluster.local:2379",
+		scheme, sts.Name, index, sts.Name, sts.Namespace)
 }
 
 func getStatefulSet(ctx context.Context, c client.Client, name, namespace string) (*appsv1.StatefulSet, error) {
@@ -492,19 +694,21 @@ func getStatefulSet(ctx context.Context, c client.Client, name, namespace string
 	return sts, nil
 }
 
-func clientEndpointsFromStatefulsets(sts *appsv1.StatefulSet) []string {
+// clientEndpointsFromStatefulsets builds the operator's client endpoints. scheme
+// MUST be the client surface's scheme (clientScheme of the owning EtcdCluster).
+func clientEndpointsFromStatefulsets(sts *appsv1.StatefulSet, scheme string) []string {
 	var endpoints []string
 	replica := int(*sts.Spec.Replicas)
 	if replica > 0 {
 		for i := 0; i < replica; i++ {
-			endpoints = append(endpoints, clientEndpointForOrdinalIndex(sts, i))
+			endpoints = append(endpoints, clientEndpointForOrdinalIndex(sts, i, scheme))
 		}
 	}
 	return endpoints
 }
 
-func areAllMembersHealthy(sts *appsv1.StatefulSet, logger logr.Logger) (bool, error) {
-	_, health, err := healthCheck(sts, logger)
+func areAllMembersHealthy(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client, sts *appsv1.StatefulSet, logger logr.Logger) (bool, error) {
+	_, health, err := healthCheck(ctx, ec, c, sts, logger)
 	if err != nil {
 		return false, err
 	}
@@ -519,16 +723,23 @@ func areAllMembersHealthy(sts *appsv1.StatefulSet, logger logr.Logger) (bool, er
 
 // healthCheck returns a memberList and an error.
 // If any member (excluding not yet started or already removed member)
-// is unhealthy, the error won't be nil.
-func healthCheck(sts *appsv1.StatefulSet, lg klog.Logger) (*clientv3.MemberListResponse, []etcdutils.EpHealth, error) {
+// is unhealthy, the error won't be nil. The operator dials the client surface's
+// scheme and, when the client surface is configured, presents its client TLS
+// config; both derive from ec so the operator never mismatches what etcd serves.
+func healthCheck(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client, sts *appsv1.StatefulSet, lg klog.Logger) (*clientv3.MemberListResponse, []etcdutils.EpHealth, error) {
 	replica := int(*sts.Spec.Replicas)
 	if replica == 0 {
 		return nil, nil, nil
 	}
 
-	endpoints := clientEndpointsFromStatefulsets(sts)
+	tlsConfig, err := buildClientTLSConfig(ctx, ec, c)
+	if err != nil {
+		return nil, nil, err
+	}
 
-	memberlistResp, err := etcdutils.MemberList(endpoints)
+	endpoints := clientEndpointsFromStatefulsets(sts, clientScheme(ec))
+
+	memberlistResp, err := etcdutils.MemberList(endpoints, tlsConfig)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -544,7 +755,7 @@ func healthCheck(sts *appsv1.StatefulSet, lg klog.Logger) (*clientv3.MemberListR
 	lg.Info("health checking", "replica", replica, "len(members)", memberCnt)
 	endpoints = endpoints[:cnt]
 
-	healthInfos, err := etcdutils.ClusterHealth(endpoints)
+	healthInfos, err := etcdutils.ClusterHealth(endpoints, tlsConfig)
 	if err != nil {
 		return memberlistResp, nil, err
 	}
@@ -590,8 +801,8 @@ func parseValidityDuration(customizedDuration string, defaultDuration time.Durat
 	return duration, nil
 }
 
-func createCMCertificateConfig(ec *ecv1alpha1.EtcdCluster) (*certInterface.Config, error) {
-	cmConfig := ec.Spec.TLS.ProviderCfg.CertManagerCfg
+func createCMCertificateConfig(ec *ecv1alpha1.EtcdCluster, surface *ecv1alpha1.TLSSurface) (*certInterface.Config, error) {
+	cmConfig := surface.ProviderCfg.CertManagerCfg
 	if cmConfig == nil {
 		return nil, fmt.Errorf("cert-manager configuration is not present")
 	}
@@ -626,15 +837,16 @@ func createCMCertificateConfig(ec *ecv1alpha1.EtcdCluster) (*certInterface.Confi
 		ValidityDuration: duration,
 		AltNames:         getAltNames,
 		ExtraConfig: map[string]any{
-			"issuerName": cmConfig.IssuerName,
-			"issuerKind": cmConfig.IssuerKind,
+			"issuerName":  cmConfig.IssuerName,
+			"issuerKind":  cmConfig.IssuerKind,
+			"issuerGroup": cmConfig.IssuerGroup,
 		},
 	}
 	return config, nil
 }
 
-func createAutoCertificateConfig(ec *ecv1alpha1.EtcdCluster) (*certInterface.Config, error) {
-	autoConfig := ec.Spec.TLS.ProviderCfg.AutoCfg
+func createAutoCertificateConfig(ec *ecv1alpha1.EtcdCluster, surface *ecv1alpha1.TLSSurface) (*certInterface.Config, error) {
+	autoConfig := surface.ProviderCfg.AutoCfg
 	// Set default values for auto configuration if not present
 	if autoConfig == nil {
 		autoConfig = &ecv1alpha1.ProviderAutoConfig{
@@ -678,9 +890,14 @@ func createAutoCertificateConfig(ec *ecv1alpha1.EtcdCluster) (*certInterface.Con
 	return config, nil
 }
 
-func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client.Client, certName string) error {
-	// The TLS field is present but spec is empty
-	providerName := ec.Spec.TLS.Provider
+// createCertificate provisions the certificate named certName from a SPECIFIC TLS
+// surface (peer or client). The surface carries its own provider and provider
+// config, so peer and client certs can flow through different issuers.
+func createCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client, surface *ecv1alpha1.TLSSurface, certName string) error {
+	logger := log.FromContext(ctx)
+
+	// An empty provider on the surface defaults to the auto provider.
+	providerName := surface.Provider
 	if providerName == "" {
 		providerName = string(certificate.Auto)
 	}
@@ -693,12 +910,12 @@ func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client
 	_, getCertError := cert.GetCertificateConfig(ctx, client.ObjectKey{Name: certName, Namespace: ec.Namespace})
 	if getCertError != nil {
 		if k8serrors.IsNotFound(getCertError) {
-			log.Printf("Creating certificate: %s for etcd-operator: %s\n", certName, ec.Name)
+			logger.Info("Creating certificate", "certificate", certName, "etcdCluster", ec.Name)
 			secretKey := client.ObjectKey{Name: certName, Namespace: ec.Namespace}
 
 			switch certificate.ProviderType(providerName) {
 			case certificate.Auto:
-				autoConfig, err := createAutoCertificateConfig(ec)
+				autoConfig, err := createAutoCertificateConfig(ec, surface)
 				if err != nil {
 					return fmt.Errorf("error creating auto certificate config: %w", err)
 				}
@@ -708,7 +925,7 @@ func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client
 				}
 				return nil
 			case certificate.CertManager:
-				cmConfig, err := createCMCertificateConfig(ec)
+				cmConfig, err := createCMCertificateConfig(ec, surface)
 				if err != nil {
 					return fmt.Errorf("error creating cert-manager certificate config: %w", err)
 				}
@@ -719,7 +936,7 @@ func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client
 				return nil
 			default: // This should never happen
 				// TODO: Use AuthProvider, since both AutoCfg and CertManagerCfg is not present
-				log.Printf("Error creating certificate, valid certificate provider not defined.")
+				logger.Info("Error creating certificate, valid certificate provider not defined", "certificate", certName)
 				return nil
 			}
 		} else {
@@ -730,9 +947,11 @@ func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client
 	return nil
 }
 
+// createClientCertificate provisions the operator's own client identity from the
+// CLIENT surface. The operator authenticates to etcd's client port as a client.
 func createClientCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client) error {
 	certName := getClientCertName(ec.Name)
-	err := createCertificate(ec, ctx, c, certName)
+	err := createCertificate(ctx, ec, c, ec.Spec.TLS.Client, certName)
 	if err != nil {
 		return err
 	}
@@ -743,9 +962,11 @@ func createClientCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c 
 	return err
 }
 
+// createServerCertificate provisions etcd's server (client-facing) identity from
+// the CLIENT surface.
 func createServerCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client) error {
 	serverCertName := getServerCertName(ec.Name)
-	err := createCertificate(ec, ctx, c, serverCertName)
+	err := createCertificate(ctx, ec, c, ec.Spec.TLS.Client, serverCertName)
 	if err != nil {
 		return err
 	}
@@ -756,9 +977,10 @@ func createServerCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c 
 	return nil
 }
 
+// createPeerCertificate provisions etcd's peer identity from the PEER surface.
 func createPeerCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client) error {
 	peerCertName := getPeerCertName(ec.Name)
-	err := createCertificate(ec, ctx, c, peerCertName)
+	err := createCertificate(ctx, ec, c, ec.Spec.TLS.Peer, peerCertName)
 	if err != nil {
 		return err
 	}
@@ -769,18 +991,69 @@ func createPeerCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c cl
 	return nil
 }
 
+// applyEtcdMemberCerts provisions per-surface member certs independently: the
+// server cert iff the client surface is configured, the peer cert iff the peer
+// surface is configured. (The operator's own client cert is provisioned separately
+// in fetchAndValidateState, also gated on the client surface.)
 func applyEtcdMemberCerts(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client) error {
-	if ec.Spec.TLS != nil {
-		err := createServerCertificate(ctx, ec, c)
-		if err != nil {
+	if clientTLSEnabled(ec) {
+		if err := createServerCertificate(ctx, ec, c); err != nil {
 			return err
 		}
-		err = createPeerCertificate(ctx, ec, c)
-		if err != nil {
+	}
+	if peerTLSEnabled(ec) {
+		if err := createPeerCertificate(ctx, ec, c); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// buildClientTLSConfig builds the operator's etcd-client *tls.Config from the
+// CLIENT surface's secret. It returns (nil, nil) when the client surface is not
+// configured, so the operator dials cleartext (byte-identical to the pre-TLS path).
+// When configured it loads the operator client keypair and pins the server's CA;
+// a missing ca.crt is an explicit error (rather than silently falling through to
+// the system trust store, which would verify against the wrong roots and fail
+// opaquely later).
+func buildClientTLSConfig(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client) (*tls.Config, error) {
+	if !clientTLSEnabled(ec) {
+		return nil, nil
+	}
+
+	secretName := getClientCertName(ec.Name)
+	secret := &corev1.Secret{}
+	if err := c.Get(ctx, client.ObjectKey{Name: secretName, Namespace: ec.Namespace}, secret); err != nil {
+		return nil, fmt.Errorf("failed to get operator client TLS secret %s/%s: %w", ec.Namespace, secretName, err)
+	}
+
+	certPEM, ok := secret.Data[tlsCertFile]
+	if !ok || len(certPEM) == 0 {
+		return nil, fmt.Errorf("operator client TLS secret %s/%s missing %q", ec.Namespace, secretName, tlsCertFile)
+	}
+	keyPEM, ok := secret.Data[tlsKeyFile]
+	if !ok || len(keyPEM) == 0 {
+		return nil, fmt.Errorf("operator client TLS secret %s/%s missing %q", ec.Namespace, secretName, tlsKeyFile)
+	}
+	keyPair, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build operator client keypair from secret %s/%s: %w", ec.Namespace, secretName, err)
+	}
+
+	caPEM, ok := secret.Data[tlsCAFile]
+	if !ok || len(caPEM) == 0 {
+		return nil, fmt.Errorf("operator client TLS secret %s/%s missing %q (cannot verify the etcd server)", ec.Namespace, secretName, tlsCAFile)
+	}
+	caPool := x509.NewCertPool()
+	if !caPool.AppendCertsFromPEM(caPEM) {
+		return nil, fmt.Errorf("operator client TLS secret %s/%s has an unparseable %q", ec.Namespace, secretName, tlsCAFile)
+	}
+
+	return &tls.Config{
+		Certificates: []tls.Certificate{keyPair},
+		RootCAs:      caPool,
+		MinVersion:   tls.VersionTLS12,
+	}, nil
 }
 
 func patchCertificateSecret(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client, certSecretName string) error {
@@ -789,7 +1062,7 @@ func patchCertificateSecret(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c c
 		return err
 	}
 
-	log.Printf("Setting ownerReference for certificate secret: %s", certSecretName)
+	log.FromContext(ctx).Info("Setting ownerReference for certificate secret", "secret", certSecretName)
 	if err := controllerutil.SetControllerReference(ec, getCertSecret, c.Scheme()); err != nil {
 		return err
 	}

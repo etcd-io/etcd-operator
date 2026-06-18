@@ -71,7 +71,6 @@ type Config struct {
 	Organization     []string
 	AltNames         AltNames
 	ValidityDuration time.Duration
-	CABundleSecret   string
 
 	// ExtraConfig contains provider specific configurations.
 	ExtraConfig map[string]any
