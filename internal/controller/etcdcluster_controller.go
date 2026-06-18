@@ -60,6 +60,7 @@ type reconcileState struct {
 	sts            *appsv1.StatefulSet          // associated StatefulSet for the cluster
 	memberListResp *clientv3.MemberListResponse // member list fetched from the etcd cluster
 	memberHealth   []etcdutils.EpHealth         // health information for each etcd member
+	tls            tlsReadiness                 // verdict on the cluster's TLS surfaces (drives the TLSReady condition)
 }
 
 // +kubebuilder:rbac:groups=operator.etcd.io,resources=etcdclusters,verbs=get;list;watch;create;update;patch;delete
@@ -137,8 +138,11 @@ func (r *EtcdClusterReconciler) fetchAndValidateState(ctx context.Context, req c
 	// an incoherent TLS spec by requeuing rather than silently proceeding into cert
 	// provisioning, which would otherwise fail deep with a less actionable error.
 	if errs := validateTLS(ec); len(errs) > 0 {
-		logger.Error(errs.ToAggregate(), "invalid TLS configuration; not reconciling until fixed",
+		agg := errs.ToAggregate()
+		logger.Error(agg, "invalid TLS configuration; not reconciling until fixed",
 			"etcdCluster", ec.Name)
+		r.Recorder.Eventf(ec, nil, corev1.EventTypeWarning, reasonClientCertificateError,
+			"ValidateTLS", "invalid TLS configuration: %v", agg)
 		return nil, ctrl.Result{RequeueAfter: requeueDuration}, nil
 	}
 
@@ -147,6 +151,8 @@ func (r *EtcdClusterReconciler) fetchAndValidateState(ctx context.Context, req c
 	if clientTLSEnabled(ec) {
 		if err := createClientCertificate(ctx, ec, r.Client); err != nil {
 			logger.Error(err, "Failed to create operator client certificate", "etcdCluster", ec.Name)
+			r.Recorder.Eventf(ec, nil, corev1.EventTypeWarning, reasonClientCertificateError,
+				"CreateClientCertificate", "failed to create operator client certificate: %v", err)
 		}
 	} else {
 		// Cleartext (no client surface) is a supported mode; log at Info, not Error,
@@ -154,6 +160,14 @@ func (r *EtcdClusterReconciler) fetchAndValidateState(ctx context.Context, req c
 		logger.Info("client TLS surface not configured; operator dials etcd in cleartext (not recommended for production)",
 			"etcdCluster", ec.Name)
 	}
+
+	// Evaluate the configured TLS surfaces (Recorder-free verdict), emit any failure
+	// Event at this controller boundary, and stash the verdict for the TLSReady
+	// condition. This is the single place the runtime peer-CA / issuer / client-cert
+	// checks are surfaced as Events; the verdict itself is computed without the
+	// Recorder so the util/status helpers stay upstream-clean.
+	tlsState := evaluateTLSReadiness(ctx, ec, r.Client)
+	r.recordTLSEvent(ec, tlsState)
 
 	logger.Info("Reconciling EtcdCluster", "spec", ec.Spec)
 
@@ -176,7 +190,7 @@ func (r *EtcdClusterReconciler) fetchAndValidateState(ctx context.Context, req c
 		// If the version to be reconciled is unsupported, throw an error.
 		if len(sts.Spec.Template.Spec.Containers) == 0 {
 			logger.Error(err, "StatefulSet has no containers yet")
-			return &reconcileState{cluster: ec, sts: sts}, ctrl.Result{}, nil
+			return &reconcileState{cluster: ec, sts: sts, tls: tlsState}, ctrl.Result{}, nil
 		}
 		stsImage := sts.Spec.Template.Spec.Containers[0].Image
 		// Note: createOrPatchStatefulSet() only supports the "registry-path:image" format.
@@ -186,7 +200,7 @@ func (r *EtcdClusterReconciler) fetchAndValidateState(ctx context.Context, req c
 		if idx == -1 {
 			logger.Error(err, "could not extract image version from StatefulSet image",
 				"image", stsImage)
-			return &reconcileState{cluster: ec, sts: sts}, ctrl.Result{}, nil
+			return &reconcileState{cluster: ec, sts: sts, tls: tlsState}, ctrl.Result{}, nil
 		}
 		currentVersion := stsImage[idx+1:]
 		targetVersion := ec.Spec.Version
@@ -204,7 +218,7 @@ func (r *EtcdClusterReconciler) fetchAndValidateState(ctx context.Context, req c
 					"target", targetVersion,
 					"error", err,
 				)
-				return &reconcileState{cluster: ec, sts: sts}, ctrl.Result{}, nil
+				return &reconcileState{cluster: ec, sts: sts, tls: tlsState}, ctrl.Result{}, nil
 			} else {
 				if err != nil {
 					logger.Error(err, "unsupported upgrade path between current and target versions",
@@ -220,7 +234,7 @@ func (r *EtcdClusterReconciler) fetchAndValidateState(ctx context.Context, req c
 		}
 	}
 
-	return &reconcileState{cluster: ec, sts: sts}, ctrl.Result{}, nil
+	return &reconcileState{cluster: ec, sts: sts, tls: tlsState}, ctrl.Result{}, nil
 }
 
 // bootstrapStatefulSet ensures that the foundational Kubernetes objects for
@@ -293,6 +307,8 @@ func (r *EtcdClusterReconciler) reconcileClusterState(ctx context.Context, s *re
 	// is cleartext) and derive client endpoints from the client surface's scheme.
 	clientTLSConfig, err := buildClientTLSConfig(ctx, s.cluster, r.Client)
 	if err != nil {
+		r.Recorder.Eventf(s.cluster, nil, corev1.EventTypeWarning, reasonClientCertificateError,
+			"BuildClientTLSConfig", "failed to build operator client TLS config: %v", err)
 		return ctrl.Result{}, err
 	}
 	cScheme := clientScheme(s.cluster)
@@ -585,6 +601,37 @@ func (r *EtcdClusterReconciler) updateConditions(s *reconcileState) {
 	meta.SetStatusCondition(&s.cluster.Status.Conditions, availableCondition)
 	meta.SetStatusCondition(&s.cluster.Status.Conditions, progressingCondition)
 	meta.SetStatusCondition(&s.cluster.Status.Conditions, degradedCondition)
+
+	// TLSReady reflects the health of the configured TLS surfaces. When no surface
+	// is configured (TLSNotConfigured) the condition is omitted entirely -- no TLS,
+	// no TLS condition -- and any stale prior condition is removed so flipping a
+	// cluster back to cleartext doesn't leave a dangling TLSReady.
+	if s.tls.configured {
+		meta.SetStatusCondition(&s.cluster.Status.Conditions, s.tls.condition(s.cluster.Generation))
+	} else {
+		meta.RemoveStatusCondition(&s.cluster.Status.Conditions, tlsReadyConditionType)
+	}
+}
+
+// recordTLSEvent emits a CR Event reflecting the TLS verdict computed by
+// evaluateTLSReadiness. It is the controller boundary that turns the Recorder-free
+// verdict into a Kubernetes Event: a Warning (reason == the verdict reason) for any
+// failure, and a single Normal "TLSReady" only when a configured cluster transitions
+// INTO the ready state (so a steady-state healthy cluster doesn't emit a TLSReady
+// event every reconcile). The reason strings match the TLSReady condition reasons.
+func (r *EtcdClusterReconciler) recordTLSEvent(ec *ecv1alpha1.EtcdCluster, t tlsReadiness) {
+	if !t.configured {
+		return
+	}
+	if !t.ready {
+		r.Recorder.Eventf(ec, nil, corev1.EventTypeWarning, t.reason, "TLSReady", "%s", t.message)
+		return
+	}
+	// Ready: only emit on transition (the prior TLSReady condition was not already True).
+	prior := meta.FindStatusCondition(ec.Status.Conditions, tlsReadyConditionType)
+	if prior == nil || prior.Status != metav1.ConditionTrue {
+		r.Recorder.Eventf(ec, nil, corev1.EventTypeNormal, reasonTLSReady, "TLSReady", "%s", t.message)
+	}
 }
 
 // isCertManagerCRDPresent checks if cert-manager CRDs are installed in the cluster
