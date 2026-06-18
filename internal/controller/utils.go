@@ -590,6 +590,19 @@ func createHeadlessServiceIfNotExist(ctx context.Context, logger logr.Logger, c 
 				Spec: corev1.ServiceSpec{
 					ClusterIP: "None", // Key for headless service
 					Selector:  labels,
+					// PublishNotReadyAddresses makes the headless service publish A
+					// records for pods that are not yet Ready. This is REQUIRED for a
+					// peer-TLS cluster to form: with --peer-client-cert-auth, etcd
+					// verifies a joining peer's source IP against its cert SANs via
+					// isHostInDNS (client/pkg transport), which forward-resolves the
+					// cluster's DNS name. A joining member is not Ready until it has
+					// joined, so without this its IP is absent from the service's A
+					// record, the peer cert SAN check fails ("does not match any of
+					// DNSNames"), the peer handshake is rejected, and the member
+					// crashloops -- deadlocking the cluster at one member. (Cleartext
+					// peer traffic does not hit this path, so the pre-TLS behaviour is
+					// unchanged for non-TLS clusters.)
+					PublishNotReadyAddresses: true,
 				},
 			}
 

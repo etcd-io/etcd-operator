@@ -170,6 +170,10 @@ func TestCreateHeadlessServiceIfNotExist(t *testing.T) {
 		err = fakeClient.Get(ctx, client.ObjectKey{Name: "test-etcd", Namespace: "default"}, service)
 		assert.NoError(t, err)
 		assert.Equal(t, "None", service.Spec.ClusterIP)
+		// Required for peer-TLS cluster formation: a joining (not-yet-Ready) member
+		// must be resolvable so etcd's peer cert SAN check (isHostInDNS) accepts it.
+		assert.True(t, service.Spec.PublishNotReadyAddresses,
+			"headless service must publish not-ready addresses so peer-TLS members can join")
 		assert.Equal(t, map[string]string{
 			"app":        "test-etcd",
 			"controller": "test-etcd",
