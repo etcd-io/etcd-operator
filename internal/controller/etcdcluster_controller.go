@@ -141,6 +141,9 @@ func (r *EtcdClusterReconciler) fetchAndValidateState(ctx context.Context, req c
 		agg := errs.ToAggregate()
 		logger.Error(agg, "invalid TLS configuration; not reconciling until fixed",
 			"etcdCluster", ec.Name)
+		// Reuses the ClientCertificateError reason: this path predates evaluateTLSReadiness
+		// (the spec is too malformed to evaluate surfaces), so there is no per-surface verdict
+		// reason to emit; the aggregated CEL message in the note carries the specifics.
 		r.Recorder.Eventf(ec, nil, corev1.EventTypeWarning, reasonClientCertificateError,
 			"ValidateTLS", "invalid TLS configuration: %v", agg)
 		return nil, ctrl.Result{RequeueAfter: requeueDuration}, nil
