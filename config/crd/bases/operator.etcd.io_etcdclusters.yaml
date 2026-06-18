@@ -3,7 +3,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.20.1
+    controller-gen.kubebuilder.io/version: v0.21.0
   name: etcdclusters.operator.etcd.io
 spec:
   group: operator.etcd.io
@@ -1332,6 +1332,43 @@ spec:
                   This reflects the .status.readyReplicas of the underlying StatefulSet.
                 format: int32
                 type: integer
+              recovery:
+                description: |-
+                  Recovery captures the state of an in-progress (or last attempted) automatic
+                  disaster recovery from quorum loss. It is managed entirely by the operator's
+                  quorum-loss recovery state machine and is nil when no recovery has ever been
+                  attempted.
+                properties:
+                  detectedTime:
+                    description: |-
+                      DetectedTime is the first time a sustained-quorum-loss candidate was
+                      observed. It anchors the grace window used to distinguish true quorum loss
+                      from transient single-member failures.
+                    format: date-time
+                    type: string
+                  lastTransitionTime:
+                    description: LastTransitionTime is the time the recovery phase
+                      last changed.
+                    format: date-time
+                    type: string
+                  message:
+                    description: Message is a human-readable description of the current
+                      recovery step.
+                    type: string
+                  phase:
+                    description: Phase is the current stage of the recovery state
+                      machine.
+                    type: string
+                  survivorOrdinal:
+                    description: |-
+                      SurvivorOrdinal is the StatefulSet pod ordinal whose data directory was
+                      chosen as the surviving source of truth for the rebuild. It is always 0
+                      today (the operator keeps ordinal-0's PVC) but is recorded explicitly so
+                      the choice is auditable and future survivor-selection policies remain
+                      backward compatible.
+                    format: int32
+                    type: integer
+                type: object
             type: object
         type: object
     served: true

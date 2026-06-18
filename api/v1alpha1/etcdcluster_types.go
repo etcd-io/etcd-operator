@@ -185,6 +185,65 @@ type EtcdClusterStatus struct {
 	// +listType=map
 	// +listMapKey=type
 	Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type"`
+
+	// Recovery captures the state of an in-progress (or last attempted) automatic
+	// disaster recovery from quorum loss. It is managed entirely by the operator's
+	// quorum-loss recovery state machine and is nil when no recovery has ever been
+	// attempted.
+	// +optional
+	Recovery *RecoveryStatus `json:"recovery,omitempty"`
+}
+
+// RecoveryPhase enumerates the stages of the automatic quorum-loss recovery
+// state machine. The phases form a strict, idempotent progression so that the
+// controller can resume recovery safely after a restart or a transient error.
+type RecoveryPhase string
+
+const (
+	// RecoveryPhaseDetecting means the controller has observed a candidate
+	// quorum-loss event but has not yet confirmed it is sustained (it may still
+	// be a transient blip that self-heals before the grace window elapses).
+	RecoveryPhaseDetecting RecoveryPhase = "Detecting"
+	// RecoveryPhaseRebuilding means sustained quorum loss was confirmed and the
+	// controller is rebuilding a single-member cluster from a surviving member
+	// using --force-new-cluster.
+	RecoveryPhaseRebuilding RecoveryPhase = "Rebuilding"
+	// RecoveryPhaseScalingOut means the single-member cluster is healthy again
+	// and the controller is re-adding the remaining members one at a time via
+	// the normal learner-add path.
+	RecoveryPhaseScalingOut RecoveryPhase = "ScalingOut"
+	// RecoveryPhaseCompleted means the cluster was restored to its desired size
+	// and quorum.
+	RecoveryPhaseCompleted RecoveryPhase = "Completed"
+)
+
+// RecoveryStatus records the progress of the quorum-loss recovery state machine.
+type RecoveryStatus struct {
+	// Phase is the current stage of the recovery state machine.
+	// +optional
+	Phase RecoveryPhase `json:"phase,omitempty"`
+
+	// SurvivorOrdinal is the StatefulSet pod ordinal whose data directory was
+	// chosen as the surviving source of truth for the rebuild. It is always 0
+	// today (the operator keeps ordinal-0's PVC) but is recorded explicitly so
+	// the choice is auditable and future survivor-selection policies remain
+	// backward compatible.
+	// +optional
+	SurvivorOrdinal int32 `json:"survivorOrdinal,omitempty"`
+
+	// DetectedTime is the first time a sustained-quorum-loss candidate was
+	// observed. It anchors the grace window used to distinguish true quorum loss
+	// from transient single-member failures.
+	// +optional
+	DetectedTime *metav1.Time `json:"detectedTime,omitempty"`
+
+	// LastTransitionTime is the time the recovery phase last changed.
+	// +optional
+	LastTransitionTime *metav1.Time `json:"lastTransitionTime,omitempty"`
+
+	// Message is a human-readable description of the current recovery step.
+	// +optional
+	Message string `json:"message,omitempty"`
 }
 
 // MemberStatus defines the observed state of a single etcd member.

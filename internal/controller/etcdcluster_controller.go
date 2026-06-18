@@ -105,8 +105,25 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return res, err
 	}
 
-	if err = r.performHealthChecks(ctx, state); err != nil {
-		return ctrl.Result{}, err
+	healthErr := r.performHealthChecks(ctx, state)
+
+	// Quorum-loss recovery gate. A failed health check on a multi-member cluster
+	// can mean the cluster has permanently lost quorum (a majority of members are
+	// gone) and cannot self-heal. maybeRecoverQuorum inspects the observed member
+	// health, and — only on sustained, true quorum loss — drives an idempotent
+	// disaster-recovery state machine (rebuild-from-survivor + re-add members).
+	// While it owns the reconcile (handled=true) we requeue and skip normal
+	// scaling so the two paths never fight. See quorum_recovery.go.
+	if handled, requeueAfter, recErr := r.maybeRecoverQuorum(ctx, state, state.memberHealth, healthErr); handled || recErr != nil {
+		return ctrl.Result{RequeueAfter: requeueAfter}, recErr
+	}
+
+	// During recovery scale-out the recovery state machine delegates membership
+	// re-adds to reconcileClusterState below; a transient per-member health error
+	// (e.g. a freshly added learner not yet caught up) must NOT short-circuit that
+	// path, or recovery would stall. Outside recovery, a health error is fatal.
+	if healthErr != nil && !recoveryActive(state.cluster) {
+		return ctrl.Result{}, healthErr
 	}
 
 	return r.reconcileClusterState(ctx, state)
