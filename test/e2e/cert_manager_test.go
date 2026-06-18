@@ -58,6 +58,10 @@ func TestCertManagerProvider(t *testing.T) {
 		ExtraConfig: map[string]any{
 			"issuerName": cmIssuerName,
 			"issuerKind": cmIssuerType,
+			// issuerGroup is optional; with no group set, cert-manager leaves
+			// IssuerRef.Group == "" and GetCertificateConfig echoes that back, so
+			// the expected ExtraConfig must include the empty key to DeepEqual-match.
+			"issuerGroup": "",
 		},
 	}
 
