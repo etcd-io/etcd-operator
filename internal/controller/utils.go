@@ -1029,6 +1029,11 @@ func applyEtcdMemberCerts(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c cli
 // a missing ca.crt is an explicit error (rather than silently falling through to
 // the system trust store, which would verify against the wrong roots and fail
 // opaquely later).
+//
+// No ServerName is set, so Go verifies the dialed pod FQDN against the server
+// cert's SANs. The default SANs cover the pod FQDNs; if a user supplies custom
+// AltNames they MUST still include *.{name}.{ns}.svc.cluster.local or every
+// operator health check fails verification.
 func buildClientTLSConfig(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client) (*tls.Config, error) {
 	if !clientTLSEnabled(ec) {
 		return nil, nil

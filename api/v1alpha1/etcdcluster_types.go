@@ -48,6 +48,11 @@ type EtcdClusterSpec struct {
 	// means that surface is served/dialed in cleartext. When TLS itself is nil, the
 	// entire cluster (peer + client + operator client) is cleartext, byte-identical
 	// to a TLS-free deployment.
+	//
+	// TLS is effectively create-time: it flows into the pod template and cert mounts.
+	// Toggling it on (or off) on a running cluster rolls the StatefulSet into a mixed
+	// http/https membership whose peers cannot connect, dropping quorum. The supported
+	// path is a NEW TLS cluster plus data migration, not an in-place flip.
 	TLS *EtcdClusterTLS `json:"tls,omitempty"`
 	// etcd configuration options are passed as command line arguments to the etcd container, refer to etcd documentation for configuration options applicable for the version of etcd being used.
 	EtcdOptions []string `json:"etcdOptions,omitempty"`
