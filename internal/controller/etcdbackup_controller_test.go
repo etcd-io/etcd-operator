@@ -251,6 +251,38 @@ func TestReconcile_HappyPath(t *testing.T) {
 	}
 }
 
+func TestReconcile_RetentionKeepsJustUploadedSnapshot(t *testing.T) {
+	// End-to-end: with RetainCount=1, after a successful snapshot the only
+	// surviving object must be the one this reconcile just uploaded — never an
+	// older pre-existing snapshot, and the new one must not be pruned.
+	cluster, sts := readyCluster()
+	backup := s3Backup("etcd-a")
+	backup.Spec.Retention = &ecv1alpha1.RetentionPolicy{RetainCount: 1}
+	store := newFakeStore("etcd/backups")
+
+	// Seed two older snapshots (clock advances per upload, so these predate the
+	// reconcile's upload).
+	for _, k := range []string{"etcd-a/backup-1-20200101T000000Z.db", "etcd-a/backup-1-20210101T000000Z.db"} {
+		_, err := store.Upload(context.Background(), k, readerOf("old"), -1)
+		require.NoError(t, err)
+	}
+
+	snap := &fakeSnapshotter{data: []byte("FRESH")}
+	r := newReconciler(t, store, snap, cluster, sts, backup)
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "backup-1", Namespace: "ns1"},
+	})
+	require.NoError(t, err)
+
+	require.Len(t, store.objects, 1, "RetainCount=1 keeps exactly one snapshot")
+	for k, v := range store.objects {
+		assert.Equal(t, []byte("FRESH"), v, "the surviving snapshot must be the just-uploaded one")
+		assert.NotContains(t, k, "20200101")
+		assert.NotContains(t, k, "20210101")
+	}
+}
+
 func TestReconcile_MissingClusterFails(t *testing.T) {
 	backup := s3Backup("absent")
 	store := newFakeStore("")

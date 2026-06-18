@@ -100,11 +100,26 @@ func (g *gcsStore) Upload(ctx context.Context, key string, r io.Reader, _ int64)
 }
 
 func (g *gcsStore) List(ctx context.Context, keyPrefix string) ([]ObjectInfo, error) {
-	infos, err := g.bucket.List(ctx, JoinKey(g.prefix, keyPrefix))
+	// Append a trailing slash so the prefix matches a directory boundary rather
+	// than a raw string prefix; otherwise listing "<prefix>/etcd-a" also matches
+	// "<prefix>/etcd-a-2" and retention would prune another cluster's snapshots.
+	// JoinKey trims trailing slashes, so the boundary is added here. An empty
+	// prefix lists the whole bucket and must stay empty.
+	listPrefix := JoinKey(g.prefix, keyPrefix)
+	if listPrefix != "" {
+		listPrefix += "/"
+	}
+	infos, err := g.bucket.List(ctx, listPrefix)
 	if err != nil {
 		return nil, err
 	}
-	sort.Slice(infos, func(i, j int) bool {
+	// Stable sort with a key tiebreaker so an equal LastModified can never
+	// non-deterministically order the just-uploaded snapshot last (and into the
+	// retention deletion set). Keys embed a sortable UTC timestamp.
+	sort.SliceStable(infos, func(i, j int) bool {
+		if infos[i].LastModified.Equal(infos[j].LastModified) {
+			return infos[i].Key > infos[j].Key
+		}
 		return infos[i].LastModified.After(infos[j].LastModified)
 	})
 	return infos, nil

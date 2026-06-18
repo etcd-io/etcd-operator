@@ -143,6 +143,47 @@ func TestS3Store_ListNewestFirst(t *testing.T) {
 	assert.True(t, infos[0].LastModified.After(infos[2].LastModified))
 }
 
+func TestS3Store_ListPrefixIsDirectoryBoundary(t *testing.T) {
+	// Two clusters whose names share a string prefix ("etcd-a" is a prefix of
+	// "etcd-a-2") live under the same destination prefix. Listing one cluster's
+	// snapshots must not return the other's, or retention would delete a live
+	// cluster's valid backups.
+	api := newFakeS3()
+	store := newTestS3Store(api, "etcd/backups")
+	for _, k := range []string{"etcd-a/1.db", "etcd-a/2.db", "etcd-a-2/1.db"} {
+		_, err := store.Upload(context.Background(), k, strings.NewReader(k), -1)
+		require.NoError(t, err)
+	}
+
+	infos, err := store.List(context.Background(), "etcd-a")
+	require.NoError(t, err)
+	require.Len(t, infos, 2, "only etcd-a/* must be listed, not etcd-a-2/*")
+	for _, info := range infos {
+		assert.True(t, strings.HasPrefix(info.Key, "etcd/backups/etcd-a/"),
+			"unexpected key crossed the directory boundary: %s", info.Key)
+	}
+}
+
+func TestS3Store_ListStableOnEqualModTimes(t *testing.T) {
+	// When several objects share an identical LastModified (S3's 1s
+	// granularity), the order must be deterministic (key descending) so the
+	// newest key is first and never falls into a retention deletion set.
+	api := newFakeS3()
+	store := newTestS3Store(api, "p")
+	tied := time.Unix(2000, 0)
+	for _, k := range []string{"c/a-20260617T000001Z.db", "c/a-20260617T000003Z.db", "c/a-20260617T000002Z.db"} {
+		api.objects["p/"+k] = []byte(k)
+		api.modTimes["p/"+k] = tied
+	}
+
+	infos, err := store.List(context.Background(), "c")
+	require.NoError(t, err)
+	require.Len(t, infos, 3)
+	// Newest timestamp (…000003Z) sorts first by key on the modtime tie.
+	assert.Equal(t, "p/c/a-20260617T000003Z.db", infos[0].Key)
+	assert.Equal(t, "p/c/a-20260617T000001Z.db", infos[2].Key)
+}
+
 func TestS3Store_Delete(t *testing.T) {
 	api := newFakeS3()
 	store := newTestS3Store(api, "p")

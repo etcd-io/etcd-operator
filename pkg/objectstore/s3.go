@@ -129,7 +129,16 @@ func (s *s3Store) Upload(ctx context.Context, key string, r io.Reader, _ int64) 
 }
 
 func (s *s3Store) List(ctx context.Context, keyPrefix string) ([]ObjectInfo, error) {
-	return s.listExact(ctx, JoinKey(s.prefix, keyPrefix))
+	// Append a trailing slash so the prefix matches a directory boundary rather
+	// than a raw string prefix. Without it, listing "etcd/backups/etcd-a" also
+	// returns (and retention would delete) objects under "etcd/backups/etcd-a-2".
+	// JoinKey trims trailing slashes, so the boundary is added here after the
+	// join. An empty prefix lists the whole bucket and must stay empty.
+	fullPrefix := JoinKey(s.prefix, keyPrefix)
+	if fullPrefix != "" {
+		fullPrefix += "/"
+	}
+	return s.listExact(ctx, fullPrefix)
 }
 
 func (s *s3Store) listExact(ctx context.Context, fullPrefix string) ([]ObjectInfo, error) {
@@ -160,8 +169,15 @@ func (s *s3Store) listExact(ctx context.Context, fullPrefix string) ([]ObjectInf
 		token = resp.NextContinuationToken
 	}
 
-	// Most-recent first so callers can apply retention trivially.
-	sort.Slice(out, func(i, j int) bool {
+	// Most-recent first so callers can apply retention trivially. S3
+	// LastModified has one-second granularity, so a stable sort with a
+	// deterministic tiebreaker on the key (which embeds a sortable UTC
+	// timestamp) is required; otherwise retention could non-deterministically
+	// delete the just-uploaded snapshot when its modtime ties an older one.
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].LastModified.Equal(out[j].LastModified) {
+			return out[i].Key > out[j].Key
+		}
 		return out[i].LastModified.After(out[j].LastModified)
 	})
 	return out, nil
