@@ -121,6 +121,8 @@ func ensureClusterCAIssuer(ctx context.Context, t *testing.T, cfg *envconf.Confi
 	}
 }
 
+// createIfAbsent gets obj by name/ns and returns if it already exists, otherwise
+// creates it, retrying past the transient cert-manager webhook errors below.
 func createIfAbsent(ctx context.Context, t *testing.T, cfg *envconf.Config, obj k8s.Object, name, ns string) {
 	t.Helper()
 	r := cfg.Client().Resources()
