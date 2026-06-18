@@ -60,8 +60,12 @@ const (
 	// or ClusterIssuer that does not exist (or is the wrong kind).
 	reasonIssuerNotFound = "IssuerNotFound"
 	// reasonPeerCANotShared indicates the peer surface uses a non-CA / self-signed
-	// *leaf* issuer that cannot establish shared peer trust, so members cannot
-	// mutually verify and the cluster would silently cap at one member.
+	// *leaf* issuer that cannot establish shared peer trust by chain verification.
+	// This is a conservative WARNING, not a hard cap: the operator mounts ONE shared
+	// peer secret (getPeerCertName) into every pod, so even a self-signed leaf is in
+	// every member's --peer-trusted-ca-file and a multi-member quorum still forms.
+	// We still flag it because that arrangement breaks the moment peer certs are
+	// rotated per-member or the secret stops being shared.
 	reasonPeerCANotShared = "PeerCANotShared"
 	// reasonClientServerCAMismatch indicates the operator's client CA does not
 	// match the CA that signs the etcd server cert.
