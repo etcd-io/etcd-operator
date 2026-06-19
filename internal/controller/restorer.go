@@ -180,6 +180,28 @@ func (e *execRestorer) Restore(ctx context.Context, params RestoreParams, r io.R
 	return cr.n, nil
 }
 
+// writerBuffer is a tiny bounded buffer used to capture exec stderr for error
+// messages without pulling in bytes.Buffer's full surface; it caps growth so a
+// chatty member cannot balloon operator memory.
+type writerBuffer struct {
+	b []byte
+}
+
+const maxStderrCapture = 4 << 10 // 4 KiB
+
+func (w *writerBuffer) Write(p []byte) (int, error) {
+	if len(w.b) < maxStderrCapture {
+		room := maxStderrCapture - len(w.b)
+		if room > len(p) {
+			room = len(p)
+		}
+		w.b = append(w.b, p[:room]...)
+	}
+	return len(p), nil
+}
+
+func (w *writerBuffer) String() string { return string(w.b) }
+
 // countingReader counts bytes read from the wrapped reader. It is the read-side
 // analogue of countingWriter (snapshotter.go).
 type countingReader struct {

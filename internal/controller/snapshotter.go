@@ -20,19 +20,19 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"time"
 
-	corev1 "k8s.io/api/core/v1"
+	"go.uber.org/zap"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/remotecommand"
+
+	"go.etcd.io/etcd/client/pkg/v3/logutil"
+	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 // Snapshotter abstracts "produce an etcd snapshot stream from a running
 // member". It exists as an interface so the backup controller's
 // snapshot+upload orchestration can be unit-tested with a fake that returns
-// canned bytes, with no Kubernetes exec or live etcd required.
+// canned bytes, with no live etcd required.
 type Snapshotter interface {
 	// Snapshot writes a consistent point-in-time etcd snapshot of the cluster
 	// reachable via pod to w. It returns the number of bytes written.
@@ -42,80 +42,87 @@ type Snapshotter interface {
 	Snapshot(ctx context.Context, pod types.NamespacedName, w io.Writer) (int64, error)
 }
 
-// execSnapshotter implements Snapshotter by running `etcdctl snapshot save` in
-// a member pod via the Kubernetes exec subresource and streaming the resulting
-// file's bytes back over stdout. The snapshot is written to the member pod's
-// own /tmp, not the operator's disk; the operator pipes the streamed bytes
-// straight into the object-store uploader.
-type execSnapshotter struct {
-	cfg           *rest.Config
-	containerName string
-	// command builds the in-pod command. Parameterized so TLS-enabled clusters
-	// can inject cert flags without changing the streaming logic.
-	command func() []string
+// clientSnapshotter implements Snapshotter using the etcd v3 Maintenance
+// Snapshot API directly from the operator process, with no in-pod exec.
+//
+// This is deliberately NOT exec-based: the etcd images the operator deploys
+// (e.g. gcr.io/etcd-development/etcd:v3.6.x) are distroless and ship no shell
+// or coreutils, so `kubectl exec -- sh -c "etcdctl snapshot save ... | cat"`
+// fails with `exec: "sh": executable file not found in $PATH`. The Maintenance
+// API streams the snapshot over the client port the operator can already reach
+// in-cluster, so it works regardless of what binaries the member image carries.
+type clientSnapshotter struct {
+	// endpointForPod resolves the etcd client URL for the target member pod.
+	// Parameterized so tests can point it at a local listener and so TLS/port
+	// specifics can evolve without touching the streaming logic.
+	endpointForPod func(pod types.NamespacedName) string
+	// dialTimeout bounds establishing the client connection.
+	dialTimeout time.Duration
 }
 
-// newExecSnapshotter constructs an execSnapshotter. etcdctl writes the snapshot
-// to a temp file (not stdout), so the command redirects etcdctl's own
-// diagnostics to fd 2 (the exec Stderr stream) and then cats the snapshot bytes
-// to stdout. Keeping etcdctl's stderr means a failure (TLS, no endpoint, etc.)
-// surfaces in the controller's error message instead of being swallowed.
-func newExecSnapshotter(cfg *rest.Config, containerName string) *execSnapshotter {
-	return &execSnapshotter{
-		cfg:           cfg,
-		containerName: containerName,
-		command: func() []string {
-			// ETCDCTL_API=3 is the default on etcd 3.4+, but set it explicitly
-			// for older images. Endpoints default to the local member.
-			// `1>&2` sends etcdctl's progress/error output to stderr so it is
-			// captured for diagnostics; only the cat'd snapshot bytes reach
-			// stdout. `&&` short-circuits so a save failure produces no bytes
-			// (the controller then reports the captured stderr).
-			return []string{
-				"sh", "-c",
-				"ETCDCTL_API=3 etcdctl snapshot save /tmp/snapshot.db 1>&2 && cat /tmp/snapshot.db && rm -f /tmp/snapshot.db",
-			}
-		},
+// newClientSnapshotter constructs the default, shell-free Snapshotter backed by
+// the etcd v3 Maintenance Snapshot API.
+func newClientSnapshotter() *clientSnapshotter {
+	return &clientSnapshotter{
+		endpointForPod: clientURLForMemberPod,
+		dialTimeout:    10 * time.Second,
 	}
 }
 
-func (e *execSnapshotter) Snapshot(ctx context.Context, pod types.NamespacedName, w io.Writer) (int64, error) {
-	clientset, err := kubernetes.NewForConfig(e.cfg)
+// clientURLForMemberPod returns the in-cluster client URL of a member pod.
+// StatefulSet pods are named <cluster>-<ordinal> and addressable through the
+// cluster's headless Service (named after the cluster) at
+// <pod>.<cluster>.<namespace>.svc.cluster.local:2379, which is exactly the
+// --advertise-client-urls the member is started with (see utils.go).
+func clientURLForMemberPod(pod types.NamespacedName) string {
+	cluster := clusterNameFromPod(pod.Name)
+	return fmt.Sprintf("http://%s.%s.%s.svc.cluster.local:2379",
+		pod.Name, cluster, pod.Namespace)
+}
+
+// clusterNameFromPod strips the trailing -<ordinal> from a StatefulSet pod name
+// to recover the cluster (and headless Service) name.
+func clusterNameFromPod(podName string) string {
+	for i := len(podName) - 1; i >= 0; i-- {
+		if podName[i] == '-' {
+			return podName[:i]
+		}
+		if podName[i] < '0' || podName[i] > '9' {
+			break
+		}
+	}
+	return podName
+}
+
+func (s *clientSnapshotter) Snapshot(ctx context.Context, pod types.NamespacedName, w io.Writer) (int64, error) {
+	lg, err := logutil.CreateDefaultZapLogger(zap.WarnLevel)
 	if err != nil {
-		return 0, fmt.Errorf("snapshotter: build clientset: %w", err)
+		lg = zap.NewNop()
 	}
 
-	req := clientset.CoreV1().RESTClient().
-		Post().
-		Resource("pods").
-		Name(pod.Name).
-		Namespace(pod.Namespace).
-		SubResource("exec").
-		VersionedParams(&corev1.PodExecOptions{
-			Container: e.containerName,
-			Command:   e.command(),
-			Stdin:     false,
-			Stdout:    true,
-			Stderr:    true,
-			TTY:       false,
-		}, scheme.ParameterCodec)
-
-	exec, err := remotecommand.NewSPDYExecutor(e.cfg, "POST", req.URL())
+	cli, err := clientv3.New(clientv3.Config{
+		Endpoints:   []string{s.endpointForPod(pod)},
+		DialTimeout: s.dialTimeout,
+		Context:     ctx,
+		Logger:      lg,
+	})
 	if err != nil {
-		return 0, fmt.Errorf("snapshotter: new executor: %w", err)
+		return 0, fmt.Errorf("snapshotter: new etcd client for %s: %w", pod, err)
 	}
+	defer func() { _ = cli.Close() }()
+
+	rc, err := cli.Snapshot(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("snapshotter: open snapshot stream for %s: %w", pod, err)
+	}
+	defer func() { _ = rc.Close() }()
 
 	cw := &countingWriter{w: w}
-	var stderr writerBuffer
-	streamErr := exec.StreamWithContext(ctx, remotecommand.StreamOptions{
-		Stdout: cw,
-		Stderr: &stderr,
-	})
-	if streamErr != nil {
-		return cw.n, fmt.Errorf("snapshotter: exec stream failed: %w (stderr: %s)", streamErr, stderr.String())
+	if _, err := io.Copy(cw, rc); err != nil {
+		return cw.n, fmt.Errorf("snapshotter: stream snapshot from %s: %w", pod, err)
 	}
 	if cw.n == 0 {
-		return 0, fmt.Errorf("snapshotter: empty snapshot produced (stderr: %s)", stderr.String())
+		return 0, fmt.Errorf("snapshotter: empty snapshot produced for %s", pod)
 	}
 	return cw.n, nil
 }
@@ -131,25 +138,3 @@ func (c *countingWriter) Write(p []byte) (int, error) {
 	c.n += int64(n)
 	return n, err
 }
-
-// writerBuffer is a tiny bounded buffer used to capture exec stderr for error
-// messages without pulling in bytes.Buffer's full surface; it caps growth so a
-// chatty member cannot balloon operator memory.
-type writerBuffer struct {
-	b []byte
-}
-
-const maxStderrCapture = 4 << 10 // 4 KiB
-
-func (w *writerBuffer) Write(p []byte) (int, error) {
-	if len(w.b) < maxStderrCapture {
-		room := maxStderrCapture - len(w.b)
-		if room > len(p) {
-			room = len(p)
-		}
-		w.b = append(w.b, p[:room]...)
-	}
-	return len(p), nil
-}
-
-func (w *writerBuffer) String() string { return string(w.b) }

@@ -56,7 +56,9 @@ type EtcdBackupReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 
-	// RESTConfig is used to build the in-pod exec snapshotter at runtime.
+	// RESTConfig is retained for parity with the restore reconciler and any
+	// future in-pod tooling. The default snapshotter is client-API based and
+	// does not use it.
 	RESTConfig *rest.Config
 
 	// Snapshotter produces the snapshot stream. Defaults to an exec-based
@@ -313,11 +315,9 @@ func (r *EtcdBackupReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		r.NewStore = objectstore.New
 	}
 	if r.Snapshotter == nil {
-		cfg := r.RESTConfig
-		if cfg == nil {
-			cfg = mgr.GetConfig()
-		}
-		r.Snapshotter = newExecSnapshotter(cfg, backupContainerName)
+		// The default snapshotter talks to etcd over the client API (no in-pod
+		// exec), so it needs no rest.Config and works against distroless images.
+		r.Snapshotter = newClientSnapshotter()
 	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&ecv1alpha1.EtcdBackup{}).
