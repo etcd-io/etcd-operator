@@ -19,14 +19,20 @@ package e2e
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"io"
 	"os"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/e2e-framework/klient/wait"
 	"sigs.k8s.io/e2e-framework/klient/wait/conditions"
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
@@ -34,6 +40,21 @@ import (
 
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 )
+
+// Pinned MinIO/mc images. Using :latest makes the e2e's pass/fail depend on
+// whatever MinIO publishes that day (flag/alias semantics have churned
+// historically); a gated "optional" e2e would rot silently. Pin to known-good
+// RELEASE tags so the test is reproducible.
+const (
+	minioImage = "quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z"
+	mcImage    = "quay.io/minio/mc:RELEASE.2025-04-16T18-13-26Z"
+)
+
+// backupSeedKeyCount is the number of keys seeded into the source cluster. A
+// single key is the weakest possible proof that a snapshot round-trips; seeding
+// a whole keyspace lets the restore side assert the *entire* dataset survives
+// (data-loss is the worst failure mode of a backup/restore feature).
+const backupSeedKeyCount = 50
 
 // TestEtcdBackupToS3 exercises the EtcdBackup snapshot+upload flow end-to-end
 // against an in-cluster MinIO (S3-compatible) bucket, so it requires NO real
@@ -48,9 +69,12 @@ import (
 //     mc pod.
 //  2. Create a creds Secret for the operator to read.
 //  3. Create a small EtcdCluster and wait for its StatefulSet ready, then seed
-//     a key so the snapshot has observable data.
+//     a distinctive keyspace so the snapshot has observable data.
 //  4. Create an EtcdBackup pointing at MinIO and wait for phase Completed,
-//     asserting the status fields (location, size, completion time).
+//     asserting the status fields (location, size, completion time) AND,
+//     independently of the controller's self-reported status, that the object
+//     actually exists in the bucket with the recorded size and is a valid etcd
+//     snapshot.
 func TestEtcdBackupToS3(t *testing.T) {
 	if os.Getenv("ETCD_E2E_BACKUP") != "true" {
 		t.Skip("set ETCD_E2E_BACKUP=true to run the object-storage backup e2e (provisions MinIO)")
@@ -74,11 +98,7 @@ func TestEtcdBackupToS3(t *testing.T) {
 		createBackupCredsSecret(ctx, t, cfg, credsSecret, accessKey, secretKey)
 		createBackupTestCluster(ctx, t, cfg, clusterName, 1)
 		waitStatefulSetReady(t, cfg, clusterName, 1)
-
-		if _, _, err := backupExecInPod(t, cfg, clusterName+"-0",
-			[]string{"etcdctl", "put", "backup-e2e-key", "backup-e2e-value"}); err != nil {
-			t.Fatalf("seed key: %v", err)
-		}
+		seedKeyspace(t, cfg, clusterName+"-0", backupSeedKeyCount)
 
 		backup := &ecv1alpha1.EtcdBackup{
 			ObjectMeta: metav1.ObjectMeta{Name: backupName, Namespace: namespace},
@@ -103,30 +123,12 @@ func TestEtcdBackupToS3(t *testing.T) {
 		return ctx
 	})
 
-	feature.Assess("backup reaches Completed", func(
+	feature.Assess("backup reaches Completed and object is really in the bucket", func(
 		ctx context.Context, t *testing.T, cfg *envconf.Config,
 	) context.Context {
-		err := wait.For(func(ctx context.Context) (bool, error) {
-			var got ecv1alpha1.EtcdBackup
-			if err := cfg.Client().Resources().Get(ctx, backupName, namespace, &got); err != nil {
-				return false, err
-			}
-			switch got.Status.Phase {
-			case ecv1alpha1.BackupPhaseCompleted:
-				return true, nil
-			case ecv1alpha1.BackupPhaseFailed:
-				t.Fatalf("backup failed: %+v", got.Status.Conditions)
-			}
-			return false, nil
-		}, wait.WithTimeout(3*time.Minute), wait.WithInterval(5*time.Second))
-		if err != nil {
-			t.Fatalf("waiting for backup completion: %v", err)
-		}
+		done := waitBackupCompleted(t, cfg, backupName)
 
-		var done ecv1alpha1.EtcdBackup
-		if err := cfg.Client().Resources().Get(ctx, backupName, namespace, &done); err != nil {
-			t.Fatalf("get completed backup: %v", err)
-		}
+		// (1) The controller's self-reported status must be coherent.
 		if done.Status.SnapshotSizeBytes <= 0 {
 			t.Errorf("expected positive snapshot size, got %d", done.Status.SnapshotSizeBytes)
 		}
@@ -136,7 +138,33 @@ func TestEtcdBackupToS3(t *testing.T) {
 		if done.Status.CompletionTime == nil {
 			t.Errorf("expected completion time to be set")
 		}
-		t.Logf("backup completed: location=%s size=%d", done.Status.SnapshotLocation, done.Status.SnapshotSizeBytes)
+
+		// (2) Independently verify the object is actually in object storage with
+		//     the recorded size. A controller that set the status fields without
+		//     uploading a byte would pass (1) but fail here.
+		objectKey := objectKeyFromLocation(t, done.Status.SnapshotLocation)
+		size := statMinIOObjectSize(t, cfg, minioName, bucket, objectKey, accessKey, secretKey)
+		if size != done.Status.SnapshotSizeBytes {
+			t.Errorf("bucket object size %d != status.SnapshotSizeBytes %d (key %q)",
+				size, done.Status.SnapshotSizeBytes, objectKey)
+		}
+
+		// (3) Sanity floor: a real etcd backend snapshot is a bbolt DB and is
+		//     never a handful of bytes. A tiny "successful" object would mean the
+		//     stream was truncated/empty even though the upload reported success.
+		if size < 16*1024 {
+			t.Errorf("snapshot object only %d bytes; too small to be a real etcd backend snapshot", size)
+		}
+
+		t.Logf("backup completed and verified: location=%s size=%d key=%s",
+			done.Status.SnapshotLocation, done.Status.SnapshotSizeBytes, objectKey)
+		return ctx
+	})
+
+	feature.Teardown(func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+		cleanupBackupWorkloads(ctx, t, cfg, minioName, credsSecret, []string{clusterName})
+		_ = cfg.Client().Resources().Delete(ctx, &ecv1alpha1.EtcdBackup{
+			ObjectMeta: metav1.ObjectMeta{Name: backupName, Namespace: namespace}})
 		return ctx
 	})
 
@@ -157,6 +185,27 @@ func backupExecInPod(t *testing.T, cfg *envconf.Config, podName string, command 
 	return stdout.String(), stderr.String(), err
 }
 
+// seedKeyspace writes backupSeedKeyCount deterministic key/value pairs into the
+// member via direct etcdctl exec (the etcd image ships etcdctl but no shell, so
+// each put is a separate argv exec). Values are content-addressable so the
+// restore side can assert exact round-trip, not mere presence.
+func seedKeyspace(t *testing.T, cfg *envconf.Config, podName string, count int) {
+	t.Helper()
+	for i := 0; i < count; i++ {
+		k, v := seedKV(i)
+		if _, stderr, err := backupExecInPod(t, cfg, podName,
+			[]string{"etcdctl", "put", k, v}); err != nil {
+			t.Fatalf("seed key %s: %v (stderr: %s)", k, err, stderr)
+		}
+	}
+}
+
+// seedKV is the single source of truth for the seeded keyspace so backup and
+// restore agree on exactly which keys/values must exist.
+func seedKV(i int) (string, string) {
+	return fmt.Sprintf("restore-e2e/k-%03d", i), fmt.Sprintf("val-%03d-payload", i)
+}
+
 func createBackupTestCluster(ctx context.Context, t *testing.T, cfg *envconf.Config, name string, size int) {
 	t.Helper()
 	cluster := &ecv1alpha1.EtcdCluster{
@@ -174,10 +223,13 @@ func waitStatefulSetReady(t *testing.T, cfg *envconf.Config, name string, replic
 	err := wait.For(func(ctx context.Context) (bool, error) {
 		var sts appsv1.StatefulSet
 		if err := cfg.Client().Resources().Get(ctx, name, namespace, &sts); err != nil {
-			return false, nil
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+			return false, err
 		}
 		return sts.Status.ReadyReplicas == replicas, nil
-	}, wait.WithTimeout(3*time.Minute), wait.WithInterval(5*time.Second))
+	}, wait.WithTimeout(3*time.Minute), wait.WithInterval(3*time.Second))
 	if err != nil {
 		t.Fatalf("statefulset %s not ready: %v", name, err)
 	}
@@ -213,7 +265,7 @@ func deployMinIO(ctx context.Context, t *testing.T, cfg *envconf.Config, name, a
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{{
 						Name:  "minio",
-						Image: "quay.io/minio/minio:latest",
+						Image: minioImage,
 						Args:  []string{"server", "/data", "--address", ":9000"},
 						Env: []corev1.EnvVar{
 							{Name: "MINIO_ROOT_USER", Value: accessKey},
@@ -240,10 +292,13 @@ func deployMinIO(ctx context.Context, t *testing.T, cfg *envconf.Config, name, a
 		t.Fatalf("create minio service: %v", err)
 	}
 
+	// Wait for Available, but fail fast (with logs) if the pod is wedged in a
+	// crash/pull-back-off rather than spinning until the deadline with no clue.
 	if err := wait.For(conditions.New(cfg.Client().Resources()).
 		DeploymentConditionMatch(deploy, appsv1.DeploymentAvailable, corev1.ConditionTrue),
-		wait.WithTimeout(2*time.Minute)); err != nil {
-		t.Fatalf("minio not available: %v", err)
+		wait.WithTimeout(2*time.Minute), wait.WithInterval(3*time.Second)); err != nil {
+		dumpPodTrouble(ctx, t, cfg, labels)
+		t.Fatalf("minio %q not available: %v", name, err)
 	}
 }
 
@@ -251,7 +306,9 @@ func createBucketPod(
 	ctx context.Context, t *testing.T, cfg *envconf.Config, minioName, bucket, accessKey, secretKey string,
 ) {
 	t.Helper()
-	podName := "mc-mkbucket"
+	// Name the bootstrap pod per-MinIO-instance so two backup/restore features in
+	// the shared namespace do not collide on a singleton "mc-mkbucket".
+	podName := "mc-mkbucket-" + minioName
 	script := "mc alias set m http://" + minioName + ":9000 " + accessKey + " " + secretKey +
 		" && mc mb --ignore-existing m/" + bucket
 	pod := &corev1.Pod{
@@ -260,21 +317,261 @@ func createBucketPod(
 			RestartPolicy: corev1.RestartPolicyOnFailure,
 			Containers: []corev1.Container{{
 				Name:    "mc",
-				Image:   "quay.io/minio/mc:latest",
+				Image:   mcImage,
+				Command: []string{"sh", "-c", script},
+			}},
+		},
+	}
+	_ = cfg.Client().Resources().Delete(ctx, pod) // tolerate a leftover from a killed run
+	if err := waitPodGone(ctx, cfg, podName); err != nil {
+		t.Fatalf("waiting for stale %s to clear: %v", podName, err)
+	}
+	if err := cfg.Client().Resources().Create(ctx, pod); err != nil {
+		t.Fatalf("create bucket-create pod: %v", err)
+	}
+	// Succeed OR fail loudly: a Failed pod (bad alias, MinIO down) must surface
+	// its logs immediately, not time out opaquely after two minutes.
+	if err := waitPodSucceeded(ctx, t, cfg, podName); err != nil {
+		t.Fatalf("bucket-create pod did not succeed: %v", err)
+	}
+}
+
+// --- object-storage verification (mc one-shot pods) -------------------------
+
+// objectKeyFromLocation extracts the bucket-relative object key from a snapshot
+// location URI like "s3://etcd-backups/e2e/etcd-backup-e2e/...snap.db". The key
+// is everything after the bucket segment.
+func objectKeyFromLocation(t *testing.T, location string) string {
+	t.Helper()
+	rest := location
+	if i := strings.Index(rest, "://"); i >= 0 {
+		rest = rest[i+3:]
+	}
+	// rest is now "<bucket>/<key...>"; drop the first path segment (the bucket).
+	if i := strings.Index(rest, "/"); i >= 0 {
+		return rest[i+1:]
+	}
+	t.Fatalf("cannot parse object key from snapshot location %q", location)
+	return ""
+}
+
+// statMinIOObjectSize runs a one-shot mc pod to `mc stat` the object and returns
+// its size in bytes, failing the test if the object is absent. This is the
+// independent "is it really in the bucket?" check the status fields cannot give.
+func statMinIOObjectSize(
+	t *testing.T, cfg *envconf.Config, minioName, bucket, key, accessKey, secretKey string,
+) int64 {
+	t.Helper()
+	// `mc stat --json` emits a JSON line with a "size" field. Parse just that.
+	script := "mc alias set m http://" + minioName + ":9000 " + accessKey + " " + secretKey +
+		" >/dev/null && mc stat --json m/" + bucket + "/" + key
+	out := runMCJob(t, cfg, "mc-stat-"+minioName, script)
+	size, ok := jsonInt64Field(out, "size")
+	if !ok {
+		t.Fatalf("could not read object size for m/%s/%s; mc output: %s", bucket, key, out)
+	}
+	return size
+}
+
+// jsonInt64Field extracts an integer field from mc's --json output without a
+// full JSON parser dependency: finds `"<field>":<number>`.
+func jsonInt64Field(jsonOut, field string) (int64, bool) {
+	needle := "\"" + field + "\":"
+	i := strings.Index(jsonOut, needle)
+	if i < 0 {
+		return 0, false
+	}
+	rest := jsonOut[i+len(needle):]
+	j := 0
+	for j < len(rest) && (rest[j] == ' ') {
+		j++
+	}
+	start := j
+	for j < len(rest) && rest[j] >= '0' && rest[j] <= '9' {
+		j++
+	}
+	if start == j {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(rest[start:j], 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+// runMCJob runs a one-shot mc pod with the given shell script and returns its
+// stdout (the pod logs), failing the test — with the pod's logs — if it does
+// not succeed.
+func runMCJob(t *testing.T, cfg *envconf.Config, podBase, script string) string {
+	t.Helper()
+	ctx := t.Context()
+	podName := podBase + "-" + strconv.FormatInt(time.Now().UnixNano()%100000, 10)
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: podName, Namespace: namespace},
+		Spec: corev1.PodSpec{
+			RestartPolicy: corev1.RestartPolicyNever,
+			Containers: []corev1.Container{{
+				Name:    "mc",
+				Image:   mcImage,
 				Command: []string{"sh", "-c", script},
 			}},
 		},
 	}
 	if err := cfg.Client().Resources().Create(ctx, pod); err != nil {
-		t.Fatalf("create bucket-create pod: %v", err)
+		t.Fatalf("create mc job pod %s: %v", podName, err)
 	}
-	if err := wait.For(func(ctx context.Context) (bool, error) {
+	defer func() { _ = cfg.Client().Resources().Delete(ctx, pod) }()
+	if err := waitPodSucceeded(ctx, t, cfg, podName); err != nil {
+		t.Fatalf("mc job %s did not succeed: %v", podName, err)
+	}
+	logs, err := podLogs(ctx, cfg, podName)
+	if err != nil {
+		t.Fatalf("read mc job logs %s: %v", podName, err)
+	}
+	return logs
+}
+
+// podLogs fetches a pod's first-container logs via the clientset (the e2e
+// framework's resource client does not expose a logs subresource).
+func podLogs(ctx context.Context, cfg *envconf.Config, podName string) (string, error) {
+	cs := kubernetes.NewForConfigOrDie(cfg.Client().RESTConfig())
+	rc, err := cs.CoreV1().Pods(namespace).GetLogs(podName, &corev1.PodLogOptions{}).Stream(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = rc.Close() }()
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, rc); err != nil {
+		return "", err
+	}
+	return buf.String(), nil
+}
+
+// --- pod-wait helpers that catch FAILURE, not just success -----------------
+
+func waitPodSucceeded(ctx context.Context, t *testing.T, cfg *envconf.Config, podName string) error {
+	t.Helper()
+	return wait.For(func(ctx context.Context) (bool, error) {
 		var p corev1.Pod
 		if err := cfg.Client().Resources().Get(ctx, podName, namespace, &p); err != nil {
-			return false, nil
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+			return false, err
 		}
-		return p.Status.Phase == corev1.PodSucceeded, nil
-	}, wait.WithTimeout(2*time.Minute), wait.WithInterval(3*time.Second)); err != nil {
-		t.Fatalf("bucket-create pod did not succeed: %v", err)
+		switch p.Status.Phase {
+		case corev1.PodSucceeded:
+			return true, nil
+		case corev1.PodFailed:
+			logs, _ := podLogs(ctx, cfg, podName)
+			return false, fmt.Errorf("pod %s entered Failed phase; logs:\n%s", podName, logs)
+		}
+		// Surface image-pull / crash-loop wedges instead of waiting blind.
+		if reason := badContainerReason(&p); reason != "" {
+			logs, _ := podLogs(ctx, cfg, podName)
+			return false, fmt.Errorf("pod %s stuck: %s; logs:\n%s", podName, reason, logs)
+		}
+		return false, nil
+	}, wait.WithTimeout(2*time.Minute), wait.WithInterval(2*time.Second))
+}
+
+// badContainerReason returns a non-empty reason if any container is wedged in a
+// known-fatal waiting/terminated state (CrashLoopBackOff, ImagePullBackOff,
+// ErrImagePull, etc.), so waiters fail fast with a diagnosis.
+func badContainerReason(p *corev1.Pod) string {
+	for _, cs := range p.Status.ContainerStatuses {
+		if w := cs.State.Waiting; w != nil {
+			switch w.Reason {
+			case "CrashLoopBackOff", "ImagePullBackOff", "ErrImagePull", "CreateContainerError",
+				"CreateContainerConfigError", "InvalidImageName":
+				return cs.Name + ": " + w.Reason + " (" + w.Message + ")"
+			}
+		}
+	}
+	return ""
+}
+
+func waitPodGone(ctx context.Context, cfg *envconf.Config, podName string) error {
+	return wait.For(func(ctx context.Context) (bool, error) {
+		var p corev1.Pod
+		err := cfg.Client().Resources().Get(ctx, podName, namespace, &p)
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, nil
+	}, wait.WithTimeout(1*time.Minute), wait.WithInterval(2*time.Second))
+}
+
+func dumpPodTrouble(ctx context.Context, t *testing.T, cfg *envconf.Config, labels map[string]string) {
+	t.Helper()
+	var pods corev1.PodList
+	if err := cfg.Client().Resources().List(ctx, &pods); err != nil {
+		return
+	}
+	for i := range pods.Items {
+		p := &pods.Items[i]
+		match := true
+		for k, v := range labels {
+			if p.Labels[k] != v {
+				match = false
+				break
+			}
+		}
+		if !match {
+			continue
+		}
+		if reason := badContainerReason(p); reason != "" || p.Status.Phase == corev1.PodPending {
+			logs, _ := podLogs(ctx, cfg, p.Name)
+			t.Logf("pod %s phase=%s reason=%q logs:\n%s", p.Name, p.Status.Phase, reason, logs)
+		}
+	}
+}
+
+// --- shared backup status wait + cleanup ------------------------------------
+
+// waitBackupCompleted blocks until the named EtcdBackup reaches Completed and
+// returns it, failing the test on a Failed phase or timeout. It never calls
+// t.Fatalf from inside the poll closure (that is racey from a poller goroutine);
+// it returns an error and fails the test from the calling goroutine instead.
+func waitBackupCompleted(t *testing.T, cfg *envconf.Config, name string) ecv1alpha1.EtcdBackup {
+	t.Helper()
+	err := wait.For(func(ctx context.Context) (bool, error) {
+		var got ecv1alpha1.EtcdBackup
+		if err := cfg.Client().Resources().Get(ctx, name, namespace, &got); err != nil {
+			return false, err
+		}
+		switch got.Status.Phase {
+		case ecv1alpha1.BackupPhaseCompleted:
+			return true, nil
+		case ecv1alpha1.BackupPhaseFailed:
+			return false, fmt.Errorf("backup %q failed: %+v", name, got.Status.Conditions)
+		}
+		return false, nil
+	}, wait.WithTimeout(3*time.Minute), wait.WithInterval(2*time.Second))
+	if err != nil {
+		t.Fatalf("waiting for backup %q completion: %v", name, err)
+	}
+	var done ecv1alpha1.EtcdBackup
+	if err := cfg.Client().Resources().Get(t.Context(), name, namespace, &done); err != nil {
+		t.Fatalf("get completed backup %q: %v", name, err)
+	}
+	return done
+}
+
+// cleanupBackupWorkloads best-effort deletes the MinIO deployment/service, the
+// bucket-bootstrap pod, the creds secret, and the named EtcdClusters so a
+// re-run (or a sibling feature in the shared namespace) starts clean.
+func cleanupBackupWorkloads(
+	ctx context.Context, t *testing.T, cfg *envconf.Config, minioName, credsSecret string, clusters []string,
+) {
+	t.Helper()
+	res := cfg.Client().Resources()
+	_ = res.Delete(ctx, &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: minioName, Namespace: namespace}})
+	_ = res.Delete(ctx, &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: minioName, Namespace: namespace}})
+	_ = res.Delete(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "mc-mkbucket-" + minioName, Namespace: namespace}})
+	_ = res.Delete(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: credsSecret, Namespace: namespace}})
+	for _, c := range clusters {
+		_ = res.Delete(ctx, &ecv1alpha1.EtcdCluster{ObjectMeta: metav1.ObjectMeta{Name: c, Namespace: namespace}})
 	}
 }
