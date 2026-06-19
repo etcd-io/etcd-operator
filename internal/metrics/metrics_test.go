@@ -39,6 +39,8 @@ func resetState() {
 	HasQuorum.Reset()
 	HasLeader.Reset()
 	TLSEnabled.Reset()
+	TLSReady.Reset()
+	ClusterAvailable.Reset()
 	LeaderChangesTotal.Reset()
 	ReconcileErrorsTotal.Reset()
 	ReconcileDurationSeconds.Reset()
@@ -172,6 +174,89 @@ func TestRecordClusterMetrics_LearnerHealthyVotingQuorate(t *testing.T) {
 	assertGauge(t, reg, "etcd_operator_cluster_has_quorum", 1, "ns1", "etcd-c2")
 }
 
+// withAvailable sets the cluster's Available condition to the given status.
+func withAvailable(c *ecv1alpha1.EtcdCluster, available bool) {
+	status := metav1.ConditionFalse
+	if available {
+		status = metav1.ConditionTrue
+	}
+	c.Status.Conditions = []metav1.Condition{{
+		Type:               "Available",
+		Status:             status,
+		Reason:             "Test",
+		LastTransitionTime: metav1.Now(),
+	}}
+}
+
+func TestRecordClusterMetrics_AvailableGauge(t *testing.T) {
+	reg := newRegistry(t)
+
+	c := newCluster("ns1", "etcd-av", 3)
+	c.Status.MemberCount = 3
+	c.Status.Members = []ecv1alpha1.MemberStatus{{ID: "1", IsHealthy: true}}
+
+	// No condition yet -> available is 0.
+	RecordClusterMetrics(c)
+	assertGauge(t, reg, "etcd_operator_cluster_available", 0, "ns1", "etcd-av")
+
+	// Available=True -> 1.
+	withAvailable(c, true)
+	RecordClusterMetrics(c)
+	assertGauge(t, reg, "etcd_operator_cluster_available", 1, "ns1", "etcd-av")
+
+	// Available=False -> back to 0.
+	withAvailable(c, false)
+	RecordClusterMetrics(c)
+	assertGauge(t, reg, "etcd_operator_cluster_available", 0, "ns1", "etcd-av")
+}
+
+func TestRecordClusterMetrics_TLSReadyOnlyForTLSClusters(t *testing.T) {
+	reg := newRegistry(t)
+
+	// Plaintext cluster: no tls_ready series should exist even when Available.
+	plain := newCluster("ns1", "etcd-plain", 3)
+	plain.Status.MemberCount = 3
+	withAvailable(plain, true)
+	RecordClusterMetrics(plain)
+	if got := readSample(t, reg, "etcd_operator_cluster_tls_ready", "ns1", "etcd-plain"); got != 0 {
+		t.Errorf("expected no tls_ready series for plaintext cluster, got %v", got)
+	}
+	assertGauge(t, reg, "etcd_operator_cluster_tls_enabled", 0, "ns1", "etcd-plain")
+
+	// TLS cluster, Available -> tls_ready=1.
+	tls := newCluster("ns1", "etcd-tls", 3)
+	tls.Spec.TLS = &ecv1alpha1.TLSCertificate{Provider: "auto"}
+	tls.Status.MemberCount = 3
+	withAvailable(tls, true)
+	RecordClusterMetrics(tls)
+	assertGauge(t, reg, "etcd_operator_cluster_tls_enabled", 1, "ns1", "etcd-tls")
+	assertGauge(t, reg, "etcd_operator_cluster_tls_ready", 1, "ns1", "etcd-tls")
+
+	// TLS cluster goes not-Available -> tls_ready=0 (the alertable state).
+	withAvailable(tls, false)
+	RecordClusterMetrics(tls)
+	assertGauge(t, reg, "etcd_operator_cluster_tls_ready", 0, "ns1", "etcd-tls")
+}
+
+func TestRecordClusterMetrics_TLSReadyClearedWhenTLSRemoved(t *testing.T) {
+	reg := newRegistry(t)
+
+	c := newCluster("ns1", "etcd-flip", 3)
+	c.Spec.TLS = &ecv1alpha1.TLSCertificate{Provider: "auto"}
+	c.Status.MemberCount = 3
+	withAvailable(c, true)
+	RecordClusterMetrics(c)
+	assertGauge(t, reg, "etcd_operator_cluster_tls_ready", 1, "ns1", "etcd-flip")
+
+	// TLS removed from spec: the tls_ready series must disappear so a "not ready"
+	// alert never fires on a cluster that no longer uses TLS.
+	c.Spec.TLS = nil
+	RecordClusterMetrics(c)
+	if got := readSample(t, reg, "etcd_operator_cluster_tls_ready", "ns1", "etcd-flip"); got != 0 {
+		t.Errorf("expected tls_ready series dropped after TLS removed, got %v", got)
+	}
+}
+
 func TestLeaderChangesCounter(t *testing.T) {
 	reg := newRegistry(t)
 	c := newCluster("ns1", "etcd-d", 3)
@@ -218,9 +303,11 @@ func TestDeleteClusterMetrics(t *testing.T) {
 	reg := newRegistry(t)
 
 	c := newCluster("ns1", "etcd-f", 1)
+	c.Spec.TLS = &ecv1alpha1.TLSCertificate{Provider: "auto"}
 	c.Status.MemberCount = 1
 	c.Status.LeaderID = "x"
 	c.Status.Members = []ecv1alpha1.MemberStatus{{ID: "1", IsHealthy: true}}
+	withAvailable(c, true)
 	RecordClusterMetrics(c)
 	ObserveReconcile("ns1", "etcd-f", 0.1, errors.New("e"))
 
@@ -232,7 +319,7 @@ func TestDeleteClusterMetrics(t *testing.T) {
 
 	for _, coll := range []prometheus.Collector{
 		MemberCount, MemberCountDesired, HasQuorum, HasLeader, TLSEnabled,
-		LeaderChangesTotal, ReconcileErrorsTotal,
+		TLSReady, ClusterAvailable, LeaderChangesTotal, ReconcileErrorsTotal,
 	} {
 		if got := testutil.CollectAndCount(coll); got != 0 {
 			t.Errorf("expected 0 series after delete, got %d", got)

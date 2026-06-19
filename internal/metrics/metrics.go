@@ -31,10 +31,16 @@ import (
 	"sync"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"k8s.io/apimachinery/pkg/api/meta"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 )
+
+// conditionTypeAvailable is the EtcdCluster status condition that reports
+// whether the cluster is ready to serve. It must match the Type set by the
+// controller's updateConditions.
+const conditionTypeAvailable = "Available"
 
 const (
 	subsystem = "etcd_operator_cluster"
@@ -101,6 +107,26 @@ var (
 		Help:      "Whether TLS is configured for the etcd cluster (1) or not (0).",
 	}, []string{labelNamespace, labelName})
 
+	// TLSReady is exported only for clusters that configure TLS. It is 1 when the
+	// cluster is both TLS-configured and Available (its TLS-secured data plane is
+	// serving), and 0 when TLS is configured but the cluster is not yet Available.
+	// Clusters without TLS produce no tls_ready series, so alerts can target
+	// "tls configured but not ready" without firing on plaintext clusters.
+	TLSReady = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Subsystem: subsystem,
+		Name:      "tls_ready",
+		Help:      "For TLS-configured clusters, whether the TLS-secured cluster is Available (1) or not (0). Absent for non-TLS clusters.",
+	}, []string{labelNamespace, labelName})
+
+	// ClusterAvailable mirrors the EtcdCluster "Available" status condition: 1
+	// when the condition is True, 0 otherwise. It is the operator's view of
+	// whether the cluster is ready to serve.
+	ClusterAvailable = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Subsystem: subsystem,
+		Name:      "available",
+		Help:      "Whether the EtcdCluster Available condition is True (1) or not (0).",
+	}, []string{labelNamespace, labelName})
+
 	// LeaderChangesTotal counts observed changes of the cluster leader ID.
 	LeaderChangesTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Subsystem: subsystem,
@@ -136,6 +162,8 @@ func allCollectors() []prometheus.Collector {
 		HasQuorum,
 		HasLeader,
 		TLSEnabled,
+		TLSReady,
+		ClusterAvailable,
 		LeaderChangesTotal,
 		ReconcileDurationSeconds,
 		ReconcileErrorsTotal,
@@ -239,7 +267,21 @@ func RecordClusterMetrics(cluster *ecv1alpha1.EtcdCluster) {
 	HasQuorum.WithLabelValues(ns, name).Set(boolToFloat(hasQuorum(voting, healthyVoting)))
 
 	HasLeader.WithLabelValues(ns, name).Set(boolToFloat(cluster.Status.LeaderID != ""))
-	TLSEnabled.WithLabelValues(ns, name).Set(boolToFloat(cluster.Spec.TLS != nil))
+
+	tlsEnabled := cluster.Spec.TLS != nil
+	TLSEnabled.WithLabelValues(ns, name).Set(boolToFloat(tlsEnabled))
+
+	available := meta.IsStatusConditionTrue(cluster.Status.Conditions, conditionTypeAvailable)
+	ClusterAvailable.WithLabelValues(ns, name).Set(boolToFloat(available))
+
+	// tls_ready only exists for TLS-configured clusters: it reflects whether the
+	// TLS-secured cluster is Available. For plaintext clusters we drop any prior
+	// series so alerts on "tls configured but not ready" never see them.
+	if tlsEnabled {
+		TLSReady.WithLabelValues(ns, name).Set(boolToFloat(available))
+	} else {
+		TLSReady.DeleteLabelValues(ns, name)
+	}
 
 	if tracker.observeLeader(ns, name, cluster.Status.LeaderID) {
 		LeaderChangesTotal.WithLabelValues(ns, name).Inc()
@@ -268,6 +310,8 @@ func DeleteClusterMetrics(namespace, name string) {
 	HasQuorum.DeleteLabelValues(lvs...)
 	HasLeader.DeleteLabelValues(lvs...)
 	TLSEnabled.DeleteLabelValues(lvs...)
+	TLSReady.DeleteLabelValues(lvs...)
+	ClusterAvailable.DeleteLabelValues(lvs...)
 	LeaderChangesTotal.DeleteLabelValues(lvs...)
 	ReconcileErrorsTotal.DeleteLabelValues(lvs...)
 	ReconcileDurationSeconds.DeleteLabelValues(lvs...)
