@@ -247,11 +247,6 @@ spec:
                   SnapshotLocation is the fully-qualified URI of the uploaded snapshot
                   (e.g. "s3://my-bucket/etcd/backup-...db" or "gs://my-bucket/...").
                 type: string
-              snapshotRevision:
-                description: SnapshotRevision is the etcd store revision captured
-                  by the snapshot, when known.
-                format: int64
-                type: integer
               snapshotSizeBytes:
                 description: SnapshotSizeBytes is the size of the uploaded snapshot
                   in bytes.

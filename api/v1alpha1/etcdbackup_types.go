@@ -174,10 +174,6 @@ type EtcdBackupStatus struct {
 	// +optional
 	SnapshotSizeBytes int64 `json:"snapshotSizeBytes,omitempty"`
 
-	// SnapshotRevision is the etcd store revision captured by the snapshot, when known.
-	// +optional
-	SnapshotRevision int64 `json:"snapshotRevision,omitempty"`
-
 	// CompletionTime is when the snapshot finished uploading successfully.
 	// +optional
 	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
