@@ -18,6 +18,7 @@ package objectstore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -27,6 +28,7 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
 func init() {
@@ -40,6 +42,9 @@ type s3API interface {
 	PutObject(
 		ctx context.Context, in *s3.PutObjectInput, optFns ...func(*s3.Options),
 	) (*s3.PutObjectOutput, error)
+	GetObject(
+		ctx context.Context, in *s3.GetObjectInput, optFns ...func(*s3.Options),
+	) (*s3.GetObjectOutput, error)
 	ListObjectsV2(
 		ctx context.Context, in *s3.ListObjectsV2Input, optFns ...func(*s3.Options),
 	) (*s3.ListObjectsV2Output, error)
@@ -126,6 +131,27 @@ func (s *s3Store) Upload(ctx context.Context, key string, r io.Reader, _ int64) 
 		URI:  fmt.Sprintf("s3://%s/%s", s.bucket, fullKey),
 		Size: size,
 	}, nil
+}
+
+// Download opens the object for streaming reads. Unlike Upload (which must spool
+// to a temp file because PutObject needs a known length), GetObject returns a
+// streaming body, so the snapshot is never staged on the operator's disk on the
+// read path. A NoSuchKey response is mapped to ErrNotFound so the restore
+// controller can report a terminal "snapshot not found" rather than retrying.
+func (s *s3Store) Download(ctx context.Context, key string) (io.ReadCloser, error) {
+	fullKey := JoinKey(s.prefix, key)
+	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(fullKey),
+	})
+	if err != nil {
+		var nsk *s3types.NoSuchKey
+		if errors.As(err, &nsk) {
+			return nil, fmt.Errorf("objectstore/s3: get %s: %w", fullKey, ErrNotFound)
+		}
+		return nil, fmt.Errorf("objectstore/s3: get %s: %w", fullKey, err)
+	}
+	return out.Body, nil
 }
 
 func (s *s3Store) List(ctx context.Context, keyPrefix string) ([]ObjectInfo, error) {

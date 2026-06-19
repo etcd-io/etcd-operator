@@ -23,7 +23,6 @@ import (
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
-	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -235,6 +234,10 @@ func (r *EtcdBackupReconciler) selectMemberPod(ctx context.Context, backup *ecv1
 func (r *EtcdBackupReconciler) buildStore(ctx context.Context, backup *ecv1alpha1.EtcdBackup) (objectstore.Store, error) {
 	dst := backup.Spec.Destination
 
+	if err := validateDestination(dst); err != nil {
+		return nil, err
+	}
+
 	osDst, err := toObjectStoreDestination(dst)
 	if err != nil {
 		return nil, err
@@ -253,31 +256,14 @@ func (r *EtcdBackupReconciler) buildStore(ctx context.Context, backup *ecv1alpha
 }
 
 // resolveCredentials reads the provider credentials from the referenced secret,
-// if any. With no secretRef the returned Credentials is empty and providers
-// fall back to ambient credentials (IRSA/Workload Identity).
+// if any, delegating to the shared, audit-logged resolver so the backup and
+// restore paths handle credentials identically (and never log their values).
+// With no secretRef the returned Credentials is empty and providers fall back
+// to ambient credentials (IRSA/Workload Identity).
 func (r *EtcdBackupReconciler) resolveCredentials(
 	ctx context.Context, namespace string, dst ecv1alpha1.BackupDestination,
 ) (objectstore.Credentials, error) {
-	var creds objectstore.Credentials
-	if dst.SecretRef == nil {
-		return creds, nil
-	}
-
-	var secret corev1.Secret
-	key := types.NamespacedName{Namespace: namespace, Name: dst.SecretRef.Name}
-	if err := r.Get(ctx, key, &secret); err != nil {
-		return creds, fmt.Errorf("get credentials secret %q: %w", dst.SecretRef.Name, err)
-	}
-
-	switch dst.Provider {
-	case ecv1alpha1.BackupProviderS3:
-		creds.AccessKeyID = string(secret.Data["accessKeyID"])
-		creds.SecretAccessKey = string(secret.Data["secretAccessKey"])
-		creds.SessionToken = string(secret.Data["sessionToken"])
-	case ecv1alpha1.BackupProviderGCS:
-		creds.ServiceAccountJSON = secret.Data["serviceAccountJSON"]
-	}
-	return creds, nil
+	return resolveStoreCredentials(ctx, r.Client, log.FromContext(ctx), namespace, dst)
 }
 
 // applyRetention deletes snapshots beyond the configured RetainCount under the

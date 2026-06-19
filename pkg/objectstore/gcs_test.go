@@ -19,11 +19,13 @@ package objectstore
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"strings"
 	"testing"
 	"time"
 
+	gcs "cloud.google.com/go/storage"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -60,6 +62,15 @@ func (w *fakeGCSWriter) Close() error {
 
 func (b *fakeGCSBucket) NewWriter(_ context.Context, key string) io.WriteCloser {
 	return &fakeGCSWriter{bucket: b, key: key}
+}
+
+func (b *fakeGCSBucket) NewReader(_ context.Context, key string) (io.ReadCloser, error) {
+	data, ok := b.objects[key]
+	if !ok {
+		// Mirror the real client: a missing object surfaces ErrObjectNotExist.
+		return nil, gcs.ErrObjectNotExist
+	}
+	return io.NopCloser(bytes.NewReader(data)), nil
 }
 
 func (b *fakeGCSBucket) Delete(_ context.Context, key string) error {
@@ -115,6 +126,28 @@ func TestGCSStore_Delete(t *testing.T) {
 	assert.Equal(t, 1, b.delCalls)
 	_, ok := b.objects["p/c/a.db"]
 	assert.False(t, ok)
+}
+
+func TestGCSStore_DownloadJoinsPrefixAndStreamsBody(t *testing.T) {
+	b := newFakeGCSBucket()
+	store := newTestGCSStore(b, "etcd")
+	_, err := store.Upload(context.Background(), "cluster/snap.db", strings.NewReader("payload"), -1)
+	require.NoError(t, err)
+
+	rc, err := store.Download(context.Background(), "cluster/snap.db")
+	require.NoError(t, err)
+	defer func() { _ = rc.Close() }()
+	got, err := io.ReadAll(rc)
+	require.NoError(t, err)
+	assert.Equal(t, "payload", string(got))
+}
+
+func TestGCSStore_DownloadMissingIsErrNotFound(t *testing.T) {
+	b := newFakeGCSBucket()
+	store := newTestGCSStore(b, "p")
+	_, err := store.Download(context.Background(), "c/absent.db")
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ErrNotFound), "missing object must map to ErrNotFound, got %v", err)
 }
 
 func TestGCSStore_Scheme(t *testing.T) {

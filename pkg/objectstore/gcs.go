@@ -36,6 +36,7 @@ func init() {
 // narrowed so the orchestration is testable with a fake (see gcs_test.go).
 type gcsBucketHandle interface {
 	NewWriter(ctx context.Context, key string) io.WriteCloser
+	NewReader(ctx context.Context, key string) (io.ReadCloser, error)
 	Delete(ctx context.Context, key string) error
 	List(ctx context.Context, prefix string) ([]ObjectInfo, error)
 }
@@ -99,6 +100,21 @@ func (g *gcsStore) Upload(ctx context.Context, key string, r io.Reader, _ int64)
 	}, nil
 }
 
+// Download opens the object for streaming reads. The GCS reader streams the
+// body, so the snapshot is never staged on the operator's disk on the read
+// path. A missing object is mapped to ErrNotFound for the restore controller.
+func (g *gcsStore) Download(ctx context.Context, key string) (io.ReadCloser, error) {
+	fullKey := JoinKey(g.prefix, key)
+	rc, err := g.bucket.NewReader(ctx, fullKey)
+	if err != nil {
+		if errors.Is(err, gcs.ErrObjectNotExist) {
+			return nil, fmt.Errorf("objectstore/gcs: get %s: %w", fullKey, ErrNotFound)
+		}
+		return nil, fmt.Errorf("objectstore/gcs: get %s: %w", fullKey, err)
+	}
+	return rc, nil
+}
+
 func (g *gcsStore) List(ctx context.Context, keyPrefix string) ([]ObjectInfo, error) {
 	// Append a trailing slash so the prefix matches a directory boundary rather
 	// than a raw string prefix; otherwise listing "<prefix>/etcd-a" also matches
@@ -136,6 +152,13 @@ type realGCSBucket struct {
 
 func (b *realGCSBucket) NewWriter(ctx context.Context, key string) io.WriteCloser {
 	return b.handle.Object(key).NewWriter(ctx)
+}
+
+func (b *realGCSBucket) NewReader(ctx context.Context, key string) (io.ReadCloser, error) {
+	// The concrete *storage.Reader surfaces storage.ErrObjectNotExist for a
+	// missing object; pass it through unwrapped so gcsStore.Download can map it
+	// to ErrNotFound.
+	return b.handle.Object(key).NewReader(ctx)
 }
 
 func (b *realGCSBucket) Delete(ctx context.Context, key string) error {

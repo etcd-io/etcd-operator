@@ -17,7 +17,9 @@ limitations under the License.
 package objectstore
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"io"
 	"strings"
 	"testing"
@@ -62,6 +64,18 @@ func (f *fakeS3) PutObject(
 	f.clock = f.clock.Add(time.Second)
 	f.modTimes[key] = f.clock
 	return &s3.PutObjectOutput{}, nil
+}
+
+func (f *fakeS3) GetObject(
+	_ context.Context, in *s3.GetObjectInput, _ ...func(*s3.Options),
+) (*s3.GetObjectOutput, error) {
+	key := aws.ToString(in.Key)
+	data, ok := f.objects[key]
+	if !ok {
+		// Mirror the real client: a missing object surfaces as *NoSuchKey.
+		return nil, &s3types.NoSuchKey{}
+	}
+	return &s3.GetObjectOutput{Body: io.NopCloser(bytes.NewReader(data))}, nil
 }
 
 func (f *fakeS3) ListObjectsV2(
@@ -193,4 +207,26 @@ func TestS3Store_Delete(t *testing.T) {
 	assert.Equal(t, 1, api.delCalls)
 	_, ok := api.objects["p/c/1.db"]
 	assert.False(t, ok)
+}
+
+func TestS3Store_DownloadJoinsPrefixAndStreamsBody(t *testing.T) {
+	api := newFakeS3()
+	store := newTestS3Store(api, "etcd/backups")
+	_, err := store.Upload(context.Background(), "cluster-a/snap.db", strings.NewReader("SNAPSHOT"), -1)
+	require.NoError(t, err)
+
+	rc, err := store.Download(context.Background(), "cluster-a/snap.db")
+	require.NoError(t, err)
+	defer func() { _ = rc.Close() }()
+	got, err := io.ReadAll(rc)
+	require.NoError(t, err)
+	assert.Equal(t, "SNAPSHOT", string(got))
+}
+
+func TestS3Store_DownloadMissingIsErrNotFound(t *testing.T) {
+	api := newFakeS3()
+	store := newTestS3Store(api, "p")
+	_, err := store.Download(context.Background(), "c/absent.db")
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ErrNotFound), "missing object must map to ErrNotFound, got %v", err)
 }

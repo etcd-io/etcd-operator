@@ -31,10 +31,17 @@ package objectstore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"time"
 )
+
+// ErrNotFound is returned by Download when the requested object does not exist.
+// Callers (e.g. the restore controller) use errors.Is to distinguish a missing
+// snapshot from a transport error so they can report an actionable, terminal
+// failure rather than retrying forever.
+var ErrNotFound = errors.New("objectstore: object not found")
 
 // Provider is the name of an object-storage backend. It mirrors the
 // v1alpha1.BackupProvider enum but is redeclared here so the package carries
@@ -101,6 +108,14 @@ type Store interface {
 	// the canonical URI and byte count. size may be -1 if unknown; providers
 	// that require a known length will buffer as needed.
 	Upload(ctx context.Context, key string, r io.Reader, size int64) (UploadResult, error)
+
+	// Download opens the object at key (joined with the destination Prefix) for
+	// reading. The caller owns the returned ReadCloser and must Close it. It is
+	// the read-side counterpart of Upload, used by the restore path to stream a
+	// snapshot back out of object storage. Implementations stream the body
+	// rather than buffering it, so an arbitrarily large snapshot stays bounded
+	// to the consumer's read buffer. A missing object surfaces as ErrNotFound.
+	Download(ctx context.Context, key string) (io.ReadCloser, error)
 
 	// List returns objects under the configured bucket/prefix whose key begins
 	// with keyPrefix (joined with the destination Prefix), most-recent first.

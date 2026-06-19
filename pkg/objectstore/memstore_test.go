@@ -17,6 +17,7 @@ limitations under the License.
 package objectstore
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -64,6 +65,17 @@ func (m *memStore) Upload(_ context.Context, key string, r io.Reader, _ int64) (
 		URI:  fmt.Sprintf("%s://%s", m.scheme, full),
 		Size: int64(len(data)),
 	}, nil
+}
+
+func (m *memStore) Download(_ context.Context, key string) (io.ReadCloser, error) {
+	full := JoinKey(m.prefix, key)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	data, ok := m.objects[full]
+	if !ok {
+		return nil, fmt.Errorf("memstore: download %q: %w", full, ErrNotFound)
+	}
+	return io.NopCloser(bytes.NewReader(data)), nil
 }
 
 func (m *memStore) List(_ context.Context, keyPrefix string) ([]ObjectInfo, error) {

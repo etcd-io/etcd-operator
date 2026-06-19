@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -74,13 +75,14 @@ func (f *fakeSnapshotter) Snapshot(ctx context.Context, pod types.NamespacedName
 
 // fakeStore is an in-memory objectstore.Store for controller tests.
 type fakeStore struct {
-	mu        sync.Mutex
-	prefix    string
-	objects   map[string][]byte
-	times     map[string]time.Time
-	clock     time.Time
-	uploadErr error
-	deleted   []string
+	mu          sync.Mutex
+	prefix      string
+	objects     map[string][]byte
+	times       map[string]time.Time
+	clock       time.Time
+	uploadErr   error
+	downloadErr error
+	deleted     []string
 }
 
 func newFakeStore(prefix string) *fakeStore {
@@ -109,6 +111,20 @@ func (s *fakeStore) Upload(_ context.Context, key string, r io.Reader, _ int64) 
 	s.clock = s.clock.Add(time.Second)
 	s.times[full] = s.clock
 	return objectstore.UploadResult{URI: "test://" + full, Size: int64(len(data))}, nil
+}
+
+func (s *fakeStore) Download(_ context.Context, key string) (io.ReadCloser, error) {
+	if s.downloadErr != nil {
+		return nil, s.downloadErr
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	full := s.key(key)
+	data, ok := s.objects[full]
+	if !ok {
+		return nil, fmt.Errorf("fakeStore: %q: %w", full, objectstore.ErrNotFound)
+	}
+	return io.NopCloser(bytes.NewReader(data)), nil
 }
 
 func (s *fakeStore) List(_ context.Context, keyPrefix string) ([]objectstore.ObjectInfo, error) {
