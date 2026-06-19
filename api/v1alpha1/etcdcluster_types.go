@@ -92,6 +92,17 @@ type PodMonitorSpec struct {
 	// Defaults to "client" when empty.
 	// +optional
 	Port string `json:"port,omitempty"`
+
+	// Labels are additional metadata labels to set on the generated
+	// PodMonitor. They are merged on top of the operator-managed labels
+	// (app.kubernetes.io/name, /managed-by, /instance): user-provided keys
+	// take precedence on conflict. This is typically used to satisfy a
+	// namespaced Prometheus's podMonitorSelector, e.g. setting
+	// "release: kvs-prometheus" so a release-scoped Prometheus discovers and
+	// scrapes this PodMonitor. When empty, only the operator-managed labels
+	// are applied (today's behavior).
+	// +optional
+	Labels map[string]string `json:"labels,omitempty"`
 }
 
 // MetricsEnabled reports whether per-cluster domain metrics should be exported

@@ -78,11 +78,13 @@ func (r *EtcdClusterReconciler) reconcilePodMonitor(ctx context.Context, ec *ecv
 
 	port := defaultPodMonitorPort
 	interval := ""
+	var userLabels map[string]string
 	if pm := ec.Spec.Metrics.PodMonitor; pm != nil {
 		if pm.Port != "" {
 			port = pm.Port
 		}
 		interval = pm.Interval
+		userLabels = pm.Labels
 	}
 
 	endpoint := map[string]any{
@@ -94,11 +96,18 @@ func (r *EtcdClusterReconciler) reconcilePodMonitor(ctx context.Context, ec *ecv
 	}
 
 	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, desired, func() error {
-		desired.SetLabels(map[string]string{
+		// Operator-managed labels first, then overlay any user-provided
+		// labels so spec.metrics.podMonitor.labels (e.g. release selectors)
+		// win on conflict while leaving the defaults intact when absent.
+		labels := map[string]string{
 			"app.kubernetes.io/name":       "etcd-operator",
 			"app.kubernetes.io/managed-by": "etcd-operator",
 			"app.kubernetes.io/instance":   ec.Name,
-		})
+		}
+		for k, v := range userLabels {
+			labels[k] = v
+		}
+		desired.SetLabels(labels)
 		spec := map[string]any{
 			"selector": map[string]any{
 				"matchLabels": map[string]any{

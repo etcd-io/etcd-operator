@@ -130,6 +130,53 @@ func TestReconcilePodMonitor_DefaultsPortWhenUnset(t *testing.T) {
 	assert.False(t, hasInterval, "interval should be omitted when unset")
 }
 
+// TestReconcilePodMonitor_AppliesCustomLabels asserts that user-provided
+// spec.metrics.podMonitor.labels are merged onto the generated PodMonitor's
+// metadata.labels (so a release-scoped Prometheus can select it) while the
+// operator-managed labels remain intact.
+func TestReconcilePodMonitor_AppliesCustomLabels(t *testing.T) {
+	scheme := podMonitorTestScheme()
+	ec := newMetricsCluster(true, "client", "30s")
+	ec.Spec.Metrics.PodMonitor.Labels = map[string]string{
+		"release": "kvs-prometheus",
+		"team":    "kv",
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ec).Build()
+	r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
+
+	r.reconcilePodMonitor(context.Background(), ec)
+
+	pm, err := getPodMonitor(context.Background(), fakeClient, ec)
+	require.NoError(t, err, "expected PodMonitor to be created")
+
+	labels := pm.GetLabels()
+	// User-provided labels are present (release selector + arbitrary label).
+	assert.Equal(t, "kvs-prometheus", labels["release"])
+	assert.Equal(t, "kv", labels["team"])
+	// Operator-managed labels are preserved.
+	assert.Equal(t, "etcd-operator", labels["app.kubernetes.io/name"])
+	assert.Equal(t, "etcd-operator", labels["app.kubernetes.io/managed-by"])
+	assert.Equal(t, ec.Name, labels["app.kubernetes.io/instance"])
+}
+
+// TestReconcilePodMonitor_CustomLabelsOverrideManaged asserts that a
+// user-provided label key wins over an operator-managed default on conflict.
+func TestReconcilePodMonitor_CustomLabelsOverrideManaged(t *testing.T) {
+	scheme := podMonitorTestScheme()
+	ec := newMetricsCluster(true, "client", "30s")
+	ec.Spec.Metrics.PodMonitor.Labels = map[string]string{
+		"app.kubernetes.io/name": "override",
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ec).Build()
+	r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
+
+	r.reconcilePodMonitor(context.Background(), ec)
+
+	pm, err := getPodMonitor(context.Background(), fakeClient, ec)
+	require.NoError(t, err)
+	assert.Equal(t, "override", pm.GetLabels()["app.kubernetes.io/name"])
+}
+
 // TestReconcilePodMonitor_CRDAbsentIsSoftSkip asserts that a missing PodMonitor
 // CRD (NoMatchError on the underlying Get) is treated as a soft skip: the
 // reconcile does not panic and creates nothing.
