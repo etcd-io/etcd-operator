@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -101,13 +102,32 @@ func TestQuorumLossRecovery(t *testing.T) {
 		},
 	)
 
-	feature.Assess("sentinel data survived the rebuild",
+	feature.Assess("rebuild flag cleared from StatefulSet after recovery",
 		func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-			got := readKey(t, c, fmt.Sprintf("%s-0", clusterName), sentinelKey)
-			if got != sentinelVal {
-				t.Fatalf("data lost during recovery: key %q = %q, want %q", sentinelKey, got, sentinelVal)
+			// The single most dangerous failure mode is leaving --force-new-cluster
+			// permanently on the StatefulSet: pod-0 would re-fork the cluster on its
+			// next restart. Once recovery is Completed, both the marker annotation
+			// and the flag MUST be gone.
+			assertForceNewClusterCleared(ctx, t, c, clusterName)
+			return ctx
+		},
+	)
+
+	feature.Assess("sentinel data survived the rebuild and replicated to a re-added member",
+		func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+			// Read from the survivor (proves the data survived the force-new-cluster
+			// bootstrap) AND from a member that was destroyed and re-added (proves the
+			// rebuilt cluster actually replicated to the rejoined member, rather than
+			// the test trivially reading back from the untouched survivor).
+			for _, ord := range []int{0, 1} {
+				pod := fmt.Sprintf("%s-%d", clusterName, ord)
+				got := readKey(t, c, pod, sentinelKey)
+				if got != sentinelVal {
+					t.Fatalf("data not present on %s after recovery: key %q = %q, want %q",
+						pod, sentinelKey, got, sentinelVal)
+				}
+				t.Logf("sentinel key intact on %s after recovery: %s=%s", pod, sentinelKey, got)
 			}
-			t.Logf("sentinel key intact after recovery: %s=%s", sentinelKey, got)
 			return ctx
 		},
 	)
@@ -141,6 +161,33 @@ func deleteMemberPVCAndPod(ctx context.Context, t *testing.T, c *envconf.Config,
 	if err := client.Resources().Delete(ctx, pod); err != nil {
 		t.Logf("deleting pod %s (best-effort): %v", podName, err)
 	}
+}
+
+// assertForceNewClusterCleared verifies the recovery left no residue on the
+// StatefulSet: neither the marker annotation nor the --force-new-cluster flag may
+// remain, or pod-0 would re-fork the cluster on its next restart.
+func assertForceNewClusterCleared(ctx context.Context, t *testing.T, c *envconf.Config, clusterName string) {
+	t.Helper()
+	// Mirror the controller's constants (not importable from the e2e package).
+	const (
+		forceNewClusterAnnotation = "operator.etcd.io/force-new-cluster"
+		forceNewClusterArg        = "--force-new-cluster"
+	)
+	var sts appsv1.StatefulSet
+	if err := c.Client().Resources().Get(ctx, clusterName, namespace, &sts); err != nil {
+		t.Fatalf("failed to get StatefulSet %s: %v", clusterName, err)
+	}
+	if _, ok := sts.Annotations[forceNewClusterAnnotation]; ok {
+		t.Fatalf("StatefulSet %s still carries the %s annotation after recovery", clusterName, forceNewClusterAnnotation)
+	}
+	for _, ct := range sts.Spec.Template.Spec.Containers {
+		for _, a := range ct.Args {
+			if a == forceNewClusterArg {
+				t.Fatalf("container %q still carries %s after recovery", ct.Name, forceNewClusterArg)
+			}
+		}
+	}
+	t.Logf("StatefulSet %s is clean: no force-new-cluster annotation or flag", clusterName)
 }
 
 // getEtcdCluster fetches the EtcdCluster CR.
