@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -29,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -129,6 +131,14 @@ func TestAssessQuorum(t *testing.T) {
 			desiredSize: 3,
 			health:      []etcdutils.EpHealth{member(1, true, false, 1), member(2, false, false, 0), member(3, false, false, 0)},
 			wantLost:    false,
+		},
+		{
+			// A learner answers health probes but cannot vote, so a surviving
+			// voter + healthy learner is NOT a quorum for a 3-node cluster.
+			name:        "3-node survivor voter + healthy learner, no leader => quorum LOST",
+			desiredSize: 3,
+			health:      []etcdutils.EpHealth{member(1, true, false, 0), member(2, true, true, 0), member(3, false, false, 0)},
+			wantLost:    true,
 		},
 	}
 
@@ -241,6 +251,13 @@ func TestMaybeRecoverQuorum_GracePeriod(t *testing.T) {
 		assert.True(t, stsHasForceNewCluster(&got))
 		assert.Contains(t, got.Spec.Template.Spec.Containers[0].Args, forceNewClusterArg)
 
+		// The state ConfigMap must be realigned to a single-member "new" bootstrap
+		// so pod-0's environment is consistent with --force-new-cluster.
+		var cm corev1.ConfigMap
+		require.NoError(t, r.Get(context.Background(), objKey("etcd-state", "default"), &cm))
+		assert.Equal(t, "new", cm.Data["ETCD_INITIAL_CLUSTER_STATE"])
+		assert.NotContains(t, cm.Data["ETCD_INITIAL_CLUSTER"], ",", "single-member initial cluster has no comma")
+
 		cond := meta.FindStatusCondition(ec.Status.Conditions, ConditionRecovering)
 		require.NotNil(t, cond)
 		assert.Equal(t, metav1.ConditionTrue, cond.Status)
@@ -293,16 +310,30 @@ func TestRecoveryScaleOut_CompletesAtDesiredSize(t *testing.T) {
 
 	t.Run("still degraded delegates to normal reconcile, stays ScalingOut", func(t *testing.T) {
 		s := &reconcileState{cluster: ec, sts: sts,
-			memberHealth: []etcdutils.EpHealth{member(1, true, false, 1)}} // only survivor
+			memberListResp: memberListResp(1),                               // member list is usable this loop
+			memberHealth:   []etcdutils.EpHealth{member(1, true, false, 1)}} // only survivor
 		handled, _, err := r.maybeRecoverQuorum(context.Background(), s, s.memberHealth, nil)
 		require.NoError(t, err)
 		assert.False(t, handled, "scale-out must delegate to reconcileClusterState")
 		assert.Equal(t, ecv1alpha1.RecoveryPhaseScalingOut, ec.Status.Recovery.Phase)
 	})
 
+	t.Run("unusable member list holds instead of delegating (no scale-down)", func(t *testing.T) {
+		// memberListResp nil and/or a member-list error must NOT delegate to
+		// reconcileClusterState, which would read memberCnt=0 and scale the STS
+		// down, reversing the rebuild. The state machine keeps the loop and requeues.
+		s := &reconcileState{cluster: ec, sts: sts,
+			memberHealth: []etcdutils.EpHealth{member(1, true, false, 1)}}
+		handled, requeue, err := r.maybeRecoverQuorum(context.Background(), s, s.memberHealth, errors.New("context deadline exceeded"))
+		require.NoError(t, err)
+		assert.True(t, handled, "must hold ownership when member list is unusable")
+		assert.Greater(t, requeue, time.Duration(0), "should requeue to retry the observation")
+		assert.Equal(t, ecv1alpha1.RecoveryPhaseScalingOut, ec.Status.Recovery.Phase)
+	})
+
 	t.Run("desired size reached marks Completed", func(t *testing.T) {
 		full := []etcdutils.EpHealth{member(1, true, false, 1), member(2, true, false, 1), member(3, true, false, 1)}
-		s := &reconcileState{cluster: ec, sts: sts, memberHealth: full}
+		s := &reconcileState{cluster: ec, sts: sts, memberListResp: memberListResp(3), memberHealth: full}
 		handled, _, err := r.maybeRecoverQuorum(context.Background(), s, full, nil)
 		require.NoError(t, err)
 		assert.False(t, handled)
@@ -317,6 +348,16 @@ func TestRecoveryScaleOut_CompletesAtDesiredSize(t *testing.T) {
 	})
 }
 
+// memberListResp builds a minimal MemberListResponse with n members, enough for
+// recoveryScaleOut's "is the member list usable this loop" guard.
+func memberListResp(n int) *clientv3.MemberListResponse {
+	members := make([]*etcdserverpb.Member, 0, n)
+	for i := 0; i < n; i++ {
+		members = append(members, &etcdserverpb.Member{ID: uint64(i + 1)})
+	}
+	return &clientv3.MemberListResponse{Members: members}
+}
+
 func TestCountHealthyVoting(t *testing.T) {
 	health := []etcdutils.EpHealth{
 		member(1, true, false, 1),  // healthy voter + leader
@@ -327,6 +368,78 @@ func TestCountHealthyVoting(t *testing.T) {
 	healthy, leader := countHealthyVoting(health)
 	assert.Equal(t, 2, healthy)
 	assert.True(t, leader)
+}
+
+// TestRecoveryRebuild_RemovesFlagAndAdvances drives the dangerous Rebuilding leg
+// to completion: once the single survivor reports healthy and self-leader, the
+// rebuild MUST remove --force-new-cluster (so a future pod-0 restart can't re-fork
+// the cluster) and advance to ScalingOut. The survivor-health probe is injected
+// via the clusterHealthFn seam so no live etcd is required. A FakeRecorder proves
+// the scale-out transition emits an observable event.
+func TestRecoveryRebuild_RemovesFlagAndAdvances(t *testing.T) {
+	r := newTestReconciler()
+	rec := events.NewFakeRecorder(16)
+	r.Recorder = rec
+
+	ec := threeNodeCluster()
+	sts := threeReplicaSTS()
+	require.NoError(t, r.Create(context.Background(), sts))
+
+	// Enter Rebuilding with the grace period already elapsed (sustained loss).
+	_, _, err := r.maybeRecoverQuorum(context.Background(), &reconcileState{cluster: ec, sts: sts}, quorumLostHealth(), nil)
+	require.NoError(t, err)
+	require.NotNil(t, ec.Status.Recovery)
+	past := metav1.NewTime(time.Now().Add(-2 * quorumLossGracePeriod))
+	ec.Status.Recovery.DetectedTime = &past
+	_, _, err = r.maybeRecoverQuorum(context.Background(), &reconcileState{cluster: ec, sts: sts}, quorumLostHealth(), nil)
+	require.NoError(t, err)
+	require.Equal(t, ecv1alpha1.RecoveryPhaseRebuilding, ec.Status.Recovery.Phase)
+
+	// Re-read the patched STS (flag injected, replicas==1).
+	var rebuilding appsv1.StatefulSet
+	require.NoError(t, r.Get(context.Background(), objKey("etcd", "default"), &rebuilding))
+	require.True(t, stsHasForceNewCluster(&rebuilding))
+
+	// First post-injection loop: survivor not yet healthy => stay in Rebuilding,
+	// flag still present.
+	r.clusterHealthFn = func(eps []string) ([]etcdutils.EpHealth, error) {
+		return []etcdutils.EpHealth{member(1, false, false, 0)}, nil
+	}
+	handled, _, err := r.maybeRecoverQuorum(context.Background(), &reconcileState{cluster: ec, sts: &rebuilding}, nil, nil)
+	require.NoError(t, err)
+	assert.True(t, handled)
+	assert.Equal(t, ecv1alpha1.RecoveryPhaseRebuilding, ec.Status.Recovery.Phase)
+
+	// Next loop: survivor is healthy AND its own leader => drop the flag and
+	// advance to ScalingOut.
+	r.clusterHealthFn = func(eps []string) ([]etcdutils.EpHealth, error) {
+		return []etcdutils.EpHealth{member(1, true, false, 1)}, nil // leader==self id 1
+	}
+	handled, _, err = r.maybeRecoverQuorum(context.Background(), &reconcileState{cluster: ec, sts: &rebuilding}, nil, nil)
+	require.NoError(t, err)
+	assert.True(t, handled)
+	assert.Equal(t, ecv1alpha1.RecoveryPhaseScalingOut, ec.Status.Recovery.Phase)
+
+	// The flag and marker annotation MUST be gone from the live StatefulSet.
+	var afterRebuild appsv1.StatefulSet
+	require.NoError(t, r.Get(context.Background(), objKey("etcd", "default"), &afterRebuild))
+	assert.False(t, stsHasForceNewCluster(&afterRebuild), "marker annotation must be cleared after rebuild")
+	assert.NotContains(t, afterRebuild.Spec.Template.Spec.Containers[0].Args, forceNewClusterArg,
+		"--force-new-cluster must be removed so pod-0 can't re-fork on restart")
+
+	// At least one event must mention the scale-out transition.
+	sawScaleOut := false
+	for drain := true; drain; {
+		select {
+		case e := <-rec.Events:
+			if strings.Contains(e, EventReasonRecoveryScalingOut) {
+				sawScaleOut = true
+			}
+		default:
+			drain = false
+		}
+	}
+	assert.True(t, sawScaleOut, "expected a RecoveryScalingOut event when the rebuild completes")
 }
 
 func TestRecoveryActive(t *testing.T) {
