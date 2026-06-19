@@ -25,6 +25,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/e2e-framework/klient/wait"
@@ -37,16 +38,23 @@ import (
 // TestQuorumLossRecovery exercises the operator's automatic quorum-loss disaster
 // recovery end to end:
 //
-//  1. Create a 3-member EtcdCluster backed by PVCs and write a sentinel key.
-//  2. Break quorum by deleting two of the three members' pods AND their PVCs,
-//     destroying their data so a majority is permanently gone — the textbook
-//     unrecoverable-by-restart scenario.
-//  3. Assert the operator detects sustained quorum loss (Recovering condition),
-//     rebuilds a single-member cluster from the surviving member, and re-adds the
-//     other members back to a healthy 3-member cluster.
-//  4. Assert the sentinel data survived the rebuild.
+//  1. Create a 3-member EtcdCluster backed by PVCs and write sentinel keys.
+//  2. Break quorum by destroying two of the three members' pods AND their PVCs,
+//     and HOLDING them down (the StatefulSet eagerly recreates them with empty
+//     data and etcd's own membership lets an empty pod rejoin and re-form quorum,
+//     so a single delete self-heals before the operator ever acts — see
+//     holdMajorityDown). Keeping a majority continuously unreachable past the
+//     operator's detection + grace window is what produces the textbook
+//     unrecoverable-by-restart scenario the recovery path exists for.
+//  3. Assert the operator detects sustained quorum loss and rebuilds a
+//     single-member cluster from the surviving member with --force-new-cluster,
+//     then re-adds the other members back to a healthy 3-member cluster.
+//  4. Assert the irreversible --force-new-cluster residue is cleared, all members
+//     share ONE cluster id (no split-brain re-fork), the possible-data-loss
+//     accounting is surfaced, and the sentinel data both survived the rebuild and
+//     provably replicated to a re-added member.
 //
-// The whole flow is bounded by an explicit timeout so a wedged recovery fails the
+// The whole flow is bounded by explicit timeouts so a wedged recovery fails the
 // test rather than hanging.
 func TestQuorumLossRecovery(t *testing.T) {
 	const (
@@ -54,6 +62,9 @@ func TestQuorumLossRecovery(t *testing.T) {
 		size        = 3
 		sentinelKey = "quorum-recovery-canary"
 		sentinelVal = "survived-the-disaster"
+		// extraKeys are written alongside the sentinel so the survival check
+		// exercises the keyspace (and its revision), not a single round-trip.
+		extraKeys = 5
 	)
 
 	feature := features.New("quorum-loss-recovery")
@@ -63,30 +74,38 @@ func TestQuorumLossRecovery(t *testing.T) {
 		// member's data (the precondition for an unrecoverable majority loss).
 		createEtcdClusterWithPVC(ctx, t, c, clusterName, size)
 		waitForSTSReadiness(t, c, clusterName, size)
-		// Confirm a healthy 3-member cluster with no learners before we break it.
-		waitForNoLearners(t, c, fmt.Sprintf("%s-0", clusterName), size, 3*time.Minute)
-		// Write a sentinel key we will verify survives the rebuild.
+		// A ready 3-replica StatefulSet on a fresh cluster already implies three
+		// voting members with no learners, so we do not re-probe here; the
+		// post-recovery waitForNoLearners is the load-bearing one.
+
+		// Write the sentinel plus a handful of extra keys. Capture the resulting
+		// revision so we can later assert the survivor retained the full keyspace,
+		// not just that one key happens to read back.
 		verifyDataOperations(t, c, clusterName, sentinelKey, sentinelVal)
+		for i := 0; i < extraKeys; i++ {
+			putKey(t, c, fmt.Sprintf("%s-0", clusterName),
+				fmt.Sprintf("%s-extra-%d", sentinelKey, i), fmt.Sprintf("val-%d", i))
+		}
 		return ctx
 	})
 
-	feature.Assess("break quorum by destroying a majority of members",
+	feature.Assess("break quorum by destroying and holding down a majority of members",
 		func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-			// Delete ordinals 1 and 2 (pods + PVCs). Ordinal 0 is the survivor whose
-			// data the operator rebuilds from. Deleting the PVCs makes the loss
-			// permanent: the StatefulSet may recreate the pods, but they come up
-			// empty and cannot rejoin the (now leaderless) cluster.
-			for _, ord := range []int{2, 1} {
-				deleteMemberPVCAndPod(ctx, t, c, clusterName, ord)
-			}
-			t.Logf("destroyed members %s-1 and %s-2 (pods + PVCs); cluster has lost quorum", clusterName, clusterName)
-			return ctx
-		},
-	)
+			// Precondition: the survivor's PVC (ordinal 0) must exist — the entire
+			// recovery rebuilds from it. Guard against a future STS retention-policy
+			// change silently wiping it.
+			assertPVCExists(ctx, t, c, fmt.Sprintf("etcd-data-%s-0", clusterName))
 
-	feature.Assess("operator detects sustained quorum loss (Recovering condition)",
-		func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-			waitForRecoveringObserved(t, c, clusterName, 5*time.Minute)
+			// Destroy ordinals 1 and 2 (pods + PVCs) and KEEP them destroyed until
+			// the operator commits to recovery. A one-shot delete is not enough: the
+			// StatefulSet recreates the empty pods within seconds and etcd's persisted
+			// membership lets them rejoin and re-form quorum, self-healing before the
+			// operator's grace window elapses. holdMajorityDown force-deletes the
+			// recreated pods+PVCs on a tight loop so a majority stays continuously
+			// unreachable, which is the only state assessQuorum classifies as true,
+			// sustained quorum loss. Ordinal 0 (the survivor) is never touched.
+			holdMajorityDown(ctx, t, c, clusterName, []int{2, 1}, 5*time.Minute)
+			t.Logf("held %s-1 and %s-2 down (pods + PVCs) until the operator committed to recovery", clusterName, clusterName)
 			return ctx
 		},
 	)
@@ -102,13 +121,16 @@ func TestQuorumLossRecovery(t *testing.T) {
 		},
 	)
 
-	feature.Assess("rebuild flag cleared from StatefulSet after recovery",
+	feature.Assess("rebuild flag cleared and cluster did not split-brain",
 		func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
 			// The single most dangerous failure mode is leaving --force-new-cluster
-			// permanently on the StatefulSet: pod-0 would re-fork the cluster on its
-			// next restart. Once recovery is Completed, both the marker annotation
-			// and the flag MUST be gone.
+			// behind: pod-0 would re-fork the cluster on its next restart, or a pod
+			// that already force-forked now diverges. Once recovery is Completed both
+			// the marker annotation and the flag MUST be gone from the StatefulSet,
+			// AND all three live members must report ONE shared cluster id — a re-fork
+			// produces a divergent cluster id, which the spec-only check cannot catch.
 			assertForceNewClusterCleared(ctx, t, c, clusterName)
+			assertSingleClusterID(t, c, clusterName, size)
 			return ctx
 		},
 	)
@@ -117,8 +139,9 @@ func TestQuorumLossRecovery(t *testing.T) {
 		func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
 			// Recovery via --force-new-cluster is not lossless: it must NEVER be
 			// silent. After a rebuild the operator must record the data-loss
-			// accounting (survivor id + retained revision) and raise the
-			// DataLossPossible condition so a human can audit the loss.
+			// accounting (survivor id + the RETAINED revision) and bump the durable
+			// attempt counter, and raise the DataLossPossible condition so a human can
+			// audit the loss.
 			assertPossibleDataLossSurfaced(ctx, t, c, clusterName)
 			return ctx
 		},
@@ -127,18 +150,33 @@ func TestQuorumLossRecovery(t *testing.T) {
 	feature.Assess("sentinel data survived the rebuild and replicated to a re-added member",
 		func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
 			// Read from the survivor (proves the data survived the force-new-cluster
-			// bootstrap) AND from a member that was destroyed and re-added (proves the
-			// rebuilt cluster actually replicated to the rejoined member, rather than
-			// the test trivially reading back from the untouched survivor).
-			for _, ord := range []int{0, 1} {
-				pod := fmt.Sprintf("%s-%d", clusterName, ord)
-				got := readKey(t, c, pod, sentinelKey)
-				if got != sentinelVal {
-					t.Fatalf("data not present on %s after recovery: key %q = %q, want %q",
-						pod, sentinelKey, got, sentinelVal)
-				}
-				t.Logf("sentinel key intact on %s after recovery: %s=%s", pod, sentinelKey, got)
+			// bootstrap) AND from a member that was destroyed and re-added. The
+			// re-added member is read with a node-LOCAL, serializable read so it is
+			// provably served from that member's own store — a linearizable read
+			// would route to the leader (almost always the survivor) and could pass
+			// even if replication to the rejoined member never happened.
+			survivor := fmt.Sprintf("%s-0", clusterName)
+			if got := readKey(t, c, survivor, sentinelKey); got != sentinelVal {
+				t.Fatalf("sentinel missing on survivor %s after recovery: %q=%q, want %q",
+					survivor, sentinelKey, got, sentinelVal)
 			}
+			t.Logf("sentinel intact on survivor %s: %s=%s", survivor, sentinelKey, sentinelVal)
+
+			readded := fmt.Sprintf("%s-1", clusterName)
+			if got := readKeyLocalSerializable(t, c, readded, sentinelKey); got != sentinelVal {
+				t.Fatalf("sentinel did not replicate to re-added member %s (local serializable read): %q=%q, want %q",
+					readded, sentinelKey, got, sentinelVal)
+			}
+			t.Logf("sentinel replicated to re-added member %s (local serializable read): %s=%s", readded, sentinelKey, sentinelVal)
+
+			// The whole keyspace, not just one key, must be present on the re-added
+			// member. Count keys under the sentinel prefix locally on etcd-1.
+			wantKeys := extraKeys + 1 // the sentinel + the extras
+			if got := countKeysLocalSerializable(t, c, readded, sentinelKey); got != wantKeys {
+				t.Fatalf("re-added member %s holds %d keys under %q prefix, want %d (keyspace did not fully replicate)",
+					readded, got, sentinelKey, wantKeys)
+			}
+			t.Logf("full keyspace (%d keys) replicated to re-added member %s", wantKeys, readded)
 			return ctx
 		},
 	)
@@ -151,9 +189,57 @@ func TestQuorumLossRecovery(t *testing.T) {
 	_ = testEnv.Test(t, feature.Feature())
 }
 
-// deleteMemberPVCAndPod deletes a single etcd member's pod and its PVC, destroying
-// that member's data. PVC is deleted first so the StatefulSet cannot re-bind the
-// old volume when it recreates the pod.
+// holdMajorityDown destroys the given member ordinals (pods + PVCs) and keeps them
+// destroyed — force-deleting whatever the StatefulSet recreates — until the
+// operator has COMMITTED to recovery (Recovery phase Rebuilding/ScalingOut/
+// Completed). Holding is required because a single delete self-heals: the
+// StatefulSet recreates the empty pods and etcd's persisted membership lets them
+// rejoin and re-form quorum long before the operator's detection + grace window
+// elapses. Once the operator scales the StatefulSet down to the single survivor
+// to inject --force-new-cluster, the recreated majority pods stop coming back and
+// the loop completes. Ordinal 0 (the survivor) is never touched.
+func holdMajorityDown(ctx context.Context, t *testing.T, c *envconf.Config, clusterName string, ordinals []int, timeout time.Duration) {
+	t.Helper()
+	committed := func(ec *ecv1alpha1.EtcdCluster) bool {
+		if ec.Status.Recovery == nil {
+			return false
+		}
+		switch ec.Status.Recovery.Phase {
+		case ecv1alpha1.RecoveryPhaseRebuilding,
+			ecv1alpha1.RecoveryPhaseScalingOut,
+			ecv1alpha1.RecoveryPhaseCompleted:
+			return true
+		}
+		return false
+	}
+
+	err := wait.For(func(ctx context.Context) (bool, error) {
+		ec := getEtcdCluster(ctx, t, c, clusterName)
+		if committed(ec) {
+			t.Logf("operator committed to recovery, phase=%s msg=%q; stopping the majority-down hold",
+				ec.Status.Recovery.Phase, ec.Status.Recovery.Message)
+			return true, nil
+		}
+		// Re-destroy the majority's data and pods. Best-effort: any of these may be
+		// transiently absent/Terminating between recreations.
+		for _, ord := range ordinals {
+			deleteMemberPVCAndPod(ctx, t, c, clusterName, ord)
+		}
+		if rec := ec.Status.Recovery; rec != nil {
+			t.Logf("holding majority down; recovery phase=%s detail=%q", rec.Phase, rec.Message)
+		}
+		return false, nil
+	}, wait.WithTimeout(timeout), wait.WithInterval(3*time.Second))
+	if err != nil {
+		t.Fatalf("operator did not commit to quorum-loss recovery within %s while a majority was held down: %v", timeout, err)
+	}
+}
+
+// deleteMemberPVCAndPod force-deletes a single etcd member's pod and its PVC,
+// destroying that member's data. The PVC is deleted first so the StatefulSet
+// cannot re-bind the old volume when it recreates the pod, and the pod is removed
+// with grace period 0 so it goes away immediately rather than draining — both are
+// needed for the majority to be simultaneously, durably unreachable.
 func deleteMemberPVCAndPod(ctx context.Context, t *testing.T, c *envconf.Config, clusterName string, ordinal int) {
 	t.Helper()
 	client := c.Client()
@@ -164,13 +250,26 @@ func deleteMemberPVCAndPod(ctx context.Context, t *testing.T, c *envconf.Config,
 	pvc := &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{Name: pvcName, Namespace: namespace},
 	}
-	if err := client.Resources().Delete(ctx, pvc); err != nil {
+	if err := client.Resources().Delete(ctx, pvc); err != nil && !apierrors.IsNotFound(err) {
 		t.Logf("deleting PVC %s (best-effort): %v", pvcName, err)
 	}
 
+	zero := int64(0)
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: podName, Namespace: namespace}}
-	if err := client.Resources().Delete(ctx, pod); err != nil {
+	if err := client.Resources().Delete(ctx, pod, func(o *metav1.DeleteOptions) {
+		o.GracePeriodSeconds = &zero
+	}); err != nil && !apierrors.IsNotFound(err) {
 		t.Logf("deleting pod %s (best-effort): %v", podName, err)
+	}
+}
+
+// assertPVCExists fails if the named PVC is absent. Used to assert the survivor's
+// volume is intact before (and implicitly the precondition recovery relies on).
+func assertPVCExists(ctx context.Context, t *testing.T, c *envconf.Config, pvcName string) {
+	t.Helper()
+	var pvc corev1.PersistentVolumeClaim
+	if err := c.Client().Resources().Get(ctx, pvcName, namespace, &pvc); err != nil {
+		t.Fatalf("survivor PVC %s must exist before breaking quorum, but: %v", pvcName, err)
 	}
 }
 
@@ -201,10 +300,42 @@ func assertForceNewClusterCleared(ctx context.Context, t *testing.T, c *envconf.
 	t.Logf("StatefulSet %s is clean: no force-new-cluster annotation or flag", clusterName)
 }
 
+// assertSingleClusterID verifies every member reports the SAME etcd cluster id.
+// A --force-new-cluster re-fork produces a divergent cluster id; this is the
+// cheapest strong proof that the rebuild re-formed one coherent cluster rather
+// than leaving a pod running a forked raft. It also confirms the expected member
+// count.
+func assertSingleClusterID(t *testing.T, c *envconf.Config, clusterName string, expectedMembers int) {
+	t.Helper()
+	ml := getEtcdMemberListPB(t, c, fmt.Sprintf("%s-0", clusterName))
+	if ml.Header == nil || ml.Header.ClusterId == 0 {
+		t.Fatalf("member list response has no cluster id")
+	}
+	if len(ml.Members) != expectedMembers {
+		t.Fatalf("member list shows %d members, want %d", len(ml.Members), expectedMembers)
+	}
+	// Cross-check each member's view of the cluster id from its own endpoint.
+	want := ml.Header.ClusterId
+	for i := 0; i < expectedMembers; i++ {
+		pod := fmt.Sprintf("%s-%d", clusterName, i)
+		got := getEtcdMemberListPB(t, c, pod)
+		if got.Header == nil || got.Header.ClusterId != want {
+			var have uint64
+			if got.Header != nil {
+				have = got.Header.ClusterId
+			}
+			t.Fatalf("member %s reports cluster id %x, want %x — the cluster split-brained during recovery",
+				pod, have, want)
+		}
+	}
+	t.Logf("all %d members share one cluster id %x — no split-brain re-fork", expectedMembers, want)
+}
+
 // assertPossibleDataLossSurfaced verifies the operator did NOT silently recover:
 // after a force-new-cluster rebuild it must raise the DataLossPossible condition
 // (True) and populate status.recovery.dataLoss with the survivor's identity and
-// retained revision, so the loss is auditable.
+// the RETAINED revision, and it must have bumped the durable attempt counter, so
+// the loss is auditable.
 func assertPossibleDataLossSurfaced(ctx context.Context, t *testing.T, c *envconf.Config, clusterName string) {
 	t.Helper()
 	// Mirror the controller's condition type (not importable from the e2e package).
@@ -220,18 +351,34 @@ func assertPossibleDataLossSurfaced(ctx context.Context, t *testing.T, c *envcon
 		t.Fatalf("%s condition = %q, want True", conditionDataLossPossible, cond.Status)
 	}
 
-	if ec.Status.Recovery == nil || ec.Status.Recovery.DataLoss == nil {
+	if ec.Status.Recovery == nil {
+		t.Fatalf("expected status.recovery after rebuild, got nil")
+	}
+	if ec.Status.Recovery.Attempts < 1 {
+		t.Fatalf("expected status.recovery.attempts >= 1 after a committed recovery, got %d", ec.Status.Recovery.Attempts)
+	}
+	if ec.Status.Recovery.DataLoss == nil {
 		t.Fatalf("expected status.recovery.dataLoss accounting after rebuild, got nil")
 	}
 	dl := ec.Status.Recovery.DataLoss
 	if dl.SurvivorMemberID == "" {
 		t.Fatalf("data-loss accounting missing survivor member id")
 	}
+	// The retained revision is the load-bearing accounting value. We wrote the
+	// sentinel + extra keys before the disaster, so the survivor's store is well
+	// past the empty-cluster revision; a zero here means the capture is broken
+	// (e.g. a nil header silently zeroed it).
+	if dl.SurvivorRevision <= 1 {
+		t.Fatalf("data-loss accounting has SurvivorRevision=%d; expected the survivor's real (>1) revision after writes", dl.SurvivorRevision)
+	}
 	if dl.RecoveredTime == nil {
 		t.Fatalf("data-loss accounting missing recoveredTime")
 	}
-	t.Logf("possible data loss surfaced: member=%s revision=%d (%s)",
-		dl.SurvivorMemberID, dl.SurvivorRevision, dl.Message)
+	if !strings.Contains(dl.Message, "data loss") && !strings.Contains(dl.Message, "NOT retained") {
+		t.Fatalf("data-loss message %q does not describe the loss", dl.Message)
+	}
+	t.Logf("possible data loss surfaced: member=%s revision=%d attempts=%d (%s)",
+		dl.SurvivorMemberID, dl.SurvivorRevision, ec.Status.Recovery.Attempts, dl.Message)
 }
 
 // getEtcdCluster fetches the EtcdCluster CR.
@@ -242,39 +389,6 @@ func getEtcdCluster(ctx context.Context, t *testing.T, c *envconf.Config, name s
 		t.Fatalf("failed to get EtcdCluster %s: %v", name, err)
 	}
 	return &ec
-}
-
-// waitForRecoveringObserved blocks until the operator surfaces evidence that it
-// has entered recovery: either the Recovering condition is present, or the
-// Recovery status records a Rebuilding/ScalingOut phase. We accept either signal
-// because the Recovering condition may flip back to False the instant the
-// single-member rebuild completes.
-func waitForRecoveringObserved(
-	t *testing.T, c *envconf.Config, name string, timeout time.Duration,
-) {
-	t.Helper()
-	err := wait.For(func(ctx context.Context) (bool, error) {
-		ec := getEtcdCluster(ctx, t, c, name)
-		if ec.Status.Recovery != nil {
-			switch ec.Status.Recovery.Phase {
-			case ecv1alpha1.RecoveryPhaseRebuilding,
-				ecv1alpha1.RecoveryPhaseScalingOut,
-				ecv1alpha1.RecoveryPhaseCompleted:
-				t.Logf("recovery observed, phase=%s msg=%q",
-					ec.Status.Recovery.Phase, ec.Status.Recovery.Message)
-				return true, nil
-			}
-		}
-		cond := meta.FindStatusCondition(ec.Status.Conditions, "Recovering")
-		if cond != nil && cond.Status == metav1.ConditionTrue {
-			t.Logf("Recovering condition observed: reason=%s msg=%q", cond.Reason, cond.Message)
-			return true, nil
-		}
-		return false, nil
-	}, wait.WithTimeout(timeout), wait.WithInterval(5*time.Second))
-	if err != nil {
-		t.Fatalf("operator did not enter quorum-loss recovery within %s: %v", timeout, err)
-	}
 }
 
 // waitForRecoveryCompleted blocks until the recovery state machine reports the
@@ -290,13 +404,23 @@ func waitForRecoveryCompleted(
 			return true, nil
 		}
 		return false, nil
-	}, wait.WithTimeout(timeout), wait.WithInterval(10*time.Second))
+	}, wait.WithTimeout(timeout), wait.WithInterval(5*time.Second))
 	if err != nil {
 		t.Fatalf("quorum-loss recovery did not complete within %s: %v", timeout, err)
 	}
 }
 
-// readKey reads a single key's value from the given pod via etcdctl.
+// putKey writes a single key via etcdctl inside the given pod.
+func putKey(t *testing.T, c *envconf.Config, podName, key, value string) {
+	t.Helper()
+	_, stderr, err := execInPod(t, c, podName, namespace, []string{"etcdctl", "put", key, value})
+	if err != nil {
+		t.Fatalf("failed to put key %q on %s: %v, stderr: %s", key, podName, err, stderr)
+	}
+}
+
+// readKey reads a single key's value from the given pod via etcdctl (default
+// linearizable read — may be served by the leader).
 func readKey(t *testing.T, c *envconf.Config, podName, key string) string {
 	t.Helper()
 	stdout, stderr, err := execInPod(t, c, podName, namespace,
@@ -305,4 +429,39 @@ func readKey(t *testing.T, c *envconf.Config, podName, key string) string {
 		t.Fatalf("failed to read key %q from %s: %v, stderr: %s", key, podName, err, stderr)
 	}
 	return strings.TrimSpace(stdout)
+}
+
+// readKeyLocalSerializable reads a key from the pod's OWN local store: it pins the
+// endpoint to the in-pod address and forces a serializable read so the answer is
+// served by that member, not routed to the leader. This is what proves data
+// actually replicated to a re-added member rather than being read back from the
+// untouched survivor.
+func readKeyLocalSerializable(t *testing.T, c *envconf.Config, podName, key string) string {
+	t.Helper()
+	stdout, stderr, err := execInPod(t, c, podName, namespace,
+		[]string{"etcdctl", "get", key, "--print-value-only",
+			"--endpoints=http://127.0.0.1:2379", "--consistency=s"})
+	if err != nil {
+		t.Fatalf("failed local serializable read of %q from %s: %v, stderr: %s", key, podName, err, stderr)
+	}
+	return strings.TrimSpace(stdout)
+}
+
+// countKeysLocalSerializable counts the keys under the given prefix from the pod's
+// own local store (serializable, node-local).
+func countKeysLocalSerializable(t *testing.T, c *envconf.Config, podName, prefix string) int {
+	t.Helper()
+	stdout, stderr, err := execInPod(t, c, podName, namespace,
+		[]string{"etcdctl", "get", prefix, "--prefix", "--keys-only",
+			"--endpoints=http://127.0.0.1:2379", "--consistency=s"})
+	if err != nil {
+		t.Fatalf("failed local serializable key count for %q from %s: %v, stderr: %s", prefix, podName, err, stderr)
+	}
+	n := 0
+	for _, line := range strings.Split(strings.TrimSpace(stdout), "\n") {
+		if strings.TrimSpace(line) != "" {
+			n++
+		}
+	}
+	return n
 }
