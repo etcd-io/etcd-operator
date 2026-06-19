@@ -50,6 +50,21 @@ type EtcdClusterReconciler struct {
 	Scheme        *runtime.Scheme
 	Recorder      events.EventRecorder
 	ImageRegistry string
+
+	// clusterHealthFn probes the health of the given endpoints. It defaults to
+	// etcdutils.ClusterHealth and exists as a seam so the recovery state machine's
+	// survivor-health gate can be unit-tested without a live etcd. Resolved lazily
+	// via clusterHealth; nil means "use the real implementation".
+	clusterHealthFn func(eps []string) ([]etcdutils.EpHealth, error)
+}
+
+// clusterHealth probes endpoint health via the injected seam, falling back to the
+// real implementation when unset (the production path).
+func (r *EtcdClusterReconciler) clusterHealth(eps []string) ([]etcdutils.EpHealth, error) {
+	if r.clusterHealthFn != nil {
+		return r.clusterHealthFn(eps)
+	}
+	return etcdutils.ClusterHealth(eps)
 }
 
 // reconcileState holds all transient data for a single reconciliation loop.

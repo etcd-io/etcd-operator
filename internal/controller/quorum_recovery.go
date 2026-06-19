@@ -130,7 +130,10 @@ func assessQuorum(desiredSize int, health []etcdutils.EpHealth, memberListErr er
 	a := quorumAssessment{expected: desiredSize}
 
 	for i := range health {
-		if health[i].Health {
+		// Only count voting members toward quorum. A learner answers health
+		// probes but cannot vote in an election, so a healthy learner does not
+		// contribute to the quorum arithmetic. This mirrors countHealthyVoting.
+		if health[i].Health && (health[i].Status == nil || !health[i].Status.IsLearner) {
 			a.reachable++
 		}
 		if health[i].Status != nil && health[i].Status.Leader != 0 {
@@ -210,7 +213,7 @@ func (r *EtcdClusterReconciler) maybeRecoverQuorum(
 	// If a recovery is already running, drive it forward regardless of the
 	// detection heuristic (the cluster is intentionally degraded mid-rebuild).
 	if recoveryActive(s.cluster) {
-		return r.advanceRecovery(ctx, logger, s)
+		return r.advanceRecovery(ctx, logger, s, memberListErr)
 	}
 
 	a := assessQuorum(s.cluster.Spec.Size, health, memberListErr)
@@ -255,7 +258,7 @@ func (r *EtcdClusterReconciler) maybeRecoverQuorum(
 		"Quorum loss sustained for %s; rebuilding cluster from survivor pod %s-0.", quorumLossGracePeriod, s.cluster.Name)
 	r.transitionRecovery(s.cluster, ecv1alpha1.RecoveryPhaseRebuilding,
 		fmt.Sprintf("rebuilding single-member cluster from survivor ordinal 0 (%s)", a.reason))
-	return r.advanceRecovery(ctx, logger, s)
+	return r.advanceRecovery(ctx, logger, s, memberListErr)
 }
 
 // advanceRecovery executes one step of the recovery state machine based on the
@@ -264,12 +267,13 @@ func (r *EtcdClusterReconciler) advanceRecovery(
 	ctx context.Context,
 	logger logr.Logger,
 	s *reconcileState,
+	memberListErr error,
 ) (bool, time.Duration, error) {
 	switch s.cluster.Status.Recovery.Phase {
 	case ecv1alpha1.RecoveryPhaseRebuilding:
 		return r.recoveryRebuild(ctx, logger, s)
 	case ecv1alpha1.RecoveryPhaseScalingOut:
-		return r.recoveryScaleOut(logger, s)
+		return r.recoveryScaleOut(logger, s, memberListErr)
 	default:
 		// Detecting handled by caller; Completed/empty means nothing to do.
 		return false, 0, nil
@@ -296,6 +300,18 @@ func (r *EtcdClusterReconciler) recoveryRebuild(
 			"survivorOrdinal", 0)
 		r.eventf(s.cluster, corev1.EventTypeWarning, EventReasonRecoveryRebuilding,
 			"Rebuilding: restarting %s-0 with --force-new-cluster from surviving data.", s.cluster.Name)
+		// Realign the state ConfigMap with the single-member bootstrap. The
+		// ConfigMap is consumed by pod-0 via EnvFrom and otherwise still advertises
+		// a multi-member "existing" cluster, which contradicts --force-new-cluster.
+		// --force-new-cluster rewrites membership from pod-0's surviving data dir
+		// and ignores ETCD_INITIAL_CLUSTER*, so a surviving data dir masks the
+		// inconsistency — but on an empty/replaced PVC etcd would otherwise try to
+		// bootstrap a fresh 3-member "existing" cluster and hang. Rewriting to a
+		// single-member "new" state removes that footgun; the scale-out path
+		// restores the multi-member state per member as it re-adds them.
+		if err := applyEtcdClusterState(ctx, s.cluster, 1, r.Client, r.Scheme, logger); err != nil {
+			return true, 0, fmt.Errorf("failed to reset cluster state ConfigMap for rebuild: %w", err)
+		}
 		if err := r.patchStatefulSetForForceNewCluster(ctx, sts, true); err != nil {
 			return true, 0, fmt.Errorf("failed to inject --force-new-cluster: %w", err)
 		}
@@ -305,7 +321,7 @@ func (r *EtcdClusterReconciler) recoveryRebuild(
 
 	// Force-new-cluster is injected; check whether the single survivor is healthy.
 	singleEndpoint := []string{clientEndpointForOrdinalIndex(sts, 0)}
-	health, healthErr := etcdutils.ClusterHealth(singleEndpoint)
+	health, healthErr := r.clusterHealth(singleEndpoint)
 	if healthErr != nil || len(health) == 0 || !health[0].Health || health[0].Status == nil {
 		logger.Info("Rebuild step 2: waiting for survivor to bootstrap single-member cluster",
 			"healthErr", healthErr)
@@ -340,7 +356,21 @@ func (r *EtcdClusterReconciler) recoveryRebuild(
 func (r *EtcdClusterReconciler) recoveryScaleOut(
 	logger logr.Logger,
 	s *reconcileState,
+	memberListErr error,
 ) (bool, time.Duration, error) {
+	// Guard the delegation to reconcileClusterState. That path derives the
+	// member count from s.memberListResp and, when it is nil, treats the cluster
+	// as having zero members — which makes targetReplica != memberCnt scale the
+	// StatefulSet DOWN, removing a pod mid-rebuild and reversing recovery. A
+	// transient member-list failure (rolling learner pod, DNS hiccup) must NOT be
+	// interpreted as "a member was removed", so we keep ownership of the loop and
+	// requeue until the observation is usable again.
+	if memberListErr != nil || s.memberListResp == nil {
+		logger.Info("Recovery scale-out: member list unavailable this loop; holding instead of delegating",
+			"memberListErr", memberListErr)
+		return true, requeueDuration, nil
+	}
+
 	healthy, leaderPresent := countHealthyVoting(s.memberHealth)
 
 	if leaderPresent && healthy >= s.cluster.Spec.Size {
