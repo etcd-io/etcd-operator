@@ -129,8 +129,10 @@ func (r *EtcdBackupReconciler) runBackup(ctx context.Context, backup *ecv1alpha1
 		return ctrl.Result{}, err
 	}
 
-	// 3. Take the snapshot and stream it straight into the uploader via a pipe,
-	//    so the snapshot file never lands on the operator's disk.
+	// 3. Take the snapshot and stream it into the uploader via a pipe. The GCS
+	//    provider streams straight through; the S3 provider spools the stream to
+	//    an ephemeral temp file first (PutObject needs a known length), so for
+	//    S3 the snapshot does briefly land in the operator pod's scratch space.
 	backup.Status.Phase = ecv1alpha1.BackupPhaseSnapshotting
 
 	timeout := defaultSnapshotTimeout

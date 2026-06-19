@@ -42,10 +42,11 @@ type Snapshotter interface {
 	Snapshot(ctx context.Context, pod types.NamespacedName, w io.Writer) (int64, error)
 }
 
-// execSnapshotter implements Snapshotter by streaming
-// `etcdctl snapshot save /dev/stdout` from a member pod via the Kubernetes
-// exec subresource. The snapshot file never lands on the operator's disk; it
-// is piped straight into the object-store uploader.
+// execSnapshotter implements Snapshotter by running `etcdctl snapshot save` in
+// a member pod via the Kubernetes exec subresource and streaming the resulting
+// file's bytes back over stdout. The snapshot is written to the member pod's
+// own /tmp, not the operator's disk; the operator pipes the streamed bytes
+// straight into the object-store uploader.
 type execSnapshotter struct {
 	cfg           *rest.Config
 	containerName string
@@ -54,9 +55,11 @@ type execSnapshotter struct {
 	command func() []string
 }
 
-// newExecSnapshotter constructs an execSnapshotter. The command writes the
-// snapshot to stdout so it can be streamed; etcdctl 3.4+ supports
-// `snapshot save` to an arbitrary path including /dev/stdout.
+// newExecSnapshotter constructs an execSnapshotter. etcdctl writes the snapshot
+// to a temp file (not stdout), so the command redirects etcdctl's own
+// diagnostics to fd 2 (the exec Stderr stream) and then cats the snapshot bytes
+// to stdout. Keeping etcdctl's stderr means a failure (TLS, no endpoint, etc.)
+// surfaces in the controller's error message instead of being swallowed.
 func newExecSnapshotter(cfg *rest.Config, containerName string) *execSnapshotter {
 	return &execSnapshotter{
 		cfg:           cfg,
@@ -64,9 +67,13 @@ func newExecSnapshotter(cfg *rest.Config, containerName string) *execSnapshotter
 		command: func() []string {
 			// ETCDCTL_API=3 is the default on etcd 3.4+, but set it explicitly
 			// for older images. Endpoints default to the local member.
+			// `1>&2` sends etcdctl's progress/error output to stderr so it is
+			// captured for diagnostics; only the cat'd snapshot bytes reach
+			// stdout. `&&` short-circuits so a save failure produces no bytes
+			// (the controller then reports the captured stderr).
 			return []string{
 				"sh", "-c",
-				"ETCDCTL_API=3 etcdctl snapshot save /tmp/snapshot.db >/dev/null 2>&1 && cat /tmp/snapshot.db && rm -f /tmp/snapshot.db",
+				"ETCDCTL_API=3 etcdctl snapshot save /tmp/snapshot.db 1>&2 && cat /tmp/snapshot.db && rm -f /tmp/snapshot.db",
 			}
 		},
 	}
