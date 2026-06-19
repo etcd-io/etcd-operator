@@ -81,6 +81,17 @@ func TestDomainMetricsExposed(t *testing.T) {
 			if !strings.Contains(body, fmt.Sprintf("name=%q", clusterName)) {
 				t.Errorf("expected /metrics to contain a series labelled name=%q", clusterName)
 			}
+			// Assert an actual value, not just the metric name: a name-substring
+			// check passes purely from collector registration (# HELP/# TYPE
+			// lines) even with zero series. The desired member count is the
+			// cluster's spec.size (3), so this proves the per-cluster gauge was
+			// recorded for the reconciled cluster.
+			wantDesired := fmt.Sprintf(
+				"etcd_operator_cluster_member_count_desired{name=%q,namespace=%q} 3",
+				clusterName, namespace)
+			if !metricsContainsSample(body, wantDesired) {
+				t.Errorf("expected /metrics to contain sample %q; body did not match", wantDesired)
+			}
 			return ctx
 		})
 
@@ -147,6 +158,19 @@ func metricsWaitForStatefulSetReady(ctx context.Context, t *testing.T, c *envcon
 	); err != nil {
 		t.Fatalf("statefulset %q did not reach %d ready replicas: %v", name, expectedReplicas, err)
 	}
+}
+
+// metricsContainsSample reports whether the Prometheus exposition text contains
+// a line equal to want after trimming surrounding whitespace. Sample lines are
+// compared line-by-line so a stray prefix/suffix elsewhere in the body cannot
+// produce a false positive.
+func metricsContainsSample(body, want string) bool {
+	for _, line := range strings.Split(body, "\n") {
+		if strings.TrimSpace(line) == want {
+			return true
+		}
+	}
+	return false
 }
 
 // metricsScrapeOperator scrapes the operator pod's metrics endpoint through the
