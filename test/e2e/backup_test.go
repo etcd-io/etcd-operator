@@ -60,61 +60,68 @@ const backupSeedKeyCount = 50
 // against an in-cluster MinIO (S3-compatible) bucket, so it requires NO real
 // cloud credentials. It is gated behind ETCD_E2E_BACKUP=true because it
 // provisions extra workloads (MinIO) and is not part of the default e2e matrix.
-//
-// Every helper it uses is defined locally in this file so the test does not
-// depend on helpers added by other in-flight e2e PRs.
-//
-// Flow:
-//  1. Deploy a single-pod MinIO + Service, and create a bucket via a one-shot
-//     mc pod.
-//  2. Create a creds Secret for the operator to read.
-//  3. Create a small EtcdCluster and wait for its StatefulSet ready, then seed
-//     a distinctive keyspace so the snapshot has observable data.
-//  4. Create an EtcdBackup pointing at MinIO and wait for phase Completed,
-//     asserting the status fields (location, size, completion time) AND,
-//     independently of the controller's self-reported status, that the object
-//     actually exists in the bucket with the recorded size and is a valid etcd
-//     snapshot.
 func TestEtcdBackupToS3(t *testing.T) {
+	requireBackupE2E(t)
+	runFullBackupCycle(t,
+		newMinIOBackend("minio-backup-e2e", "etcd-backups", "backup-e2e-creds"),
+		"etcd-backup-s3", "etcd-backup-e2e", "etcd-backup-e2e-snap")
+}
+
+// TestEtcdBackupToGCS exercises the identical snapshot+upload flow against an
+// in-cluster fake-gcs-server (GCS JSON-API emulator), via the new
+// GCSDestinationSpec.Endpoint + the unauthenticated WithEndpoint path in
+// newGCSStore. It requires NO real Google credentials and runs the SAME
+// present-and-valid assertion stack as the S3 cycle, so the operator's
+// second advertised provider is exercised live rather than only with fakes.
+func TestEtcdBackupToGCS(t *testing.T) {
+	requireBackupE2E(t)
+	runFullBackupCycle(t,
+		newFakeGCSBackend("fake-gcs-backup-e2e", "etcd-backups"),
+		"etcd-backup-gcs", "etcd-backup-gcs-e2e", "etcd-backup-gcs-e2e-snap")
+}
+
+// requireBackupE2E skips unless the object-storage backup e2e is explicitly
+// enabled; these tests provision extra in-cluster workloads (MinIO / fake-gcs)
+// and are not part of the default matrix.
+func requireBackupE2E(t *testing.T) {
+	t.Helper()
 	if os.Getenv("ETCD_E2E_BACKUP") != "true" {
-		t.Skip("set ETCD_E2E_BACKUP=true to run the object-storage backup e2e (provisions MinIO)")
+		t.Skip("set ETCD_E2E_BACKUP=true to run the object-storage backup e2e (provisions a backend)")
 	}
+}
 
-	const (
-		clusterName = "etcd-backup-e2e"
-		backupName  = "etcd-backup-e2e-snap"
-		minioName   = "minio-backup-e2e"
-		bucket      = "etcd-backups"
-		accessKey   = "minioadmin"
-		secretKey   = "minioadmin"
-		credsSecret = "backup-e2e-creds"
-	)
-
-	feature := features.New("etcd-backup-s3")
+// runFullBackupCycle drives one provider through the complete backup proof:
+//
+//  1. Stand up the object-storage backend + bucket (+ creds when authenticated).
+//  2. Create a single-member EtcdCluster, wait for it ready, and seed a rich,
+//     content-addressable keyspace (50 keys whose values are hash(key)) plus
+//     edge values (a ~100 KiB large value, a multibyte UTF-8 value) and a
+//     pre-backup provenance sentinel.
+//  3. Create an EtcdBackup at the backend and wait for phase Completed.
+//  4. Assert the controller status is coherent (size>0, location, completion).
+//  5. Independently of the controller, stat the object directly on the backend
+//     and assert its size equals status.SnapshotSizeBytes and clears the 16 KiB
+//     real-snapshot floor.
+//  6. Strongest, controller-independent validity proof: download the object's
+//     bytes and run `etcdutl snapshot status` on them, asserting it is an
+//     intact etcd backend snapshot whose totalKey equals the seeded key count.
+//     A controller that set status without uploading, or uploaded a truncated
+//     blob, or uploaded a snapshot missing the seeded data, fails one of (5)/(6).
+func runFullBackupCycle(t *testing.T, backend backupBackend, featureName, clusterName, backupName string) {
+	feature := features.New(featureName)
 
 	feature.Setup(func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
-		deployMinIO(ctx, t, cfg, minioName, accessKey, secretKey)
-		createBucketPod(ctx, t, cfg, minioName, bucket, accessKey, secretKey)
-		createBackupCredsSecret(ctx, t, cfg, credsSecret, accessKey, secretKey)
+		backend.deploy(ctx, t, cfg)
+		backend.bootstrapBucket(ctx, t, cfg)
 		createBackupTestCluster(ctx, t, cfg, clusterName, 1)
 		waitStatefulSetReady(t, cfg, clusterName, 1)
-		seedKeyspace(t, cfg, clusterName+"-0", backupSeedKeyCount)
+		seedRichKeyspace(t, cfg, clusterName+"-0")
 
 		backup := &ecv1alpha1.EtcdBackup{
 			ObjectMeta: metav1.ObjectMeta{Name: backupName, Namespace: namespace},
 			Spec: ecv1alpha1.EtcdBackupSpec{
-				ClusterRef: clusterName,
-				Destination: ecv1alpha1.BackupDestination{
-					Provider:  ecv1alpha1.BackupProviderS3,
-					Prefix:    "e2e",
-					SecretRef: &corev1.LocalObjectReference{Name: credsSecret},
-					S3: &ecv1alpha1.S3DestinationSpec{
-						Bucket:         bucket,
-						Region:         "us-east-1",
-						Endpoint:       "http://" + minioName + "." + namespace + ".svc.cluster.local:9000",
-						ForcePathStyle: true,
-					},
-				},
+				ClusterRef:  clusterName,
+				Destination: backend.destination("e2e"),
 			},
 		}
 		if err := cfg.Client().Resources().Create(ctx, backup); err != nil {
@@ -123,7 +130,7 @@ func TestEtcdBackupToS3(t *testing.T) {
 		return ctx
 	})
 
-	feature.Assess("backup reaches Completed and object is really in the bucket", func(
+	feature.Assess("backup reaches Completed and the object is a valid snapshot containing the seeded keyspace", func(
 		ctx context.Context, t *testing.T, cfg *envconf.Config,
 	) context.Context {
 		done := waitBackupCompleted(t, cfg, backupName)
@@ -143,18 +150,22 @@ func TestEtcdBackupToS3(t *testing.T) {
 		//     the recorded size. A controller that set the status fields without
 		//     uploading a byte would pass (1) but fail here.
 		objectKey := objectKeyFromLocation(t, done.Status.SnapshotLocation)
-		size := statMinIOObjectSize(t, cfg, minioName, bucket, objectKey, accessKey, secretKey)
+		size := backend.statObjectSize(t, cfg, objectKey)
 		if size != done.Status.SnapshotSizeBytes {
-			t.Errorf("bucket object size %d != status.SnapshotSizeBytes %d (key %q)",
+			t.Errorf("backend object size %d != status.SnapshotSizeBytes %d (key %q)",
 				size, done.Status.SnapshotSizeBytes, objectKey)
 		}
 
 		// (3) Sanity floor: a real etcd backend snapshot is a bbolt DB and is
-		//     never a handful of bytes. A tiny "successful" object would mean the
-		//     stream was truncated/empty even though the upload reported success.
+		//     never a handful of bytes.
 		if size < 16*1024 {
 			t.Errorf("snapshot object only %d bytes; too small to be a real etcd backend snapshot", size)
 		}
+
+		// (4) Strongest check: download the bytes and prove via `etcdutl
+		//     snapshot status` that it is an intact etcd snapshot whose key count
+		//     equals the seeded keyspace — controller status is never consulted.
+		assertSnapshotValid(t, cfg, backend, objectKey, int64(expectedSeedKeyCount()))
 
 		t.Logf("backup completed and verified: location=%s size=%d key=%s",
 			done.Status.SnapshotLocation, done.Status.SnapshotSizeBytes, objectKey)
@@ -162,7 +173,9 @@ func TestEtcdBackupToS3(t *testing.T) {
 	})
 
 	feature.Teardown(func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
-		cleanupBackupWorkloads(ctx, t, cfg, minioName, credsSecret, []string{clusterName})
+		backend.cleanup(ctx, t, cfg)
+		_ = cfg.Client().Resources().Delete(ctx, &ecv1alpha1.EtcdCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: namespace}})
 		_ = cfg.Client().Resources().Delete(ctx, &ecv1alpha1.EtcdBackup{
 			ObjectMeta: metav1.ObjectMeta{Name: backupName, Namespace: namespace}})
 		return ctx
@@ -383,7 +396,10 @@ func jsonInt64Field(jsonOut, field string) (int64, bool) {
 	}
 	rest := jsonOut[i+len(needle):]
 	j := 0
-	for j < len(rest) && (rest[j] == ' ') {
+	// Skip leading spaces and an optional opening quote: mc emits a bare number
+	// ("size":22) while the GCS JSON API quotes it ("size":"22"). Both must
+	// parse with the same extractor.
+	for j < len(rest) && (rest[j] == ' ' || rest[j] == '"') {
 		j++
 	}
 	start := j

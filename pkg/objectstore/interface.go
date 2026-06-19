@@ -188,8 +188,12 @@ func (d Destination) validate() error {
 	case ProviderS3:
 		// Region/Endpoint are optional (endpoint covers S3-compatible stores).
 	case ProviderGCS:
-		if d.Endpoint != "" || d.ForcePathStyle {
-			return fmt.Errorf("objectstore: s3-only fields set for gcs destination")
+		// Endpoint is shared with S3 and carries the optional emulator URL
+		// (fake-gcs-server / testbench) for hermetic tests; it is honored by
+		// newGCSStore. ForcePathStyle remains S3-only addressing semantics and
+		// has no meaning for GCS, so it is still rejected.
+		if d.ForcePathStyle {
+			return fmt.Errorf("objectstore: forcePathStyle is s3-only and unsupported for gcs destination")
 		}
 	case "":
 		return fmt.Errorf("objectstore: destination provider must not be empty")

@@ -90,6 +90,16 @@ type GCSDestinationSpec struct {
 	// Bucket is the destination GCS bucket name.
 	// +kubebuilder:validation:MinLength=1
 	Bucket string `json:"bucket"`
+
+	// Endpoint overrides the GCS endpoint, enabling GCS-compatible emulators
+	// such as fake-gcs-server or the gcloud storage testbench for hermetic,
+	// credential-free testing. It must point at the JSON API root the emulator
+	// serves (e.g. "http://fake-gcs:9000/storage/v1/"). When set, the client is
+	// pointed at this endpoint and runs unauthenticated, mirroring the S3
+	// endpoint override that targets MinIO. If empty, the real Google endpoint
+	// and the normal credential chain are used.
+	// +optional
+	Endpoint string `json:"endpoint,omitempty"`
 }
 
 // BackupDestination describes where a snapshot is uploaded. Exactly one

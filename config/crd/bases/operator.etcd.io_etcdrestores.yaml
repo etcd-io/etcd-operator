@@ -102,6 +102,16 @@ spec:
                                   name.
                                 minLength: 1
                                 type: string
+                              endpoint:
+                                description: |-
+                                  Endpoint overrides the GCS endpoint, enabling GCS-compatible emulators
+                                  such as fake-gcs-server or the gcloud storage testbench for hermetic,
+                                  credential-free testing. It must point at the JSON API root the emulator
+                                  serves (e.g. "http://fake-gcs:9000/storage/v1/"). When set, the client is
+                                  pointed at this endpoint and runs unauthenticated, mirroring the S3
+                                  endpoint override that targets MinIO. If empty, the real Google endpoint
+                                  and the normal credential chain are used.
+                                type: string
                             required:
                             - bucket
                             type: object

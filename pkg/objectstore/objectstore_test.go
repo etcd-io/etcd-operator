@@ -53,10 +53,15 @@ func TestDestinationValidate(t *testing.T) {
 			false,
 		},
 		{"gcs ok", Destination{Provider: ProviderGCS, Bucket: "b"}, false},
+		{
+			"gcs emulator endpoint ok",
+			Destination{Provider: ProviderGCS, Bucket: "b", Endpoint: "http://fake-gcs:9000/storage/v1/"},
+			false,
+		},
 		{"empty bucket", Destination{Provider: ProviderS3}, true},
 		{"empty provider", Destination{Bucket: "b"}, true},
 		{"unknown provider", Destination{Provider: "azure", Bucket: "b"}, true},
-		{"gcs with s3 fields", Destination{Provider: ProviderGCS, Bucket: "b", ForcePathStyle: true}, true},
+		{"gcs with forcePathStyle rejected", Destination{Provider: ProviderGCS, Bucket: "b", ForcePathStyle: true}, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

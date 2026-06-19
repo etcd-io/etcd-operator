@@ -54,7 +54,20 @@ type gcsStore struct {
 // (Workload Identity in-cluster), the recommended production posture.
 func newGCSStore(ctx context.Context, dst Destination, creds Credentials) (Store, error) {
 	var opts []option.ClientOption
-	if len(creds.ServiceAccountJSON) > 0 {
+	switch {
+	case dst.Endpoint != "":
+		// Emulator mode (fake-gcs-server / gcloud storage testbench): point the
+		// client at the emulator's JSON-API root and skip the token source.
+		// WithoutAuthentication is required because the emulator is
+		// unauthenticated — without it the client tries to mint a Google token
+		// at startup and fails. This mirrors the S3 endpoint override that lets
+		// the same code path target MinIO, and keeps emulator credentials out
+		// of the picture entirely (any secretRef is ignored in this mode).
+		opts = append(opts,
+			option.WithEndpoint(dst.Endpoint),
+			option.WithoutAuthentication(),
+		)
+	case len(creds.ServiceAccountJSON) > 0:
 		// WithCredentialsJSON is the documented way to pass an explicit GCP
 		// service-account key. The deprecation note concerns the general risk
 		// of handling raw key material; here the key originates from a

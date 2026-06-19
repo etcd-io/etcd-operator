@@ -84,6 +84,7 @@ func toObjectStoreDestination(dst ecv1alpha1.BackupDestination) (objectstore.Des
 			return out, fmt.Errorf("destination.gcs is required when provider is %q", dst.Provider)
 		}
 		out.Bucket = dst.GCS.Bucket
+		out.Endpoint = dst.GCS.Endpoint
 	default:
 		return out, fmt.Errorf("unsupported backup provider %q", dst.Provider)
 	}
