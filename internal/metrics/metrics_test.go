@@ -128,10 +128,34 @@ func TestRecordClusterMetrics_DegradedNoQuorumNoLeader(t *testing.T) {
 	assertGauge(t, reg, "etcd_operator_cluster_tls_enabled", 0, "ns1", "etcd-b")
 }
 
-func TestRecordClusterMetrics_LearnerCounted(t *testing.T) {
+func TestRecordClusterMetrics_LearnerExcludedFromQuorum(t *testing.T) {
 	reg := newRegistry(t)
 
-	c := newCluster("ns1", "etcd-c", 4)
+	// 2 voting members (1 healthy, 1 down) plus 1 healthy learner. The learner
+	// does not vote, so the voting set (1/2 healthy) has no quorum even though a
+	// naive headcount (2/3 healthy) would look quorate.
+	c := newCluster("ns1", "etcd-c", 3)
+	c.Status.MemberCount = 3
+	c.Status.Members = []ecv1alpha1.MemberStatus{
+		{ID: "1", IsHealthy: true, IsLeader: true},
+		{ID: "2", IsHealthy: false},
+		{ID: "3", IsHealthy: true, IsLearner: true},
+	}
+	c.Status.LeaderID = "1"
+
+	RecordClusterMetrics(c)
+
+	assertGauge(t, reg, "etcd_operator_cluster_learner_count", 1, "ns1", "etcd-c")
+	// Voting members: 2, healthy voting: 1 -> below quorum of 2.
+	assertGauge(t, reg, "etcd_operator_cluster_has_quorum", 0, "ns1", "etcd-c")
+}
+
+func TestRecordClusterMetrics_LearnerHealthyVotingQuorate(t *testing.T) {
+	reg := newRegistry(t)
+
+	// 3 healthy voting members plus 1 healthy learner: the voting set is fully
+	// healthy, so quorum holds and the learner is merely counted.
+	c := newCluster("ns1", "etcd-c2", 4)
 	c.Status.MemberCount = 4
 	c.Status.Members = []ecv1alpha1.MemberStatus{
 		{ID: "1", IsHealthy: true, IsLeader: true},
@@ -143,9 +167,9 @@ func TestRecordClusterMetrics_LearnerCounted(t *testing.T) {
 
 	RecordClusterMetrics(c)
 
-	assertGauge(t, reg, "etcd_operator_cluster_learner_count", 1, "ns1", "etcd-c")
-	// 4 healthy of 4 members -> quorum (>=3) satisfied.
-	assertGauge(t, reg, "etcd_operator_cluster_has_quorum", 1, "ns1", "etcd-c")
+	assertGauge(t, reg, "etcd_operator_cluster_learner_count", 1, "ns1", "etcd-c2")
+	// 3 voting members, all healthy -> quorum (>=2) satisfied.
+	assertGauge(t, reg, "etcd_operator_cluster_has_quorum", 1, "ns1", "etcd-c2")
 }
 
 func TestLeaderChangesCounter(t *testing.T) {

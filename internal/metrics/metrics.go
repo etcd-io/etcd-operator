@@ -216,10 +216,14 @@ func RecordClusterMetrics(cluster *ecv1alpha1.EtcdCluster) {
 	MemberCountReady.WithLabelValues(ns, name).Set(float64(cluster.Status.ReadyReplicas))
 
 	healthy := 0
+	healthyVoting := 0
 	learners := 0
 	for _, m := range cluster.Status.Members {
 		if m.IsHealthy {
 			healthy++
+			if !m.IsLearner {
+				healthyVoting++
+			}
 		}
 		if m.IsLearner {
 			learners++
@@ -228,8 +232,11 @@ func RecordClusterMetrics(cluster *ecv1alpha1.EtcdCluster) {
 	MemberCountHealthy.WithLabelValues(ns, name).Set(float64(healthy))
 	LearnerCount.WithLabelValues(ns, name).Set(float64(learners))
 
-	// Quorum: a strict majority of the registered members must be healthy.
-	HasQuorum.WithLabelValues(ns, name).Set(boolToFloat(hasQuorum(int(cluster.Status.MemberCount), healthy)))
+	// Quorum is decided over voting members only: learners do not participate in
+	// the etcd raft quorum, so a healthy learner must not be able to make a
+	// degraded voting set look quorate.
+	voting := int(cluster.Status.MemberCount) - learners
+	HasQuorum.WithLabelValues(ns, name).Set(boolToFloat(hasQuorum(voting, healthyVoting)))
 
 	HasLeader.WithLabelValues(ns, name).Set(boolToFloat(cluster.Status.LeaderID != ""))
 	TLSEnabled.WithLabelValues(ns, name).Set(boolToFloat(cluster.Spec.TLS != nil))
