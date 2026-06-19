@@ -23,6 +23,7 @@ import (
 	"strings"
 
 	"github.com/coreos/go-semver/semver"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -140,8 +141,7 @@ func (v *EtcdClusterCustomValidator) ValidateUpdate(
 	log := etcdclusterlog.WithValues("name", ec.Name, "namespace", ec.Namespace, "operation", "update")
 	log.Info("validating EtcdCluster on update")
 
-	errs := validateEtcdClusterSpec(&ec.Spec)
-	errs = append(errs, validateEtcdClusterUpdate(&oldEc.Spec, &ec.Spec)...)
+	errs := validateEtcdClusterUpdate(&oldEc.Spec, &ec.Spec)
 	return finish(log, ec, errs)
 }
 
@@ -175,7 +175,8 @@ func finish(log logr, ec *EtcdCluster, errs field.ErrorList) (admission.Warnings
 // exact message text.
 // ---------------------------------------------------------------------------
 
-// validateEtcdClusterSpec runs all create-time (and update-time) spec invariants.
+// validateEtcdClusterSpec runs all create-time spec invariants. On update only the
+// subset of these that changed is re-checked; see validateEtcdClusterUpdate.
 func validateEtcdClusterSpec(spec *EtcdClusterSpec) field.ErrorList {
 	errs := make(field.ErrorList, 0, 3)
 	specPath := field.NewPath("spec")
@@ -268,18 +269,35 @@ func validateTLS(tls *TLSCertificate, path *field.Path) field.ErrorList {
 	return errs
 }
 
-// validateEtcdClusterUpdate enforces transition invariants between the old and new
-// spec: immutable fields and the supported etcd upgrade path.
+// validateEtcdClusterUpdate runs all update-time invariants between the old and
+// new spec. Unlike ValidateCreate it does NOT re-run the full create-time spec
+// validation: the CRD historically only enforced "size >= 1", so pre-existing
+// clusters with an even size or an unknown-but-well-formed version are legal on
+// the API server. With failurePolicy: Fail and no objectSelector, re-validating
+// those invariants on every update would wedge unrelated edits (metadata,
+// annotations, TLS) to legacy clusters. We therefore only enforce the size and
+// version-format invariants when the offending field actually changed — keeping
+// the guardrail for new values while letting legacy clusters be remediated. TLS
+// coherence is cheap and self-contained, so it is always re-validated.
 func validateEtcdClusterUpdate(oldSpec, newSpec *EtcdClusterSpec) field.ErrorList {
 	var errs field.ErrorList
 	specPath := field.NewPath("spec")
+
+	if newSpec.Size != oldSpec.Size {
+		errs = append(errs, validateSize(newSpec.Size, specPath.Child("size"))...)
+	}
+	if newSpec.Version != oldSpec.Version {
+		errs = append(errs, validateVersionFormat(newSpec.Version, specPath.Child("version"))...)
+	}
+	errs = append(errs, validateTLS(newSpec.TLS, specPath.Child("tls"))...)
 
 	// storageSpec is immutable once set: changing the PVC template after the
 	// StatefulSet exists cannot be reconciled in place and risks data loss.
 	if oldSpec.StorageSpec != nil && newSpec.StorageSpec == nil {
 		errs = append(errs, field.Invalid(specPath.Child("storageSpec"), nil,
 			"storageSpec is immutable and cannot be removed once set; restore the original storageSpec or recreate the cluster."))
-	} else if oldSpec.StorageSpec != nil && newSpec.StorageSpec != nil && *oldSpec.StorageSpec != *newSpec.StorageSpec {
+	} else if oldSpec.StorageSpec != nil && newSpec.StorageSpec != nil &&
+		!apiequality.Semantic.DeepEqual(oldSpec.StorageSpec, newSpec.StorageSpec) {
 		errs = append(errs, field.Invalid(specPath.Child("storageSpec"), newSpec.StorageSpec,
 			"storageSpec is immutable and cannot be changed once set; revert spec.storageSpec to its original value or recreate the cluster."))
 	}
@@ -295,6 +313,12 @@ func validateEtcdClusterUpdate(oldSpec, newSpec *EtcdClusterSpec) field.ErrorLis
 // upgrades and downgrades), reusing the same ordered version table the controller
 // uses at reconcile time. A no-op (equal versions) or an unparseable version is
 // not reported here (the latter is handled by validateVersionFormat).
+//
+// Note: this validates the *declared* spec transition (old spec.version ->
+// new spec.version), not the actual running version. The controller compares the
+// live StatefulSet image against the spec at reconcile time and remains
+// authoritative; if a prior upgrade stalled before convergence, a skip-minor edit
+// could pass this declared-transition check yet still be caught by the controller.
 func validateUpgradePath(current, target string, path *field.Path) field.ErrorList {
 	if current == target {
 		return nil

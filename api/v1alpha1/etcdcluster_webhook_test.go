@@ -23,6 +23,7 @@ import (
 	"testing"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 // causeMessages flattens the aggregated field errors carried by an
@@ -258,12 +259,64 @@ func TestValidateUpdate_UpgradePathAndImmutability(t *testing.T) {
 	}
 }
 
+// TestValidateUpdate_LegacyClustersRemediable guards C3: pre-existing clusters
+// whose values predate the create-time invariants (the CRD historically only
+// enforced size >= 1) must not be frozen on update. Unchanged-but-non-conforming
+// values are tolerated; a metadata-only edit must be allowed; but the invariant is
+// still enforced the moment the offending field is actually changed.
+func TestValidateUpdate_LegacyClustersRemediable(t *testing.T) {
+	v := &EtcdClusterCustomValidator{}
+	ctx := context.Background()
+
+	t.Run("even-sized legacy cluster: unrelated edit is allowed", func(t *testing.T) {
+		// size 4 would fail ValidateCreate, but it already exists; an unrelated
+		// (TLS) edit must not be rejected for the pre-existing even size.
+		old := newCluster(4, "3.6.1")
+		updated := newCluster(4, "3.6.1")
+		updated.Spec.TLS = &TLSCertificate{Provider: "auto"}
+		if _, err := v.ValidateUpdate(ctx, old, updated); err != nil {
+			t.Fatalf("expected unrelated edit on legacy even-sized cluster to be allowed, got: %v", err)
+		}
+	})
+
+	t.Run("changing size to another even value is still rejected", func(t *testing.T) {
+		old := newCluster(4, "3.6.1")
+		updated := newCluster(6, "3.6.1")
+		_, err := v.ValidateUpdate(ctx, old, updated)
+		msgs := causeMessages(t, err)
+		found := false
+		for _, m := range msgs {
+			if strings.HasPrefix(m, "spec.size: Invalid value:") &&
+				strings.Contains(m, "size must be an odd number") {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("expected even-size rejection when size is changed, got: %s", strings.Join(msgs, " | "))
+		}
+	})
+
+	t.Run("remediating size to a valid odd value is allowed", func(t *testing.T) {
+		old := newCluster(4, "3.6.1")
+		updated := newCluster(3, "3.6.1")
+		if _, err := v.ValidateUpdate(ctx, old, updated); err != nil {
+			t.Fatalf("expected remediation 4 -> 3 to be allowed, got: %v", err)
+		}
+	})
+}
+
 func TestValidateUpdate_StorageSpecImmutable(t *testing.T) {
 	v := &EtcdClusterCustomValidator{}
 
+	// withStorage populates a non-zero VolumeSizeRequest on purpose: a zero-valued
+	// Quantity has an empty string cache and nil *inf.Dec, so struct == happens to
+	// agree with the numeric value and would mask the comparison bug C1 fixes.
 	withStorage := func() *EtcdCluster {
 		c := newCluster(3, "3.6.1")
-		c.Spec.StorageSpec = &StorageSpec{StorageClassName: "standard"}
+		c.Spec.StorageSpec = &StorageSpec{
+			StorageClassName:  "standard",
+			VolumeSizeRequest: resource.MustParse("1Gi"),
+		}
 		return c
 	}
 
@@ -293,6 +346,40 @@ func TestValidateUpdate_StorageSpecImmutable(t *testing.T) {
 	t.Run("unchanged storageSpec is allowed", func(t *testing.T) {
 		if _, err := v.ValidateUpdate(context.Background(), withStorage(), withStorage()); err != nil {
 			t.Fatalf("expected unchanged storageSpec to be allowed, got: %v", err)
+		}
+	})
+
+	// Regression guard for C1: a re-spelled but numerically identical quantity
+	// (1Gi vs 1024Mi) must NOT trip immutability. Struct == compares the cached
+	// string and *inf.Dec pointer, so it sees these as different; Semantic.DeepEqual
+	// compares the value and sees them as equal.
+	t.Run("numerically-equal re-spelled quantity is allowed", func(t *testing.T) {
+		old := withStorage()
+		old.Spec.StorageSpec.VolumeSizeRequest = resource.MustParse("1Gi")
+		updated := withStorage()
+		updated.Spec.StorageSpec.VolumeSizeRequest = resource.MustParse("1024Mi")
+		if _, err := v.ValidateUpdate(context.Background(), old, updated); err != nil {
+			t.Fatalf("expected 1Gi vs 1024Mi to be allowed (equal value), got: %v", err)
+		}
+	})
+
+	// A real size change (1Gi -> 2Gi) must still be rejected: immutability holds.
+	t.Run("changing the quantity value is rejected", func(t *testing.T) {
+		old := withStorage()
+		old.Spec.StorageSpec.VolumeSizeRequest = resource.MustParse("1Gi")
+		updated := withStorage()
+		updated.Spec.StorageSpec.VolumeSizeRequest = resource.MustParse("2Gi")
+		_, err := v.ValidateUpdate(context.Background(), old, updated)
+		msgs := causeMessages(t, err)
+		ok := false
+		for _, m := range msgs {
+			if strings.HasPrefix(m, "spec.storageSpec: Invalid value:") &&
+				strings.Contains(m, "storageSpec is immutable and cannot be changed once set") {
+				ok = true
+			}
+		}
+		if !ok {
+			t.Fatalf("expected storageSpec immutability error for 1Gi->2Gi, got: %s", strings.Join(msgs, " | "))
 		}
 	})
 }
