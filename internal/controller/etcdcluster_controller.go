@@ -91,11 +91,13 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	start := time.Now()
 
 	// Defer status update to ensure it's called regardless of return path.
-	// Reconcile timing/error metrics are always recorded; per-cluster gauges are
-	// refreshed inside updateStatus once observed state is available.
+	// Reconcile timing/error metrics and per-cluster gauges are only recorded when
+	// the cluster still exists: on the NotFound path fetchAndValidateState already
+	// dropped the series via DeleteClusterMetrics, so observing here would
+	// re-create them for a deleted cluster and defeat that cardinality bound.
 	defer func() {
-		metrics.ObserveReconcile(req.Namespace, req.Name, time.Since(start).Seconds(), err)
 		if state != nil {
+			metrics.ObserveReconcile(req.Namespace, req.Name, time.Since(start).Seconds(), err)
 			if statusErr := r.updateStatus(ctx, state); statusErr != nil {
 				// Log but don't override the main reconciliation error
 				log.FromContext(ctx).Error(statusErr, "Failed to update status")
@@ -453,10 +455,14 @@ func (r *EtcdClusterReconciler) updateStatus(ctx context.Context, s *reconcileSt
 			s.cluster.Status.Members = append(s.cluster.Status.Members, memberStatus)
 		}
 
-		// Update leader ID
+		// Update leader ID. Clear it when no leader is currently known so that
+		// has_leader can drop to 0 during a leaderless window instead of
+		// reporting a permanently stale leader from an earlier reconcile.
 		_, leaderStatus := etcdutils.FindLeaderStatus(s.memberHealth, logger)
 		if leaderStatus != nil {
 			s.cluster.Status.LeaderID = fmt.Sprintf("%x", leaderStatus.Leader)
+		} else {
+			s.cluster.Status.LeaderID = ""
 		}
 
 		// Update current version from leader or first healthy member
