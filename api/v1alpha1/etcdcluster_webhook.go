@@ -299,13 +299,28 @@ func validateSize(size int, path *field.Path) field.ErrorList {
 	return nil
 }
 
+// normalizeEtcdVersion strips an optional leading "v" from an etcd version string
+// so it can be parsed by the CoreOS go-semver library, which rejects the "v"
+// prefix. The canonical etcd release images at the default registry
+// (gcr.io/etcd-development/etcd) are published ONLY with v-prefixed tags (e.g.
+// "v3.5.21" — see config/samples), so users legitimately write spec.version with
+// or without the "v". Both forms must validate identically here, and the
+// controller (internal/controller/utils.go: etcdImageTag) re-applies the "v" the
+// registry expects when rendering the image, so a bare spec.version still pulls.
+func normalizeEtcdVersion(version string) string {
+	return strings.TrimPrefix(strings.TrimSpace(version), "v")
+}
+
 // validateVersionFormat ensures spec.version is non-empty and parses as semver.
+// A leading "v" is accepted (and stripped before parsing) because the default
+// etcd-development registry only publishes v-prefixed tags; rejecting "v3.6.1"
+// would make the operator's own working samples unappliable.
 func validateVersionFormat(version string, path *field.Path) field.ErrorList {
 	if strings.TrimSpace(version) == "" {
 		return field.ErrorList{field.Required(path,
 			"version is required; set spec.version to a semver etcd image tag such as \"3.6.1\".")}
 	}
-	if _, err := semver.NewVersion(version); err != nil {
+	if _, err := semver.NewVersion(normalizeEtcdVersion(version)); err != nil {
 		return field.ErrorList{field.Invalid(path, version,
 			fmt.Sprintf("version %q is not a valid semantic version (expected MAJOR.MINOR.PATCH, e.g. \"3.6.1\"): %v.",
 				version, err))}
@@ -446,13 +461,15 @@ func validateEtcdClusterUpdate(oldSpec, newSpec *EtcdClusterSpec) field.ErrorLis
 // authoritative; if a prior upgrade stalled before convergence, a skip-minor edit
 // could pass this declared-transition check yet still be caught by the controller.
 func validateUpgradePath(current, target string, path *field.Path) field.ErrorList {
-	if current == target {
+	// Compare on the normalized form so "v3.6.1" -> "3.6.1" (same release, just a
+	// prefix difference) is correctly treated as a no-op rather than a transition.
+	if normalizeEtcdVersion(current) == normalizeEtcdVersion(target) {
 		return nil
 	}
-	if _, err := semver.NewVersion(current); err != nil {
+	if _, err := semver.NewVersion(normalizeEtcdVersion(current)); err != nil {
 		return nil // old object had a bad version; nothing actionable to add here.
 	}
-	if _, err := semver.NewVersion(target); err != nil {
+	if _, err := semver.NewVersion(normalizeEtcdVersion(target)); err != nil {
 		return nil // format error already reported by validateVersionFormat.
 	}
 
@@ -468,11 +485,13 @@ func validateUpgradePath(current, target string, path *field.Path) field.ErrorLi
 // but is local to the api package (controller internals are not importable here)
 // and returns only the actionable error. supportedVersions must be ascending.
 func checkUpgradePath(supportedVersions []semver.Version, current, target string) error {
-	currentVer, err := semver.NewVersion(current)
+	// go-semver rejects a leading "v"; normalize so a v-prefixed spec.version (the
+	// default registry's tag convention) participates in the ordering check.
+	currentVer, err := semver.NewVersion(normalizeEtcdVersion(current))
 	if err != nil {
 		return fmt.Errorf("failed to parse current version %s: %w", current, err)
 	}
-	targetVer, err := semver.NewVersion(target)
+	targetVer, err := semver.NewVersion(normalizeEtcdVersion(target))
 	if err != nil {
 		return fmt.Errorf("failed to parse target version %s: %w", target, err)
 	}

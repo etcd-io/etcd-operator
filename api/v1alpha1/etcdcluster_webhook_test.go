@@ -67,6 +67,19 @@ func TestValidateCreate_Messages(t *testing.T) {
 			wantOK:  true,
 		},
 		{
+			// The default etcd-development registry only publishes v-prefixed tags
+			// (config/samples ships version: v3.5.21), so the webhook must accept a
+			// leading "v" or it would reject the operator's own working samples.
+			name:    "v-prefixed semver version is accepted",
+			cluster: newCluster(3, "v3.6.1"),
+			wantOK:  true,
+		},
+		{
+			name:    "bare semver version is accepted",
+			cluster: newCluster(3, "3.5.21"),
+			wantOK:  true,
+		},
+		{
 			name:        "even size is rejected with quorum guidance",
 			cluster:     newCluster(4, "3.6.1"),
 			wantField:   "spec.size",
@@ -220,6 +233,26 @@ func TestValidateUpdate_UpgradePathAndImmutability(t *testing.T) {
 			old:     newCluster(3, "3.5.1"),
 			updated: newCluster(3, "3.6.1"),
 			wantOK:  true,
+		},
+		{
+			name:    "v-prefixed single minor upgrade is allowed",
+			old:     newCluster(3, "v3.5.1"),
+			updated: newCluster(3, "v3.6.1"),
+			wantOK:  true,
+		},
+		{
+			// v-prefixed and bare forms of the same release must be treated as a
+			// no-op, not a transition.
+			name:    "v-prefixed vs bare same release is a no-op",
+			old:     newCluster(3, "v3.5.21"),
+			updated: newCluster(3, "3.5.21"),
+			wantOK:  true,
+		},
+		{
+			name:        "v-prefixed skip-minor upgrade is still rejected",
+			old:         newCluster(3, "v3.5.1"),
+			updated:     newCluster(3, "v3.7.1"),
+			wantMessage: "spec.version: Invalid value: \"v3.7.1\": upgrading from version 3.5.1 to version 3.7.1 is not allowed (skips a minor version). etcd only supports sequential single-minor upgrades and forbids downgrades; upgrade one minor version at a time (current \"v3.5.1\" -> target \"v3.7.1\").",
 		},
 		{
 			name:        "skip-minor upgrade is rejected",

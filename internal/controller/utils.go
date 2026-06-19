@@ -39,6 +39,38 @@ const (
 	volumeName  = "etcd-data"
 )
 
+// normalizeEtcdVersion strips an optional leading "v" from an etcd version
+// string. The CoreOS go-semver parser (used for upgrade-path checks here and in
+// the admission webhook) rejects a leading "v", but the canonical etcd release
+// images at the default registry (gcr.io/etcd-development/etcd) are published
+// ONLY with v-prefixed tags (e.g. "v3.5.21"). Users therefore legitimately set
+// spec.version with or without the "v"; normalizing to the bare semver here lets
+// both forms compare and parse identically.
+func normalizeEtcdVersion(version string) string {
+	return strings.TrimPrefix(strings.TrimSpace(version), "v")
+}
+
+// etcdImageTag renders the image tag for spec.version against the configured
+// registry. The default etcd-development registry only publishes v-prefixed
+// tags, so a bare "3.5.21" would resolve to a NotFound "...:3.5.21" image
+// (ImagePullBackOff). We therefore prepend the "v" the registry convention
+// expects whenever the user supplied a bare semver. A version the user already
+// wrote with a leading "v" is passed through unchanged, and a non-semver/custom
+// tag (e.g. a pinned digest-less internal tag) is left exactly as written so
+// non-default registries with their own tagging scheme are not disturbed.
+func etcdImageTag(version string) string {
+	v := strings.TrimSpace(version)
+	if strings.HasPrefix(v, "v") {
+		return v
+	}
+	// Only re-apply the registry's "v" convention to values that are real
+	// semver; anything else is an explicit custom tag we must not rewrite.
+	if _, err := semver.NewVersion(v); err != nil {
+		return v
+	}
+	return "v" + v
+}
+
 type etcdClusterState string
 
 const (
@@ -146,7 +178,7 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 				Name:    "etcd",
 				Command: []string{"/usr/local/bin/etcd"},
 				Args:    createArgs(ec.Name, ec.Spec.EtcdOptions),
-				Image:   fmt.Sprintf("%s:%s", ec.Spec.ImageRegistry, ec.Spec.Version),
+				Image:   fmt.Sprintf("%s:%s", ec.Spec.ImageRegistry, etcdImageTag(ec.Spec.Version)),
 				Env: []corev1.EnvVar{
 					{
 						Name: "POD_NAME",
@@ -811,11 +843,14 @@ func validateEtcdUpgradePath(etcdVersions []semver.Version, current, target stri
 		currentIdx, targetIdx = -1, -1
 	)
 
-	currentVer, err = semver.NewVersion(current)
+	// The live StatefulSet image tag is v-prefixed (the registry convention) while
+	// spec.version may be bare; normalize both so go-semver can parse them and so a
+	// "v3.5.21" image vs a "3.5.21" spec is not mistaken for a version change.
+	currentVer, err = semver.NewVersion(normalizeEtcdVersion(current))
 	if err != nil {
 		return false, fmt.Errorf("failed to parse current version %s: %w", current, err)
 	}
-	targetVer, err = semver.NewVersion(target)
+	targetVer, err = semver.NewVersion(normalizeEtcdVersion(target))
 	if err != nil {
 		return false, fmt.Errorf("failed to parse target version %s: %w", target, err)
 	}
