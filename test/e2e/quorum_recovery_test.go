@@ -113,6 +113,17 @@ func TestQuorumLossRecovery(t *testing.T) {
 		},
 	)
 
+	feature.Assess("possible data loss is surfaced (condition + status accounting)",
+		func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+			// Recovery via --force-new-cluster is not lossless: it must NEVER be
+			// silent. After a rebuild the operator must record the data-loss
+			// accounting (survivor id + retained revision) and raise the
+			// DataLossPossible condition so a human can audit the loss.
+			assertPossibleDataLossSurfaced(ctx, t, c, clusterName)
+			return ctx
+		},
+	)
+
 	feature.Assess("sentinel data survived the rebuild and replicated to a re-added member",
 		func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
 			// Read from the survivor (proves the data survived the force-new-cluster
@@ -188,6 +199,39 @@ func assertForceNewClusterCleared(ctx context.Context, t *testing.T, c *envconf.
 		}
 	}
 	t.Logf("StatefulSet %s is clean: no force-new-cluster annotation or flag", clusterName)
+}
+
+// assertPossibleDataLossSurfaced verifies the operator did NOT silently recover:
+// after a force-new-cluster rebuild it must raise the DataLossPossible condition
+// (True) and populate status.recovery.dataLoss with the survivor's identity and
+// retained revision, so the loss is auditable.
+func assertPossibleDataLossSurfaced(ctx context.Context, t *testing.T, c *envconf.Config, clusterName string) {
+	t.Helper()
+	// Mirror the controller's condition type (not importable from the e2e package).
+	const conditionDataLossPossible = "DataLossPossible"
+
+	ec := getEtcdCluster(ctx, t, c, clusterName)
+
+	cond := meta.FindStatusCondition(ec.Status.Conditions, conditionDataLossPossible)
+	if cond == nil {
+		t.Fatalf("expected %s condition after a force-new-cluster rebuild; recovery must not be silent", conditionDataLossPossible)
+	}
+	if cond.Status != metav1.ConditionTrue {
+		t.Fatalf("%s condition = %q, want True", conditionDataLossPossible, cond.Status)
+	}
+
+	if ec.Status.Recovery == nil || ec.Status.Recovery.DataLoss == nil {
+		t.Fatalf("expected status.recovery.dataLoss accounting after rebuild, got nil")
+	}
+	dl := ec.Status.Recovery.DataLoss
+	if dl.SurvivorMemberID == "" {
+		t.Fatalf("data-loss accounting missing survivor member id")
+	}
+	if dl.RecoveredTime == nil {
+		t.Fatalf("data-loss accounting missing recoveredTime")
+	}
+	t.Logf("possible data loss surfaced: member=%s revision=%d (%s)",
+		dl.SurvivorMemberID, dl.SurvivorRevision, dl.Message)
 }
 
 // getEtcdCluster fetches the EtcdCluster CR.

@@ -244,6 +244,65 @@ type RecoveryStatus struct {
 	// Message is a human-readable description of the current recovery step.
 	// +optional
 	Message string `json:"message,omitempty"`
+
+	// Attempts is the number of times the operator has committed to a destructive
+	// rebuild for this cluster (i.e. entered the Rebuilding phase from Detecting).
+	// It is a monotonically increasing counter that survives across recoveries and
+	// is never reset, giving operators a durable signal of how often this cluster
+	// has needed disaster recovery — repeated recoveries usually point at an
+	// underlying infrastructure problem rather than a one-off event.
+	// +optional
+	Attempts int32 `json:"attempts,omitempty"`
+
+	// DataLoss records the data-loss accounting for the most recent rebuild.
+	//
+	// Quorum-loss recovery via --force-new-cluster is NOT a lossless operation:
+	// the rebuilt cluster retains only the writes that were committed to the
+	// surviving member's local data directory. Any write that a now-destroyed
+	// majority had committed but had not yet replicated to the survivor is GONE.
+	// This field surfaces that fact explicitly (alongside a Warning Event, the
+	// DataLossPossible condition, and structured logs) so the loss is auditable
+	// and never silent. It is nil until a rebuild from a survivor completes.
+	// +optional
+	DataLoss *DataLossInfo `json:"dataLoss,omitempty"`
+}
+
+// DataLossInfo captures what the operator knows about the data retained by — and
+// therefore the data potentially lost during — a force-new-cluster rebuild.
+//
+// The operator cannot enumerate exactly which keys were lost (the members that
+// held the un-replicated writes are gone), so this records the provable lower
+// bound on retained state: the survivor's identity and its last committed
+// revision. Everything the destroyed majority committed beyond SurvivorRevision
+// is unrecoverable.
+type DataLossInfo struct {
+	// SurvivorMemberID is the hex-encoded etcd member ID of the survivor whose
+	// data directory was used to rebuild the cluster.
+	// +optional
+	SurvivorMemberID string `json:"survivorMemberID,omitempty"`
+
+	// SurvivorRevision is the key-value store revision present on the survivor at
+	// the moment the single-member cluster came back healthy. It is the highest
+	// revision guaranteed to be retained; any revision the lost majority committed
+	// above this value did not survive the rebuild.
+	// +optional
+	SurvivorRevision int64 `json:"survivorRevision,omitempty"`
+
+	// RaftIndex is the survivor's raft committed index at rebuild time, recorded
+	// for forensic correlation with member logs.
+	// +optional
+	RaftIndex uint64 `json:"raftIndex,omitempty"`
+
+	// RecoveredTime is when the rebuilt single-member cluster was confirmed
+	// healthy and this accounting was captured.
+	// +optional
+	RecoveredTime *metav1.Time `json:"recoveredTime,omitempty"`
+
+	// Message is a human-readable, operator-facing summary of the data-loss
+	// situation, e.g. "recovered with possible data loss; rebuilt from member
+	// <id> at revision <r>".
+	// +optional
+	Message string `json:"message,omitempty"`
 }
 
 // MemberStatus defines the observed state of a single etcd member.

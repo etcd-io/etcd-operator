@@ -61,6 +61,7 @@ import (
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -68,6 +69,7 @@ import (
 
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 	"go.etcd.io/etcd-operator/internal/etcdutils"
+	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 const (
@@ -91,6 +93,15 @@ const (
 	// ConditionRecovering is the status condition type the operator raises while
 	// a quorum-loss recovery is in progress.
 	ConditionRecovering = "Recovering"
+
+	// ConditionDataLossPossible is the status condition type the operator raises
+	// when it rebuilds a cluster from a single survivor. The rebuild retains only
+	// the data committed to that survivor, so any write the destroyed majority had
+	// committed but not yet replicated to the survivor is lost. This condition is
+	// set True and LEFT True after a rebuild so the loss remains visible long after
+	// the (transient) Recovering condition clears — it is an audit marker, not a
+	// liveness signal, and a human is expected to acknowledge it.
+	ConditionDataLossPossible = "DataLossPossible"
 )
 
 // Event reasons surfaced on the EtcdCluster object during recovery.
@@ -100,6 +111,10 @@ const (
 	EventReasonRecoveryRebuilding = "RecoveryRebuilding"
 	EventReasonRecoveryScalingOut = "RecoveryScalingOut"
 	EventReasonRecoveryCompleted  = "RecoveryCompleted"
+	// EventReasonPossibleDataLoss is a Warning surfaced LOUDLY when a rebuild
+	// from a survivor completes. It is the user-visible counterpart of the
+	// DataLossPossible condition and the DataLoss status accounting.
+	EventReasonPossibleDataLoss = "PossibleDataLoss"
 )
 
 // quorumAssessment is the outcome of inspecting member health for quorum loss.
@@ -252,10 +267,15 @@ func (r *EtcdClusterReconciler) maybeRecoverQuorum(
 		return true, requeueDuration, nil
 	}
 
-	// Grace period elapsed and quorum is still lost: commit to recovery.
-	logger.Info("Sustained quorum loss confirmed; initiating disaster recovery", "detail", a.reason)
+	// Grace period elapsed and quorum is still lost: commit to recovery. This is
+	// the one place we cross from "suspected" to "destructive action", so it is
+	// where the durable attempt counter is bumped.
+	s.cluster.Status.Recovery.Attempts++
+	logger.Info("Sustained quorum loss confirmed; initiating disaster recovery",
+		"detail", a.reason, "attempt", s.cluster.Status.Recovery.Attempts)
 	r.eventf(s.cluster, corev1.EventTypeWarning, EventReasonRecoveryStarted,
-		"Quorum loss sustained for %s; rebuilding cluster from survivor pod %s-0.", quorumLossGracePeriod, s.cluster.Name)
+		"Quorum loss sustained for %s (recovery attempt #%d); rebuilding cluster from survivor pod %s-0. WARNING: rebuilding from a single survivor may lose writes not yet replicated to it.",
+		quorumLossGracePeriod, s.cluster.Status.Recovery.Attempts, s.cluster.Name)
 	r.transitionRecovery(s.cluster, ecv1alpha1.RecoveryPhaseRebuilding,
 		fmt.Sprintf("rebuilding single-member cluster from survivor ordinal 0 (%s)", a.reason))
 	return r.advanceRecovery(ctx, logger, s, memberListErr)
@@ -296,10 +316,27 @@ func (r *EtcdClusterReconciler) recoveryRebuild(
 	sts := s.sts
 
 	if !stsHasForceNewCluster(sts) {
+		// Safety gate before the destructive flag goes on: confirm the survivor pod
+		// actually exists. --force-new-cluster is irreversible (it rewrites raft
+		// membership), so we must not arm it for a pod the StatefulSet has not yet
+		// created — doing so against a not-yet-scheduled / freshly-replaced ordinal-0
+		// risks forking from an empty data dir. If the pod is absent this loop, hold
+		// and requeue; the StatefulSet will (re)create it.
+		survivorPodName := fmt.Sprintf("%s-%d", sts.Name, s.cluster.Status.Recovery.SurvivorOrdinal)
+		var survivor corev1.Pod
+		if err := r.Get(ctx, client.ObjectKey{Namespace: sts.Namespace, Name: survivorPodName}, &survivor); err != nil {
+			if apierrors.IsNotFound(err) {
+				logger.Info("Rebuild step 1: survivor pod not present yet; holding before arming --force-new-cluster",
+					"survivorPod", survivorPodName)
+				return true, requeueDuration, nil
+			}
+			return true, 0, fmt.Errorf("failed to read survivor pod %s/%s before rebuild: %w", sts.Namespace, survivorPodName, err)
+		}
+
 		logger.Info("Rebuild step 1: scaling StatefulSet to single survivor and injecting --force-new-cluster",
-			"survivorOrdinal", 0)
+			"survivorOrdinal", s.cluster.Status.Recovery.SurvivorOrdinal, "survivorPod", survivorPodName)
 		r.eventf(s.cluster, corev1.EventTypeWarning, EventReasonRecoveryRebuilding,
-			"Rebuilding: restarting %s-0 with --force-new-cluster from surviving data.", s.cluster.Name)
+			"Rebuilding: restarting %s with --force-new-cluster from surviving data.", survivorPodName)
 		// Realign the state ConfigMap with the single-member bootstrap. The
 		// ConfigMap is consumed by pod-0 via EnvFrom and otherwise still advertises
 		// a multi-member "existing" cluster, which contradicts --force-new-cluster.
@@ -335,8 +372,19 @@ func (r *EtcdClusterReconciler) recoveryRebuild(
 		return true, requeueDuration, nil
 	}
 
-	// Single-member cluster is healthy and is its own leader. Drop the flag so the
-	// pod won't re-fork on its next restart, then move to scale-out.
+	// Single-member cluster is healthy and is its own leader. Before we move on,
+	// account for the data loss this rebuild may have incurred: the cluster now
+	// contains exactly what THIS survivor had on disk. Anything the destroyed
+	// majority committed beyond the survivor's revision is gone. Surface that
+	// loudly and durably — Event + condition + structured log + status — so it is
+	// never silent. Record it once (the first time we confirm the survivor) so a
+	// requeue can't overwrite the captured revision with a later, post-write one.
+	if s.cluster.Status.Recovery.DataLoss == nil {
+		r.recordPossibleDataLoss(logger, s.cluster, st)
+	}
+
+	// Drop the flag so the pod won't re-fork on its next restart, then move to
+	// scale-out.
 	logger.Info("Rebuild complete: survivor is a healthy single-member cluster; removing --force-new-cluster")
 	if err := r.patchStatefulSetForForceNewCluster(ctx, sts, false); err != nil {
 		return true, 0, fmt.Errorf("failed to remove --force-new-cluster after rebuild: %w", err)
@@ -346,6 +394,69 @@ func (r *EtcdClusterReconciler) recoveryRebuild(
 	r.eventf(s.cluster, corev1.EventTypeNormal, EventReasonRecoveryScalingOut,
 		"Survivor healthy; re-adding members to reach desired size %d.", s.cluster.Spec.Size)
 	return true, requeueDuration, nil
+}
+
+// recordPossibleDataLoss captures and LOUDLY surfaces the data-loss accounting
+// for a completed rebuild. The survivor's status (st) is the source of truth for
+// what was retained: its member ID and the highest revision committed to its
+// local store. Anything the destroyed majority committed above that revision did
+// not survive --force-new-cluster and is unrecoverable.
+//
+// This is deliberately multi-channel so the loss cannot be missed:
+//   - status.recovery.dataLoss: machine-readable accounting that persists.
+//   - DataLossPossible condition (True): visible in `kubectl get`/`describe`,
+//     left True until a human acknowledges it.
+//   - a Warning Event: shows up in `kubectl describe` and event streams/alerts.
+//   - a structured log at the operator.
+func (r *EtcdClusterReconciler) recordPossibleDataLoss(
+	logger logr.Logger,
+	ec *ecv1alpha1.EtcdCluster,
+	st *clientv3.StatusResponse,
+) {
+	now := metav1.Now()
+
+	var (
+		memberID string
+		revision int64
+		raftIdx  uint64
+	)
+	if st.Header != nil {
+		memberID = fmt.Sprintf("%x", st.Header.MemberId)
+		revision = st.Header.Revision
+	}
+	raftIdx = st.RaftIndex
+
+	msg := fmt.Sprintf(
+		"recovered with possible data loss; rebuilt from survivor member %s (ordinal %d) at revision %d. "+
+			"Writes committed by the lost majority above revision %d were NOT retained.",
+		memberID, ec.Status.Recovery.SurvivorOrdinal, revision, revision)
+
+	ec.Status.Recovery.DataLoss = &ecv1alpha1.DataLossInfo{
+		SurvivorMemberID: memberID,
+		SurvivorRevision: revision,
+		RaftIndex:        raftIdx,
+		RecoveredTime:    &now,
+		Message:          msg,
+	}
+
+	// Audit marker: set True and leave it True. This is not a liveness signal;
+	// it records that a lossy recovery happened and is awaiting human review.
+	meta.SetStatusCondition(&ec.Status.Conditions, metav1.Condition{
+		Type:               ConditionDataLossPossible,
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: ec.Generation,
+		Reason:             "RebuiltFromSurvivor",
+		Message:            msg,
+	})
+
+	logger.Info("POSSIBLE DATA LOSS during quorum-loss recovery",
+		"survivorMemberID", memberID,
+		"survivorRevision", revision,
+		"survivorRaftIndex", raftIdx,
+		"survivorOrdinal", ec.Status.Recovery.SurvivorOrdinal,
+		"detail", msg)
+
+	r.eventf(ec, corev1.EventTypeWarning, EventReasonPossibleDataLoss, "%s", msg)
 }
 
 // recoveryScaleOut checks whether the cluster has been rebuilt to its desired

@@ -195,6 +195,16 @@ func quorumLostHealth() []etcdutils.EpHealth {
 	return []etcdutils.EpHealth{member(1, true, false, 0), member(2, false, false, 0), member(3, false, false, 0)}
 }
 
+// survivorPod builds the ordinal-0 pod that the rebuild step requires to exist
+// before it arms --force-new-cluster. Tests that drive the Rebuilding phase must
+// create it so the survivor-presence gate passes.
+func survivorPod() *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "etcd-0", Namespace: "default"},
+		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "etcd"}}},
+	}
+}
+
 // TestMaybeRecoverQuorum_GracePeriod verifies the detection state machine waits
 // out the grace window and only commits to recovery once quorum loss is
 // sustained — and that it cancels cleanly if quorum returns first.
@@ -225,6 +235,7 @@ func TestMaybeRecoverQuorum_GracePeriod(t *testing.T) {
 		r := newTestReconciler()
 		ec := threeNodeCluster()
 		require.NoError(t, r.Create(context.Background(), sts))
+		require.NoError(t, r.Create(context.Background(), survivorPod()))
 		s := &reconcileState{cluster: ec, sts: sts}
 
 		// Enter Detecting.
@@ -384,6 +395,7 @@ func TestRecoveryRebuild_RemovesFlagAndAdvances(t *testing.T) {
 	ec := threeNodeCluster()
 	sts := threeReplicaSTS()
 	require.NoError(t, r.Create(context.Background(), sts))
+	require.NoError(t, r.Create(context.Background(), survivorPod()))
 
 	// Enter Rebuilding with the grace period already elapsed (sustained loss).
 	_, _, err := r.maybeRecoverQuorum(context.Background(), &reconcileState{cluster: ec, sts: sts}, quorumLostHealth(), nil)
@@ -451,4 +463,130 @@ func TestRecoveryActive(t *testing.T) {
 
 	ec.Status.Recovery.Phase = ecv1alpha1.RecoveryPhaseCompleted
 	assert.False(t, recoveryActive(ec))
+}
+
+// survivorHealth builds the single-survivor health observation reported once the
+// force-new-cluster bootstrap is up: healthy, self-leader, at a given revision.
+func survivorHealth(memberID uint64, revision int64, raftIndex uint64) []etcdutils.EpHealth {
+	return []etcdutils.EpHealth{{
+		Ep:     "http://etcd-0:2379",
+		Health: true,
+		Status: &clientv3.StatusResponse{
+			Header:    &etcdserverpb.ResponseHeader{MemberId: memberID, Revision: revision},
+			Leader:    memberID, // self-leader
+			RaftIndex: raftIndex,
+		},
+	}}
+}
+
+// TestRecoveryRebuild_RecordsPossibleDataLoss is the core data-loss-accounting
+// test. When a rebuild from the survivor completes, the operator MUST surface the
+// possible loss on every channel: the DataLoss status accounting (with the
+// survivor's id + retained revision), the DataLossPossible condition set True,
+// and a Warning Event. The accounting must be captured exactly once and must NOT
+// be overwritten by a later loop observing a higher (post-recovery-write) revision.
+func TestRecoveryRebuild_RecordsPossibleDataLoss(t *testing.T) {
+	r := newTestReconciler()
+	rec := events.NewFakeRecorder(32)
+	r.Recorder = rec
+
+	ec := threeNodeCluster()
+	sts := threeReplicaSTS()
+	require.NoError(t, r.Create(context.Background(), sts))
+	require.NoError(t, r.Create(context.Background(), survivorPod()))
+
+	// Commit to recovery (grace already elapsed) => Rebuilding, flag injected.
+	_, _, err := r.maybeRecoverQuorum(context.Background(), &reconcileState{cluster: ec, sts: sts}, quorumLostHealth(), nil)
+	require.NoError(t, err)
+	require.NotNil(t, ec.Status.Recovery)
+	past := metav1.NewTime(time.Now().Add(-2 * quorumLossGracePeriod))
+	ec.Status.Recovery.DetectedTime = &past
+	_, _, err = r.maybeRecoverQuorum(context.Background(), &reconcileState{cluster: ec, sts: sts}, quorumLostHealth(), nil)
+	require.NoError(t, err)
+	require.Equal(t, ecv1alpha1.RecoveryPhaseRebuilding, ec.Status.Recovery.Phase)
+
+	// Committing to a destructive rebuild bumps the durable attempt counter.
+	assert.Equal(t, int32(1), ec.Status.Recovery.Attempts, "first commit to rebuild => attempt #1")
+
+	var rebuilding appsv1.StatefulSet
+	require.NoError(t, r.Get(context.Background(), objKey("etcd", "default"), &rebuilding))
+
+	// Survivor comes up healthy and self-leader at revision 4242 / raftIndex 9000.
+	r.clusterHealthFn = func(eps []string) ([]etcdutils.EpHealth, error) {
+		return survivorHealth(0xabc, 4242, 9000), nil
+	}
+	handled, _, err := r.maybeRecoverQuorum(context.Background(), &reconcileState{cluster: ec, sts: &rebuilding}, nil, nil)
+	require.NoError(t, err)
+	assert.True(t, handled)
+	require.Equal(t, ecv1alpha1.RecoveryPhaseScalingOut, ec.Status.Recovery.Phase)
+
+	// (1) DataLoss accounting captured with survivor id + retained revision.
+	dl := ec.Status.Recovery.DataLoss
+	require.NotNil(t, dl, "DataLoss accounting must be recorded on rebuild completion")
+	assert.Equal(t, "abc", dl.SurvivorMemberID, "member id is hex-encoded")
+	assert.Equal(t, int64(4242), dl.SurvivorRevision)
+	assert.Equal(t, uint64(9000), dl.RaftIndex)
+	require.NotNil(t, dl.RecoveredTime)
+	assert.Contains(t, dl.Message, "possible data loss")
+	assert.Contains(t, dl.Message, "revision 4242")
+
+	// (2) DataLossPossible condition set True (audit marker, left True).
+	cond := meta.FindStatusCondition(ec.Status.Conditions, ConditionDataLossPossible)
+	require.NotNil(t, cond, "DataLossPossible condition must be set")
+	assert.Equal(t, metav1.ConditionTrue, cond.Status)
+	assert.Equal(t, "RebuiltFromSurvivor", cond.Reason)
+
+	// (3) A Warning Event surfaced the loss loudly.
+	sawDataLoss := false
+	for drain := true; drain; {
+		select {
+		case e := <-rec.Events:
+			if strings.Contains(e, EventReasonPossibleDataLoss) && strings.Contains(e, "Warning") {
+				sawDataLoss = true
+			}
+		default:
+			drain = false
+		}
+	}
+	assert.True(t, sawDataLoss, "expected a Warning PossibleDataLoss event on rebuild completion")
+
+	// Idempotency: a subsequent rebuild loop observing a HIGHER revision (a write
+	// landed post-recovery) must NOT clobber the originally-retained revision. We
+	// re-enter Rebuilding to exercise the "DataLoss already set" guard directly.
+	ec.Status.Recovery.Phase = ecv1alpha1.RecoveryPhaseRebuilding
+	// Re-arm the flag annotation so recoveryRebuild takes the "survivor healthy" leg.
+	require.NoError(t, r.patchStatefulSetForForceNewCluster(context.Background(), &rebuilding, true))
+	r.clusterHealthFn = func(eps []string) ([]etcdutils.EpHealth, error) {
+		return survivorHealth(0xabc, 5000, 9999), nil
+	}
+	_, _, err = r.maybeRecoverQuorum(context.Background(), &reconcileState{cluster: ec, sts: &rebuilding}, nil, nil)
+	require.NoError(t, err)
+	assert.Equal(t, int64(4242), ec.Status.Recovery.DataLoss.SurvivorRevision,
+		"data-loss revision must be captured once and not overwritten by later loops")
+}
+
+// TestRecoveryRebuild_HoldsWhenSurvivorPodMissing verifies the survivor-presence
+// safety gate: the operator must NOT arm the irreversible --force-new-cluster flag
+// while the survivor pod does not exist. It holds (handled, no flag) and requeues.
+func TestRecoveryRebuild_HoldsWhenSurvivorPodMissing(t *testing.T) {
+	r := newTestReconciler()
+	ec := threeNodeCluster()
+	sts := threeReplicaSTS()
+	require.NoError(t, r.Create(context.Background(), sts))
+	// Deliberately do NOT create the survivor pod.
+
+	ec.Status.Recovery = &ecv1alpha1.RecoveryStatus{
+		Phase:        ecv1alpha1.RecoveryPhaseRebuilding,
+		DetectedTime: &metav1.Time{Time: time.Now()},
+	}
+
+	handled, requeue, err := r.maybeRecoverQuorum(context.Background(), &reconcileState{cluster: ec, sts: sts}, nil, nil)
+	require.NoError(t, err)
+	assert.True(t, handled, "must keep ownership while waiting for the survivor pod")
+	assert.Greater(t, requeue, time.Duration(0))
+
+	var got appsv1.StatefulSet
+	require.NoError(t, r.Get(context.Background(), objKey("etcd", "default"), &got))
+	assert.False(t, stsHasForceNewCluster(&got),
+		"--force-new-cluster must NOT be armed until the survivor pod exists")
 }
