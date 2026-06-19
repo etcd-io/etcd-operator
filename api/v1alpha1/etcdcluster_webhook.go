@@ -23,8 +23,10 @@ import (
 	"strings"
 
 	"github.com/coreos/go-semver/semver"
+	corev1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation/field"
@@ -65,7 +67,33 @@ func (r *EtcdCluster) SetupWebhookWithManager(mgr ctrl.Manager) error {
 		Complete()
 }
 
-// +kubebuilder:webhook:path=/mutate-operator-etcd-io-v1alpha1-etcdcluster,mutating=true,failurePolicy=fail,sideEffects=None,groups=operator.etcd.io,resources=etcdclusters,verbs=create;update,versions=v1alpha1,name=metcdcluster-v1alpha1.kb.io,admissionReviewVersions=v1
+// Webhook policy rationale (applies to BOTH webhooks declared in this file).
+//
+//   - failurePolicy=fail: these webhooks are correctness-critical. Defaulting
+//     (provider=auto) and validation (odd size, semver, supported upgrade path,
+//     storageSpec immutability) protect a stateful, quorum-based datastore where a
+//     bad spec admitted while the webhook is unreachable can produce a cluster that
+//     cannot form quorum or silent data loss on a botched PVC change. We therefore
+//     fail closed: if the API server cannot reach the webhook, the EtcdCluster
+//     create/update is rejected rather than admitted unchecked.
+//   - Failing closed does NOT brick the cluster. The rule scope is EXACTLY
+//     {operator.etcd.io/v1alpha1 etcdclusters}, so a webhook outage only blocks
+//     mutations to EtcdCluster CRs (a narrow, operator-owned resource); core
+//     workloads, nodes, and every other API object stay fully editable. As an
+//     explicit break-glass escape hatch, config/default injects an objectSelector
+//     so an admin can label a single CR with
+//     `etcd.operator.etcd.io/skip-webhooks: "true"` to bypass admission while the
+//     webhook is down (see config/default/webhook_selector_patch.yaml).
+//   - timeoutSeconds=10: validation is pure, in-memory, and dependency-free (no
+//     external calls), so 10s is generous headroom that still bounds API-server
+//     stalls if the webhook pod is wedged. With failurePolicy=fail a timeout is a
+//     rejection, which is the safe direction.
+//   - matchPolicy=Equivalent: match the request even if it arrives via a different
+//     but equivalent API group/version, so a future served/stored version cannot
+//     silently slip past the validator. Only v1alpha1 exists today, but Equivalent
+//     is the safe default and costs nothing now.
+
+// +kubebuilder:webhook:path=/mutate-operator-etcd-io-v1alpha1-etcdcluster,mutating=true,failurePolicy=fail,matchPolicy=Equivalent,timeoutSeconds=10,sideEffects=None,groups=operator.etcd.io,resources=etcdclusters,verbs=create;update,versions=v1alpha1,name=metcdcluster-v1alpha1.kb.io,admissionReviewVersions=v1
 
 // EtcdClusterCustomDefaulter applies defaults to EtcdCluster objects on admission.
 // +kubebuilder:object:generate=false
@@ -99,7 +127,11 @@ func applyEtcdClusterDefaults(ec *EtcdCluster, log logr) {
 	}
 }
 
-// +kubebuilder:webhook:path=/validate-operator-etcd-io-v1alpha1-etcdcluster,mutating=false,failurePolicy=fail,sideEffects=None,groups=operator.etcd.io,resources=etcdclusters,verbs=create;update,versions=v1alpha1,name=vetcdcluster-v1alpha1.kb.io,admissionReviewVersions=v1
+// See the "Webhook policy rationale" comment above the mutating webhook marker;
+// failurePolicy=fail, matchPolicy=Equivalent, and timeoutSeconds=10 are chosen on
+// the same grounds for the validating webhook.
+
+// +kubebuilder:webhook:path=/validate-operator-etcd-io-v1alpha1-etcdcluster,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,timeoutSeconds=10,sideEffects=None,groups=operator.etcd.io,resources=etcdclusters,verbs=create;update,versions=v1alpha1,name=vetcdcluster-v1alpha1.kb.io,admissionReviewVersions=v1
 
 // EtcdClusterCustomValidator validates EtcdCluster objects on admission.
 // +kubebuilder:object:generate=false
@@ -184,6 +216,68 @@ func validateEtcdClusterSpec(spec *EtcdClusterSpec) field.ErrorList {
 	errs = append(errs, validateSize(spec.Size, specPath.Child("size"))...)
 	errs = append(errs, validateVersionFormat(spec.Version, specPath.Child("version"))...)
 	errs = append(errs, validateTLS(spec.TLS, specPath.Child("tls"))...)
+	errs = append(errs, validateStorageSpec(spec.StorageSpec, specPath.Child("storageSpec"))...)
+
+	return errs
+}
+
+// minVolumeSizeRequest mirrors the controller's reconcile-time floor
+// (internal/controller/utils.go) so the webhook rejects an undersized PVC
+// synchronously at apply time instead of letting the StatefulSet build fail later
+// with no actionable feedback.
+var minVolumeSizeRequest = resource.MustParse("1Mi")
+
+// validateStorageSpec enforces the same storage invariants the controller checks
+// while building the StatefulSet, but at admission time so the user gets an
+// immediate, actionable rejection rather than a silently failing reconcile:
+//
+//   - volumeSizeRequest is required and must be >= 1Mi.
+//   - volumeSizeLimit, if set, must be >= volumeSizeRequest (a PVC whose limit is
+//     below its request is rejected by the API server when the StatefulSet is
+//     created).
+//   - accessModes must be one the operator handles (ReadWriteOnce, ReadWriteMany,
+//     or empty -> ReadWriteOnce); ReadOnlyMany and others are unsupported.
+//   - pvcName is required when accessModes is ReadWriteMany (the operator mounts a
+//     pre-provisioned shared PVC by name in that mode).
+func validateStorageSpec(s *StorageSpec, path *field.Path) field.ErrorList {
+	if s == nil {
+		return nil
+	}
+	var errs field.ErrorList
+
+	switch {
+	case s.VolumeSizeRequest.IsZero():
+		errs = append(errs, field.Required(path.Child("volumeSizeRequest"),
+			"volumeSizeRequest is required when storageSpec is set; specify a persistent volume size such as \"1Gi\"."))
+	case s.VolumeSizeRequest.Cmp(minVolumeSizeRequest) < 0:
+		errs = append(errs, field.Invalid(path.Child("volumeSizeRequest"), s.VolumeSizeRequest.String(),
+			fmt.Sprintf("volumeSizeRequest must be at least 1Mi; got %q. Request a larger persistent volume (e.g. \"1Gi\").",
+				s.VolumeSizeRequest.String())))
+	}
+
+	// Only meaningful to compare the limit when both are usable values; if the
+	// request itself is invalid the message above is the actionable one.
+	if !s.VolumeSizeLimit.IsZero() && !s.VolumeSizeRequest.IsZero() &&
+		s.VolumeSizeLimit.Cmp(s.VolumeSizeRequest) < 0 {
+		errs = append(errs, field.Invalid(path.Child("volumeSizeLimit"), s.VolumeSizeLimit.String(),
+			fmt.Sprintf("volumeSizeLimit (%q) must be greater than or equal to volumeSizeRequest (%q); "+
+				"raise volumeSizeLimit or lower volumeSizeRequest.",
+				s.VolumeSizeLimit.String(), s.VolumeSizeRequest.String())))
+	}
+
+	switch s.AccessModes {
+	case "", corev1.ReadWriteOnce:
+		// default / single-writer: nothing else required.
+	case corev1.ReadWriteMany:
+		if strings.TrimSpace(s.PVCName) == "" {
+			errs = append(errs, field.Required(path.Child("pvcName"),
+				"pvcName is required when accessModes is \"ReadWriteMany\"; set it to the name of the "+
+					"pre-provisioned shared PersistentVolumeClaim the etcd pods should mount."))
+		}
+	default:
+		errs = append(errs, field.NotSupported(path.Child("accessModes"),
+			s.AccessModes, []string{string(corev1.ReadWriteOnce), string(corev1.ReadWriteMany)}))
+	}
 
 	return errs
 }
@@ -236,37 +330,62 @@ func validateTLS(tls *TLSCertificate, path *field.Path) field.ErrorList {
 		provider = tlsProviderAuto
 	}
 
+	cfgPath := path.Child("providerCfg")
 	switch provider {
 	case tlsProviderAuto:
 		// auto provider self-generates certs; cert-manager config must not be set.
 		if tls.ProviderCfg.CertManagerCfg != nil {
-			errs = append(errs, field.Invalid(path.Child("providerCfg").Child("certManagerCfg"),
+			errs = append(errs, field.Invalid(cfgPath.Child("certManagerCfg"),
 				"<set>",
 				"providerCfg.certManagerCfg must not be set when provider is \"auto\"; "+
 					"either remove providerCfg.certManagerCfg or set provider to \"cert-manager\"."))
 		}
+		if ac := tls.ProviderCfg.AutoCfg; ac != nil {
+			errs = append(errs, validateCommonName(ac.CommonName,
+				cfgPath.Child("autoCfg").Child("commonName"))...)
+		}
 	case tlsProviderCertManager:
 		cm := tls.ProviderCfg.CertManagerCfg
 		if cm == nil {
-			errs = append(errs, field.Required(path.Child("providerCfg").Child("certManagerCfg"),
+			errs = append(errs, field.Required(cfgPath.Child("certManagerCfg"),
 				"providerCfg.certManagerCfg is required when provider is \"cert-manager\"; "+
 					"supply issuerKind and issuerName."))
 			break
 		}
 		if strings.TrimSpace(cm.IssuerName) == "" {
-			errs = append(errs, field.Required(path.Child("providerCfg").Child("certManagerCfg").Child("issuerName"),
+			errs = append(errs, field.Required(cfgPath.Child("certManagerCfg").Child("issuerName"),
 				"issuerName is required for the cert-manager provider; set it to the name of an Issuer or ClusterIssuer."))
 		}
 		if k := strings.TrimSpace(cm.IssuerKind); k != "" && k != "Issuer" && k != "ClusterIssuer" {
 			errs = append(errs, field.NotSupported(
-				path.Child("providerCfg").Child("certManagerCfg").Child("issuerKind"),
+				cfgPath.Child("certManagerCfg").Child("issuerKind"),
 				cm.IssuerKind, []string{"Issuer", "ClusterIssuer"}))
 		}
+		errs = append(errs, validateCommonName(cm.CommonName,
+			cfgPath.Child("certManagerCfg").Child("commonName"))...)
 	default:
 		errs = append(errs, field.NotSupported(path.Child("provider"), tls.Provider, knownTLSProviders))
 	}
 
 	return errs
+}
+
+// maxCommonNameLen is the X.509 CommonName ceiling documented on CommonConfig: a
+// CN longer than 64 characters produces an invalid CSR, so the cert never issues.
+// Catching it at admission turns a silent never-ready certificate into an
+// immediate, actionable rejection.
+const maxCommonNameLen = 64
+
+// validateCommonName enforces the documented 64-character CommonName limit. An
+// empty CommonName is valid (the provider derives a default).
+func validateCommonName(cn string, path *field.Path) field.ErrorList {
+	if len(cn) <= maxCommonNameLen {
+		return nil
+	}
+	return field.ErrorList{field.Invalid(path, cn,
+		fmt.Sprintf("commonName must be %d characters or fewer to produce a valid X.509 CSR; got %d. "+
+			"Shorten commonName (the certificate provider derives a default when it is empty).",
+			maxCommonNameLen, len(cn)))}
 }
 
 // validateEtcdClusterUpdate runs all update-time invariants between the old and
@@ -293,13 +412,20 @@ func validateEtcdClusterUpdate(oldSpec, newSpec *EtcdClusterSpec) field.ErrorLis
 
 	// storageSpec is immutable once set: changing the PVC template after the
 	// StatefulSet exists cannot be reconciled in place and risks data loss.
-	if oldSpec.StorageSpec != nil && newSpec.StorageSpec == nil {
+	switch {
+	case oldSpec.StorageSpec != nil && newSpec.StorageSpec == nil:
 		errs = append(errs, field.Invalid(specPath.Child("storageSpec"), nil,
 			"storageSpec is immutable and cannot be removed once set; restore the original storageSpec or recreate the cluster."))
-	} else if oldSpec.StorageSpec != nil && newSpec.StorageSpec != nil &&
-		!apiequality.Semantic.DeepEqual(oldSpec.StorageSpec, newSpec.StorageSpec) {
+	case oldSpec.StorageSpec != nil && newSpec.StorageSpec != nil &&
+		!apiequality.Semantic.DeepEqual(oldSpec.StorageSpec, newSpec.StorageSpec):
 		errs = append(errs, field.Invalid(specPath.Child("storageSpec"), newSpec.StorageSpec,
 			"storageSpec is immutable and cannot be changed once set; revert spec.storageSpec to its original value or recreate the cluster."))
+	case oldSpec.StorageSpec == nil && newSpec.StorageSpec != nil:
+		// Adding storage to a cluster that previously had none is permitted (it is
+		// not yet "set"), but the new block must itself be valid — otherwise the
+		// content invariants would only be enforced at create time and a malformed
+		// storageSpec could be introduced via update.
+		errs = append(errs, validateStorageSpec(newSpec.StorageSpec, specPath.Child("storageSpec"))...)
 	}
 
 	// Upgrade-path check. Only meaningful when both versions parse and actually

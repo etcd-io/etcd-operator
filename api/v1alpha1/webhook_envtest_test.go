@@ -27,6 +27,7 @@ import (
 	"testing"
 	"time"
 
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
@@ -199,6 +200,21 @@ func TestEnvtest_RejectsBadVersion(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "is not a valid semantic version") {
 		t.Fatalf("unexpected rejection message: %v", err)
+	}
+}
+
+func TestEnvtest_RejectsUndersizedStorage(t *testing.T) {
+	skipIfNoEnvtest(t)
+	c := mkCluster("bad-storage", 3, "3.6.1")
+	c.Spec.StorageSpec = &operatorv1alpha1.StorageSpec{
+		VolumeSizeRequest: resource.MustParse("512Ki"), // below the 1Mi floor
+	}
+	err := whClient.Create(context.Background(), c)
+	if err == nil {
+		t.Fatal("expected undersized volumeSizeRequest to be rejected by the validating webhook")
+	}
+	if !strings.Contains(err.Error(), "volumeSizeRequest must be at least 1Mi") {
+		t.Fatalf("unexpected storage rejection message: %v", err)
 	}
 }
 

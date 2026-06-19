@@ -21,6 +21,7 @@ import (
 	"strings"
 	"testing"
 
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
 	"sigs.k8s.io/e2e-framework/pkg/features"
@@ -88,6 +89,23 @@ func TestAdmissionWebhooks(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), "auto") || !strings.Contains(err.Error(), "cert-manager") {
 				t.Fatalf("expected supported-provider list in rejection, got: %v", err)
+			}
+			return ctx
+		})
+
+	feature.Assess("rejects undersized storageSpec volumeSizeRequest",
+		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+			c := cfg.Client()
+			cluster := newWebhookTestCluster("wh-badstorage", 3, etcdVersion)
+			cluster.Spec.StorageSpec = &ecv1alpha1.StorageSpec{
+				VolumeSizeRequest: resource.MustParse("512Ki"), // below the 1Mi floor
+			}
+			err := c.Resources().Create(ctx, cluster)
+			if err == nil {
+				t.Fatal("expected undersized volumeSizeRequest to be rejected")
+			}
+			if !strings.Contains(err.Error(), "volumeSizeRequest must be at least 1Mi") {
+				t.Fatalf("expected storage-size guidance in rejection, got: %v", err)
 			}
 			return ctx
 		})

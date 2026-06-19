@@ -47,6 +47,18 @@ patches:
   target:
     kind: Deployment
 
+# [WEBHOOK] Break-glass escape hatch: add an objectSelector to both fail-closed
+# webhook configurations so an admin can opt a single EtcdCluster out of admission
+# (label etcd.operator.etcd.io/skip-webhooks=true) while the webhook is down.
+- path: webhook_selector_patch.yaml
+  target:
+    group: admissionregistration.k8s.io
+    kind: ValidatingWebhookConfiguration
+- path: webhook_selector_patch.yaml
+  target:
+    group: admissionregistration.k8s.io
+    kind: MutatingWebhookConfiguration
+
 # [CERTMANAGER] To enable cert-manager, the following replacements wire the
 # cert-manager CA into the webhook configurations and the serving Certificate's
 # dnsNames so the API server trusts the webhook server's TLS cert.

@@ -430,3 +430,162 @@ func TestDefault_TLSProvider(t *testing.T) {
 		}
 	})
 }
+
+func TestValidateStorageSpec_Messages(t *testing.T) {
+	v := &EtcdClusterCustomValidator{}
+
+	// withStorage returns a valid 3-node cluster we can attach a storageSpec to.
+	withStorage := func(s *StorageSpec) *EtcdCluster {
+		c := newCluster(3, "3.6.1")
+		c.Spec.StorageSpec = s
+		return c
+	}
+
+	tests := []struct {
+		name        string
+		storage     *StorageSpec
+		wantOK      bool
+		wantMessage string // exact "<field>: <message>"
+	}{
+		{
+			name:    "valid RWO storage is accepted",
+			storage: &StorageSpec{VolumeSizeRequest: resource.MustParse("1Gi")},
+			wantOK:  true,
+		},
+		{
+			name:        "missing volumeSizeRequest is required",
+			storage:     &StorageSpec{StorageClassName: "standard"},
+			wantMessage: "spec.storageSpec.volumeSizeRequest: Required value: volumeSizeRequest is required when storageSpec is set; specify a persistent volume size such as \"1Gi\".",
+		},
+		{
+			name:        "volumeSizeRequest below 1Mi is rejected",
+			storage:     &StorageSpec{VolumeSizeRequest: resource.MustParse("512Ki")},
+			wantMessage: "spec.storageSpec.volumeSizeRequest: Invalid value: \"512Ki\": volumeSizeRequest must be at least 1Mi; got \"512Ki\". Request a larger persistent volume (e.g. \"1Gi\").",
+		},
+		{
+			name: "volumeSizeLimit below request is rejected",
+			storage: &StorageSpec{
+				VolumeSizeRequest: resource.MustParse("2Gi"),
+				VolumeSizeLimit:   resource.MustParse("1Gi"),
+			},
+			wantMessage: "spec.storageSpec.volumeSizeLimit: Invalid value: \"1Gi\": volumeSizeLimit (\"1Gi\") must be greater than or equal to volumeSizeRequest (\"2Gi\"); raise volumeSizeLimit or lower volumeSizeRequest.",
+		},
+		{
+			name: "volumeSizeLimit equal to request is accepted",
+			storage: &StorageSpec{
+				VolumeSizeRequest: resource.MustParse("1Gi"),
+				VolumeSizeLimit:   resource.MustParse("1Gi"),
+			},
+			wantOK: true,
+		},
+		{
+			name: "unsupported accessModes lists the supported choices",
+			storage: &StorageSpec{
+				VolumeSizeRequest: resource.MustParse("1Gi"),
+				AccessModes:       "ReadOnlyMany",
+			},
+			wantMessage: "spec.storageSpec.accessModes: Unsupported value: \"ReadOnlyMany\": supported values: \"ReadWriteOnce\", \"ReadWriteMany\"",
+		},
+		{
+			name: "ReadWriteMany without pvcName is required",
+			storage: &StorageSpec{
+				VolumeSizeRequest: resource.MustParse("1Gi"),
+				AccessModes:       "ReadWriteMany",
+			},
+			wantMessage: "spec.storageSpec.pvcName: Required value: pvcName is required when accessModes is \"ReadWriteMany\"; set it to the name of the pre-provisioned shared PersistentVolumeClaim the etcd pods should mount.",
+		},
+		{
+			name: "ReadWriteMany with pvcName is accepted",
+			storage: &StorageSpec{
+				VolumeSizeRequest: resource.MustParse("1Gi"),
+				AccessModes:       "ReadWriteMany",
+				PVCName:           "shared-etcd-pvc",
+			},
+			wantOK: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := v.ValidateCreate(context.Background(), withStorage(tc.storage))
+			if tc.wantOK {
+				if err != nil {
+					t.Fatalf("expected storageSpec to be accepted, got: %v", err)
+				}
+				return
+			}
+			assertCause(t, err, tc.wantMessage)
+		})
+	}
+}
+
+// TestValidateStorageSpec_OnUpdate guards the update-path handling: a storageSpec
+// added to a cluster that previously had none must still be validated, while the
+// immutability rule continues to protect a storageSpec that was already set.
+func TestValidateStorageSpec_OnUpdate(t *testing.T) {
+	v := &EtcdClusterCustomValidator{}
+	ctx := context.Background()
+
+	t.Run("adding an invalid storageSpec on update is rejected", func(t *testing.T) {
+		old := newCluster(3, "3.6.1") // no storage
+		updated := newCluster(3, "3.6.1")
+		updated.Spec.StorageSpec = &StorageSpec{StorageClassName: "standard"} // missing size
+		_, err := v.ValidateUpdate(ctx, old, updated)
+		assertCause(t, err,
+			"spec.storageSpec.volumeSizeRequest: Required value: volumeSizeRequest is required when storageSpec is set; specify a persistent volume size such as \"1Gi\".")
+	})
+
+	t.Run("adding a valid storageSpec on update is accepted", func(t *testing.T) {
+		old := newCluster(3, "3.6.1")
+		updated := newCluster(3, "3.6.1")
+		updated.Spec.StorageSpec = &StorageSpec{VolumeSizeRequest: resource.MustParse("1Gi")}
+		if _, err := v.ValidateUpdate(ctx, old, updated); err != nil {
+			t.Fatalf("expected adding a valid storageSpec to be allowed, got: %v", err)
+		}
+	})
+}
+
+func TestValidateCommonName_Messages(t *testing.T) {
+	v := &EtcdClusterCustomValidator{}
+	ctx := context.Background()
+
+	// 65 characters: one over the documented 64-char X.509 CN ceiling.
+	tooLong := strings.Repeat("a", 65)
+
+	t.Run("auto provider commonName over 64 chars is rejected", func(t *testing.T) {
+		c := newCluster(3, "3.6.1")
+		c.Spec.TLS = &TLSCertificate{
+			Provider:    "auto",
+			ProviderCfg: ProviderConfig{AutoCfg: &ProviderAutoConfig{CommonConfig: CommonConfig{CommonName: tooLong}}},
+		}
+		_, err := v.ValidateCreate(ctx, c)
+		assertCause(t, err,
+			"spec.tls.providerCfg.autoCfg.commonName: Invalid value: \""+tooLong+"\": commonName must be 64 characters or fewer to produce a valid X.509 CSR; got 65. Shorten commonName (the certificate provider derives a default when it is empty).")
+	})
+
+	t.Run("cert-manager provider commonName over 64 chars is rejected", func(t *testing.T) {
+		c := newCluster(3, "3.6.1")
+		c.Spec.TLS = &TLSCertificate{
+			Provider: "cert-manager",
+			ProviderCfg: ProviderConfig{CertManagerCfg: &ProviderCertManagerConfig{
+				IssuerName:   "ca",
+				IssuerKind:   "Issuer",
+				CommonConfig: CommonConfig{CommonName: tooLong},
+			}},
+		}
+		_, err := v.ValidateCreate(ctx, c)
+		assertCause(t, err,
+			"spec.tls.providerCfg.certManagerCfg.commonName: Invalid value: \""+tooLong+"\": commonName must be 64 characters or fewer to produce a valid X.509 CSR; got 65. Shorten commonName (the certificate provider derives a default when it is empty).")
+	})
+
+	t.Run("commonName exactly 64 chars is accepted", func(t *testing.T) {
+		c := newCluster(3, "3.6.1")
+		c.Spec.TLS = &TLSCertificate{
+			Provider:    "auto",
+			ProviderCfg: ProviderConfig{AutoCfg: &ProviderAutoConfig{CommonConfig: CommonConfig{CommonName: strings.Repeat("a", 64)}}},
+		}
+		if _, err := v.ValidateCreate(ctx, c); err != nil {
+			t.Fatalf("expected a 64-char commonName to be accepted, got: %v", err)
+		}
+	})
+}

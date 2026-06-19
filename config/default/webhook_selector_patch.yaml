@@ -1,0 +1,26 @@
+# Break-glass escape hatch for the fail-closed (failurePolicy: Fail) webhooks.
+#
+# Both the validating and the mutating webhook fail closed so a bad EtcdCluster
+# spec cannot be admitted while the webhook server is unreachable (see the
+# "Webhook policy rationale" comment in api/v1alpha1/etcdcluster_webhook.go). The
+# rule scope is already narrow (only operator.etcd.io/v1alpha1 etcdclusters), so an
+# operator outage never blocks core cluster objects -- but it would still block
+# remediating an EtcdCluster CR while the operator is down.
+#
+# This objectSelector adds a per-object opt-out: an admin can label the single CR
+# that needs editing with
+#
+#     etcd.operator.etcd.io/skip-webhooks: "true"
+#
+# and that object (and only that object) bypasses both webhooks. The default --
+# no label -- still matches, so every EtcdCluster is validated/defaulted unless an
+# operator has explicitly turned the webhooks off for break-glass. matchExpressions
+# uses NotIn so the absence of the label is treated as "selected".
+- op: add
+  path: /webhooks/0/objectSelector
+  value:
+    matchExpressions:
+    - key: etcd.operator.etcd.io/skip-webhooks
+      operator: NotIn
+      values:
+      - "true"
