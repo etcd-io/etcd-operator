@@ -19,8 +19,6 @@ package controller
 import (
 	"fmt"
 
-	"k8s.io/apimachinery/pkg/types"
-
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 )
 
@@ -67,19 +65,4 @@ func snapshotKeyFromBackup(backup *ecv1alpha1.EtcdBackup) (string, error) {
 		return "", fmt.Errorf("EtcdBackup %q has no recorded snapshotLocation", backup.Name)
 	}
 	return snapshotObjectKey(backup), nil
-}
-
-// restoreParamsForCluster builds the RestoreParams for restoring into the
-// genesis (ordinal 0) member of a cluster. The member name and peer URL are
-// derived with the same helper the cluster controller uses to start members, so
-// the restored data directory's member identity matches exactly what the
-// bootstrapping pod advertises.
-func restoreParamsForCluster(cluster *ecv1alpha1.EtcdCluster) RestoreParams {
-	name, peerURL := peerEndpointForOrdinalIndex(cluster, 0)
-	return RestoreParams{
-		Pod:        types.NamespacedName{Namespace: cluster.Namespace, Name: name},
-		MemberName: name,
-		PeerURL:    peerURL,
-		DataDir:    defaultRestoreDataDir,
-	}
 }

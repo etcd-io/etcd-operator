@@ -10,3 +10,9 @@ spec:
           env:
             - name: GOFAIL_HTTP
               value: ":22381"
+            # The restore controller stamps this image onto restore-target
+            # clusters as the restore init-container. It must match the operator
+            # image the e2e builds and loads into kind (see config/manager
+            # images: transform). Kept in sync manually with that tag.
+            - name: OPERATOR_IMAGE
+              value: "etcd-operator:v0.1"

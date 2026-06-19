@@ -19,8 +19,6 @@ package controller
 import (
 	"context"
 	"fmt"
-	"io"
-	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -37,37 +35,16 @@ import (
 	"go.etcd.io/etcd-operator/pkg/objectstore"
 )
 
-// --- test doubles -----------------------------------------------------------
-
-// fakeRestorer records what it was asked to restore and returns canned bytes
-// read (or an error) instead of exec'ing into a pod.
-type fakeRestorer struct {
-	mu        sync.Mutex
-	gotParams RestoreParams
-	gotBytes  []byte
-	calls     int
-	err       error
-}
-
-func (f *fakeRestorer) Restore(_ context.Context, params RestoreParams, r io.Reader) (int64, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.calls++
-	f.gotParams = params
-	if f.err != nil {
-		return 0, f.err
-	}
-	data, err := io.ReadAll(r)
-	f.gotBytes = data
-	return int64(len(data)), err
-}
-
 // --- fixtures ---------------------------------------------------------------
 
-const testRestoreName = "restore-1"
+const (
+	testRestoreName  = "restore-1"
+	testOperatorImg  = "ghcr.io/etcd/etcd-operator:test"
+	restoreReadySize = 1
+)
 
 func newRestoreReconciler(
-	t *testing.T, store *fakeStore, restorer *fakeRestorer, objs ...client.Object,
+	t *testing.T, store *fakeStore, objs ...client.Object,
 ) *EtcdRestoreReconciler {
 	t.Helper()
 	s := backupScheme(t)
@@ -77,9 +54,9 @@ func newRestoreReconciler(
 		WithStatusSubresource(&ecv1alpha1.EtcdRestore{}).
 		Build()
 	return &EtcdRestoreReconciler{
-		Client:   cl,
-		Scheme:   s,
-		Restorer: restorer,
+		Client:        cl,
+		Scheme:        s,
+		OperatorImage: testOperatorImg,
 		NewStore: func(_ context.Context, _ objectstore.Destination, _ objectstore.Credentials) (objectstore.Store, error) {
 			return store, nil
 		},
@@ -121,55 +98,102 @@ func getRestore(t *testing.T, r *EtcdRestoreReconciler) ecv1alpha1.EtcdRestore {
 	return got
 }
 
+func getCluster(t *testing.T, r *EtcdRestoreReconciler, name string) ecv1alpha1.EtcdCluster {
+	t.Helper()
+	var c ecv1alpha1.EtcdCluster
+	require.NoError(t, r.Get(context.Background(),
+		types.NamespacedName{Name: name, Namespace: testNS}, &c))
+	return c
+}
+
 // --- tests ------------------------------------------------------------------
 
-func TestRestore_HappyPath_ExplicitLocation(t *testing.T) {
+// TestRestore_StampsTargetAndRequeues proves the controller's core init-container
+// model: it creates the target EtcdCluster, stamps it with the restore-source
+// annotation (so the cluster controller injects the restore init-container), and
+// requeues in Restoring (NOT Completed) until the genesis member boots.
+func TestRestore_StampsTargetAndRequeues(t *testing.T) {
 	store := newFakeStore("etcd/backups")
-	// Seed the snapshot object at the requested key.
 	_, err := store.Upload(context.Background(), "etcd-a/snap.db", readerOf("SNAPSHOT"), -1)
 	require.NoError(t, err)
 
-	restorer := &fakeRestorer{}
 	restore := locationRestore("restored-a", "v3.6.1")
-	r := newRestoreReconciler(t, store, restorer, restore)
+	r := newRestoreReconciler(t, store, restore)
 
-	_, err = reconcileRestore(t, r)
+	res, err := reconcileRestore(t, r)
 	require.NoError(t, err)
+	assert.Positive(t, res.RequeueAfter, "should requeue while the member boots")
 
 	got := getRestore(t, r)
+	assert.Equal(t, ecv1alpha1.RestorePhaseRestoring, got.Status.Phase)
+	assert.NotEqual(t, ecv1alpha1.RestorePhaseCompleted, got.Status.Phase)
+
+	// Target cluster created, owned by the restore, and stamped.
+	cluster := getCluster(t, r, "restored-a")
+	assert.Equal(t, "v3.6.1", cluster.Spec.Version)
+	assert.Equal(t, 1, cluster.Spec.Size)
+	require.Len(t, cluster.OwnerReferences, 1)
+	assert.Equal(t, "EtcdRestore", cluster.OwnerReferences[0].Kind)
+
+	// The annotation must decode to a valid restore source carrying our snapshot
+	// addressing, the operator image, and a generation token.
+	raw := cluster.Annotations[restoreSourceAnnotation]
+	require.NotEmpty(t, raw, "target cluster must carry the restore-source annotation")
+	src, decErr := decodeRestoreSource(raw)
+	require.NoError(t, decErr)
+	assert.Equal(t, "s3", src.Provider)
+	assert.Equal(t, "b", src.Bucket)
+	assert.Equal(t, "etcd-a/snap.db", src.Key)
+	assert.Equal(t, "etcd/backups", src.Prefix)
+	assert.Equal(t, testOperatorImg, src.OperatorImage)
+	assert.NotEmpty(t, src.Generation)
+}
+
+// TestRestore_CompletesWhenMemberReady proves the controller marks Completed
+// only once the restore-target StatefulSet reports a ready member — Completed
+// truthfully means "a member booted from the restored data".
+func TestRestore_CompletesWhenMemberReady(t *testing.T) {
+	store := newFakeStore("etcd/backups")
+	_, err := store.Upload(context.Background(), "etcd-a/snap.db", readerOf("SNAPSHOT"), -1)
+	require.NoError(t, err)
+
+	restore := locationRestore("restored-ready", "v3.6.1")
+	r := newRestoreReconciler(t, store, restore)
+
+	// First reconcile: stamps + requeues.
+	_, err = reconcileRestore(t, r)
+	require.NoError(t, err)
+	require.Equal(t, ecv1alpha1.RestorePhaseRestoring, getRestore(t, r).Status.Phase)
+
+	// Simulate the cluster controller bringing a member up: create a ready STS.
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "restored-ready", Namespace: testNS},
+		Status:     appsv1.StatefulSetStatus{ReadyReplicas: 1},
+	}
+	require.NoError(t, r.Create(context.Background(), sts))
+
+	// Second reconcile: observes the ready member and completes.
+	_, err = reconcileRestore(t, r)
+	require.NoError(t, err)
+	got := getRestore(t, r)
 	assert.Equal(t, ecv1alpha1.RestorePhaseCompleted, got.Status.Phase)
-	assert.Equal(t, "restored-a", got.Status.RestoredCluster)
+	assert.Equal(t, "restored-ready", got.Status.RestoredCluster)
 	assert.NotNil(t, got.Status.CompletionTime)
 	assert.Contains(t, got.Status.SnapshotLocation, "etcd/backups/etcd-a/snap.db")
 	cond := meta.FindStatusCondition(got.Status.Conditions, ecv1alpha1.RestoreConditionSucceeded)
 	require.NotNil(t, cond)
 	assert.Equal(t, metav1.ConditionTrue, cond.Status)
-
-	// The restorer got the snapshot bytes and the genesis member identity.
-	assert.Equal(t, 1, restorer.calls)
-	assert.Equal(t, []byte("SNAPSHOT"), restorer.gotBytes)
-	assert.Equal(t, "restored-a-0", restorer.gotParams.MemberName)
-	assert.Equal(t, "restored-a-0", restorer.gotParams.Pod.Name)
-	assert.Contains(t, restorer.gotParams.PeerURL, "restored-a-0.restored-a.ns1.svc.cluster.local:2380")
-
-	// The target EtcdCluster was created, owned by the restore, with the spec.
-	var cluster ecv1alpha1.EtcdCluster
-	require.NoError(t, r.Get(context.Background(),
-		types.NamespacedName{Name: "restored-a", Namespace: testNS}, &cluster))
-	assert.Equal(t, "v3.6.1", cluster.Spec.Version)
-	assert.Equal(t, 1, cluster.Spec.Size)
-	require.Len(t, cluster.OwnerReferences, 1)
-	assert.Equal(t, "EtcdRestore", cluster.OwnerReferences[0].Kind)
 }
 
-func TestRestore_HappyPath_BackupRef(t *testing.T) {
-	// A completed EtcdBackup of cluster etcd-a; the restore references it.
+// TestRestore_BackupRefStampsInheritedVersion proves the backupRef path resolves
+// the snapshot key + inherits the source cluster's version into the stamped
+// target.
+func TestRestore_BackupRefStampsInheritedVersion(t *testing.T) {
 	cluster, _ := readyCluster() // source cluster still exists -> version hint
 	backup := s3Backup("etcd-a")
 	backup.Status.Phase = ecv1alpha1.BackupPhaseCompleted
 	backup.Status.SnapshotLocation = "test://etcd/backups/etcd-a/backup-1-...db"
 
-	// Seed the object at the key the backup controller would have written.
 	store := newFakeStore("etcd/backups")
 	objKey := snapshotObjectKey(backup)
 	_, err := store.Upload(context.Background(), objKey, readerOf("FROMBACKUP"), -1)
@@ -181,24 +205,21 @@ func TestRestore_HappyPath_BackupRef(t *testing.T) {
 			Source: ecv1alpha1.SnapshotSource{
 				BackupRef: &ecv1alpha1.BackupReference{Name: testBackupName},
 			},
-			Target: ecv1alpha1.RestoreTarget{Name: "restored-b"}, // no version -> inherit from source cluster
+			Target: ecv1alpha1.RestoreTarget{Name: "restored-b"}, // no version -> inherit
 		},
 	}
-	restorer := &fakeRestorer{}
-	r := newRestoreReconciler(t, store, restorer, cluster, backup, restore)
+	r := newRestoreReconciler(t, store, cluster, backup, restore)
 
 	_, err = reconcileRestore(t, r)
 	require.NoError(t, err)
 
-	got := getRestore(t, r)
-	assert.Equal(t, ecv1alpha1.RestorePhaseCompleted, got.Status.Phase)
-	assert.Equal(t, []byte("FROMBACKUP"), restorer.gotBytes)
-
-	// Version was inherited from the still-existing source cluster.
-	var created ecv1alpha1.EtcdCluster
-	require.NoError(t, r.Get(context.Background(),
-		types.NamespacedName{Name: "restored-b", Namespace: testNS}, &created))
+	created := getCluster(t, r, "restored-b")
 	assert.Equal(t, cluster.Spec.Version, created.Spec.Version)
+	raw := created.Annotations[restoreSourceAnnotation]
+	require.NotEmpty(t, raw)
+	src, decErr := decodeRestoreSource(raw)
+	require.NoError(t, decErr)
+	assert.Equal(t, objKey, src.Key)
 }
 
 func TestRestore_BackupRefNotCompletedFails(t *testing.T) {
@@ -211,7 +232,7 @@ func TestRestore_BackupRefNotCompletedFails(t *testing.T) {
 			Target: ecv1alpha1.RestoreTarget{Name: "restored-c", Version: "v3.6.1"},
 		},
 	}
-	r := newRestoreReconciler(t, store, &fakeRestorer{}, backup, restore)
+	r := newRestoreReconciler(t, store, backup, restore)
 
 	_, err := reconcileRestore(t, r)
 	require.Error(t, err)
@@ -227,7 +248,7 @@ func TestRestore_MissingBackupRefFails(t *testing.T) {
 			Target: ecv1alpha1.RestoreTarget{Name: "restored-d", Version: "v3.6.1"},
 		},
 	}
-	r := newRestoreReconciler(t, store, &fakeRestorer{}, restore)
+	r := newRestoreReconciler(t, store, restore)
 	_, err := reconcileRestore(t, r)
 	require.Error(t, err)
 	assert.Equal(t, ecv1alpha1.RestorePhaseFailed, getRestore(t, r).Status.Phase)
@@ -236,7 +257,7 @@ func TestRestore_MissingBackupRefFails(t *testing.T) {
 func TestRestore_BothSourcesFails(t *testing.T) {
 	restore := locationRestore("restored-e", "v3.6.1")
 	restore.Spec.Source.BackupRef = &ecv1alpha1.BackupReference{Name: "x"}
-	r := newRestoreReconciler(t, newFakeStore(""), &fakeRestorer{}, restore)
+	r := newRestoreReconciler(t, newFakeStore(""), restore)
 	_, err := reconcileRestore(t, r)
 	require.Error(t, err)
 	assert.Equal(t, ecv1alpha1.RestorePhaseFailed, getRestore(t, r).Status.Phase)
@@ -249,7 +270,7 @@ func TestRestore_NoSourceFails(t *testing.T) {
 			Target: ecv1alpha1.RestoreTarget{Name: "restored-f", Version: "v3.6.1"},
 		},
 	}
-	r := newRestoreReconciler(t, newFakeStore(""), &fakeRestorer{}, restore)
+	r := newRestoreReconciler(t, newFakeStore(""), restore)
 	_, err := reconcileRestore(t, r)
 	require.Error(t, err)
 	assert.Equal(t, ecv1alpha1.RestorePhaseFailed, getRestore(t, r).Status.Phase)
@@ -260,18 +281,21 @@ func TestRestore_VersionRequiredForExplicitLocation(t *testing.T) {
 	_, err := store.Upload(context.Background(), "etcd-a/snap.db", readerOf("S"), -1)
 	require.NoError(t, err)
 	restore := locationRestore("restored-g", "") // no version, no source cluster -> error
-	r := newRestoreReconciler(t, store, &fakeRestorer{}, restore)
+	r := newRestoreReconciler(t, store, restore)
 	_, err = reconcileRestore(t, r)
 	require.Error(t, err)
 	assert.Equal(t, ecv1alpha1.RestorePhaseFailed, getRestore(t, r).Status.Phase)
 }
 
-func TestRestore_NonEmptyTargetRejected(t *testing.T) {
+// TestRestore_NonEmptyUnstampedTargetRejected proves a restore into a cluster
+// that already has a ready member AND is NOT already a restore target is
+// rejected, and is never stamped (so the cluster controller never mutates that
+// live cluster's pod template).
+func TestRestore_NonEmptyUnstampedTargetRejected(t *testing.T) {
 	store := newFakeStore("etcd/backups")
 	_, err := store.Upload(context.Background(), "etcd-a/snap.db", readerOf("S"), -1)
 	require.NoError(t, err)
 
-	// A target cluster that already exists AND has a ready StatefulSet member.
 	existing := &ecv1alpha1.EtcdCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "restored-h", Namespace: testNS},
 		Spec:       ecv1alpha1.EtcdClusterSpec{Size: 3, Version: "v3.6.1"},
@@ -281,21 +305,25 @@ func TestRestore_NonEmptyTargetRejected(t *testing.T) {
 		Status:     appsv1.StatefulSetStatus{ReadyReplicas: 3},
 	}
 	restore := locationRestore("restored-h", "v3.6.1")
-	restorer := &fakeRestorer{}
-	r := newRestoreReconciler(t, store, restorer, existing, sts, restore)
+	r := newRestoreReconciler(t, store, existing, sts, restore)
 
 	_, err = reconcileRestore(t, r)
 	require.Error(t, err)
-	assert.Equal(t, ecv1alpha1.RestorePhaseFailed, getRestore(t, r).Status.Phase)
-	assert.Equal(t, 0, restorer.calls, "must not restore over a non-empty cluster")
+	got := getRestore(t, r)
+	assert.Equal(t, ecv1alpha1.RestorePhaseFailed, got.Status.Phase)
+	// The live cluster must NOT have been stamped.
+	cluster := getCluster(t, r, "restored-h")
+	_, stamped := cluster.Annotations[restoreSourceAnnotation]
+	assert.False(t, stamped, "must not stamp (and thus mutate) a non-empty live cluster")
 }
 
-func TestRestore_EmptyExistingTargetAccepted(t *testing.T) {
+// TestRestore_EmptyExistingTargetStamped proves an existing empty shell cluster
+// is accepted and gets stamped.
+func TestRestore_EmptyExistingTargetStamped(t *testing.T) {
 	store := newFakeStore("etcd/backups")
 	_, err := store.Upload(context.Background(), "etcd-a/snap.db", readerOf("S"), -1)
 	require.NoError(t, err)
 
-	// Target exists but its StatefulSet reports zero ready members (empty shell).
 	existing := &ecv1alpha1.EtcdCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "restored-i", Namespace: testNS},
 		Spec:       ecv1alpha1.EtcdClusterSpec{Size: 1, Version: "v3.6.1"},
@@ -305,63 +333,70 @@ func TestRestore_EmptyExistingTargetAccepted(t *testing.T) {
 		Status:     appsv1.StatefulSetStatus{ReadyReplicas: 0},
 	}
 	restore := locationRestore("restored-i", "v3.6.1")
-	restorer := &fakeRestorer{}
-	r := newRestoreReconciler(t, store, restorer, existing, sts, restore)
+	r := newRestoreReconciler(t, store, existing, sts, restore)
 
 	_, err = reconcileRestore(t, r)
 	require.NoError(t, err)
-	assert.Equal(t, ecv1alpha1.RestorePhaseCompleted, getRestore(t, r).Status.Phase)
-	assert.Equal(t, 1, restorer.calls)
+	assert.Equal(t, ecv1alpha1.RestorePhaseRestoring, getRestore(t, r).Status.Phase)
+	cluster := getCluster(t, r, "restored-i")
+	_, stamped := cluster.Annotations[restoreSourceAnnotation]
+	assert.True(t, stamped)
 }
 
 func TestRestore_SnapshotNotFoundFails(t *testing.T) {
 	store := newFakeStore("etcd/backups") // empty: object absent
 	restore := locationRestore("restored-j", "v3.6.1")
-	r := newRestoreReconciler(t, store, &fakeRestorer{}, restore)
+	r := newRestoreReconciler(t, store, restore)
 
 	_, err := reconcileRestore(t, r)
 	require.Error(t, err)
-	assert.Equal(t, ecv1alpha1.RestorePhaseFailed, getRestore(t, r).Status.Phase)
+	got := getRestore(t, r)
+	assert.Equal(t, ecv1alpha1.RestorePhaseFailed, got.Status.Phase)
+	// The target cluster must not have been created/stamped — verification fails
+	// before the cluster is touched.
+	var cluster ecv1alpha1.EtcdCluster
+	getErr := r.Get(context.Background(), types.NamespacedName{Name: "restored-j", Namespace: testNS}, &cluster)
+	assert.Error(t, getErr, "no cluster should be created when the snapshot is missing")
 }
 
 func TestRestore_DownloadErrorFails(t *testing.T) {
 	store := newFakeStore("etcd/backups")
 	store.downloadErr = fmt.Errorf("network down")
 	restore := locationRestore("restored-k", "v3.6.1")
-	r := newRestoreReconciler(t, store, &fakeRestorer{}, restore)
+	r := newRestoreReconciler(t, store, restore)
 
 	_, err := reconcileRestore(t, r)
 	require.Error(t, err)
 	assert.Equal(t, ecv1alpha1.RestorePhaseFailed, getRestore(t, r).Status.Phase)
 }
 
-func TestRestore_RestorerErrorFails(t *testing.T) {
+// TestRestore_NoOperatorImageFails proves the controller refuses to stamp a
+// restore target when it does not know its own image (it could not build a
+// working restore init-container).
+func TestRestore_NoOperatorImageFails(t *testing.T) {
 	store := newFakeStore("etcd/backups")
 	_, err := store.Upload(context.Background(), "etcd-a/snap.db", readerOf("S"), -1)
 	require.NoError(t, err)
-	restorer := &fakeRestorer{err: fmt.Errorf("etcdctl restore boom")}
-	restore := locationRestore("restored-l", "v3.6.1")
-	r := newRestoreReconciler(t, store, restorer, restore)
-
+	restore := locationRestore("restored-noimg", "v3.6.1")
+	r := newRestoreReconciler(t, store, restore)
+	r.OperatorImage = "" // simulate a misconfigured operator
 	_, err = reconcileRestore(t, r)
 	require.Error(t, err)
-	got := getRestore(t, r)
-	assert.Equal(t, ecv1alpha1.RestorePhaseFailed, got.Status.Phase)
-	cond := meta.FindStatusCondition(got.Status.Conditions, ecv1alpha1.RestoreConditionSucceeded)
-	require.NotNil(t, cond)
-	assert.Equal(t, metav1.ConditionFalse, cond.Status)
+	assert.Equal(t, ecv1alpha1.RestorePhaseFailed, getRestore(t, r).Status.Phase)
 }
 
 func TestRestore_TerminalIsNoOp(t *testing.T) {
 	store := newFakeStore("etcd/backups")
 	restore := locationRestore("restored-m", "v3.6.1")
 	restore.Status.Phase = ecv1alpha1.RestorePhaseCompleted
-	restorer := &fakeRestorer{}
-	r := newRestoreReconciler(t, store, restorer, restore)
+	r := newRestoreReconciler(t, store, restore)
 
 	_, err := reconcileRestore(t, r)
 	require.NoError(t, err)
-	assert.Equal(t, 0, restorer.calls)
+	// No target cluster should have been created by a terminal restore.
+	var cluster ecv1alpha1.EtcdCluster
+	getErr := r.Get(context.Background(), types.NamespacedName{Name: "restored-m", Namespace: testNS}, &cluster)
+	assert.Error(t, getErr)
 }
 
 func TestValidateRestoreSpec(t *testing.T) {
@@ -419,14 +454,21 @@ func TestValidateRestoreSpec(t *testing.T) {
 	}
 }
 
-func TestRestoreParamsForCluster(t *testing.T) {
-	cluster := &ecv1alpha1.EtcdCluster{
-		ObjectMeta: metav1.ObjectMeta{Name: "etcd-z", Namespace: "nsz"},
+// TestRestoreSourceAnnotationRoundTrip proves encode/decode of the annotation is
+// lossless and that decode rejects incomplete payloads (which would otherwise
+// build a data-less restore pod).
+func TestRestoreSourceAnnotationRoundTrip(t *testing.T) {
+	src := restoreSource{
+		Provider: "s3", Bucket: "b", Prefix: "p", Key: "k.db",
+		Region: "us-east-1", Endpoint: "http://minio:9000", ForcePathStyle: true,
+		CredsSecretName: "creds", OperatorImage: testOperatorImg, Generation: "k.db",
 	}
-	p := restoreParamsForCluster(cluster)
-	assert.Equal(t, "etcd-z-0", p.MemberName)
-	assert.Equal(t, "etcd-z-0", p.Pod.Name)
-	assert.Equal(t, "nsz", p.Pod.Namespace)
-	assert.Contains(t, p.PeerURL, "etcd-z-0.etcd-z.nsz.svc.cluster.local:2380")
-	assert.Equal(t, defaultRestoreDataDir, p.DataDir)
+	raw, err := encodeRestoreSource(src)
+	require.NoError(t, err)
+	got, err := decodeRestoreSource(raw)
+	require.NoError(t, err)
+	assert.Equal(t, src, got)
+
+	_, err = decodeRestoreSource(`{"provider":"s3","bucket":"b"}`) // missing key + image
+	require.Error(t, err)
 }

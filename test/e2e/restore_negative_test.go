@@ -19,7 +19,6 @@ package e2e
 import (
 	"context"
 	"fmt"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -35,12 +34,12 @@ import (
 // These adversarial restore tests exercise the operator's SAFETY guards — the
 // code paths whose silent regression is catastrophic (clobbering a live
 // cluster, hanging forever on a missing object, restoring a corrupt snapshot).
-// Crucially, each guard fires BEFORE or INDEPENDENTLY of the (known-incomplete)
-// restore data-path, so they run live and green under ETCD_E2E_BACKUP=true even
-// though the full byte-identical round-trip remains gated behind
-// ETCD_E2E_RESTORE. The one exception — corrupted-snapshot rejection — can only
-// be told apart from the broken restorer once the restorer is fixed, so it is
-// honestly gated behind ETCD_E2E_RESTORE and documented as such below.
+// All three now run live and green under ETCD_E2E_BACKUP=true: the populated-
+// target and missing-object guards fire in the controller before/independently
+// of the data path, and corrupt-snapshot rejection is surfaced by the init-
+// container restore (etcd's snapshot-restore library fails its integrity check
+// on a corrupt snapshot and the init-container exits non-zero), so it is a true
+// integrity-rejection proof rather than an artifact of a broken restorer.
 
 // TestEtcdRestoreRejectsPopulatedTarget proves the empty-target guarantee
 // (ensureEmptyTargetCluster/assertClusterEmpty): a restore that targets a
@@ -196,19 +195,16 @@ func TestEtcdRestoreMissingObjectFailsCleanly(t *testing.T) {
 }
 
 // TestEtcdRestoreRejectsCorruptSnapshot uploads a deliberately corrupt object
-// (random bytes that are not a valid bbolt/etcd snapshot) and asserts the
-// restore fails rather than bootstrapping a garbage cluster.
+// (64 KiB of non-bbolt bytes) and asserts the restore fails rather than
+// bootstrapping a garbage cluster.
 //
-// It is gated behind ETCD_E2E_RESTORE because, against the CURRENT restorer,
-// a restore fails for the WRONG reason (the distroless `sh -c` exec bug, not
-// snapshot-integrity rejection) — so the test cannot honestly distinguish
-// "rejected the corruption" from "restore is broken" until the restore
-// data-path is fixed to actually run `etcdutl snapshot restore`, which fails
-// non-zero on a corrupt snapshot. When that fix lands, drop the gate and this
-// becomes a true integrity-rejection proof.
+// With the init-container restore data-path, the restore init-container runs
+// etcd's snapshot-restore library in-process, which fails its integrity (hash)
+// check on a corrupt snapshot and exits non-zero; the controller observes the
+// wedged init-container and marks the restore Failed. So this is now a true
+// integrity-rejection proof and runs live under ETCD_E2E_BACKUP=true.
 func TestEtcdRestoreRejectsCorruptSnapshot(t *testing.T) {
 	requireBackupE2E(t)
-	requireRestoreE2E(t)
 
 	const (
 		targetCluster = "etcd-neg-corrupt-tgt"
@@ -263,14 +259,6 @@ func TestEtcdRestoreRejectsCorruptSnapshot(t *testing.T) {
 }
 
 // --- shared negative-path helpers ------------------------------------------
-
-func requireRestoreE2E(t *testing.T) {
-	t.Helper()
-	if !restoreE2EEnabled() {
-		t.Skip("set ETCD_E2E_RESTORE=true to run restore data-path tests that " +
-			"cannot be validated against the current (known-incomplete) restorer")
-	}
-}
 
 func mkBackup(ctx context.Context, t *testing.T, cfg *envconf.Config, name, clusterRef string, dst ecv1alpha1.BackupDestination) {
 	t.Helper()
@@ -328,13 +316,6 @@ func deleteClusters(ctx context.Context, cfg *envconf.Config, names ...string) {
 	for _, n := range names {
 		_ = res.Delete(ctx, &ecv1alpha1.EtcdCluster{ObjectMeta: metav1.ObjectMeta{Name: n, Namespace: namespace}})
 	}
-}
-
-// restoreE2EEnabled reports whether the (gated) restore data-path tests should
-// run. The restore round-trip is known-incomplete against distroless etcd
-// images, so it is opt-in behind ETCD_E2E_RESTORE.
-func restoreE2EEnabled() bool {
-	return os.Getenv("ETCD_E2E_RESTORE") == "true"
 }
 
 // uploadCorruptMinIOObject writes `size` bytes of non-snapshot data to the

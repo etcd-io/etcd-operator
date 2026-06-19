@@ -16,6 +16,7 @@ require (
 	go.etcd.io/etcd/api/v3 v3.6.12
 	go.etcd.io/etcd/client/pkg/v3 v3.6.12
 	go.etcd.io/etcd/client/v3 v3.6.12
+	go.etcd.io/etcd/etcdutl/v3 v3.6.12
 	go.etcd.io/etcd/server/v3 v3.6.12
 	go.uber.org/zap v1.28.0
 	google.golang.org/api v0.285.0

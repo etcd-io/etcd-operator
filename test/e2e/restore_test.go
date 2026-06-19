@@ -19,12 +19,10 @@ package e2e
 import (
 	"context"
 	"fmt"
-	"os"
 	"strings"
 	"testing"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/e2e-framework/klient/wait"
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
@@ -33,95 +31,61 @@ import (
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 )
 
-// TestEtcdRestoreFromBackup exercises the full backup -> restore round trip
-// end-to-end against an in-cluster MinIO (S3-compatible) bucket.
+// TestEtcdRestoreFromBackupS3 / ...GCS exercise the FULL backup -> restore round
+// trip end-to-end against an in-cluster object store (MinIO for S3, fake-gcs-
+// server for GCS), so they require NO real cloud credentials.
 //
-// It is gated behind ETCD_E2E_BACKUP=true (provisions MinIO) AND, separately,
-// behind ETCD_E2E_RESTORE=true. The second gate exists because the restore
-// data-path of the feature is known-incomplete against the distroless etcd
-// images the operator deploys; running this test against the current restorer
-// fails (correctly). The gate keeps the working backup e2e green in the default
-// matrix while preserving this test as an executable specification of the
-// round-trip the restorer must eventually satisfy.
+// They are gated ONLY behind ETCD_E2E_BACKUP=true (which provisions the
+// backends). The restore data-path is now a real init-container restore (the
+// operator image's `restore-localize` subcommand downloads the snapshot and runs
+// etcd's snapshot-restore library in-process into the genesis member's data dir
+// before etcd starts), so the round-trip runs live in the default backup matrix.
 //
-// Three confirmed product gaps make the round-trip impossible today (each is a
-// real bug in the restore data-path, not a test defect):
-//
-//  1. internal/controller/restorer.go execs `sh -c "...; etcdctl snapshot
-//     restore ...; ..."` into the member pod, but gcr.io/etcd-development/etcd
-//     images are distroless and ship no shell: the exec fails with
-//     `exec: "sh": executable file not found in $PATH`. (Same root cause the
-//     snapshotter hit; the snapshotter was moved off exec to the clientv3
-//     Maintenance API, but restore must write a *data directory* and cannot.)
-//  2. The restore writes the data dir to defaultRestoreDataDir
-//     (/var/run/etcd/default.etcd), but the member's real data dir is
-//     etcdDataDir (/var/lib/etcd, set via ETCD_DATA_DIR and the volume mount in
-//     utils.go). etcd never reads the restored directory.
-//  3. The restore execs into an already-running member without
-//     `--force-new-cluster`/restart semantics, so even a correctly-placed data
-//     dir would not be adopted by the live member.
-//
-// When the restorer is fixed (e.g. restore via an init container into
-// /var/lib/etcd before the member starts), drop the ETCD_E2E_RESTORE gate and
-// this test becomes a live proof of the round-trip.
-//
-// Flow (when enabled):
-//  1. Deploy MinIO + bucket + creds secret.
-//  2. Create a source EtcdCluster, seed a distinctive keyspace, and back it up
-//     to MinIO; wait for the EtcdBackup to reach Completed.
+// Flow:
+//  1. Deploy the backend + bucket (+ creds for S3).
+//  2. Create a source EtcdCluster, seed a distinctive keyspace, back it up; wait
+//     for the EtcdBackup to reach Completed.
 //  3. Create an EtcdRestore referencing that backup, targeting a NEW cluster.
 //  4. Wait for the EtcdRestore to reach Completed, then assert the ENTIRE seeded
-//     keyspace is readable from the restored member, exact values match, and a
-//     key that was never in the snapshot is absent (negative control).
-func TestEtcdRestoreFromBackup(t *testing.T) {
-	if os.Getenv("ETCD_E2E_BACKUP") != "true" {
-		t.Skip("set ETCD_E2E_BACKUP=true to run the object-storage restore e2e (provisions MinIO)")
-	}
-	if os.Getenv("ETCD_E2E_RESTORE") != "true" {
-		t.Skip("restore data-path is known-incomplete against distroless etcd images " +
-			"(restorer.go execs `sh -c` with no shell in image; restores to /var/run/etcd " +
-			"not /var/lib/etcd; no member restart). Set ETCD_E2E_RESTORE=true to run anyway.")
-	}
+//     keyspace is readable from the restored member with exact values, and a key
+//     that was never in the snapshot is absent (negative control).
+func TestEtcdRestoreFromBackupS3(t *testing.T) {
+	requireBackupE2E(t)
+	runRestoreRoundTrip(t,
+		newMinIOBackend("minio-restore-e2e", "etcd-restores", "restore-e2e-creds"),
+		"etcd-restore-s3",
+		"etcd-restore-src-e2e", "etcd-restore-dst-e2e", "etcd-restore-e2e-snap", "etcd-restore-e2e")
+}
 
-	const (
-		sourceCluster   = "etcd-restore-src-e2e"
-		restoredCluster = "etcd-restore-dst-e2e"
-		backupName      = "etcd-restore-e2e-snap"
-		restoreName     = "etcd-restore-e2e"
-		minioName       = "minio-restore-e2e"
-		bucket          = "etcd-restores"
-		accessKey       = "minioadmin"
-		secretKey       = "minioadmin"
-		credsSecret     = "restore-e2e-creds"
-		absentKey       = "restore-e2e/never-in-snapshot"
-	)
+func TestEtcdRestoreFromBackupGCS(t *testing.T) {
+	requireBackupE2E(t)
+	runRestoreRoundTrip(t,
+		newFakeGCSBackend("fake-gcs-restore-e2e", "etcd-restores"),
+		"etcd-restore-gcs",
+		"etcd-restore-gcs-src", "etcd-restore-gcs-dst", "etcd-restore-gcs-snap", "etcd-restore-gcs")
+}
 
-	feature := features.New("etcd-restore-from-backup")
+// runRestoreRoundTrip drives one provider through the full backup->restore->byte-
+// identical-readback proof.
+func runRestoreRoundTrip(
+	t *testing.T, backend backupBackend, featureName, sourceCluster, restoredCluster, backupName, restoreName string,
+) {
+	const absentKey = "restore-e2e/never-in-snapshot"
+
+	feature := features.New(featureName)
 
 	feature.Setup(func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
-		deployMinIO(ctx, t, cfg, minioName, accessKey, secretKey)
-		createBucketPod(ctx, t, cfg, minioName, bucket, accessKey, secretKey)
-		createBackupCredsSecret(ctx, t, cfg, credsSecret, accessKey, secretKey)
+		backend.deploy(ctx, t, cfg)
+		backend.bootstrapBucket(ctx, t, cfg)
 		createBackupTestCluster(ctx, t, cfg, sourceCluster, 1)
 		waitStatefulSetReady(t, cfg, sourceCluster, 1)
 		seedKeyspace(t, cfg, sourceCluster+"-0", backupSeedKeyCount)
 
-		endpoint := "http://" + minioName + "." + namespace + ".svc.cluster.local:9000"
 		backup := &ecv1alpha1.EtcdBackup{
 			ObjectMeta: metav1.ObjectMeta{Name: backupName, Namespace: namespace},
 			Spec: ecv1alpha1.EtcdBackupSpec{
-				ClusterRef: sourceCluster,
-				Destination: ecv1alpha1.BackupDestination{
-					Provider:  ecv1alpha1.BackupProviderS3,
-					Prefix:    "e2e",
-					SecretRef: &corev1.LocalObjectReference{Name: credsSecret},
-					S3: &ecv1alpha1.S3DestinationSpec{
-						Bucket:         bucket,
-						Region:         "us-east-1",
-						Endpoint:       endpoint,
-						ForcePathStyle: true,
-					},
-				},
+				ClusterRef:  sourceCluster,
+				Destination: backend.destination("e2e"),
 			},
 		}
 		if err := cfg.Client().Resources().Create(ctx, backup); err != nil {
@@ -210,7 +174,8 @@ func TestEtcdRestoreFromBackup(t *testing.T) {
 	})
 
 	feature.Teardown(func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
-		cleanupBackupWorkloads(ctx, t, cfg, minioName, credsSecret, []string{sourceCluster, restoredCluster})
+		backend.cleanup(ctx, t, cfg)
+		deleteClusters(ctx, cfg, sourceCluster, restoredCluster)
 		_ = cfg.Client().Resources().Delete(ctx, &ecv1alpha1.EtcdBackup{
 			ObjectMeta: metav1.ObjectMeta{Name: backupName, Namespace: namespace}})
 		_ = cfg.Client().Resources().Delete(ctx, &ecv1alpha1.EtcdRestore{
