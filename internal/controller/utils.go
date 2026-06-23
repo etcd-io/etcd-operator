@@ -7,6 +7,7 @@ import (
 	"log"
 	"maps"
 	"net"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -55,7 +56,7 @@ func reconcileStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1alpha
 	}
 
 	// Add server and peer certificate
-	err = applyEtcdMemberCerts(ctx, ec, c)
+	err = applyEtcdMemberCerts(ctx, ec, c, scheme)
 	if err != nil {
 		return nil, err
 	}
@@ -578,19 +579,37 @@ func getPeerCertName(etcdClusterName string) string {
 
 // parseValidityDuration parses a duration string and returns the parsed duration.
 // If the customizedDuration is empty, it returns the defaultDuration.
+// Supports day units (d) by converting them to hours (e.g., "365d" -> "8760h").
 // Returns an error if the duration string cannot be parsed.
 func parseValidityDuration(customizedDuration string, defaultDuration time.Duration) (time.Duration, error) {
 	if customizedDuration == "" {
 		return defaultDuration, nil
 	}
-	duration, err := time.ParseDuration(customizedDuration)
+
+	// Convert days to hours using regex since time.ParseDuration doesn't support 'd' unit
+	// Matches patterns like "365d", "100.5d", etc. and converts them to hours
+	// Example: "365d" -> "8760h", "100d12h" -> "2400h12h" (which time.ParseDuration sums to 2412h)
+	dayRegex := regexp.MustCompile(`([0-9.]+)d`)
+	durationStr := dayRegex.ReplaceAllStringFunc(customizedDuration, func(match string) string {
+		// Extract the numeric part (remove 'd')
+		daysStr := match[:len(match)-1]
+		days, err := strconv.ParseFloat(daysStr, 64)
+		if err != nil {
+			// Return original if parsing fails, will be caught by time.ParseDuration
+			return match
+		}
+		hours := days * 24
+		return fmt.Sprintf("%.0fh", hours)
+	})
+
+	duration, err := time.ParseDuration(durationStr)
 	if err != nil {
 		return 0, fmt.Errorf("failed to parse ValidityDuration: %w", err)
 	}
 	return duration, nil
 }
 
-func createCMCertificateConfig(ec *ecv1alpha1.EtcdCluster) (*certInterface.Config, error) {
+func createCMCertificateConfig(ec *ecv1alpha1.EtcdCluster, scheme *runtime.Scheme) (*certInterface.Config, error) {
 	cmConfig := ec.Spec.TLS.ProviderCfg.CertManagerCfg
 	if cmConfig == nil {
 		return nil, fmt.Errorf("cert-manager configuration is not present")
@@ -626,8 +645,10 @@ func createCMCertificateConfig(ec *ecv1alpha1.EtcdCluster) (*certInterface.Confi
 		ValidityDuration: duration,
 		AltNames:         getAltNames,
 		ExtraConfig: map[string]any{
-			"issuerName": cmConfig.IssuerName,
-			"issuerKind": cmConfig.IssuerKind,
+			"ownerReference": ec,
+			"scheme":         scheme,
+			"issuerName":     cmConfig.IssuerName,
+			"issuerKind":     cmConfig.IssuerKind,
 		},
 	}
 	return config, nil
@@ -678,7 +699,7 @@ func createAutoCertificateConfig(ec *ecv1alpha1.EtcdCluster) (*certInterface.Con
 	return config, nil
 }
 
-func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client.Client, certName string) error {
+func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client.Client, scheme *runtime.Scheme, certName string) error {
 	// The TLS field is present but spec is empty
 	providerName := ec.Spec.TLS.Provider
 	if providerName == "" {
@@ -708,7 +729,7 @@ func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client
 				}
 				return nil
 			case certificate.CertManager:
-				cmConfig, err := createCMCertificateConfig(ec)
+				cmConfig, err := createCMCertificateConfig(ec, scheme)
 				if err != nil {
 					return fmt.Errorf("error creating cert-manager certificate config: %w", err)
 				}
@@ -730,9 +751,9 @@ func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client
 	return nil
 }
 
-func createClientCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client) error {
+func createClientCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client, scheme *runtime.Scheme) error {
 	certName := getClientCertName(ec.Name)
-	err := createCertificate(ec, ctx, c, certName)
+	err := createCertificate(ec, ctx, c, scheme, certName)
 	if err != nil {
 		return err
 	}
@@ -743,9 +764,9 @@ func createClientCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c 
 	return err
 }
 
-func createServerCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client) error {
+func createServerCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client, scheme *runtime.Scheme) error {
 	serverCertName := getServerCertName(ec.Name)
-	err := createCertificate(ec, ctx, c, serverCertName)
+	err := createCertificate(ec, ctx, c, scheme, serverCertName)
 	if err != nil {
 		return err
 	}
@@ -756,9 +777,9 @@ func createServerCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c 
 	return nil
 }
 
-func createPeerCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client) error {
+func createPeerCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client, scheme *runtime.Scheme) error {
 	peerCertName := getPeerCertName(ec.Name)
-	err := createCertificate(ec, ctx, c, peerCertName)
+	err := createCertificate(ec, ctx, c, scheme, peerCertName)
 	if err != nil {
 		return err
 	}
@@ -769,13 +790,13 @@ func createPeerCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c cl
 	return nil
 }
 
-func applyEtcdMemberCerts(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client) error {
+func applyEtcdMemberCerts(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client, scheme *runtime.Scheme) error {
 	if ec.Spec.TLS != nil {
-		err := createServerCertificate(ctx, ec, c)
+		err := createServerCertificate(ctx, ec, c, scheme)
 		if err != nil {
 			return err
 		}
-		err = createPeerCertificate(ctx, ec, c)
+		err = createPeerCertificate(ctx, ec, c, scheme)
 		if err != nil {
 			return err
 		}
@@ -783,10 +804,25 @@ func applyEtcdMemberCerts(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c cli
 	return nil
 }
 
+func hasControllerOwnerReference(obj client.Object) bool {
+	for _, ownerRef := range obj.GetOwnerReferences() {
+		if ownerRef.Controller != nil && *ownerRef.Controller {
+			return true
+		}
+	}
+	return false
+}
+
 func patchCertificateSecret(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client, certSecretName string) error {
 	getCertSecret := &corev1.Secret{}
 	if err := c.Get(ctx, client.ObjectKey{Name: certSecretName, Namespace: ec.Namespace}, getCertSecret); err != nil {
 		return err
+	}
+
+	// Skip setting owner reference if Secret already has a controller owner (e.g., cert-manager Certificate)
+	if hasControllerOwnerReference(getCertSecret) {
+		log.Printf("Secret %s already has a controller owner reference, skipping ownership patch", certSecretName)
+		return nil
 	}
 
 	log.Printf("Setting ownerReference for certificate secret: %s", certSecretName)

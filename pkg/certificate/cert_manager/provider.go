@@ -21,8 +21,11 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
+	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 	interfaces "go.etcd.io/etcd-operator/pkg/certificate/interfaces"
 )
 
@@ -340,6 +343,27 @@ func (cm *CertManagerProvider) createCertificate(ctx context.Context, secretKey 
 			},
 			Duration: &metav1.Duration{Duration: cfg.ValidityDuration},
 		},
+	}
+
+	// Set owner reference if provided in ExtraConfig
+	if ownerRef, ok := cfg.ExtraConfig["ownerReference"]; ok {
+		log.Printf("Found ownerReference in ExtraConfig")
+		if etcdCluster, ok := ownerRef.(*ecv1alpha1.EtcdCluster); ok {
+			log.Printf("Successfully cast to EtcdCluster: %s/%s", etcdCluster.Namespace, etcdCluster.Name)
+			if scheme, ok := cfg.ExtraConfig["scheme"].(*runtime.Scheme); ok {
+				log.Printf("Found scheme in ExtraConfig, setting owner reference")
+				if err := controllerutil.SetControllerReference(etcdCluster, certificateResource, scheme); err != nil {
+					return fmt.Errorf("failed to set owner reference: %w", err)
+				}
+				log.Printf("Successfully set owner reference for certificate: %s", certificateResource.Name)
+			} else {
+				log.Printf("WARNING: scheme not found in ExtraConfig")
+			}
+		} else {
+			log.Printf("WARNING: failed to cast ownerReference to EtcdCluster")
+		}
+	} else {
+		log.Printf("WARNING: ownerReference not found in ExtraConfig")
 	}
 
 	return cm.Create(ctx, certificateResource)
