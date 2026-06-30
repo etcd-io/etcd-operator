@@ -8,13 +8,13 @@ import (
 	"maps"
 	"net"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/coreos/go-semver/semver"
 	"github.com/go-logr/logr"
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -46,41 +46,391 @@ const (
 	etcdClusterStateExisting etcdClusterState = "existing"
 )
 
-func reconcileStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1alpha1.EtcdCluster, c client.Client, replicas int32, scheme *runtime.Scheme) (*appsv1.StatefulSet, error) {
-
-	// prepare/update configmap for StatefulSet
-	err := applyEtcdClusterState(ctx, ec, int(replicas), c, scheme, logger)
-	if err != nil {
-		return nil, err
-	}
-
-	// Add server and peer certificate
-	err = applyEtcdMemberCerts(ctx, ec, c)
-	if err != nil {
-		return nil, err
-	}
-
-	// Create Update StatefulSet
-	err = createOrPatchStatefulSet(ctx, logger, ec, c, replicas, scheme)
-	if err != nil {
-		return nil, err
-	}
-
-	// Wait for statefulset to be ready
-	err = waitForStatefulSetReady(ctx, logger, c, ec.Name, ec.Namespace)
-	if err != nil {
-		return nil, err
-	}
-
-	// Return latest Stateful set. (This is to ensure that we return the latest statefulset for next operation to act on)
-	return getStatefulSet(ctx, c, ec.Name, ec.Namespace)
+// memberPodName returns the deterministic name for an etcd member pod.
+// The naming convention mirrors StatefulSet so that headless-service DNS is identical.
+func memberPodName(clusterName string, ordinal int) string {
+	return fmt.Sprintf("%s-%d", clusterName, ordinal)
 }
+
+// pvcNameForMember returns the PVC name for a given pod, matching the naming
+// convention that StatefulSet VolumeClaimTemplates would have produced.
+func pvcNameForMember(podName string) string {
+	return fmt.Sprintf("%s-%s", volumeName, podName)
+}
+
+// podOrdinal extracts the numeric ordinal from a pod name of the form
+// "{clusterName}-{ordinal}".  Returns -1 on parse failure.
+func podOrdinal(podName, clusterName string) int {
+	suffix := strings.TrimPrefix(podName, clusterName+"-")
+	ordinal, err := strconv.Atoi(suffix)
+	if err != nil {
+		return -1
+	}
+	return ordinal
+}
+
+// listOwnedPods returns all Pods that are owned (via OwnerReference) by ec,
+// sorted in ascending ordinal order.
+func listOwnedPods(ctx context.Context, c client.Client, ec *ecv1alpha1.EtcdCluster) ([]*corev1.Pod, error) {
+	podList := &corev1.PodList{}
+	if err := c.List(ctx, podList,
+		client.InNamespace(ec.Namespace),
+		client.MatchingLabels(etcdClusterLabels(ec)),
+	); err != nil {
+		return nil, fmt.Errorf("failed to list pods for cluster %s: %w", ec.Name, err)
+	}
+
+	var owned []*corev1.Pod
+	for i := range podList.Items {
+		if metav1.IsControlledBy(&podList.Items[i], ec) {
+			owned = append(owned, &podList.Items[i])
+		}
+	}
+
+	sort.Slice(owned, func(i, j int) bool {
+		return podOrdinal(owned[i].Name, ec.Name) < podOrdinal(owned[j].Name, ec.Name)
+	})
+	return owned, nil
+}
+
+// etcdClusterLabels returns the label set applied to every member pod and used
+// by the headless Service selector.
+func etcdClusterLabels(ec *ecv1alpha1.EtcdCluster) map[string]string {
+	return map[string]string{
+		"app":        ec.Name,
+		"controller": ec.Name,
+	}
+}
+
+// createMemberPod creates a single etcd member Pod (and, if needed, its PVC)
+// for the given ordinal index.  It does not wait for the pod to become ready;
+// the caller is responsible for requeueing until the pod is healthy.
+func createMemberPod(ctx context.Context, logger logr.Logger, c client.Client, ec *ecv1alpha1.EtcdCluster, ordinal int, scheme *runtime.Scheme) error {
+	podName := memberPodName(ec.Name, ordinal)
+
+	// Ensure TLS certificates exist before the pod mounts them.
+	if err := applyEtcdMemberCerts(ctx, ec, c); err != nil {
+		return err
+	}
+
+	// Create per-member PVC for ReadWriteOnce storage.
+	if ec.Spec.StorageSpec != nil && ec.Spec.StorageSpec.AccessModes != corev1.ReadWriteMany {
+		if err := createPVCForMember(ctx, c, ec, podName, scheme); err != nil {
+			return err
+		}
+	}
+
+	state := etcdClusterStateExisting
+	if ordinal == 0 {
+		state = etcdClusterStateNew
+	}
+
+	// Build the initial-cluster value: all peers from ordinal 0 to this one.
+	var clusterParts []string
+	for i := 0; i <= ordinal; i++ {
+		name, peerURL := peerEndpointForOrdinalIndex(ec, i)
+		clusterParts = append(clusterParts, fmt.Sprintf("%s=%s", name, peerURL))
+	}
+
+	pod := buildMemberPod(ec, podName, state, strings.Join(clusterParts, ","))
+	if err := controllerutil.SetControllerReference(ec, pod, scheme); err != nil {
+		return err
+	}
+
+	logger.Info("Creating member pod", "name", podName, "ordinal", ordinal, "state", state)
+	return c.Create(ctx, pod)
+}
+
+// buildMemberPod constructs the Pod object for a single etcd member.
+func buildMemberPod(ec *ecv1alpha1.EtcdCluster, podName string, state etcdClusterState, initialCluster string) *corev1.Pod {
+	// Start with custom labels then overwrite with the mandatory defaults so
+	// that the headless-service selector is always satisfied.
+	labels := make(map[string]string)
+	if ec.Spec.PodTemplate != nil && ec.Spec.PodTemplate.Metadata != nil {
+		maps.Copy(labels, ec.Spec.PodTemplate.Metadata.Labels)
+	}
+	maps.Copy(labels, etcdClusterLabels(ec))
+
+	// Annotations are purely from the PodTemplate; nil when not provided.
+	var annotations map[string]string
+	if ec.Spec.PodTemplate != nil && ec.Spec.PodTemplate.Metadata != nil &&
+		len(ec.Spec.PodTemplate.Metadata.Annotations) > 0 {
+		annotations = ec.Spec.PodTemplate.Metadata.Annotations
+	}
+
+	envVars := []corev1.EnvVar{
+		{
+			Name: "POD_NAME",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"},
+			},
+		},
+		{
+			Name: "POD_NAMESPACE",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"},
+			},
+		},
+		{Name: "ETCD_INITIAL_CLUSTER_STATE", Value: string(state)},
+		{Name: "ETCD_INITIAL_CLUSTER", Value: initialCluster},
+		{Name: "ETCD_DATA_DIR", Value: etcdDataDir},
+	}
+
+	container := corev1.Container{
+		Name:    "etcd",
+		Image:   fmt.Sprintf("%s:%s", ec.Spec.ImageRegistry, ec.Spec.Version),
+		Command: []string{"/usr/local/bin/etcd"},
+		Args:    createArgs(ec.Name, ec.Spec.EtcdOptions),
+		Env:     envVars,
+		Ports: []corev1.ContainerPort{
+			{Name: "client", ContainerPort: 2379},
+			{Name: "peer", ContainerPort: 2380},
+		},
+	}
+
+	podSpec := corev1.PodSpec{
+		Containers: []corev1.Container{container},
+	}
+
+	// Pod scheduling customisation.
+	if ec.Spec.PodTemplate != nil && ec.Spec.PodTemplate.Spec != nil {
+		podSpec.Affinity = ec.Spec.PodTemplate.Spec.Affinity
+		podSpec.NodeSelector = ec.Spec.PodTemplate.Spec.NodeSelector
+		podSpec.Tolerations = ec.Spec.PodTemplate.Spec.Tolerations
+	}
+
+	// Persistent storage volumes.
+	if ec.Spec.StorageSpec != nil {
+		podSpec.Containers[0].VolumeMounts = []corev1.VolumeMount{{
+			Name:      volumeName,
+			MountPath: etcdDataDir,
+		}}
+
+		switch ec.Spec.StorageSpec.AccessModes {
+		case corev1.ReadWriteMany:
+			// All pods share a single pre-existing PVC.
+			podSpec.Volumes = append(podSpec.Volumes, corev1.Volume{
+				Name: volumeName,
+				VolumeSource: corev1.VolumeSource{
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+						ClaimName: ec.Spec.StorageSpec.PVCName,
+					},
+				},
+			})
+		default: // ReadWriteOnce
+			podSpec.Volumes = append(podSpec.Volumes, corev1.Volume{
+				Name: volumeName,
+				VolumeSource: corev1.VolumeSource{
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+						ClaimName: pvcNameForMember(podName),
+					},
+				},
+			})
+		}
+	}
+
+	// TLS certificate volumes (mounted as secrets).
+	if ec.Spec.TLS != nil {
+		podSpec.Volumes = append(podSpec.Volumes,
+			corev1.Volume{
+				Name: "server-secret",
+				VolumeSource: corev1.VolumeSource{
+					Secret: &corev1.SecretVolumeSource{SecretName: getServerCertName(ec.Name)},
+				},
+			},
+			corev1.Volume{
+				Name: "peer-secret",
+				VolumeSource: corev1.VolumeSource{
+					Secret: &corev1.SecretVolumeSource{SecretName: getPeerCertName(ec.Name)},
+				},
+			},
+		)
+	}
+
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        podName,
+			Namespace:   ec.Namespace,
+			Labels:      labels,
+			Annotations: annotations,
+		},
+		Spec: podSpec,
+	}
+}
+
+// createPVCForMember creates a PVC for the given pod if one does not already
+// exist.  Naming mirrors StatefulSet VolumeClaimTemplates: "{volumeName}-{podName}".
+func createPVCForMember(ctx context.Context, c client.Client, ec *ecv1alpha1.EtcdCluster, podName string, scheme *runtime.Scheme) error {
+	pvcName := pvcNameForMember(podName)
+
+	existing := &corev1.PersistentVolumeClaim{}
+	err := c.Get(ctx, types.NamespacedName{Name: pvcName, Namespace: ec.Namespace}, existing)
+	if err == nil {
+		return nil // already exists
+	}
+	if !k8serrors.IsNotFound(err) {
+		return fmt.Errorf("failed to check PVC %s: %w", pvcName, err)
+	}
+
+	if ec.Spec.StorageSpec.VolumeSizeRequest.Cmp(resource.MustParse("1Mi")) < 0 {
+		return fmt.Errorf("VolumeSizeRequest must be at least 1Mi")
+	}
+
+	volumeSizeLimit := ec.Spec.StorageSpec.VolumeSizeLimit
+	if volumeSizeLimit.IsZero() {
+		volumeSizeLimit = ec.Spec.StorageSpec.VolumeSizeRequest
+	}
+
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      pvcName,
+			Namespace: ec.Namespace,
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: ec.Spec.StorageSpec.VolumeSizeRequest,
+				},
+				Limits: corev1.ResourceList{
+					corev1.ResourceStorage: volumeSizeLimit,
+				},
+			},
+		},
+	}
+
+	if ec.Spec.StorageSpec.StorageClassName != "" {
+		pvc.Spec.StorageClassName = &ec.Spec.StorageSpec.StorageClassName
+	}
+
+	if err := controllerutil.SetControllerReference(ec, pvc, scheme); err != nil {
+		return err
+	}
+
+	return c.Create(ctx, pvc)
+}
+
+// waitForPodReady polls until the given Pod has its Ready condition set to True,
+// using an exponential back-off.  It is provided as a utility; the primary
+// reconcile paths do not block on it, relying on natural requeueing instead.
+func waitForPodReady(ctx context.Context, logger logr.Logger, c client.Client, podName, namespace string) error {
+	logger.Info("Waiting for pod to become ready", "name", podName, "namespace", namespace)
+
+	backoff := wait.Backoff{
+		Duration: 3 * time.Second,
+		Factor:   2.0,
+		Steps:    5,
+	}
+
+	err := wait.ExponentialBackoffWithContext(ctx, backoff, func(ctx context.Context) (bool, error) {
+		pod := &corev1.Pod{}
+		if err := c.Get(ctx, types.NamespacedName{Name: podName, Namespace: namespace}, pod); err != nil {
+			return false, err
+		}
+		if isPodReady(pod) {
+			logger.Info("Pod is ready", "name", podName, "namespace", namespace)
+			return true, nil
+		}
+		logger.Info("Pod is not ready yet", "name", podName, "namespace", namespace)
+		return false, nil
+	})
+
+	if err != nil {
+		return fmt.Errorf("pod %s/%s did not become ready: %w", namespace, podName, err)
+	}
+	return nil
+}
+
+// isPodReady returns true when the Pod's Ready condition is True.
+func isPodReady(pod *corev1.Pod) bool {
+	for _, cond := range pod.Status.Conditions {
+		if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+// clientEndpointsFromPods builds the client endpoint URL for every pod in the
+// slice, in the same order.  The DNS form is:
+//
+//	http://{podName}.{clusterName}.{namespace}.svc.cluster.local:2379
+func clientEndpointsFromPods(clusterName, namespace string, pods []*corev1.Pod) []string {
+	if len(pods) == 0 {
+		return nil
+	}
+	eps := make([]string, 0, len(pods))
+	for _, pod := range pods {
+		eps = append(eps, clientEndpointForOrdinal(clusterName, namespace, podOrdinal(pod.Name, clusterName)))
+	}
+	return eps
+}
+
+// clientEndpointForOrdinal returns the client endpoint URL for a member at the
+// given ordinal index.
+func clientEndpointForOrdinal(clusterName, namespace string, ordinal int) string {
+	return fmt.Sprintf("http://%s-%d.%s.%s.svc.cluster.local:2379",
+		clusterName, ordinal, clusterName, namespace)
+}
+
+// areAllMembersHealthy returns true when every entry in the supplied health
+// slice reports healthy.  It uses already-fetched health data and does not make
+// additional network calls.
+func areAllMembersHealthy(memberHealth []etcdutils.EpHealth) bool {
+	for _, h := range memberHealth {
+		if !h.Health {
+			return false
+		}
+	}
+	return true
+}
+
+// healthCheck returns a MemberListResponse and per-endpoint health information
+// for the etcd cluster reachable through the given pods.
+func healthCheck(clusterName, namespace string, pods []*corev1.Pod, lg klog.Logger) (*clientv3.MemberListResponse, []etcdutils.EpHealth, error) {
+	if len(pods) == 0 {
+		return nil, nil, nil
+	}
+
+	endpoints := clientEndpointsFromPods(clusterName, namespace, pods)
+
+	memberlistResp, err := etcdutils.MemberList(endpoints)
+	if err != nil {
+		return nil, nil, err
+	}
+	memberCnt := len(memberlistResp.Members)
+
+	// Use the smaller of the two counts: pods that are starting up may not yet
+	// appear in the member list and already-removed members may have no pod.
+	cnt := min(len(pods), memberCnt)
+	lg.Info("health checking", "podCount", len(pods), "len(members)", memberCnt)
+	endpoints = endpoints[:cnt]
+
+	healthInfos, err := etcdutils.ClusterHealth(endpoints)
+	if err != nil {
+		return memberlistResp, nil, err
+	}
+
+	var memberErrors []error
+	for _, healthInfo := range healthInfos {
+		if !healthInfo.Health {
+			memberErrors = append(memberErrors, errors.New(healthInfo.String()))
+		}
+		lg.Info(healthInfo.String())
+	}
+
+	return memberlistResp, healthInfos, utilerrors.NewAggregate(memberErrors)
+}
+
+// ---------------------------------------------------------------------------
+// etcd argument helpers
+// ---------------------------------------------------------------------------
 
 func defaultArgs(name string) []string {
 	return []string{
 		"--name=$(POD_NAME)",
-		"--listen-peer-urls=http://0.0.0.0:2380",   // TODO: only listen on 127.0.0.1 and host IP
-		"--listen-client-urls=http://0.0.0.0:2379", // TODO: only listen on 127.0.0.1 and host IP
+		"--listen-peer-urls=http://0.0.0.0:2380",
+		"--listen-client-urls=http://0.0.0.0:2379",
 		fmt.Sprintf("--initial-advertise-peer-urls=http://$(POD_NAME).%s.$(POD_NAMESPACE).svc.cluster.local:2380", name),
 		fmt.Sprintf("--advertise-client-urls=http://$(POD_NAME).%s.$(POD_NAMESPACE).svc.cluster.local:2379", name),
 	}
@@ -99,27 +449,21 @@ func RemoveStringFromSlice(s []string, str string) []string {
 
 func getArgName(s string) string {
 	idx := strings.Index(s, "=")
-
 	if idx != -1 {
 		return s[:idx]
 	}
-
 	idx = strings.Index(s, " ")
 	if idx != -1 {
 		return s[:idx]
 	}
-
-	// Assume arg is bool switch if idx is still -1
 	return strings.TrimSpace(s)
 }
 
 func createArgs(name string, etcdOptions []string) []string {
 	defaultArgs := defaultArgs(name)
 	if len(etcdOptions) > 0 {
-		var argName string
-		// Remove default arguments if conflicts with user supplied
 		for i := range etcdOptions {
-			argName = getArgName(etcdOptions[i])
+			argName := getArgName(etcdOptions[i])
 			defaultArgs = RemoveStringFromSlice(defaultArgs, argName)
 		}
 	}
@@ -127,283 +471,34 @@ func createArgs(name string, etcdOptions []string) []string {
 	return defaultArgs
 }
 
-func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1alpha1.EtcdCluster, c client.Client, replicas int32, scheme *runtime.Scheme) error {
-	sts := &appsv1.StatefulSet{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      ec.Name,
-			Namespace: ec.Namespace,
-		},
-	}
-
-	labels := map[string]string{
-		"app":        ec.Name,
-		"controller": ec.Name,
-	}
-
-	podSpec := corev1.PodSpec{
-		Containers: []corev1.Container{
-			{
-				Name:    "etcd",
-				Command: []string{"/usr/local/bin/etcd"},
-				Args:    createArgs(ec.Name, ec.Spec.EtcdOptions),
-				Image:   fmt.Sprintf("%s:%s", ec.Spec.ImageRegistry, ec.Spec.Version),
-				Env: []corev1.EnvVar{
-					{
-						Name: "POD_NAME",
-						ValueFrom: &corev1.EnvVarSource{
-							FieldRef: &corev1.ObjectFieldSelector{
-								FieldPath: "metadata.name",
-							},
-						},
-					},
-					{
-						Name: "POD_NAMESPACE",
-						ValueFrom: &corev1.EnvVarSource{
-							FieldRef: &corev1.ObjectFieldSelector{
-								FieldPath: "metadata.namespace",
-							},
-						},
-					},
-				},
-				EnvFrom: []corev1.EnvFromSource{
-					{
-						ConfigMapRef: &corev1.ConfigMapEnvSource{
-							LocalObjectReference: corev1.LocalObjectReference{
-								Name: configMapNameForEtcdCluster(ec),
-							},
-						},
-					},
-				},
-				Ports: []corev1.ContainerPort{
-					{
-						Name:          "client",
-						ContainerPort: 2379,
-					},
-					{
-						Name:          "peer",
-						ContainerPort: 2380,
-					},
-				},
-			},
-		},
-	}
-
-	// mount server and peer certificate secret to each pods of the statefulset via PodSpec
-	var certVolume []corev1.Volume
-	serverCertName := getServerCertName(ec.Name)
-	peerCertName := getPeerCertName(ec.Name)
-	if ec.Spec.TLS != nil {
-		serverCertVolume := corev1.Volume{
-			Name: "server-secret",
-			VolumeSource: corev1.VolumeSource{
-				Secret: &corev1.SecretVolumeSource{SecretName: serverCertName},
-			},
-		}
-		peerCertVolume := corev1.Volume{
-			Name: "peer-secret",
-			VolumeSource: corev1.VolumeSource{
-				Secret: &corev1.SecretVolumeSource{SecretName: peerCertName},
-			},
-		}
-		certVolume = append(certVolume, serverCertVolume, peerCertVolume)
-	}
-	if len(certVolume) != 0 {
-		podSpec.Volumes = certVolume
-	}
-
-	// Prepare pod template metadata
-	podTemplateMetadata := metav1.ObjectMeta{
-		Labels:      make(map[string]string),
-		Annotations: make(map[string]string),
-	}
-
-	// Pod Scheduling specs
-	if ec.Spec.PodTemplate != nil && ec.Spec.PodTemplate.Spec != nil {
-		podSpec.Affinity = ec.Spec.PodTemplate.Spec.Affinity
-		podSpec.NodeSelector = ec.Spec.PodTemplate.Spec.NodeSelector
-		podSpec.Tolerations = ec.Spec.PodTemplate.Spec.Tolerations
-	}
-
-	// Apply custom metadata from PodTemplate if provided
-	if ec.Spec.PodTemplate != nil && ec.Spec.PodTemplate.Metadata != nil {
-		// Apply custom labels
-		if len(ec.Spec.PodTemplate.Metadata.Labels) > 0 {
-			maps.Copy(podTemplateMetadata.Labels, ec.Spec.PodTemplate.Metadata.Labels)
-		}
-
-		// Apply annotations
-		if len(ec.Spec.PodTemplate.Metadata.Annotations) > 0 {
-			podTemplateMetadata.Annotations = ec.Spec.PodTemplate.Metadata.Annotations
-		}
-	}
-
-	// Apply default labels
-	maps.Copy(podTemplateMetadata.Labels, labels)
-
-	stsSpec := appsv1.StatefulSetSpec{
-		Replicas:    &replicas,
-		ServiceName: ec.Name,
-		Selector: &metav1.LabelSelector{
-			MatchLabels: labels,
-		},
-		Template: corev1.PodTemplateSpec{
-			ObjectMeta: podTemplateMetadata,
-			Spec:       podSpec,
-		},
-	}
-
-	if ec.Spec.StorageSpec != nil {
-
-		stsSpec.Template.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{
-			Name:        volumeName,
-			MountPath:   etcdDataDir,
-			SubPathExpr: "$(POD_NAME)",
-		}}
-		// Create a new volume claim template
-		if ec.Spec.StorageSpec.VolumeSizeRequest.Cmp(resource.MustParse("1Mi")) < 0 {
-			return fmt.Errorf("VolumeSizeRequest must be at least 1Mi")
-		}
-
-		if ec.Spec.StorageSpec.VolumeSizeLimit.IsZero() {
-			logger.Info("VolumeSizeLimit is not set. Setting it to VolumeSizeRequest")
-			ec.Spec.StorageSpec.VolumeSizeLimit = ec.Spec.StorageSpec.VolumeSizeRequest
-		}
-
-		pvcResources := corev1.VolumeResourceRequirements{
-			Requests: corev1.ResourceList{
-				corev1.ResourceStorage: ec.Spec.StorageSpec.VolumeSizeRequest,
-			},
-			Limits: corev1.ResourceList{
-				corev1.ResourceStorage: ec.Spec.StorageSpec.VolumeSizeLimit,
-			},
-		}
-
-		switch ec.Spec.StorageSpec.AccessModes {
-		case corev1.ReadWriteOnce, "":
-			stsSpec.VolumeClaimTemplates = []corev1.PersistentVolumeClaim{
-				{
-					ObjectMeta: metav1.ObjectMeta{Name: volumeName},
-					Spec: corev1.PersistentVolumeClaimSpec{
-						AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
-						Resources:   pvcResources,
-					},
-				},
-			}
-
-			if ec.Spec.StorageSpec.StorageClassName != "" {
-				stsSpec.VolumeClaimTemplates[0].Spec.StorageClassName = &ec.Spec.StorageSpec.StorageClassName
-			}
-		case corev1.ReadWriteMany:
-			if ec.Spec.StorageSpec.PVCName == "" {
-				return fmt.Errorf("PVCName must be set when AccessModes is ReadWriteMany")
-			}
-			stsSpec.Template.Spec.Volumes = append(stsSpec.Template.Spec.Volumes, corev1.Volume{
-				Name: volumeName,
-				VolumeSource: corev1.VolumeSource{
-					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-						ClaimName: ec.Spec.StorageSpec.PVCName,
-					},
-				},
-			})
-		default:
-			return fmt.Errorf("AccessMode %s is not supported", ec.Spec.StorageSpec.AccessModes)
-		}
-	}
-
-	logger.Info("Now creating/updating statefulset", "name", ec.Name, "namespace", ec.Namespace, "replicas", replicas)
-	_, err := controllerutil.CreateOrPatch(ctx, c, sts, func() error {
-		// Define or update the desired spec
-		sts.ObjectMeta = metav1.ObjectMeta{
-			Name:      ec.Name,
-			Namespace: ec.Namespace,
-		}
-		sts.Spec = stsSpec
-
-		// Set ower reference
-		if err := controllerutil.SetControllerReference(ec, sts, scheme); err != nil {
-			return err
-		}
-
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-
-	logger.Info("Stateful set created/updated", "name", ec.Name, "namespace", ec.Namespace, "replicas", replicas)
-	return nil
-}
-
-func waitForStatefulSetReady(ctx context.Context, logger logr.Logger, r client.Client, name, namespace string) error {
-	logger.Info("Now checking the readiness of statefulset", "name", name, "namespace", namespace)
-
-	backoff := wait.Backoff{
-		Duration: 3 * time.Second,
-		Factor:   2.0,
-		Steps:    5,
-	}
-
-	err := wait.ExponentialBackoffWithContext(ctx, backoff, func(ctx context.Context) (bool, error) {
-		// Fetch the StatefulSet
-		sts, err := getStatefulSet(ctx, r, name, namespace)
-		if err != nil {
-			return false, err
-		}
-
-		// Check if the StatefulSet is ready
-		if sts.Status.ReadyReplicas == *sts.Spec.Replicas {
-			// StatefulSet is ready
-			logger.Info("StatefulSet is ready", "name", name, "namespace", namespace)
-			return true, nil
-		}
-
-		// Log the current status
-		logger.Info("StatefulSet is not ready", "ReadyReplicas", strconv.Itoa(int(sts.Status.ReadyReplicas)), "DesiredReplicas", strconv.Itoa(int(*sts.Spec.Replicas)))
-		return false, nil
-	})
-
-	if err != nil {
-		return fmt.Errorf("StatefulSet %s/%s did not become ready: %w", namespace, name, err)
-	}
-
-	return nil
-}
+// ---------------------------------------------------------------------------
+// Kubernetes resource helpers
+// ---------------------------------------------------------------------------
 
 func createHeadlessServiceIfNotExist(ctx context.Context, logger logr.Logger, c client.Client, ec *ecv1alpha1.EtcdCluster, scheme *runtime.Scheme) error {
 	service := &corev1.Service{}
 	err := c.Get(ctx, client.ObjectKey{Name: ec.Name, Namespace: ec.Namespace}, service)
-
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
 			logger.Info("Headless service does not exist. Creating headless service")
-
-			labels := map[string]string{
-				"app":        ec.Name,
-				"controller": ec.Name,
-			}
-			// Create the headless service
 			headlessSvc := &corev1.Service{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      ec.Name,
 					Namespace: ec.Namespace,
-					Labels:    labels,
+					Labels:    etcdClusterLabels(ec),
 				},
 				Spec: corev1.ServiceSpec{
-					ClusterIP: "None", // Key for headless service
-					Selector:  labels,
+					ClusterIP: "None",
+					Selector:  etcdClusterLabels(ec),
 				},
 			}
-
-			// Set owner reference
 			if err := controllerutil.SetControllerReference(ec, headlessSvc, scheme); err != nil {
 				return err
 			}
-
 			if createErr := c.Create(ctx, headlessSvc); createErr != nil {
 				return fmt.Errorf("failed to create headless service: %w", createErr)
 			}
 			logger.Info("Headless service created successfully")
-
 			return nil
 		}
 		return fmt.Errorf("failed to get headless service: %w", err)
@@ -411,174 +506,30 @@ func createHeadlessServiceIfNotExist(ctx context.Context, logger logr.Logger, c 
 	return nil
 }
 
-func checkStatefulSetControlledByEtcdOperator(ec *ecv1alpha1.EtcdCluster, sts *appsv1.StatefulSet) error {
-	if !metav1.IsControlledBy(sts, ec) {
-		return fmt.Errorf("StatefulSet %s/%s is not controlled by EtcdCluster %s/%s", sts.Namespace, sts.Name, ec.Namespace, ec.Name)
-	}
-	return nil
-}
-
-func configMapNameForEtcdCluster(ec *ecv1alpha1.EtcdCluster) string {
-	return fmt.Sprintf("%s-state", ec.Name)
-}
-
+// peerEndpointForOrdinalIndex returns the member name and peer URL for a given
+// ordinal, used both to build ETCD_INITIAL_CLUSTER and to call AddMember.
 func peerEndpointForOrdinalIndex(ec *ecv1alpha1.EtcdCluster, index int) (string, string) {
 	name := fmt.Sprintf("%s-%d", ec.Name, index)
 	return name, fmt.Sprintf("http://%s-%d.%s.%s.svc.cluster.local:2380",
 		ec.Name, index, ec.Name, ec.Namespace)
 }
 
-func newEtcdClusterState(ec *ecv1alpha1.EtcdCluster, replica int) *corev1.ConfigMap {
-	// We always add members one by one, so the state is always
-	// "existing" if replica > 1.
-
-	state := etcdClusterStateNew
-	if replica > 1 {
-		state = etcdClusterStateExisting
-	}
-
-	var initialCluster []string
-	for i := 0; i < replica; i++ {
-		name, peerURL := peerEndpointForOrdinalIndex(ec, i)
-		initialCluster = append(initialCluster, fmt.Sprintf("%s=%s", name, peerURL))
-	}
-
-	return &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      configMapNameForEtcdCluster(ec),
-			Namespace: ec.Namespace,
-		},
-		Data: map[string]string{
-			"ETCD_INITIAL_CLUSTER_STATE": string(state),
-			"ETCD_INITIAL_CLUSTER":       strings.Join(initialCluster, ","),
-			"ETCD_DATA_DIR":              etcdDataDir,
-		},
-	}
-}
-
-func applyEtcdClusterState(ctx context.Context, ec *ecv1alpha1.EtcdCluster, replica int, c client.Client, scheme *runtime.Scheme, logger logr.Logger) error {
-	cm := newEtcdClusterState(ec, replica)
-
-	// Set owner reference
-	if err := controllerutil.SetControllerReference(ec, cm, scheme); err != nil {
-		return err
-	}
-
-	logger.Info("Now updating configmap", "name", configMapNameForEtcdCluster(ec), "namespace", ec.Namespace)
-	err := c.Get(ctx, types.NamespacedName{Name: configMapNameForEtcdCluster(ec), Namespace: ec.Namespace}, &corev1.ConfigMap{})
-	if err != nil {
-		if k8serrors.IsNotFound(err) {
-			createErr := c.Create(ctx, cm)
-			return createErr
-		}
-		return err
-	}
-
-	updateErr := c.Update(ctx, cm)
-	return updateErr
-}
-
-func clientEndpointForOrdinalIndex(sts *appsv1.StatefulSet, index int) string {
-	return fmt.Sprintf("http://%s-%d.%s.%s.svc.cluster.local:2379",
-		sts.Name, index, sts.Name, sts.Namespace)
-}
-
-func getStatefulSet(ctx context.Context, c client.Client, name, namespace string) (*appsv1.StatefulSet, error) {
-	sts := &appsv1.StatefulSet{}
-	err := c.Get(ctx, client.ObjectKey{Name: name, Namespace: namespace}, sts)
-	if err != nil {
-		return nil, err
-	}
-	return sts, nil
-}
-
-func clientEndpointsFromStatefulsets(sts *appsv1.StatefulSet) []string {
-	var endpoints []string
-	replica := int(*sts.Spec.Replicas)
-	if replica > 0 {
-		for i := 0; i < replica; i++ {
-			endpoints = append(endpoints, clientEndpointForOrdinalIndex(sts, i))
-		}
-	}
-	return endpoints
-}
-
-func areAllMembersHealthy(sts *appsv1.StatefulSet, logger logr.Logger) (bool, error) {
-	_, health, err := healthCheck(sts, logger)
-	if err != nil {
-		return false, err
-	}
-
-	for _, h := range health {
-		if !h.Health {
-			return false, nil
-		}
-	}
-	return true, nil
-}
-
-// healthCheck returns a memberList and an error.
-// If any member (excluding not yet started or already removed member)
-// is unhealthy, the error won't be nil.
-func healthCheck(sts *appsv1.StatefulSet, lg klog.Logger) (*clientv3.MemberListResponse, []etcdutils.EpHealth, error) {
-	replica := int(*sts.Spec.Replicas)
-	if replica == 0 {
-		return nil, nil, nil
-	}
-
-	endpoints := clientEndpointsFromStatefulsets(sts)
-
-	memberlistResp, err := etcdutils.MemberList(endpoints)
-	if err != nil {
-		return nil, nil, err
-	}
-	memberCnt := len(memberlistResp.Members)
-
-	// Usually replica should be equal to memberCnt. If it isn't, then
-	// it means previous reconcile loop somehow interrupted right after
-	// adding (replica < memberCnt) or removing (replica > memberCnt)
-	// a member from the cluster. In that case, we shouldn't run health
-	// check on the not yet started or already removed member.
-	cnt := min(replica, memberCnt)
-
-	lg.Info("health checking", "replica", replica, "len(members)", memberCnt)
-	endpoints = endpoints[:cnt]
-
-	healthInfos, err := etcdutils.ClusterHealth(endpoints)
-	if err != nil {
-		return memberlistResp, nil, err
-	}
-
-	var memberErrors []error
-	for _, healthInfo := range healthInfos {
-		if !healthInfo.Health {
-			// TODO: also update metrics?
-			memberErrors = append(memberErrors, errors.New(healthInfo.String()))
-		}
-		lg.Info(healthInfo.String())
-	}
-
-	return memberlistResp, healthInfos, utilerrors.NewAggregate(memberErrors)
-}
+// ---------------------------------------------------------------------------
+// Certificate helpers (unchanged from original implementation)
+// ---------------------------------------------------------------------------
 
 func getClientCertName(etcdClusterName string) string {
-	clientCertName := fmt.Sprintf("%s-%s-tls", etcdClusterName, "client")
-	return clientCertName
+	return fmt.Sprintf("%s-%s-tls", etcdClusterName, "client")
 }
 
 func getServerCertName(etcdClusterName string) string {
-	serverCertName := fmt.Sprintf("%s-%s-tls", etcdClusterName, "server")
-	return serverCertName
+	return fmt.Sprintf("%s-%s-tls", etcdClusterName, "server")
 }
 
 func getPeerCertName(etcdClusterName string) string {
-	peerCertName := fmt.Sprintf("%s-%s-tls", etcdClusterName, "peer")
-	return peerCertName
+	return fmt.Sprintf("%s-%s-tls", etcdClusterName, "peer")
 }
 
-// parseValidityDuration parses a duration string and returns the parsed duration.
-// If the customizedDuration is empty, it returns the defaultDuration.
-// Returns an error if the duration string cannot be parsed.
 func parseValidityDuration(customizedDuration string, defaultDuration time.Duration) (time.Duration, error) {
 	if customizedDuration == "" {
 		return defaultDuration, nil
@@ -596,7 +547,6 @@ func createCMCertificateConfig(ec *ecv1alpha1.EtcdCluster) (*certInterface.Confi
 		return nil, fmt.Errorf("cert-manager configuration is not present")
 	}
 
-	// Set default duration to 90 days for cert-manager if not provided
 	duration, err := parseValidityDuration(cmConfig.ValidityDuration, certInterface.DefaultCertManagerValidity)
 	if err != nil {
 		return nil, err
@@ -609,18 +559,14 @@ func createCMCertificateConfig(ec *ecv1alpha1.EtcdCluster) (*certInterface.Confi
 			IPs:      make([]net.IP, len(cmConfig.AltNames.DNSNames)),
 		}
 	} else {
-		// Use wildcard DNS for the cluster's headless service to cover all pods
-		// This allows the certificate to work for pod-0, pod-1, etc.
 		defaultDNSNames := []string{
 			fmt.Sprintf("*.%s.%s.%s", ec.Name, ec.Namespace, certInterface.DefaultDomainName),
 			fmt.Sprintf("%s.%s.%s", ec.Name, ec.Namespace, certInterface.DefaultDomainName),
 		}
-		getAltNames = certInterface.AltNames{
-			DNSNames: defaultDNSNames,
-		}
+		getAltNames = certInterface.AltNames{DNSNames: defaultDNSNames}
 	}
 
-	config := &certInterface.Config{
+	return &certInterface.Config{
 		CommonName:       cmConfig.CommonName,
 		Organization:     cmConfig.Organization,
 		ValidityDuration: duration,
@@ -629,13 +575,11 @@ func createCMCertificateConfig(ec *ecv1alpha1.EtcdCluster) (*certInterface.Confi
 			"issuerName": cmConfig.IssuerName,
 			"issuerKind": cmConfig.IssuerKind,
 		},
-	}
-	return config, nil
+	}, nil
 }
 
 func createAutoCertificateConfig(ec *ecv1alpha1.EtcdCluster) (*certInterface.Config, error) {
 	autoConfig := ec.Spec.TLS.ProviderCfg.AutoCfg
-	// Set default values for auto configuration if not present
 	if autoConfig == nil {
 		autoConfig = &ecv1alpha1.ProviderAutoConfig{
 			CommonConfig: ecv1alpha1.CommonConfig{
@@ -645,7 +589,6 @@ func createAutoCertificateConfig(ec *ecv1alpha1.EtcdCluster) (*certInterface.Con
 		}
 	}
 
-	// Set default duration to 365 days for auto provider if not provided
 	duration, err := parseValidityDuration(autoConfig.ValidityDuration, certInterface.DefaultAutoValidity)
 	if err != nil {
 		return nil, err
@@ -658,28 +601,22 @@ func createAutoCertificateConfig(ec *ecv1alpha1.EtcdCluster) (*certInterface.Con
 			IPs:      make([]net.IP, len(autoConfig.AltNames.DNSNames)),
 		}
 	} else {
-		// Use wildcard DNS for the cluster's headless service to cover all pods
-		// This allows the certificate to work for pod-0, pod-1, etc.
 		defaultDNSNames := []string{
 			fmt.Sprintf("*.%s.%s.%s", ec.Name, ec.Namespace, certInterface.DefaultDomainName),
 			fmt.Sprintf("%s.%s.%s", ec.Name, ec.Namespace, certInterface.DefaultDomainName),
 		}
-		altNames = certInterface.AltNames{
-			DNSNames: defaultDNSNames,
-		}
+		altNames = certInterface.AltNames{DNSNames: defaultDNSNames}
 	}
 
-	config := &certInterface.Config{
+	return &certInterface.Config{
 		CommonName:       autoConfig.CommonName,
 		Organization:     autoConfig.Organization,
 		ValidityDuration: duration,
 		AltNames:         altNames,
-	}
-	return config, nil
+	}, nil
 }
 
 func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client.Client, certName string) error {
-	// The TLS field is present but spec is empty
 	providerName := ec.Spec.TLS.Provider
 	if providerName == "" {
 		providerName = string(certificate.Auto)
@@ -687,7 +624,6 @@ func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client
 
 	cert, certErr := certificate.NewProvider(certificate.ProviderType(providerName), c)
 	if certErr != nil {
-		// TODO: instead of error, set default autoConfig
 		return certErr
 	}
 	_, getCertError := cert.GetCertificateConfig(ctx, client.ObjectKey{Name: certName, Namespace: ec.Namespace})
@@ -702,8 +638,7 @@ func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client
 				if err != nil {
 					return fmt.Errorf("error creating auto certificate config: %w", err)
 				}
-				createCertErr := cert.EnsureCertificateSecret(ctx, secretKey, autoConfig)
-				if createCertErr != nil {
+				if createCertErr := cert.EnsureCertificateSecret(ctx, secretKey, autoConfig); createCertErr != nil {
 					return fmt.Errorf("error creating auto certificate: %w", createCertErr)
 				}
 				return nil
@@ -712,73 +647,50 @@ func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client
 				if err != nil {
 					return fmt.Errorf("error creating cert-manager certificate config: %w", err)
 				}
-				createCertErr := cert.EnsureCertificateSecret(ctx, secretKey, cmConfig)
-				if createCertErr != nil {
+				if createCertErr := cert.EnsureCertificateSecret(ctx, secretKey, cmConfig); createCertErr != nil {
 					return fmt.Errorf("error creating cert-manager certificate: %w", createCertErr)
 				}
 				return nil
-			default: // This should never happen
-				// TODO: Use AuthProvider, since both AutoCfg and CertManagerCfg is not present
+			default:
 				log.Printf("Error creating certificate, valid certificate provider not defined.")
 				return nil
 			}
-		} else {
-			return fmt.Errorf("%s:Error getting certificate", getCertError)
 		}
+		return fmt.Errorf("%s:Error getting certificate", getCertError)
 	}
-
 	return nil
 }
 
 func createClientCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client) error {
 	certName := getClientCertName(ec.Name)
-	err := createCertificate(ec, ctx, c, certName)
-	if err != nil {
+	if err := createCertificate(ec, ctx, c, certName); err != nil {
 		return err
 	}
-	err = patchCertificateSecret(ctx, ec, c, certName)
-	if err != nil {
-		return fmt.Errorf("patching certificate secret: %s with ownerReference failed: %w", certName, err)
-	}
-	return err
+	return patchCertificateSecret(ctx, ec, c, certName)
 }
 
 func createServerCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client) error {
 	serverCertName := getServerCertName(ec.Name)
-	err := createCertificate(ec, ctx, c, serverCertName)
-	if err != nil {
+	if err := createCertificate(ec, ctx, c, serverCertName); err != nil {
 		return err
 	}
-	err = patchCertificateSecret(ctx, ec, c, serverCertName)
-	if err != nil {
-		return fmt.Errorf("patching certificate secret: %s with ownerReference failed: %w", serverCertName, err)
-	}
-	return nil
+	return patchCertificateSecret(ctx, ec, c, serverCertName)
 }
 
 func createPeerCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client) error {
 	peerCertName := getPeerCertName(ec.Name)
-	err := createCertificate(ec, ctx, c, peerCertName)
-	if err != nil {
+	if err := createCertificate(ec, ctx, c, peerCertName); err != nil {
 		return err
 	}
-	err = patchCertificateSecret(ctx, ec, c, peerCertName)
-	if err != nil {
-		return fmt.Errorf("patching certificate secret: %s with ownerReference failed: %w", peerCertName, err)
-	}
-	return nil
+	return patchCertificateSecret(ctx, ec, c, peerCertName)
 }
 
 func applyEtcdMemberCerts(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client) error {
 	if ec.Spec.TLS != nil {
-		err := createServerCertificate(ctx, ec, c)
-		if err != nil {
+		if err := createServerCertificate(ctx, ec, c); err != nil {
 			return err
 		}
-		err = createPeerCertificate(ctx, ec, c)
-		if err != nil {
-			return err
-		}
+		return createPeerCertificate(ctx, ec, c)
 	}
 	return nil
 }
@@ -796,14 +708,16 @@ func patchCertificateSecret(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c c
 	if err := c.Update(ctx, getCertSecret); err != nil {
 		return fmt.Errorf("failed to update certificate secret with ownerReference: %w", err)
 	}
-
 	return nil
 }
 
-// validateEtcdUpgradePat can be used to check if the current and target versions align
-// with the official upgrade paths for etcd. If one of the versions cannot be parsed
-// canParse is false. If the versions are equal the function will not return an error
-// but that should be handled on the call site.
+// ---------------------------------------------------------------------------
+// Version validation
+// ---------------------------------------------------------------------------
+
+// validateEtcdUpgradePath checks whether upgrading from current to target is
+// permitted by the official etcd upgrade policy. If canParse is false, one of
+// the version strings could not be parsed as semver.
 func validateEtcdUpgradePath(etcdVersions []semver.Version, current, target string) (canParse bool, err error) {
 	var (
 		currentVer            *semver.Version
@@ -835,14 +749,11 @@ func validateEtcdUpgradePath(etcdVersions []semver.Version, current, target stri
 	switch {
 	case currentIdx == -1:
 		return true, fmt.Errorf("unknown current version %s", currentVer)
-
 	case targetIdx == -1:
 		return true, fmt.Errorf("unknown target version %s", targetVer)
-
 	case currentIdx > targetIdx || (currentIdx == targetIdx && currentVer.Patch > targetVer.Patch):
 		return true, fmt.Errorf("downgrading from version %s to version %s is not allowed",
 			currentVer, targetVer)
-
 	case targetIdx > currentIdx+1:
 		return true, fmt.Errorf("upgrading from version %s to version %s is not allowed",
 			currentVer, targetVer)

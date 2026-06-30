@@ -143,13 +143,11 @@ type EtcdClusterStatus struct {
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
-	// CurrentReplicas is the number of etcd pods managed by the StatefulSet for this cluster.
-	// This reflects the .spec.replicas of the underlying StatefulSet.
+	// CurrentReplicas is the number of etcd member pods currently owned by this cluster.
 	// +optional
 	CurrentReplicas int32 `json:"currentReplicas,omitempty"`
 
-	// ReadyReplicas is the number of etcd pods managed by the StatefulSet that are currently ready.
-	// This reflects the .status.readyReplicas of the underlying StatefulSet.
+	// ReadyReplicas is the number of etcd member pods that are currently Ready.
 	// +optional
 	ReadyReplicas int32 `json:"readyReplicas,omitempty"`
 
