@@ -170,6 +170,10 @@ func TestCreateHeadlessServiceIfNotExist(t *testing.T) {
 		err = fakeClient.Get(ctx, client.ObjectKey{Name: "test-etcd", Namespace: "default"}, service)
 		assert.NoError(t, err)
 		assert.Equal(t, "None", service.Spec.ClusterIP)
+		// Required for peer-TLS cluster formation: a joining (not-yet-Ready) member
+		// must be resolvable so etcd's peer cert SAN check (isHostInDNS) accepts it.
+		assert.True(t, service.Spec.PublishNotReadyAddresses,
+			"headless service must publish not-ready addresses so peer-TLS members can join")
 		assert.Equal(t, map[string]string{
 			"app":        "test-etcd",
 			"controller": "test-etcd",
@@ -205,7 +209,7 @@ func TestClientEndpointForOrdinalIndex(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(fmt.Sprintf("index %d", tt.index), func(t *testing.T) {
-			result := clientEndpointForOrdinalIndex(sts, tt.index)
+			result := clientEndpointForOrdinalIndex(sts, tt.index, "http")
 			assert.Equal(t, tt.expectedResult, result)
 		})
 	}
@@ -384,7 +388,7 @@ func TestClientEndpointsFromStatefulsets(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := clientEndpointsFromStatefulsets(tt.statefulSet)
+			result := clientEndpointsFromStatefulsets(tt.statefulSet, "http")
 			assert.Equal(t, tt.expectedResult, result)
 		})
 	}
@@ -423,7 +427,13 @@ func TestAreAllMembersHealthy(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			logger := logr.Discard() // Use a no-op logger for testing
 
-			result, err := areAllMembersHealthy(tt.statefulSet, logger)
+			// Cleartext cluster: buildClientTLSConfig returns nil and the dial
+			// times out, exactly as before the TLS-config threading.
+			ec := &ecv1alpha1.EtcdCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-sts", Namespace: "default"},
+			}
+			fakeClient := fake.NewClientBuilder().Build()
+			result, err := areAllMembersHealthy(t.Context(), ec, fakeClient, tt.statefulSet, logger)
 			assert.Equal(t, tt.expectedResult, result)
 			if tt.expectedError != nil {
 				assert.Error(t, err)
@@ -788,7 +798,7 @@ func TestCreatingArgs(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.testName, func(t *testing.T) {
-			result := createArgs(tt.clusterName, tt.etcdOptions)
+			result := createArgs(tt.clusterName, tt.etcdOptions, tlsArgs{})
 			assert.Equal(t, tt.expectedResult, result)
 		})
 	}
@@ -910,6 +920,7 @@ func TestCreateAutoCertificateConfig(t *testing.T) {
 	tests := []struct {
 		name     string
 		ec       *ecv1alpha1.EtcdCluster
+		surface  *ecv1alpha1.TLSSurface
 		expected *certInterface.Config
 		wantErr  bool
 	}{
@@ -920,19 +931,17 @@ func TestCreateAutoCertificateConfig(t *testing.T) {
 					Name:      "test-cluster",
 					Namespace: "test-namespace",
 				},
-				Spec: ecv1alpha1.EtcdClusterSpec{
-					TLS: &ecv1alpha1.TLSCertificate{
-						Provider: string(certificate.Auto),
-						ProviderCfg: ecv1alpha1.ProviderConfig{
-							AutoCfg: &ecv1alpha1.ProviderAutoConfig{
-								CommonConfig: ecv1alpha1.CommonConfig{
-									CommonName:       "custom.example.com",
-									Organization:     []string{"Test Org"},
-									ValidityDuration: "720h", // 30 days
-									AltNames: ecv1alpha1.AltNames{
-										DNSNames: []string{"custom1.example.com", "custom2.example.com"},
-									},
-								},
+			},
+			surface: &ecv1alpha1.TLSSurface{
+				Provider: string(certificate.Auto),
+				ProviderCfg: ecv1alpha1.ProviderConfig{
+					AutoCfg: &ecv1alpha1.ProviderAutoConfig{
+						CommonConfig: ecv1alpha1.CommonConfig{
+							CommonName:       "custom.example.com",
+							Organization:     []string{"Test Org"},
+							ValidityDuration: "720h", // 30 days
+							AltNames: ecv1alpha1.AltNames{
+								DNSNames: []string{"custom1.example.com", "custom2.example.com"},
 							},
 						},
 					},
@@ -956,13 +965,11 @@ func TestCreateAutoCertificateConfig(t *testing.T) {
 					Name:      "test-cluster",
 					Namespace: "test-namespace",
 				},
-				Spec: ecv1alpha1.EtcdClusterSpec{
-					TLS: &ecv1alpha1.TLSCertificate{
-						Provider: string(certificate.Auto),
-						ProviderCfg: ecv1alpha1.ProviderConfig{
-							AutoCfg: nil,
-						},
-					},
+			},
+			surface: &ecv1alpha1.TLSSurface{
+				Provider: string(certificate.Auto),
+				ProviderCfg: ecv1alpha1.ProviderConfig{
+					AutoCfg: nil,
 				},
 			},
 			expected: &certInterface.Config{
@@ -982,7 +989,7 @@ func TestCreateAutoCertificateConfig(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result, err := createAutoCertificateConfig(tt.ec)
+			result, err := createAutoCertificateConfig(tt.ec, tt.surface)
 
 			if tt.wantErr {
 				require.Error(t, err)
@@ -1004,6 +1011,7 @@ func TestCreateCMCertificateConfig(t *testing.T) {
 	tests := []struct {
 		name     string
 		ec       *ecv1alpha1.EtcdCluster
+		surface  *ecv1alpha1.TLSSurface
 		expected *certInterface.Config
 		wantErr  bool
 	}{
@@ -1014,23 +1022,22 @@ func TestCreateCMCertificateConfig(t *testing.T) {
 					Name:      "test-cluster",
 					Namespace: "test-namespace",
 				},
-				Spec: ecv1alpha1.EtcdClusterSpec{
-					TLS: &ecv1alpha1.TLSCertificate{
-						Provider: string(certificate.CertManager),
-						ProviderCfg: ecv1alpha1.ProviderConfig{
-							CertManagerCfg: &ecv1alpha1.ProviderCertManagerConfig{
-								CommonConfig: ecv1alpha1.CommonConfig{
-									CommonName:       "cm.example.com",
-									Organization:     []string{"CM Org"},
-									ValidityDuration: "1440h", // 60 days
-									AltNames: ecv1alpha1.AltNames{
-										DNSNames: []string{"cm1.example.com", "cm2.example.com"},
-									},
-								},
-								IssuerName: "test-issuer",
-								IssuerKind: "ClusterIssuer",
+			},
+			surface: &ecv1alpha1.TLSSurface{
+				Provider: string(certificate.CertManager),
+				ProviderCfg: ecv1alpha1.ProviderConfig{
+					CertManagerCfg: &ecv1alpha1.ProviderCertManagerConfig{
+						CommonConfig: ecv1alpha1.CommonConfig{
+							CommonName:       "cm.example.com",
+							Organization:     []string{"CM Org"},
+							ValidityDuration: "1440h", // 60 days
+							AltNames: ecv1alpha1.AltNames{
+								DNSNames: []string{"cm1.example.com", "cm2.example.com"},
 							},
 						},
+						IssuerName:  "test-issuer",
+						IssuerKind:  "ClusterIssuer",
+						IssuerGroup: "example.io",
 					},
 				},
 			},
@@ -1043,8 +1050,9 @@ func TestCreateCMCertificateConfig(t *testing.T) {
 					IPs:      make([]net.IP, 2),
 				},
 				ExtraConfig: map[string]any{
-					"issuerName": "test-issuer",
-					"issuerKind": "ClusterIssuer",
+					"issuerName":  "test-issuer",
+					"issuerKind":  "ClusterIssuer",
+					"issuerGroup": "example.io",
 				},
 			},
 			wantErr: false,
@@ -1056,13 +1064,11 @@ func TestCreateCMCertificateConfig(t *testing.T) {
 					Name:      "test-cluster",
 					Namespace: "test-namespace",
 				},
-				Spec: ecv1alpha1.EtcdClusterSpec{
-					TLS: &ecv1alpha1.TLSCertificate{
-						Provider: string(certificate.CertManager),
-						ProviderCfg: ecv1alpha1.ProviderConfig{
-							CertManagerCfg: nil,
-						},
-					},
+			},
+			surface: &ecv1alpha1.TLSSurface{
+				Provider: string(certificate.CertManager),
+				ProviderCfg: ecv1alpha1.ProviderConfig{
+					CertManagerCfg: nil,
 				},
 			},
 			expected: nil,
@@ -1072,7 +1078,7 @@ func TestCreateCMCertificateConfig(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result, err := createCMCertificateConfig(tt.ec)
+			result, err := createCMCertificateConfig(tt.ec, tt.surface)
 
 			if tt.wantErr {
 				require.Error(t, err)
