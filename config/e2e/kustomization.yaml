@@ -6,3 +6,7 @@ patches:
     target:
       kind: Deployment
       name: controller-manager
+  - path: patch-metrics.yaml
+    target:
+      kind: Deployment
+      name: controller-manager
