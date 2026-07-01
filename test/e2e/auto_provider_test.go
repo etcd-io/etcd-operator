@@ -137,16 +137,9 @@ func TestClusterAutoCertCreation(t *testing.T) {
 		Spec: ecv1alpha1.EtcdClusterSpec{
 			Size:    size,
 			Version: etcdVersion,
-			TLS: &ecv1alpha1.TLSCertificate{
-				Provider: string(certificate.Auto),
-				ProviderCfg: ecv1alpha1.ProviderConfig{
-					AutoCfg: &ecv1alpha1.ProviderAutoConfig{
-						CommonConfig: ecv1alpha1.CommonConfig{
-							CommonName:       "etcd-operator-system",
-							ValidityDuration: "8760h",
-						},
-					},
-				},
+			TLS: &ecv1alpha1.EtcdClusterTLS{
+				Peer:   autoSurface(),
+				Client: autoSurface(),
 			},
 		},
 	}

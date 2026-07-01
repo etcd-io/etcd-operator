@@ -27,8 +27,9 @@ import (
 )
 
 const (
-	IssuerNameKey = "issuerName"
-	IssuerKindKey = "issuerKind"
+	IssuerNameKey  = "issuerName"
+	IssuerKindKey  = "issuerKind"
+	IssuerGroupKey = "issuerGroup"
 )
 
 type CertManagerProvider struct {
@@ -234,8 +235,9 @@ func (cm *CertManagerProvider) GetCertificateConfig(ctx context.Context,
 		},
 		ValidityDuration: cmCertificate.Spec.Duration.Duration,
 		ExtraConfig: map[string]any{
-			IssuerNameKey: cmCertificate.Spec.IssuerRef.Name,
-			IssuerKindKey: cmCertificate.Spec.IssuerRef.Kind,
+			IssuerNameKey:  cmCertificate.Spec.IssuerRef.Name,
+			IssuerKindKey:  cmCertificate.Spec.IssuerRef.Kind,
+			IssuerGroupKey: cmCertificate.Spec.IssuerRef.Group,
 		},
 	}
 
@@ -320,6 +322,10 @@ func (cm *CertManagerProvider) createCertificate(ctx context.Context, secretKey 
 	if !isValid {
 		return fmt.Errorf("value for %s not correctly provided, try again", IssuerKindKey)
 	}
+	// issuerGroup is optional: empty (or absent) leaves IssuerRef.Group == "" so
+	// cert-manager defaults it to "cert-manager.io". Unlike issuerName/issuerKind,
+	// absence is legal here, so use comma-ok and do NOT error on a missing key.
+	issuerGroup, _ := cfg.ExtraConfig[IssuerGroupKey].(string)
 
 	certificateResource := &certmanagerv1.Certificate{
 		ObjectMeta: metav1.ObjectMeta{
@@ -335,8 +341,9 @@ func (cm *CertManagerProvider) createCertificate(ctx context.Context, secretKey 
 			DNSNames:    cfg.AltNames.DNSNames,
 			IPAddresses: strings.Fields(strings.Trim(fmt.Sprint(cfg.AltNames.IPs), "[]")),
 			IssuerRef: cmmeta.IssuerReference{
-				Name: issuerName,
-				Kind: issuerKind,
+				Name:  issuerName,
+				Kind:  issuerKind,
+				Group: issuerGroup,
 			},
 			Duration: &metav1.Duration{Duration: cfg.ValidityDuration},
 		},

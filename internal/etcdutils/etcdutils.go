@@ -2,6 +2,7 @@ package etcdutils
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"sort"
@@ -17,12 +18,19 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
-func MemberList(eps []string) (*clientv3.MemberListResponse, error) {
+// All etcd-client entry points take a trailing optional *tls.Config. When nil the
+// client dials cleartext (byte-identical to the pre-TLS behaviour); when non-nil
+// the config is set on clientv3.Config.TLS so the operator authenticates to a TLS
+// etcd over its client port. The caller builds this from the client TLS surface
+// only (see controller.buildClientTLSConfig).
+
+func MemberList(eps []string, tlsConfig *tls.Config) (*clientv3.MemberListResponse, error) {
 	cfg := clientv3.Config{
 		Endpoints:            eps,
 		DialTimeout:          2 * time.Second,
 		DialKeepAliveTime:    2 * time.Second,
 		DialKeepAliveTimeout: 6 * time.Second,
+		TLS:                  tlsConfig,
 	}
 
 	c, err := clientv3.New(cfg)
@@ -120,7 +128,7 @@ func FindLearnerStatus(healthInfos []EpHealth, logger logr.Logger) (uint64, *cli
 	return learner, learnerStatus
 }
 
-func ClusterHealth(eps []string) ([]EpHealth, error) {
+func ClusterHealth(eps []string, tlsConfig *tls.Config) ([]EpHealth, error) {
 	lg, err := logutil.CreateDefaultZapLogger(zap.InfoLevel)
 	if err != nil {
 		return nil, err
@@ -133,6 +141,7 @@ func ClusterHealth(eps []string) ([]EpHealth, error) {
 			DialTimeout:          2 * time.Second,
 			DialKeepAliveTime:    2 * time.Second,
 			DialKeepAliveTimeout: 6 * time.Second,
+			TLS:                  tlsConfig,
 		}
 
 		cfgs = append(cfgs, cfg)
@@ -200,12 +209,13 @@ func ClusterHealth(eps []string) ([]EpHealth, error) {
 	return healthList, nil
 }
 
-func AddMember(eps []string, peerURLs []string, learner bool) (*clientv3.MemberAddResponse, error) {
+func AddMember(eps []string, peerURLs []string, learner bool, tlsConfig *tls.Config) (*clientv3.MemberAddResponse, error) {
 	cfg := clientv3.Config{
 		Endpoints:            eps,
 		DialTimeout:          2 * time.Second,
 		DialKeepAliveTime:    2 * time.Second,
 		DialKeepAliveTimeout: 6 * time.Second,
+		TLS:                  tlsConfig,
 	}
 
 	c, err := clientv3.New(cfg)
@@ -230,12 +240,13 @@ func AddMember(eps []string, peerURLs []string, learner bool) (*clientv3.MemberA
 	return c.MemberAdd(ctx, peerURLs)
 }
 
-func PromoteLearner(eps []string, learnerId uint64) error {
+func PromoteLearner(eps []string, learnerId uint64, tlsConfig *tls.Config) error {
 	cfg := clientv3.Config{
 		Endpoints:            eps,
 		DialTimeout:          2 * time.Second,
 		DialKeepAliveTime:    2 * time.Second,
 		DialKeepAliveTimeout: 6 * time.Second,
+		TLS:                  tlsConfig,
 	}
 
 	c, err := clientv3.New(cfg)
@@ -257,12 +268,13 @@ func PromoteLearner(eps []string, learnerId uint64) error {
 	return err
 }
 
-func RemoveMember(eps []string, memberID uint64) error {
+func RemoveMember(eps []string, memberID uint64, tlsConfig *tls.Config) error {
 	cfg := clientv3.Config{
 		Endpoints:            eps,
 		DialTimeout:          2 * time.Second,
 		DialKeepAliveTime:    2 * time.Second,
 		DialKeepAliveTimeout: 6 * time.Second,
+		TLS:                  tlsConfig,
 	}
 
 	c, err := clientv3.New(cfg)

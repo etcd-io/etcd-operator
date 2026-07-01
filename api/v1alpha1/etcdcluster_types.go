@@ -43,8 +43,17 @@ type EtcdClusterSpec struct {
 	Version string `json:"version"`
 	// StorageSpec is the name of the StorageSpec to use for the etcd cluster. If not provided, then each POD just uses the temporary storage inside the container.
 	StorageSpec *StorageSpec `json:"storageSpec,omitempty"`
-	// TLS is the TLS certificate configuration to use for the etcd cluster and etcd operator.
-	TLS *TLSCertificate `json:"tls,omitempty"`
+	// TLS configures etcd's two independent TLS surfaces (peer and client/server).
+	// Each surface is optional and configured fully independently; a nil surface
+	// means that surface is served/dialed in cleartext. When TLS itself is nil, the
+	// entire cluster (peer + client + operator client) is cleartext, byte-identical
+	// to a TLS-free deployment.
+	//
+	// TLS is effectively create-time: it flows into the pod template and cert mounts.
+	// Toggling it on (or off) on a running cluster rolls the StatefulSet into a mixed
+	// http/https membership whose peers cannot connect, dropping quorum. The supported
+	// path is a NEW TLS cluster plus data migration, not an in-place flip.
+	TLS *EtcdClusterTLS `json:"tls,omitempty"`
 	// etcd configuration options are passed as command line arguments to the etcd container, refer to etcd documentation for configuration options applicable for the version of etcd being used.
 	EtcdOptions []string `json:"etcdOptions,omitempty"`
 	// PodTemplate is the pod template to use for the etcd cluster.
@@ -68,9 +77,64 @@ type PodMetadata struct {
 	Labels      map[string]string `json:"labels,omitempty"`
 }
 
-type TLSCertificate struct {
-	Provider    string         `json:"provider,omitempty"` // Defaults to Auto provider if not present
+// EtcdClusterTLS configures etcd's two independent TLS surfaces. Each surface is
+// optional; a nil surface means that surface is served/dialed in cleartext (http).
+// The two surfaces are configured fully independently -- different providers,
+// issuers, and client-cert-auth policy are allowed and expected. Both surfaces nil
+// is legal and means fully-cleartext (today's default); it is intentional, not an
+// error, so there is no "at least one surface" validation.
+type EtcdClusterTLS struct {
+	// Peer configures etcd<->etcd (peer) TLS. When nil, peer traffic is cleartext.
+	// A configured peer surface REQUIRES a CA-capable issuer shared by all members
+	// so members can mutually verify; a self-signed *leaf* issuer cannot form a
+	// multi-member cluster. (CA-capability lives on the cert-manager Issuer object,
+	// not on this spec, so that check is enforced at reconcile time, not via CEL.)
+	// +optional
+	Peer *TLSSurface `json:"peer,omitempty"`
+
+	// Client configures client->etcd (server) TLS AND, transitively, the operator's
+	// own etcd client identity (the operator authenticates to etcd as a client).
+	// When nil, client traffic is cleartext and the operator dials cleartext.
+	// +optional
+	Client *TLSSurface `json:"client,omitempty"`
+}
+
+// TLSSurface is the full, independent TLS configuration for ONE surface (peer or
+// client). It carries its own provider, provider config (issuer), and mutual
+// client-cert-auth policy.
+//
+// The two XValidation rules below are the apply-time anti-misconfiguration
+// guardrails (plan Decision 2.1/2.2): they reject incoherent provider/config
+// combinations and mTLS-without-a-resolvable-CA at the API server, so a user
+// "cannot misconfigure" these from the spec alone. Rules that require reading
+// cluster objects (issuer existence, peer CA-capability, client/server CA match)
+// cannot be expressed in CEL and are enforced at reconcile time instead (plan
+// Decision 2.5-2.7, Decision 3) -- see validateTLSSurface and the cert-manager
+// provider's validateCertificateConfig.
+//
+// +kubebuilder:validation:XValidation:rule="self.provider != 'cert-manager' || has(self.providerCfg.certManagerCfg)",message="provider 'cert-manager' requires providerCfg.certManagerCfg"
+// +kubebuilder:validation:XValidation:rule="self.provider == 'cert-manager' || !has(self.providerCfg.certManagerCfg)",message="providerCfg.certManagerCfg may only be set when provider is 'cert-manager'"
+// +kubebuilder:validation:XValidation:rule="!self.clientCertAuth || self.provider != 'cert-manager' || (has(self.providerCfg.certManagerCfg) && size(self.providerCfg.certManagerCfg.issuerName) > 0)",message="clientCertAuth requires a trusted CA: set providerCfg.certManagerCfg.issuerName"
+type TLSSurface struct {
+	// Provider selects the certificate provider for THIS surface.
+	// Defaults to "auto" when empty.
+	// +kubebuilder:validation:Enum=auto;cert-manager
+	// +optional
+	Provider string `json:"provider,omitempty"`
+
+	// ProviderCfg is the provider-specific config for THIS surface.
+	// +optional
 	ProviderCfg ProviderConfig `json:"providerCfg,omitempty"`
+
+	// ClientCertAuth toggles mutual cert auth for THIS surface (etcd's
+	// --client-cert-auth for the client surface, --peer-client-cert-auth for the
+	// peer surface). Defaults to true (mTLS). Set false to serve server-only TLS
+	// where clients authenticate by other means (password/token). When true with
+	// the cert-manager provider a trusted CA (issuerName) is REQUIRED, enforced by
+	// the XValidation rule above.
+	// +kubebuilder:default=true
+	// +optional
+	ClientCertAuth *bool `json:"clientCertAuth,omitempty"`
 }
 
 type ProviderConfig struct {
@@ -109,13 +173,6 @@ type CommonConfig struct {
 	// and 365d for auto as per: https://github.com/etcd-io/etcd/blob/b87bc1c3a275d7d4904f4d201b963a2de2264f0d/client/pkg/transport/listener.go#L275
 	// +optional
 	ValidityDuration string `json:"validityDuration,omitempty"`
-
-	// CABundleSecret is the expected secret name with CABundle present. It's used
-	// by each etcd POD to verify TLS communications with its peers or clients. If it isn't
-	// provided, the CA included in the secret generated by certificate provider will be
-	// used instead if present; otherwise, there is no way to verify TLS communications.
-	// +optional
-	CABundleSecret string `json:"caBundleSecret,omitempty"`
 }
 
 type ProviderAutoConfig struct {
@@ -127,11 +184,18 @@ type ProviderCertManagerConfig struct {
 	// CommonConfig is the struct of common fields required to create a certificate
 	CommonConfig `json:",inline"`
 
-	// IssuerKind is the expected kind of Issuer, either "ClusterIssuer" or "Issuer"
+	// IssuerKind is the expected kind of Issuer, either "ClusterIssuer" or "Issuer".
+	// +kubebuilder:validation:Enum=Issuer;ClusterIssuer
 	IssuerKind string `json:"issuerKind"`
 
 	// IssuerName is the expected name of Issuer required to issue a certificate
 	IssuerName string `json:"issuerName"`
+
+	// IssuerGroup is the API group of the issuer referenced by IssuerKind/IssuerName.
+	// Empty defaults to "cert-manager.io". Set this to target issuers served by an
+	// external/intermediate issuer group (e.g. an out-of-tree CA controller).
+	// +optional
+	IssuerGroup string `json:"issuerGroup,omitempty"`
 }
 
 // EtcdClusterStatus defines the observed state of EtcdCluster.
