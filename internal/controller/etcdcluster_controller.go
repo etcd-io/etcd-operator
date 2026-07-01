@@ -50,6 +50,21 @@ type EtcdClusterReconciler struct {
 	Scheme        *runtime.Scheme
 	Recorder      events.EventRecorder
 	ImageRegistry string
+
+	// clusterHealthFn probes the health of the given endpoints. It defaults to
+	// etcdutils.ClusterHealth and exists as a seam so the recovery state machine's
+	// survivor-health gate can be unit-tested without a live etcd. Resolved lazily
+	// via clusterHealth; nil means "use the real implementation".
+	clusterHealthFn func(eps []string) ([]etcdutils.EpHealth, error)
+}
+
+// clusterHealth probes endpoint health via the injected seam, falling back to the
+// real implementation when unset (the production path).
+func (r *EtcdClusterReconciler) clusterHealth(eps []string) ([]etcdutils.EpHealth, error) {
+	if r.clusterHealthFn != nil {
+		return r.clusterHealthFn(eps)
+	}
+	return etcdutils.ClusterHealth(eps)
 }
 
 // reconcileState holds all transient data for a single reconciliation loop.
@@ -68,6 +83,9 @@ type reconcileState struct {
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
+// Quorum-loss recovery reads the survivor pod (cached client => list+watch) to
+// confirm it exists before arming the irreversible --force-new-cluster rebuild.
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch;get;list;update
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;patch;update;delete
 // +kubebuilder:rbac:groups="cert-manager.io",resources=certificates,verbs=get;list;watch;create;patch;update;delete
@@ -105,8 +123,25 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return res, err
 	}
 
-	if err = r.performHealthChecks(ctx, state); err != nil {
-		return ctrl.Result{}, err
+	healthErr := r.performHealthChecks(ctx, state)
+
+	// Quorum-loss recovery gate. A failed health check on a multi-member cluster
+	// can mean the cluster has permanently lost quorum (a majority of members are
+	// gone) and cannot self-heal. maybeRecoverQuorum inspects the observed member
+	// health, and — only on sustained, true quorum loss — drives an idempotent
+	// disaster-recovery state machine (rebuild-from-survivor + re-add members).
+	// While it owns the reconcile (handled=true) we requeue and skip normal
+	// scaling so the two paths never fight. See quorum_recovery.go.
+	if handled, requeueAfter, recErr := r.maybeRecoverQuorum(ctx, state, state.memberHealth, healthErr); handled || recErr != nil {
+		return ctrl.Result{RequeueAfter: requeueAfter}, recErr
+	}
+
+	// During recovery scale-out the recovery state machine delegates membership
+	// re-adds to reconcileClusterState below; a transient per-member health error
+	// (e.g. a freshly added learner not yet caught up) must NOT short-circuit that
+	// path, or recovery would stall. Outside recovery, a health error is fatal.
+	if healthErr != nil && !recoveryActive(state.cluster) {
+		return ctrl.Result{}, healthErr
 	}
 
 	return r.reconcileClusterState(ctx, state)

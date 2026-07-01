@@ -185,6 +185,124 @@ type EtcdClusterStatus struct {
 	// +listType=map
 	// +listMapKey=type
 	Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type"`
+
+	// Recovery captures the state of an in-progress (or last attempted) automatic
+	// disaster recovery from quorum loss. It is managed entirely by the operator's
+	// quorum-loss recovery state machine and is nil when no recovery has ever been
+	// attempted.
+	// +optional
+	Recovery *RecoveryStatus `json:"recovery,omitempty"`
+}
+
+// RecoveryPhase enumerates the stages of the automatic quorum-loss recovery
+// state machine. The phases form a strict, idempotent progression so that the
+// controller can resume recovery safely after a restart or a transient error.
+type RecoveryPhase string
+
+const (
+	// RecoveryPhaseDetecting means the controller has observed a candidate
+	// quorum-loss event but has not yet confirmed it is sustained (it may still
+	// be a transient blip that self-heals before the grace window elapses).
+	RecoveryPhaseDetecting RecoveryPhase = "Detecting"
+	// RecoveryPhaseRebuilding means sustained quorum loss was confirmed and the
+	// controller is rebuilding a single-member cluster from a surviving member
+	// using --force-new-cluster.
+	RecoveryPhaseRebuilding RecoveryPhase = "Rebuilding"
+	// RecoveryPhaseScalingOut means the single-member cluster is healthy again
+	// and the controller is re-adding the remaining members one at a time via
+	// the normal learner-add path.
+	RecoveryPhaseScalingOut RecoveryPhase = "ScalingOut"
+	// RecoveryPhaseCompleted means the cluster was restored to its desired size
+	// and quorum.
+	RecoveryPhaseCompleted RecoveryPhase = "Completed"
+)
+
+// RecoveryStatus records the progress of the quorum-loss recovery state machine.
+type RecoveryStatus struct {
+	// Phase is the current stage of the recovery state machine.
+	// +optional
+	Phase RecoveryPhase `json:"phase,omitempty"`
+
+	// SurvivorOrdinal is the StatefulSet pod ordinal whose data directory was
+	// chosen as the surviving source of truth for the rebuild. It is always 0
+	// today (the operator keeps ordinal-0's PVC) but is recorded explicitly so
+	// the choice is auditable and future survivor-selection policies remain
+	// backward compatible.
+	// +optional
+	SurvivorOrdinal int32 `json:"survivorOrdinal,omitempty"`
+
+	// DetectedTime is the first time a sustained-quorum-loss candidate was
+	// observed. It anchors the grace window used to distinguish true quorum loss
+	// from transient single-member failures.
+	// +optional
+	DetectedTime *metav1.Time `json:"detectedTime,omitempty"`
+
+	// LastTransitionTime is the time the recovery phase last changed.
+	// +optional
+	LastTransitionTime *metav1.Time `json:"lastTransitionTime,omitempty"`
+
+	// Message is a human-readable description of the current recovery step.
+	// +optional
+	Message string `json:"message,omitempty"`
+
+	// Attempts is the number of times the operator has committed to a destructive
+	// rebuild for this cluster (i.e. entered the Rebuilding phase from Detecting).
+	// It is a monotonically increasing counter that survives across recoveries and
+	// is never reset, giving operators a durable signal of how often this cluster
+	// has needed disaster recovery — repeated recoveries usually point at an
+	// underlying infrastructure problem rather than a one-off event.
+	// +optional
+	Attempts int32 `json:"attempts,omitempty"`
+
+	// DataLoss records the data-loss accounting for the most recent rebuild.
+	//
+	// Quorum-loss recovery via --force-new-cluster is NOT a lossless operation:
+	// the rebuilt cluster retains only the writes that were committed to the
+	// surviving member's local data directory. Any write that a now-destroyed
+	// majority had committed but had not yet replicated to the survivor is GONE.
+	// This field surfaces that fact explicitly (alongside a Warning Event, the
+	// DataLossPossible condition, and structured logs) so the loss is auditable
+	// and never silent. It is nil until a rebuild from a survivor completes.
+	// +optional
+	DataLoss *DataLossInfo `json:"dataLoss,omitempty"`
+}
+
+// DataLossInfo captures what the operator knows about the data retained by — and
+// therefore the data potentially lost during — a force-new-cluster rebuild.
+//
+// The operator cannot enumerate exactly which keys were lost (the members that
+// held the un-replicated writes are gone), so this records the provable lower
+// bound on retained state: the survivor's identity and its last committed
+// revision. Everything the destroyed majority committed beyond SurvivorRevision
+// is unrecoverable.
+type DataLossInfo struct {
+	// SurvivorMemberID is the hex-encoded etcd member ID of the survivor whose
+	// data directory was used to rebuild the cluster.
+	// +optional
+	SurvivorMemberID string `json:"survivorMemberID,omitempty"`
+
+	// SurvivorRevision is the key-value store revision present on the survivor at
+	// the moment the single-member cluster came back healthy. It is the highest
+	// revision guaranteed to be retained; any revision the lost majority committed
+	// above this value did not survive the rebuild.
+	// +optional
+	SurvivorRevision int64 `json:"survivorRevision,omitempty"`
+
+	// RaftIndex is the survivor's raft committed index at rebuild time, recorded
+	// for forensic correlation with member logs.
+	// +optional
+	RaftIndex uint64 `json:"raftIndex,omitempty"`
+
+	// RecoveredTime is when the rebuilt single-member cluster was confirmed
+	// healthy and this accounting was captured.
+	// +optional
+	RecoveredTime *metav1.Time `json:"recoveredTime,omitempty"`
+
+	// Message is a human-readable, operator-facing summary of the data-loss
+	// situation, e.g. "recovered with possible data loss; rebuilt from member
+	// <id> at revision <r>".
+	// +optional
+	Message string `json:"message,omitempty"`
 }
 
 // MemberStatus defines the observed state of a single etcd member.
