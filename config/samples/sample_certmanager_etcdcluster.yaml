@@ -1,10 +1,52 @@
-# creating and managing the Issuer/ClusterIssuer is the users’ responsibility, while etcd-operator only needs to know which Issuer/ClusterIssuer to use.
+# A multi-member TLS etcd cluster needs a SHARED CA so members can mutually verify
+# each other's peer certs and the operator can verify the server certs. A bare
+# self-signed ClusterIssuer mints CA:FALSE leaf certs that are each their own root,
+# so peer mTLS cannot form across members and the cluster is effectively capped at
+# one member.
+#
+# The supported pattern (and the one this sample models) is a two-tier CA:
+#   1. a SelfSigned ClusterIssuer bootstraps
+#   2. a CA Certificate (isCA: true), whose secret is signed by (1)
+#   3. a CA ClusterIssuer built from that CA secret signs all of the leaf certs
+# Then every issued secret's ca.crt is the same real CA and all verification chains
+# succeed. Creating/managing the Issuer/ClusterIssuer is the user's responsibility;
+# etcd-operator only needs to know which Issuer/ClusterIssuer to reference.
 apiVersion: cert-manager.io/v1
 kind: ClusterIssuer
 metadata:
-  name: selfsigned
+  name: selfsigned-bootstrap
 spec:
   selfSigned: {}
+
+---
+# CA Certificate: isCA so it can sign leaf certs. Its secret is consumed by the CA
+# ClusterIssuer below. cert-manager resolves a ClusterIssuer's CA secret out of the
+# cluster resource namespace (where cert-manager runs), so place it there.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: etcd-ca
+  namespace: cert-manager
+spec:
+  isCA: true
+  commonName: etcd-ca
+  secretName: etcd-ca
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  issuerRef:
+    name: selfsigned-bootstrap
+    kind: ClusterIssuer
+    group: cert-manager.io
+
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: etcd-ca-issuer
+spec:
+  ca:
+    secretName: etcd-ca
 
 ---
 apiVersion: operator.etcd.io/v1alpha1
@@ -17,11 +59,24 @@ metadata:
 spec:
   version: v3.5.21
   size: 3
+  # Peer and client/server TLS are configured independently. Here both surfaces use
+  # the shared CA issuer so peer mTLS forms across members and the operator can
+  # verify the server. Either surface may be omitted to serve that surface in
+  # cleartext, or pointed at a different issuer.
   tls:
-    provider: "cert-manager"
-    providerCfg:
-      certManagerCfg:
-        commonName: "etcd-operator-system"
-        validityDuration: "365d"
-        issuerKind: "ClusterIssuer"
-        issuerName: "selfsigned"
+    peer:
+      provider: "cert-manager"
+      providerCfg:
+        certManagerCfg:
+          commonName: "etcd-operator-system"
+          validityDuration: "365d"
+          issuerKind: "ClusterIssuer"
+          issuerName: "etcd-ca-issuer"
+    client:
+      provider: "cert-manager"
+      providerCfg:
+        certManagerCfg:
+          commonName: "etcd-operator-system"
+          validityDuration: "365d"
+          issuerKind: "ClusterIssuer"
+          issuerName: "etcd-ca-issuer"

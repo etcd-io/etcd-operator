@@ -338,3 +338,38 @@ func httpViaProxy(ctx context.Context, r *rest.Request, pod corev1.Pod, failpoin
 		Do(ctx)
 	return result.Error()
 }
+
+// certManagerSurface returns a cert-manager TLSSurface for one TLS surface (peer
+// or client). The peer/client split is configured independently in the new CRD
+// shape; the e2e helpers set both surfaces to the same issuer to mirror the
+// pre-split single-toggle behaviour.
+func certManagerSurface(issuerKind, issuerName string) *ecv1alpha1.TLSSurface {
+	return &ecv1alpha1.TLSSurface{
+		Provider: "cert-manager",
+		ProviderCfg: ecv1alpha1.ProviderConfig{
+			CertManagerCfg: &ecv1alpha1.ProviderCertManagerConfig{
+				CommonConfig: ecv1alpha1.CommonConfig{
+					CommonName:       "etcd-operator-system",
+					ValidityDuration: "90h",
+				},
+				IssuerKind: issuerKind,
+				IssuerName: issuerName,
+			},
+		},
+	}
+}
+
+// autoSurface returns an auto-provider TLSSurface for one TLS surface.
+func autoSurface() *ecv1alpha1.TLSSurface {
+	return &ecv1alpha1.TLSSurface{
+		Provider: "auto",
+		ProviderCfg: ecv1alpha1.ProviderConfig{
+			AutoCfg: &ecv1alpha1.ProviderAutoConfig{
+				CommonConfig: ecv1alpha1.CommonConfig{
+					CommonName:       "etcd-operator-system",
+					ValidityDuration: "8760h",
+				},
+			},
+		},
+	}
+}

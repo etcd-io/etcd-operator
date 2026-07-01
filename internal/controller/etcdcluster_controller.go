@@ -133,17 +133,26 @@ func (r *EtcdClusterReconciler) fetchAndValidateState(ctx context.Context, req c
 		ec.Spec.ImageRegistry = r.ImageRegistry
 	}
 
-	// Ensure the operator has TLS credentials when the cluster requests TLS.
-	if ec.Spec.TLS != nil {
+	// Reconcile-time backstop for the apply-time CEL rules (see validateTLS). Reject
+	// an incoherent TLS spec by requeuing rather than silently proceeding into cert
+	// provisioning, which would otherwise fail deep with a less actionable error.
+	if errs := validateTLS(ec); len(errs) > 0 {
+		logger.Error(errs.ToAggregate(), "invalid TLS configuration; not reconciling until fixed",
+			"etcdCluster", ec.Name)
+		return nil, ctrl.Result{RequeueAfter: requeueDuration}, nil
+	}
+
+	// The operator authenticates to etcd as a client, so it needs its own client
+	// identity iff the CLIENT surface is configured (independent of the peer surface).
+	if clientTLSEnabled(ec) {
 		if err := createClientCertificate(ctx, ec, r.Client); err != nil {
-			logger.Error(err, "Failed to create Client Certificate.")
+			logger.Error(err, "Failed to create operator client certificate", "etcdCluster", ec.Name)
 		}
 	} else {
-		// TODO: instead of logging error, set default autoConfig
-		logger.Error(nil, fmt.Sprintf(
-			"missing TLS config for %s,\n running etcd-cluster without TLS protection is NOT recommended for production.",
-			ec.Name,
-		))
+		// Cleartext (no client surface) is a supported mode; log at Info, not Error,
+		// so legitimately-cleartext clusters don't spam error logs every reconcile.
+		logger.Info("client TLS surface not configured; operator dials etcd in cleartext (not recommended for production)",
+			"etcdCluster", ec.Name)
 	}
 
 	logger.Info("Reconciling EtcdCluster", "spec", ec.Spec)
@@ -260,7 +269,7 @@ func (r *EtcdClusterReconciler) performHealthChecks(ctx context.Context, s *reco
 	logger := log.FromContext(ctx)
 	logger.Info("Now checking health of the cluster members")
 	var err error
-	s.memberListResp, s.memberHealth, err = healthCheck(s.sts, logger)
+	s.memberListResp, s.memberHealth, err = healthCheck(ctx, s.cluster, r.Client, s.sts, logger)
 	if err != nil {
 		return fmt.Errorf("health check failed: %w", err)
 	}
@@ -279,6 +288,14 @@ func (r *EtcdClusterReconciler) reconcileClusterState(ctx context.Context, s *re
 	}
 	targetReplica := *s.sts.Spec.Replicas
 	var err error
+
+	// Build the operator's etcd-client TLS config once (nil when the client surface
+	// is cleartext) and derive client endpoints from the client surface's scheme.
+	clientTLSConfig, err := buildClientTLSConfig(ctx, s.cluster, r.Client)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	cScheme := clientScheme(s.cluster)
 
 	// The number of replicas in the StatefulSet doesn't match the number of etcd members in the cluster.
 	if int(targetReplica) != memberCnt {
@@ -322,9 +339,9 @@ func (r *EtcdClusterReconciler) reconcileClusterState(ctx context.Context, s *re
 			if etcdutils.IsLearnerReady(leaderStatus, learnerStatus) {
 				logger.Info("Learner is ready to be promoted to voting member", "learnerID", learner)
 				logger.Info("Promoting the learner member", "learnerID", learner)
-				eps := clientEndpointsFromStatefulsets(s.sts)
+				eps := clientEndpointsFromStatefulsets(s.sts, cScheme)
 				eps = eps[:(len(eps) - 1)]
-				if err := etcdutils.PromoteLearner(eps, learner); err != nil {
+				if err := etcdutils.PromoteLearner(eps, learner, clientTLSConfig); err != nil {
 					// The member is not promoted yet, so we error out and requeue via the caller.
 					return ctrl.Result{}, err
 				}
@@ -341,7 +358,7 @@ func (r *EtcdClusterReconciler) reconcileClusterState(ctx context.Context, s *re
 		return ctrl.Result{}, nil
 	}
 
-	eps := clientEndpointsFromStatefulsets(s.sts)
+	eps := clientEndpointsFromStatefulsets(s.sts, cScheme)
 
 	// If there are no learners left, we can proceed to scale the cluster towards the desired size.
 	// When there are no members to add, the controller will requeue above and this block won't execute.
@@ -350,7 +367,7 @@ func (r *EtcdClusterReconciler) reconcileClusterState(ctx context.Context, s *re
 		_, peerURL := peerEndpointForOrdinalIndex(s.cluster, int(targetReplica))
 		targetReplica++
 		logger.Info("[Scale out] adding a new learner member to etcd cluster", "peerURLs", peerURL)
-		if _, err := etcdutils.AddMember(eps, []string{peerURL}, true); err != nil {
+		if _, err := etcdutils.AddMember(eps, []string{peerURL}, true, clientTLSConfig); err != nil {
 			return ctrl.Result{}, err
 		}
 
@@ -374,7 +391,7 @@ func (r *EtcdClusterReconciler) reconcileClusterState(ctx context.Context, s *re
 
 		logger.Info("[Scale in] removing one member", "memberID", memberID)
 		eps = eps[:targetReplica]
-		if err := etcdutils.RemoveMember(eps, memberID); err != nil {
+		if err := etcdutils.RemoveMember(eps, memberID, clientTLSConfig); err != nil {
 			return ctrl.Result{}, err
 		}
 
@@ -388,7 +405,7 @@ func (r *EtcdClusterReconciler) reconcileClusterState(ctx context.Context, s *re
 	}
 
 	// Ensure every etcd member reports itself healthy before declaring success.
-	allMembersHealthy, err := areAllMembersHealthy(s.sts, logger)
+	allMembersHealthy, err := areAllMembersHealthy(ctx, s.cluster, r.Client, s.sts, logger)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
