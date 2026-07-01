@@ -1,0 +1,50 @@
+apiVersion: operator.etcd.io/v1alpha1
+kind: EtcdMirror
+metadata:
+  labels:
+    app.kubernetes.io/name: etcd-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: etcdmirror-sample
+spec:
+  # External RKE1/AWS source reached over a public NLB, over TLS with a
+  # CA-verified server certificate.
+  source:
+    endpointList:
+      - "https://etcd-rke1.example.com:2379"
+    prefix: "/registry/"
+    tls:
+      secretRef:
+        name: etcdmirror-sample-source-tls
+    auth:
+      secretRef:
+        name: etcdmirror-sample-source-auth
+
+  # In-cluster EtcdCluster reached via its client Service.
+  target:
+    serviceRef:
+      name: etcdcluster-sample-client
+      port: client
+    prefix: "/mirrored/registry/"
+    tls:
+      secretRef:
+        name: etcdmirror-sample-target-tls
+
+  expectEmptyPrefix: true
+
+  sync:
+    maxTxnOps: 128
+    maxOpsPerSecond: 500
+    dialTimeout: 10s
+    reconnectBackoff:
+      initialDelay: 1s
+      maxDelay: 30s
+
+  checkpoint:
+    storageSpec:
+      volumeSizeRequest: 64Mi
+    syncInterval: 5s
+
+  reconciliation:
+    enabled: true
+    interval: 1h
+    deleteOrphans: false
