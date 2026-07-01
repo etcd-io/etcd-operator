@@ -1,0 +1,624 @@
+/*
+Copyright 2025.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package v1alpha1
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
+)
+
+// causeMessages flattens the aggregated field errors carried by an
+// apierrors.NewInvalid status into "<field>: <message>" strings so tests can
+// assert on the exact user-facing rejection text.
+func causeMessages(t *testing.T, err error) []string {
+	t.Helper()
+	if err == nil {
+		return nil
+	}
+	var status apierrors.APIStatus
+	if !errors.As(err, &status) {
+		t.Fatalf("expected an apierrors status error, got %T: %v", err, err)
+	}
+	var msgs []string
+	if status.Status().Details != nil {
+		for _, c := range status.Status().Details.Causes {
+			msgs = append(msgs, c.Field+": "+c.Message)
+		}
+	}
+	return msgs
+}
+
+func newCluster(size int, version string) *EtcdCluster {
+	return &EtcdCluster{Spec: EtcdClusterSpec{Size: size, Version: version}}
+}
+
+func TestValidateCreate_Messages(t *testing.T) {
+	v := &EtcdClusterCustomValidator{}
+
+	tests := []struct {
+		name        string
+		cluster     *EtcdCluster
+		wantOK      bool
+		wantField   string
+		wantMessage string // exact, fully-formed message text
+	}{
+		{
+			name:    "valid odd size with semver version",
+			cluster: newCluster(3, "3.6.1"),
+			wantOK:  true,
+		},
+		{
+			// The default etcd-development registry only publishes v-prefixed tags
+			// (config/samples ships version: v3.5.21), so the webhook must accept a
+			// leading "v" or it would reject the operator's own working samples.
+			name:    "v-prefixed semver version is accepted",
+			cluster: newCluster(3, "v3.6.1"),
+			wantOK:  true,
+		},
+		{
+			name:    "bare semver version is accepted",
+			cluster: newCluster(3, "3.5.21"),
+			wantOK:  true,
+		},
+		{
+			name:        "even size is rejected with quorum guidance",
+			cluster:     newCluster(4, "3.6.1"),
+			wantField:   "spec.size",
+			wantMessage: "Invalid value: 4: size must be an odd number so the cluster can form a majority quorum; got 4. An even-sized etcd cluster tolerates no more failures than the next-smaller odd size while being more likely to lose quorum. Use 3 or 5 instead.",
+		},
+		{
+			name:        "zero size is rejected",
+			cluster:     newCluster(0, "3.6.1"),
+			wantField:   "spec.size",
+			wantMessage: "Invalid value: 0: size must be at least 1; got 0. Set spec.size to a positive odd number (e.g. 1, 3, or 5).",
+		},
+		{
+			name:        "empty version is rejected as required",
+			cluster:     newCluster(1, ""),
+			wantField:   "spec.version",
+			wantMessage: "Required value: version is required; set spec.version to a semver etcd image tag such as \"3.6.1\".",
+		},
+		{
+			name:        "non-semver version is rejected",
+			cluster:     newCluster(1, "latest"),
+			wantField:   "spec.version",
+			wantMessage: "Invalid value: \"latest\": version \"latest\" is not a valid semantic version (expected MAJOR.MINOR.PATCH, e.g. \"3.6.1\"): latest is not in dotted-tri format.",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := v.ValidateCreate(context.Background(), tc.cluster)
+			if tc.wantOK {
+				if err != nil {
+					t.Fatalf("expected admission to succeed, got error: %v", err)
+				}
+				return
+			}
+			msgs := causeMessages(t, err)
+			joined := strings.Join(msgs, " | ")
+			found := false
+			for _, m := range msgs {
+				if m == tc.wantField+": "+tc.wantMessage {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Fatalf("did not find expected cause.\n  want: %s: %s\n  got:  %s",
+					tc.wantField, tc.wantMessage, joined)
+			}
+		})
+	}
+}
+
+func TestValidateTLS_Messages(t *testing.T) {
+	v := &EtcdClusterCustomValidator{}
+
+	tests := []struct {
+		name        string
+		tls         *TLSCertificate
+		wantOK      bool
+		wantMessage string
+	}{
+		{
+			name:   "auto provider with no config is valid",
+			tls:    &TLSCertificate{Provider: "auto"},
+			wantOK: true,
+		},
+		{
+			name:   "empty provider is treated as auto and is valid",
+			tls:    &TLSCertificate{},
+			wantOK: true,
+		},
+		{
+			name:        "unknown provider lists the supported choices",
+			tls:         &TLSCertificate{Provider: "vault"},
+			wantMessage: "spec.tls.provider: Unsupported value: \"vault\": supported values: \"auto\", \"cert-manager\"",
+		},
+		{
+			name:        "cert-manager provider without config block",
+			tls:         &TLSCertificate{Provider: "cert-manager"},
+			wantMessage: "spec.tls.providerCfg.certManagerCfg: Required value: providerCfg.certManagerCfg is required when provider is \"cert-manager\"; supply issuerKind and issuerName.",
+		},
+		{
+			name: "cert-manager provider missing issuerName",
+			tls: &TLSCertificate{
+				Provider:    "cert-manager",
+				ProviderCfg: ProviderConfig{CertManagerCfg: &ProviderCertManagerConfig{IssuerKind: "Issuer"}},
+			},
+			wantMessage: "spec.tls.providerCfg.certManagerCfg.issuerName: Required value: issuerName is required for the cert-manager provider; set it to the name of an Issuer or ClusterIssuer.",
+		},
+		{
+			name: "cert-manager provider with bad issuerKind",
+			tls: &TLSCertificate{
+				Provider:    "cert-manager",
+				ProviderCfg: ProviderConfig{CertManagerCfg: &ProviderCertManagerConfig{IssuerKind: "Bogus", IssuerName: "ca"}},
+			},
+			wantMessage: "spec.tls.providerCfg.certManagerCfg.issuerKind: Unsupported value: \"Bogus\": supported values: \"Issuer\", \"ClusterIssuer\"",
+		},
+		{
+			name: "auto provider must not carry cert-manager config",
+			tls: &TLSCertificate{
+				Provider:    "auto",
+				ProviderCfg: ProviderConfig{CertManagerCfg: &ProviderCertManagerConfig{IssuerName: "ca"}},
+			},
+			wantMessage: "spec.tls.providerCfg.certManagerCfg: Invalid value: \"<set>\": providerCfg.certManagerCfg must not be set when provider is \"auto\"; either remove providerCfg.certManagerCfg or set provider to \"cert-manager\".",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newCluster(1, "3.6.1")
+			c.Spec.TLS = tc.tls
+			_, err := v.ValidateCreate(context.Background(), c)
+			if tc.wantOK {
+				if err != nil {
+					t.Fatalf("expected admission to succeed, got: %v", err)
+				}
+				return
+			}
+			msgs := causeMessages(t, err)
+			found := false
+			for _, m := range msgs {
+				if m == tc.wantMessage {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("did not find expected TLS cause.\n  want: %s\n  got:  %s",
+					tc.wantMessage, strings.Join(msgs, " | "))
+			}
+		})
+	}
+}
+
+func TestValidateUpdate_UpgradePathAndImmutability(t *testing.T) {
+	v := &EtcdClusterCustomValidator{}
+
+	tests := []struct {
+		name        string
+		old         *EtcdCluster
+		updated     *EtcdCluster
+		wantOK      bool
+		wantMessage string
+	}{
+		{
+			name:    "same version no-op is allowed",
+			old:     newCluster(3, "3.6.1"),
+			updated: newCluster(3, "3.6.2"),
+			wantOK:  true,
+		},
+		{
+			name:    "single minor upgrade is allowed",
+			old:     newCluster(3, "3.5.1"),
+			updated: newCluster(3, "3.6.1"),
+			wantOK:  true,
+		},
+		{
+			name:    "v-prefixed single minor upgrade is allowed",
+			old:     newCluster(3, "v3.5.1"),
+			updated: newCluster(3, "v3.6.1"),
+			wantOK:  true,
+		},
+		{
+			// v-prefixed and bare forms of the same release must be treated as a
+			// no-op, not a transition.
+			name:    "v-prefixed vs bare same release is a no-op",
+			old:     newCluster(3, "v3.5.21"),
+			updated: newCluster(3, "3.5.21"),
+			wantOK:  true,
+		},
+		{
+			name:        "v-prefixed skip-minor upgrade is still rejected",
+			old:         newCluster(3, "v3.5.1"),
+			updated:     newCluster(3, "v3.7.1"),
+			wantMessage: "spec.version: Invalid value: \"v3.7.1\": upgrading from version 3.5.1 to version 3.7.1 is not allowed (skips a minor version). etcd only supports sequential single-minor upgrades and forbids downgrades; upgrade one minor version at a time (current \"v3.5.1\" -> target \"v3.7.1\").",
+		},
+		{
+			name:        "skip-minor upgrade is rejected",
+			old:         newCluster(3, "3.5.1"),
+			updated:     newCluster(3, "3.7.1"),
+			wantMessage: "spec.version: Invalid value: \"3.7.1\": upgrading from version 3.5.1 to version 3.7.1 is not allowed (skips a minor version). etcd only supports sequential single-minor upgrades and forbids downgrades; upgrade one minor version at a time (current \"3.5.1\" -> target \"3.7.1\").",
+		},
+		{
+			name:        "downgrade is rejected",
+			old:         newCluster(3, "3.6.1"),
+			updated:     newCluster(3, "3.5.1"),
+			wantMessage: "spec.version: Invalid value: \"3.5.1\": downgrading from version 3.6.1 to version 3.5.1 is not allowed. etcd only supports sequential single-minor upgrades and forbids downgrades; upgrade one minor version at a time (current \"3.6.1\" -> target \"3.5.1\").",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := v.ValidateUpdate(context.Background(), tc.old, tc.updated)
+			if tc.wantOK {
+				if err != nil {
+					t.Fatalf("expected update to succeed, got: %v", err)
+				}
+				return
+			}
+			msgs := causeMessages(t, err)
+			found := false
+			for _, m := range msgs {
+				if m == tc.wantMessage {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("did not find expected upgrade cause.\n  want: %s\n  got:  %s",
+					tc.wantMessage, strings.Join(msgs, " | "))
+			}
+		})
+	}
+}
+
+// TestValidateUpdate_LegacyClustersRemediable guards C3: pre-existing clusters
+// whose values predate the create-time invariants (the CRD historically only
+// enforced size >= 1) must not be frozen on update. Unchanged-but-non-conforming
+// values are tolerated; a metadata-only edit must be allowed; but the invariant is
+// still enforced the moment the offending field is actually changed.
+func TestValidateUpdate_LegacyClustersRemediable(t *testing.T) {
+	v := &EtcdClusterCustomValidator{}
+	ctx := context.Background()
+
+	t.Run("even-sized legacy cluster: unrelated edit is allowed", func(t *testing.T) {
+		// size 4 would fail ValidateCreate, but it already exists; an unrelated
+		// (TLS) edit must not be rejected for the pre-existing even size.
+		old := newCluster(4, "3.6.1")
+		updated := newCluster(4, "3.6.1")
+		updated.Spec.TLS = &TLSCertificate{Provider: "auto"}
+		if _, err := v.ValidateUpdate(ctx, old, updated); err != nil {
+			t.Fatalf("expected unrelated edit on legacy even-sized cluster to be allowed, got: %v", err)
+		}
+	})
+
+	t.Run("changing size to another even value is still rejected", func(t *testing.T) {
+		old := newCluster(4, "3.6.1")
+		updated := newCluster(6, "3.6.1")
+		_, err := v.ValidateUpdate(ctx, old, updated)
+		msgs := causeMessages(t, err)
+		found := false
+		for _, m := range msgs {
+			if strings.HasPrefix(m, "spec.size: Invalid value:") &&
+				strings.Contains(m, "size must be an odd number") {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("expected even-size rejection when size is changed, got: %s", strings.Join(msgs, " | "))
+		}
+	})
+
+	t.Run("remediating size to a valid odd value is allowed", func(t *testing.T) {
+		old := newCluster(4, "3.6.1")
+		updated := newCluster(3, "3.6.1")
+		if _, err := v.ValidateUpdate(ctx, old, updated); err != nil {
+			t.Fatalf("expected remediation 4 -> 3 to be allowed, got: %v", err)
+		}
+	})
+}
+
+func TestValidateUpdate_StorageSpecImmutable(t *testing.T) {
+	v := &EtcdClusterCustomValidator{}
+
+	// withStorage populates a non-zero VolumeSizeRequest on purpose: a zero-valued
+	// Quantity has an empty string cache and nil *inf.Dec, so struct == happens to
+	// agree with the numeric value and would mask the comparison bug C1 fixes.
+	withStorage := func() *EtcdCluster {
+		c := newCluster(3, "3.6.1")
+		c.Spec.StorageSpec = &StorageSpec{
+			StorageClassName:  "standard",
+			VolumeSizeRequest: resource.MustParse("1Gi"),
+		}
+		return c
+	}
+
+	t.Run("removing storageSpec is rejected", func(t *testing.T) {
+		_, err := v.ValidateUpdate(context.Background(), withStorage(), newCluster(3, "3.6.1"))
+		want := "spec.storageSpec: Invalid value: null: storageSpec is immutable and cannot be removed once set; restore the original storageSpec or recreate the cluster."
+		assertCause(t, err, want)
+	})
+
+	t.Run("changing storageSpec is rejected", func(t *testing.T) {
+		updated := withStorage()
+		updated.Spec.StorageSpec.StorageClassName = "fast"
+		_, err := v.ValidateUpdate(context.Background(), withStorage(), updated)
+		msgs := causeMessages(t, err)
+		ok := false
+		for _, m := range msgs {
+			if strings.HasPrefix(m, "spec.storageSpec: Invalid value:") &&
+				strings.Contains(m, "storageSpec is immutable and cannot be changed once set") {
+				ok = true
+			}
+		}
+		if !ok {
+			t.Fatalf("expected storageSpec immutability error, got: %s", strings.Join(msgs, " | "))
+		}
+	})
+
+	t.Run("unchanged storageSpec is allowed", func(t *testing.T) {
+		if _, err := v.ValidateUpdate(context.Background(), withStorage(), withStorage()); err != nil {
+			t.Fatalf("expected unchanged storageSpec to be allowed, got: %v", err)
+		}
+	})
+
+	// Regression guard for C1: a re-spelled but numerically identical quantity
+	// (1Gi vs 1024Mi) must NOT trip immutability. Struct == compares the cached
+	// string and *inf.Dec pointer, so it sees these as different; Semantic.DeepEqual
+	// compares the value and sees them as equal.
+	t.Run("numerically-equal re-spelled quantity is allowed", func(t *testing.T) {
+		old := withStorage()
+		old.Spec.StorageSpec.VolumeSizeRequest = resource.MustParse("1Gi")
+		updated := withStorage()
+		updated.Spec.StorageSpec.VolumeSizeRequest = resource.MustParse("1024Mi")
+		if _, err := v.ValidateUpdate(context.Background(), old, updated); err != nil {
+			t.Fatalf("expected 1Gi vs 1024Mi to be allowed (equal value), got: %v", err)
+		}
+	})
+
+	// A real size change (1Gi -> 2Gi) must still be rejected: immutability holds.
+	t.Run("changing the quantity value is rejected", func(t *testing.T) {
+		old := withStorage()
+		old.Spec.StorageSpec.VolumeSizeRequest = resource.MustParse("1Gi")
+		updated := withStorage()
+		updated.Spec.StorageSpec.VolumeSizeRequest = resource.MustParse("2Gi")
+		_, err := v.ValidateUpdate(context.Background(), old, updated)
+		msgs := causeMessages(t, err)
+		ok := false
+		for _, m := range msgs {
+			if strings.HasPrefix(m, "spec.storageSpec: Invalid value:") &&
+				strings.Contains(m, "storageSpec is immutable and cannot be changed once set") {
+				ok = true
+			}
+		}
+		if !ok {
+			t.Fatalf("expected storageSpec immutability error for 1Gi->2Gi, got: %s", strings.Join(msgs, " | "))
+		}
+	})
+}
+
+func assertCause(t *testing.T, err error, want string) {
+	t.Helper()
+	msgs := causeMessages(t, err)
+	for _, m := range msgs {
+		if m == want {
+			return
+		}
+	}
+	t.Fatalf("did not find expected cause.\n  want: %s\n  got:  %s", want, strings.Join(msgs, " | "))
+}
+
+func TestDefault_TLSProvider(t *testing.T) {
+	d := &EtcdClusterCustomDefaulter{}
+
+	t.Run("empty provider defaults to auto", func(t *testing.T) {
+		c := newCluster(3, "3.6.1")
+		c.Spec.TLS = &TLSCertificate{}
+		if err := d.Default(context.Background(), c); err != nil {
+			t.Fatalf("Default returned error: %v", err)
+		}
+		if c.Spec.TLS.Provider != "auto" {
+			t.Fatalf("expected provider to default to \"auto\", got %q", c.Spec.TLS.Provider)
+		}
+	})
+
+	t.Run("explicit provider is preserved", func(t *testing.T) {
+		c := newCluster(3, "3.6.1")
+		c.Spec.TLS = &TLSCertificate{Provider: "cert-manager"}
+		if err := d.Default(context.Background(), c); err != nil {
+			t.Fatalf("Default returned error: %v", err)
+		}
+		if c.Spec.TLS.Provider != "cert-manager" {
+			t.Fatalf("expected provider preserved, got %q", c.Spec.TLS.Provider)
+		}
+	})
+
+	t.Run("nil TLS is left untouched", func(t *testing.T) {
+		c := newCluster(3, "3.6.1")
+		if err := d.Default(context.Background(), c); err != nil {
+			t.Fatalf("Default returned error: %v", err)
+		}
+		if c.Spec.TLS != nil {
+			t.Fatalf("expected TLS to stay nil")
+		}
+	})
+}
+
+func TestValidateStorageSpec_Messages(t *testing.T) {
+	v := &EtcdClusterCustomValidator{}
+
+	// withStorage returns a valid 3-node cluster we can attach a storageSpec to.
+	withStorage := func(s *StorageSpec) *EtcdCluster {
+		c := newCluster(3, "3.6.1")
+		c.Spec.StorageSpec = s
+		return c
+	}
+
+	tests := []struct {
+		name        string
+		storage     *StorageSpec
+		wantOK      bool
+		wantMessage string // exact "<field>: <message>"
+	}{
+		{
+			name:    "valid RWO storage is accepted",
+			storage: &StorageSpec{VolumeSizeRequest: resource.MustParse("1Gi")},
+			wantOK:  true,
+		},
+		{
+			name:        "missing volumeSizeRequest is required",
+			storage:     &StorageSpec{StorageClassName: "standard"},
+			wantMessage: "spec.storageSpec.volumeSizeRequest: Required value: volumeSizeRequest is required when storageSpec is set; specify a persistent volume size such as \"1Gi\".",
+		},
+		{
+			name:        "volumeSizeRequest below 1Mi is rejected",
+			storage:     &StorageSpec{VolumeSizeRequest: resource.MustParse("512Ki")},
+			wantMessage: "spec.storageSpec.volumeSizeRequest: Invalid value: \"512Ki\": volumeSizeRequest must be at least 1Mi; got \"512Ki\". Request a larger persistent volume (e.g. \"1Gi\").",
+		},
+		{
+			name: "volumeSizeLimit below request is rejected",
+			storage: &StorageSpec{
+				VolumeSizeRequest: resource.MustParse("2Gi"),
+				VolumeSizeLimit:   resource.MustParse("1Gi"),
+			},
+			wantMessage: "spec.storageSpec.volumeSizeLimit: Invalid value: \"1Gi\": volumeSizeLimit (\"1Gi\") must be greater than or equal to volumeSizeRequest (\"2Gi\"); raise volumeSizeLimit or lower volumeSizeRequest.",
+		},
+		{
+			name: "volumeSizeLimit equal to request is accepted",
+			storage: &StorageSpec{
+				VolumeSizeRequest: resource.MustParse("1Gi"),
+				VolumeSizeLimit:   resource.MustParse("1Gi"),
+			},
+			wantOK: true,
+		},
+		{
+			name: "unsupported accessModes lists the supported choices",
+			storage: &StorageSpec{
+				VolumeSizeRequest: resource.MustParse("1Gi"),
+				AccessModes:       "ReadOnlyMany",
+			},
+			wantMessage: "spec.storageSpec.accessModes: Unsupported value: \"ReadOnlyMany\": supported values: \"ReadWriteOnce\", \"ReadWriteMany\"",
+		},
+		{
+			name: "ReadWriteMany without pvcName is required",
+			storage: &StorageSpec{
+				VolumeSizeRequest: resource.MustParse("1Gi"),
+				AccessModes:       "ReadWriteMany",
+			},
+			wantMessage: "spec.storageSpec.pvcName: Required value: pvcName is required when accessModes is \"ReadWriteMany\"; set it to the name of the pre-provisioned shared PersistentVolumeClaim the etcd pods should mount.",
+		},
+		{
+			name: "ReadWriteMany with pvcName is accepted",
+			storage: &StorageSpec{
+				VolumeSizeRequest: resource.MustParse("1Gi"),
+				AccessModes:       "ReadWriteMany",
+				PVCName:           "shared-etcd-pvc",
+			},
+			wantOK: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := v.ValidateCreate(context.Background(), withStorage(tc.storage))
+			if tc.wantOK {
+				if err != nil {
+					t.Fatalf("expected storageSpec to be accepted, got: %v", err)
+				}
+				return
+			}
+			assertCause(t, err, tc.wantMessage)
+		})
+	}
+}
+
+// TestValidateStorageSpec_OnUpdate guards the update-path handling: a storageSpec
+// added to a cluster that previously had none must still be validated, while the
+// immutability rule continues to protect a storageSpec that was already set.
+func TestValidateStorageSpec_OnUpdate(t *testing.T) {
+	v := &EtcdClusterCustomValidator{}
+	ctx := context.Background()
+
+	t.Run("adding an invalid storageSpec on update is rejected", func(t *testing.T) {
+		old := newCluster(3, "3.6.1") // no storage
+		updated := newCluster(3, "3.6.1")
+		updated.Spec.StorageSpec = &StorageSpec{StorageClassName: "standard"} // missing size
+		_, err := v.ValidateUpdate(ctx, old, updated)
+		assertCause(t, err,
+			"spec.storageSpec.volumeSizeRequest: Required value: volumeSizeRequest is required when storageSpec is set; specify a persistent volume size such as \"1Gi\".")
+	})
+
+	t.Run("adding a valid storageSpec on update is accepted", func(t *testing.T) {
+		old := newCluster(3, "3.6.1")
+		updated := newCluster(3, "3.6.1")
+		updated.Spec.StorageSpec = &StorageSpec{VolumeSizeRequest: resource.MustParse("1Gi")}
+		if _, err := v.ValidateUpdate(ctx, old, updated); err != nil {
+			t.Fatalf("expected adding a valid storageSpec to be allowed, got: %v", err)
+		}
+	})
+}
+
+func TestValidateCommonName_Messages(t *testing.T) {
+	v := &EtcdClusterCustomValidator{}
+	ctx := context.Background()
+
+	// 65 characters: one over the documented 64-char X.509 CN ceiling.
+	tooLong := strings.Repeat("a", 65)
+
+	t.Run("auto provider commonName over 64 chars is rejected", func(t *testing.T) {
+		c := newCluster(3, "3.6.1")
+		c.Spec.TLS = &TLSCertificate{
+			Provider:    "auto",
+			ProviderCfg: ProviderConfig{AutoCfg: &ProviderAutoConfig{CommonConfig: CommonConfig{CommonName: tooLong}}},
+		}
+		_, err := v.ValidateCreate(ctx, c)
+		assertCause(t, err,
+			"spec.tls.providerCfg.autoCfg.commonName: Invalid value: \""+tooLong+"\": commonName must be 64 characters or fewer to produce a valid X.509 CSR; got 65. Shorten commonName (the certificate provider derives a default when it is empty).")
+	})
+
+	t.Run("cert-manager provider commonName over 64 chars is rejected", func(t *testing.T) {
+		c := newCluster(3, "3.6.1")
+		c.Spec.TLS = &TLSCertificate{
+			Provider: "cert-manager",
+			ProviderCfg: ProviderConfig{CertManagerCfg: &ProviderCertManagerConfig{
+				IssuerName:   "ca",
+				IssuerKind:   "Issuer",
+				CommonConfig: CommonConfig{CommonName: tooLong},
+			}},
+		}
+		_, err := v.ValidateCreate(ctx, c)
+		assertCause(t, err,
+			"spec.tls.providerCfg.certManagerCfg.commonName: Invalid value: \""+tooLong+"\": commonName must be 64 characters or fewer to produce a valid X.509 CSR; got 65. Shorten commonName (the certificate provider derives a default when it is empty).")
+	})
+
+	t.Run("commonName exactly 64 chars is accepted", func(t *testing.T) {
+		c := newCluster(3, "3.6.1")
+		c.Spec.TLS = &TLSCertificate{
+			Provider:    "auto",
+			ProviderCfg: ProviderConfig{AutoCfg: &ProviderAutoConfig{CommonConfig: CommonConfig{CommonName: strings.Repeat("a", 64)}}},
+		}
+		if _, err := v.ValidateCreate(ctx, c); err != nil {
+			t.Fatalf("expected a 64-char commonName to be accepted, got: %v", err)
+		}
+	})
+}
