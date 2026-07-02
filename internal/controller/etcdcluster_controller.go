@@ -422,22 +422,30 @@ func (r *EtcdClusterReconciler) updateStatus(ctx context.Context, s *reconcileSt
 	if s.memberListResp != nil {
 		s.cluster.Status.MemberCount = int32(len(s.memberListResp.Members))
 
+		// The member list is ordered by member ID while the health report is
+		// ordered by endpoint, so health info must be correlated by member ID
+		// rather than by index.
+		leader, leaderStatus := etcdutils.FindLeaderStatus(s.memberHealth, logger)
+		healthByID := make(map[uint64]etcdutils.EpHealth, len(s.memberHealth))
+		for _, health := range s.memberHealth {
+			if health.Status != nil {
+				healthByID[health.Status.Header.MemberId] = health
+			}
+		}
+
 		// Update individual member statuses
 		s.cluster.Status.Members = make([]ecv1alpha1.MemberStatus, 0, len(s.memberListResp.Members))
-		for i, member := range s.memberListResp.Members {
+		for _, member := range s.memberListResp.Members {
 			memberStatus := ecv1alpha1.MemberStatus{
 				ID:   fmt.Sprintf("%x", member.ID),
 				Name: member.Name,
 			}
 
 			// Find health info for this member
-			if i < len(s.memberHealth) {
-				health := s.memberHealth[i]
+			if health, ok := healthByID[member.ID]; ok {
 				memberStatus.IsHealthy = health.Health
-				if health.Status != nil {
-					memberStatus.Version = health.Status.Version
-					memberStatus.IsLeader = health.Status.Header.MemberId == health.Status.Leader
-				}
+				memberStatus.Version = health.Status.Version
+				memberStatus.IsLeader = leader != 0 && member.ID == leader
 			}
 
 			memberStatus.IsLearner = member.IsLearner
@@ -445,9 +453,8 @@ func (r *EtcdClusterReconciler) updateStatus(ctx context.Context, s *reconcileSt
 		}
 
 		// Update leader ID
-		_, leaderStatus := etcdutils.FindLeaderStatus(s.memberHealth, logger)
 		if leaderStatus != nil {
-			s.cluster.Status.LeaderID = fmt.Sprintf("%x", leaderStatus.Leader)
+			s.cluster.Status.LeaderID = fmt.Sprintf("%x", leader)
 		}
 
 		// Update current version from leader or first healthy member
