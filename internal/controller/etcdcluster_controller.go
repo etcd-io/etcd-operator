@@ -511,7 +511,7 @@ func (r *EtcdClusterReconciler) updateConditions(s *reconcileState) {
 
 	// Determine if cluster is available (has quorum and healthy members)
 	availableCondition := metav1.Condition{
-		Type:               "Available",
+		Type:               ConditionAvailable,
 		Status:             metav1.ConditionFalse,
 		ObservedGeneration: s.cluster.Generation,
 		LastTransitionTime: now,
@@ -603,6 +603,20 @@ func (r *EtcdClusterReconciler) updateConditions(s *reconcileState) {
 	meta.SetStatusCondition(&s.cluster.Status.Conditions, availableCondition)
 	meta.SetStatusCondition(&s.cluster.Status.Conditions, progressingCondition)
 	meta.SetStatusCondition(&s.cluster.Status.Conditions, degradedCondition)
+
+	// One-way latch: the first time the cluster reaches quorum, record durably
+	// that bootstrap completed. Never cleared — quorum-loss detection gates on
+	// it (see quorum_recovery.go) because Available flips False during outages.
+	if availableCondition.Status == metav1.ConditionTrue &&
+		!meta.IsStatusConditionTrue(s.cluster.Status.Conditions, ConditionBootstrapComplete) {
+		meta.SetStatusCondition(&s.cluster.Status.Conditions, metav1.Condition{
+			Type:               ConditionBootstrapComplete,
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: s.cluster.Generation,
+			Reason:             ReasonInitialQuorumReached,
+			Message:            "Etcd cluster reached quorum for the first time",
+		})
+	}
 }
 
 // isCertManagerCRDPresent checks if cert-manager CRDs are installed in the cluster

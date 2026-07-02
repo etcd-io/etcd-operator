@@ -55,6 +55,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -69,6 +70,7 @@ import (
 
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 	"go.etcd.io/etcd-operator/internal/etcdutils"
+	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
@@ -89,6 +91,23 @@ const (
 	// currently injected", making the rebuild step idempotent and observable with
 	// `kubectl get sts -o yaml` even mid-recovery.
 	recoveryForceNewClusterAnnotation = "operator.etcd.io/force-new-cluster"
+
+	// ConditionAvailable is the status condition type maintained by
+	// updateConditions. It tracks the LIVE quorum state: it flips False on any
+	// reconcile that cannot observe quorum (including a real outage), so it is
+	// not a durable "has ever formed" signal — that is ConditionBootstrapComplete.
+	ConditionAvailable = "Available"
+
+	// ConditionBootstrapComplete is a one-way latch: updateConditions sets it
+	// True the first time the cluster reaches quorum and it is never cleared
+	// afterwards. Quorum-loss detection arms only when this latch is set, so a
+	// still-forming cluster is never rebuilt, while a real outage on a cluster
+	// that finished forming (which drives Available back to False) still arms.
+	ConditionBootstrapComplete = "BootstrapComplete"
+
+	// ReasonInitialQuorumReached is the stable reason on the BootstrapComplete
+	// latch condition.
+	ReasonInitialQuorumReached = "InitialQuorumReached"
 
 	// ConditionRecovering is the status condition type the operator raises while
 	// a quorum-loss recovery is in progress.
@@ -181,6 +200,20 @@ func assessQuorum(desiredSize int, health []etcdutils.EpHealth, memberListErr er
 		return a
 	}
 
+	// A learner rejecting the member-list RPC is an application-level etcd
+	// reply, not a transport failure: at least one member is up and serving.
+	// This happens routinely during bootstrap/scale-out when the health check
+	// races a not-yet-promoted learner, so it must never be read as "all
+	// members unreachable".
+	//
+	// Accepted tradeoff: a genuine majority loss whose only survivor is a
+	// learner keeps returning this rejection, so it will never auto-arm
+	// recovery; manual recovery remains the escape hatch for that corner case.
+	if isLearnerRejection(memberListErr) {
+		a.reason = "member list rejected by learner — at least one member up and serving, not quorum loss"
+		return a
+	}
+
 	// Majority unreachable and no leader: true quorum loss.
 	a.lost = true
 	if memberListErr != nil {
@@ -191,6 +224,15 @@ func assessQuorum(desiredSize int, health []etcdutils.EpHealth, memberListErr er
 			a.reachable, desiredSize, quorum)
 	}
 	return a
+}
+
+// isLearnerRejection reports whether err (anywhere in its wrap chain) is etcd's
+// "rpc not supported for learner" rejection. The clientv3 layer surfaces it
+// either as the raw gRPC status error or as its rpctypes.EtcdError translation,
+// so both forms are matched.
+func isLearnerRejection(err error) bool {
+	return errors.Is(err, rpctypes.ErrGRPCNotSupportedForLearner) ||
+		errors.Is(err, rpctypes.Error(rpctypes.ErrGRPCNotSupportedForLearner))
 }
 
 // recoveryActive reports whether a COMMITTED recovery is currently in flight,
@@ -246,6 +288,18 @@ func (r *EtcdClusterReconciler) maybeRecoverQuorum(
 	// Quorum loss observed. Start (or continue) the grace-period clock.
 	now := metav1.Now()
 	if s.cluster.Status.Recovery == nil || s.cluster.Status.Recovery.Phase != ecv1alpha1.RecoveryPhaseDetecting {
+		// Bootstrap gate: only arm detection once the cluster has finished
+		// forming at least once. Quorum-loss recovery rebuilds from surviving
+		// data, which is meaningless for a cluster that never formed — a slow
+		// bootstrap must never be force-new-cluster'd. The gate is the one-way
+		// BootstrapComplete latch, NOT the live Available condition: Available
+		// flips False on any loop that cannot observe quorum (including the
+		// outage we are here to recover from), so gating on it would block
+		// re-arming forever.
+		if !meta.IsStatusConditionTrue(s.cluster.Status.Conditions, ConditionBootstrapComplete) {
+			logger.Info("Quorum appears lost but the BootstrapComplete latch is not set; assuming initial bootstrap in progress, not arming recovery", "detail", a.reason)
+			return false, 0, nil
+		}
 		logger.Info("Candidate quorum loss observed; starting grace period before recovery", "grace", quorumLossGracePeriod, "detail", a.reason)
 		s.cluster.Status.Recovery = &ecv1alpha1.RecoveryStatus{
 			Phase:              ecv1alpha1.RecoveryPhaseDetecting,

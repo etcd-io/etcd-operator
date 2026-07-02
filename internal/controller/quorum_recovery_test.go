@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -37,6 +38,7 @@ import (
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 	"go.etcd.io/etcd-operator/internal/etcdutils"
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
+	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
@@ -133,6 +135,23 @@ func TestAssessQuorum(t *testing.T) {
 			wantLost:    false,
 		},
 		{
+			// During bootstrap the member-list call can land on a learner, which
+			// rejects it at the application level. That reply proves a member is
+			// up and serving — it must not read as "all members unreachable".
+			name:          "3-node bootstrap, member list rejected by learner (gRPC error) => not lost",
+			desiredSize:   3,
+			health:        nil,
+			memberListErr: fmt.Errorf("health check failed: %w", rpctypes.ErrGRPCNotSupportedForLearner),
+			wantLost:      false,
+		},
+		{
+			name:          "3-node bootstrap, member list rejected by learner (EtcdError) => not lost",
+			desiredSize:   3,
+			health:        nil,
+			memberListErr: fmt.Errorf("health check failed: %w", rpctypes.Error(rpctypes.ErrGRPCNotSupportedForLearner)),
+			wantLost:      false,
+		},
+		{
 			// A learner answers health probes but cannot vote, so a surviving
 			// voter + healthy learner is NOT a quorum for a 3-node cluster.
 			name:        "3-node survivor voter + healthy learner, no leader => quorum LOST",
@@ -170,6 +189,17 @@ func threeNodeCluster() *ecv1alpha1.EtcdCluster {
 		ObjectMeta: metav1.ObjectMeta{Name: "etcd", Namespace: "default"},
 		Spec:       ecv1alpha1.EtcdClusterSpec{Size: 3, Version: "3.5.17"},
 	}
+}
+
+// markBootstrapComplete stamps the one-way BootstrapComplete latch that
+// updateConditions sets the first time the cluster reaches quorum. Detection
+// only arms on clusters carrying the latch.
+func markBootstrapComplete(ec *ecv1alpha1.EtcdCluster) {
+	meta.SetStatusCondition(&ec.Status.Conditions, metav1.Condition{
+		Type:   ConditionBootstrapComplete,
+		Status: metav1.ConditionTrue,
+		Reason: ReasonInitialQuorumReached,
+	})
 }
 
 func threeReplicaSTS() *appsv1.StatefulSet {
@@ -212,6 +242,7 @@ func TestMaybeRecoverQuorum_GracePeriod(t *testing.T) {
 	t.Run("transient loss within grace period does not recover", func(t *testing.T) {
 		r := newTestReconciler()
 		ec := threeNodeCluster()
+		markBootstrapComplete(ec)
 		s := &reconcileState{cluster: ec, sts: threeReplicaSTS()}
 
 		// First observation: enters Detecting, requeues, does NOT recover.
@@ -234,6 +265,7 @@ func TestMaybeRecoverQuorum_GracePeriod(t *testing.T) {
 		sts := threeReplicaSTS()
 		r := newTestReconciler()
 		ec := threeNodeCluster()
+		markBootstrapComplete(ec)
 		require.NoError(t, r.Create(context.Background(), sts))
 		require.NoError(t, r.Create(context.Background(), survivorPod()))
 		s := &reconcileState{cluster: ec, sts: sts}
@@ -273,6 +305,87 @@ func TestMaybeRecoverQuorum_GracePeriod(t *testing.T) {
 		require.NotNil(t, cond)
 		assert.Equal(t, metav1.ConditionTrue, cond.Status)
 	})
+
+	t.Run("learner-rejected member list during bootstrap does not arm detection", func(t *testing.T) {
+		r := newTestReconciler()
+		ec := threeNodeCluster() // BootstrapComplete latch unset: still forming
+		s := &reconcileState{cluster: ec, sts: threeReplicaSTS()}
+
+		memberListErr := fmt.Errorf("health check failed: %w", rpctypes.ErrGRPCNotSupportedForLearner)
+		handled, _, err := r.maybeRecoverQuorum(context.Background(), s, nil, memberListErr)
+		require.NoError(t, err)
+		assert.False(t, handled)
+		assert.Nil(t, ec.Status.Recovery, "learner rejection must not start quorum-loss detection")
+		assert.Nil(t, meta.FindStatusCondition(ec.Status.Conditions, ConditionRecovering))
+	})
+
+	t.Run("total outage before bootstrap ever completed does not arm detection", func(t *testing.T) {
+		r := newTestReconciler()
+		ec := threeNodeCluster()
+		s := &reconcileState{cluster: ec, sts: threeReplicaSTS()}
+
+		handled, _, err := r.maybeRecoverQuorum(context.Background(), s, quorumLostHealth(), nil)
+		require.NoError(t, err)
+		assert.False(t, handled)
+		assert.Nil(t, ec.Status.Recovery, "cluster without BootstrapComplete latch must not arm recovery")
+
+		// Once the latch is set, the same observation arms detection.
+		markBootstrapComplete(ec)
+		handled, _, err = r.maybeRecoverQuorum(context.Background(), s, quorumLostHealth(), nil)
+		require.NoError(t, err)
+		assert.True(t, handled)
+		require.NotNil(t, ec.Status.Recovery)
+		assert.Equal(t, ecv1alpha1.RecoveryPhaseDetecting, ec.Status.Recovery.Phase)
+	})
+
+	t.Run("outage that already flipped Available=False still arms detection", func(t *testing.T) {
+		// Regression: updateConditions recomputes Available every reconcile and
+		// persists False whenever the member list is unavailable or quorum is
+		// lost — i.e. during the very outage recovery exists for. Gating on the
+		// live Available condition therefore blocked re-arming forever; the
+		// BootstrapComplete latch must arm regardless of Available's live value.
+		r := newTestReconciler()
+		ec := threeNodeCluster()
+		markBootstrapComplete(ec)
+		meta.SetStatusCondition(&ec.Status.Conditions, metav1.Condition{
+			Type:   ConditionAvailable,
+			Status: metav1.ConditionFalse,
+			Reason: "ClusterNotReady",
+		})
+		s := &reconcileState{cluster: ec, sts: threeReplicaSTS()}
+
+		handled, _, err := r.maybeRecoverQuorum(context.Background(), s, quorumLostHealth(), nil)
+		require.NoError(t, err)
+		assert.True(t, handled, "previously formed cluster must arm even while Available=False")
+		require.NotNil(t, ec.Status.Recovery)
+		assert.Equal(t, ecv1alpha1.RecoveryPhaseDetecting, ec.Status.Recovery.Phase)
+	})
+}
+
+// TestUpdateConditions_BootstrapCompleteLatch verifies the latch is set the
+// first time quorum is observed and survives later loops that flip Available
+// back to False (member list gone / quorum lost).
+func TestUpdateConditions_BootstrapCompleteLatch(t *testing.T) {
+	r := newTestReconciler()
+	ec := threeNodeCluster()
+
+	// Loop 1: no member list yet — Available False, latch unset.
+	r.updateConditions(&reconcileState{cluster: ec})
+	assert.False(t, meta.IsStatusConditionTrue(ec.Status.Conditions, ConditionAvailable))
+	assert.Nil(t, meta.FindStatusCondition(ec.Status.Conditions, ConditionBootstrapComplete))
+
+	// Loop 2: quorum observed — Available True, latch set.
+	members := &clientv3.MemberListResponse{Members: []*etcdserverpb.Member{{ID: 1}, {ID: 2}, {ID: 3}}}
+	healthy := []etcdutils.EpHealth{member(1, true, false, 1), member(2, true, false, 1), member(3, true, false, 1)}
+	r.updateConditions(&reconcileState{cluster: ec, memberListResp: members, memberHealth: healthy})
+	assert.True(t, meta.IsStatusConditionTrue(ec.Status.Conditions, ConditionAvailable))
+	assert.True(t, meta.IsStatusConditionTrue(ec.Status.Conditions, ConditionBootstrapComplete))
+
+	// Loop 3: outage — Available flips False, latch stays True.
+	r.updateConditions(&reconcileState{cluster: ec})
+	assert.False(t, meta.IsStatusConditionTrue(ec.Status.Conditions, ConditionAvailable))
+	assert.True(t, meta.IsStatusConditionTrue(ec.Status.Conditions, ConditionBootstrapComplete),
+		"BootstrapComplete is a one-way latch and must never be cleared")
 }
 
 // TestRecoveryRebuild_FlagRemovedWhenSurvivorHealthy is covered indirectly via
@@ -393,6 +506,7 @@ func TestRecoveryRebuild_RemovesFlagAndAdvances(t *testing.T) {
 	r.Recorder = rec
 
 	ec := threeNodeCluster()
+	markBootstrapComplete(ec)
 	sts := threeReplicaSTS()
 	require.NoError(t, r.Create(context.Background(), sts))
 	require.NoError(t, r.Create(context.Background(), survivorPod()))
@@ -491,6 +605,7 @@ func TestRecoveryRebuild_RecordsPossibleDataLoss(t *testing.T) {
 	r.Recorder = rec
 
 	ec := threeNodeCluster()
+	markBootstrapComplete(ec)
 	sts := threeReplicaSTS()
 	require.NoError(t, r.Create(context.Background(), sts))
 	require.NoError(t, r.Create(context.Background(), survivorPod()))
