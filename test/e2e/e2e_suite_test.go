@@ -40,28 +40,34 @@ import (
 )
 
 var (
-	testEnv       env.Environment
-	imageName     = "etcd-operator:v0.1"
-	namespace     = "etcd-operator-system"
-	containerTool = os.Getenv("CONTAINER_TOOL")
-	skipTeardown  = os.Getenv("ETCD_E2E_SKIP_TEARDOWN") == "true"
+	testEnv                             env.Environment
+	imageName                           = "etcd-operator:v0.1"
+	namespace                           = "etcd-operator-system"
+	containerTool                       = os.Getenv("CONTAINER_TOOL")
+	skipTeardown                        = os.Getenv("ETCD_E2E_SKIP_TEARDOWN") == "true"
+	kindClusterName, useExistingCluster = os.LookupEnv("TEST_KIND_CLUSTER")
 )
 
 func TestMain(m *testing.M) {
 	testEnv = env.New()
-	kindClusterName := "etcd-cluster"
+
+	if !useExistingCluster {
+		kindClusterName = "etcd-cluster"
+	}
+
 	kindCluster := kind.NewCluster(kindClusterName)
 	clusterVersion := kind.WithImage("kindest/node:v1.32.0")
 
-	log.Println("Creating KinD cluster...")
 	testEnv.Setup(
 		// create KinD cluster
 		func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
-			// create KinD cluster
+
+			// Kind's Cluster.Create() skips cluster creation internally if cluster already exists.
 			var err error
+			log.Println("Creating KinD cluster...")
 			ctx, err = envfuncs.CreateClusterWithOpts(kindCluster, kindClusterName, clusterVersion)(ctx, cfg)
 			if err != nil {
-				log.Printf("failed to create cluster: %s", err)
+				log.Printf("Failed to create cluster: %s", err)
 				return ctx, err
 			}
 
@@ -70,6 +76,12 @@ func TestMain(m *testing.M) {
 
 		// prepare the resources
 		func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
+			// Check if image already exists in the cluster (when using existing cluster)
+			if useExistingCluster && test_utils.IsImageLoadedInKindCluster(kindClusterName, imageName) {
+				log.Printf("Image %s already loaded in cluster %s, skipping build and load", imageName, kindClusterName)
+				return ctx, nil
+			}
+
 			// Build docker image
 			log.Println("Building docker image...")
 			cmd := exec.Command("make", "docker-build", fmt.Sprintf("IMG=%s", imageName))
@@ -90,6 +102,12 @@ func TestMain(m *testing.M) {
 
 		// install prometheus
 		func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
+			// Skip if using existing cluster and Prometheus is already installed
+			if useExistingCluster && test_utils.IsPrometheusCRDsInstalled() {
+				log.Println("Prometheus operator already installed in existing cluster, skipping installation")
+				return ctx, nil
+			}
+
 			log.Println("Installing prometheus operator...")
 			if err := test_utils.InstallPrometheusOperator(); err != nil {
 				log.Printf("Unable to install Prometheus operator: %s", err)
@@ -100,12 +118,16 @@ func TestMain(m *testing.M) {
 
 		// set up environment
 		func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
-			// create namespace
-			var err error
-			ctx, err = envfuncs.CreateNamespace(namespace)(ctx, cfg)
-			if err != nil {
-				log.Printf("failed to create namespace: %s", err)
-				return ctx, err
+			// Ensure namespace exists (skip creation if already exists in existing cluster)
+			if useExistingCluster && test_utils.NamespaceExists(namespace) {
+				log.Printf("Namespace %s already exists in existing cluster, skipping creation", namespace)
+			} else {
+				log.Printf("Creating namespace %s...", namespace)
+				ctx, err := envfuncs.CreateNamespace(namespace)(ctx, cfg)
+				if err != nil {
+					log.Printf("Failed to create namespace: %s", err)
+					return ctx, err
+				}
 			}
 
 			// install crd
@@ -174,11 +196,14 @@ func TestMain(m *testing.M) {
 			}
 
 			// remove namespace
-			var err error
+			if useExistingCluster {
+				log.Println("Skipping namespace cleanup")
+				return ctx, nil
+			}
 			log.Println("Destroying namespace...")
-			ctx, err = envfuncs.DeleteNamespace(namespace)(ctx, cfg)
+			ctx, err := envfuncs.DeleteNamespace(namespace)(ctx, cfg)
 			if err != nil {
-				log.Printf("failed to delete namespace: %s", err)
+				log.Printf("Warning: Failed to delete namespace (may not exist): %s", err)
 			}
 
 			return ctx, nil
@@ -186,7 +211,7 @@ func TestMain(m *testing.M) {
 
 		// remove the installed dependencies
 		func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
-			if skipTeardown {
+			if skipTeardown || useExistingCluster {
 				log.Println("Skipping dependency cleanup")
 				return ctx, nil
 			}
@@ -203,8 +228,12 @@ func TestMain(m *testing.M) {
 
 		// Destroy environment
 		func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
-			if skipTeardown {
-				log.Println("Skipping KinD cluster destruction")
+			if skipTeardown || useExistingCluster {
+				if useExistingCluster {
+					log.Printf("Skipping cluster destruction, existing cluster could be in use: %s", kindClusterName)
+				} else {
+					log.Println("Skipping KinD cluster destruction")
+				}
 				return ctx, nil
 			}
 			var err error
