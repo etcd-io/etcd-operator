@@ -65,6 +65,15 @@ spec:
           - --health-probe-bind-address=:8081
         image: controller:latest
         name: manager
+        env:
+          # OPERATOR_IMAGE is stamped onto restore-target EtcdClusters as the
+          # restore init-container (it runs `manager restore-localize` to fetch
+          # the snapshot and lay the genesis data dir). It must equal the image
+          # this Deployment runs. Override it (or pass --operator-image) to match
+          # your deployed operator image; kustomize's images: transform rewrites
+          # the container image: above but not this env value.
+          - name: OPERATOR_IMAGE
+            value: "gcr.io/etcd-io/etcd-operator:latest"
         securityContext:
           allowPrivilegeEscalation: false
           capabilities:

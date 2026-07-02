@@ -310,6 +310,19 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 		}
 	}
 
+	// Restore-target clusters (marked by the EtcdRestore controller with the
+	// restore-source annotation) get a single restore init-container that
+	// bootstraps the genesis member's data dir from a snapshot before etcd
+	// starts. A normal cluster carries no such annotation and its pod template is
+	// left byte-identical (zero init-containers / no extra volumes), so the
+	// existing cluster reconcile/e2e is unaffected.
+	if src, ok, srcErr := restoreSourceFromCluster(ec); srcErr != nil {
+		return fmt.Errorf("invalid restore-source annotation on EtcdCluster %s/%s: %w",
+			ec.Namespace, ec.Name, srcErr)
+	} else if ok {
+		applyRestoreInitContainers(&stsSpec.Template.Spec, ec, src)
+	}
+
 	logger.Info("Now creating/updating statefulset", "name", ec.Name, "namespace", ec.Namespace, "replicas", replicas)
 	_, err := controllerutil.CreateOrPatch(ctx, c, sts, func() error {
 		// Define or update the desired spec

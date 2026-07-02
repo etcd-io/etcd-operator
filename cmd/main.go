@@ -58,7 +58,17 @@ func init() {
 }
 
 func main() {
+	// Subcommand dispatch: the operator image doubles as the restore
+	// download helper. When invoked as `manager restore-download` (by the
+	// restore download init-container the cluster controller injects), stream
+	// the snapshot out of object storage and exit, never starting the manager.
+	if len(os.Args) > 1 && os.Args[1] == "restore-localize" {
+		runRestoreLocalize()
+		return
+	}
+
 	var imageRegistry string
+	var operatorImage string
 	var metricsAddr string
 	var enableLeaderElection bool
 	var probeAddr string
@@ -67,6 +77,9 @@ func main() {
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&imageRegistry, "image-registry", "gcr.io/etcd-development/etcd",
 		"The container registry to pull etcd images from. Defaults to gcr.io/etcd-development/etcd.")
+	flag.StringVar(&operatorImage, "operator-image", os.Getenv("OPERATOR_IMAGE"),
+		"The operator's own image, used as the restore init-container that bootstraps a "+
+			"restore-target member from a snapshot. Defaults to the OPERATOR_IMAGE env var.")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -156,6 +169,23 @@ func main() {
 		ImageRegistry: imageRegistry,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "EtcdCluster")
+		os.Exit(1)
+	}
+	if err = (&controller.EtcdBackupReconciler{
+		Client:     mgr.GetClient(),
+		Scheme:     mgr.GetScheme(),
+		RESTConfig: mgr.GetConfig(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "EtcdBackup")
+		os.Exit(1)
+	}
+	if err = (&controller.EtcdRestoreReconciler{
+		Client:        mgr.GetClient(),
+		Scheme:        mgr.GetScheme(),
+		RESTConfig:    mgr.GetConfig(),
+		OperatorImage: operatorImage,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "EtcdRestore")
 		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder

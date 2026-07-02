@@ -1,0 +1,55 @@
+# Sample EtcdBackup CRs for the two built-in object-storage providers.
+#
+# Each backup is a one-shot snapshot of the referenced EtcdCluster, uploaded to
+# the configured bucket/prefix. Credentials are optional: when secretRef is
+# omitted the operator falls back to ambient cloud credentials (IRSA on AWS,
+# Workload Identity on GCP), which is the recommended production posture.
+---
+apiVersion: operator.etcd.io/v1alpha1
+kind: EtcdBackup
+metadata:
+  labels:
+    app.kubernetes.io/name: etcd-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: etcdbackup-s3-sample
+spec:
+  # Name of an EtcdCluster in the same namespace.
+  clusterRef: etcdcluster-sample
+  # Bound the snapshot-save step (defaults to 10m if omitted).
+  snapshotTimeout: 10m
+  destination:
+    provider: s3
+    # Optional "folder" within the bucket.
+    prefix: etcd/backups
+    s3:
+      bucket: my-etcd-backups
+      region: us-east-1
+      # endpoint + forcePathStyle enable S3-compatible stores (MinIO, Ceph RGW).
+      # endpoint: http://minio.storage.svc.cluster.local:9000
+      # forcePathStyle: true
+    # Optional credentials secret. Keys: accessKeyID / secretAccessKey
+    # (and optionally sessionToken). Omit to use ambient credentials (IRSA).
+    secretRef:
+      name: s3-backup-credentials
+  # Optional retention: keep the 7 most-recent snapshots under bucket/prefix.
+  retention:
+    retainCount: 7
+---
+apiVersion: operator.etcd.io/v1alpha1
+kind: EtcdBackup
+metadata:
+  labels:
+    app.kubernetes.io/name: etcd-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: etcdbackup-gcs-sample
+spec:
+  clusterRef: etcdcluster-sample
+  destination:
+    provider: gcs
+    prefix: etcd/backups
+    gcs:
+      bucket: my-etcd-backups
+    # Optional credentials secret. Key: serviceAccountJSON (a GCP SA key).
+    # Omit to use Application Default Credentials (Workload Identity).
+    secretRef:
+      name: gcs-backup-credentials
