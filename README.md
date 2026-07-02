@@ -51,6 +51,14 @@ make deploy IMG=<some-registry>/etcd-operator:tag
 > **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
 privileges or be logged in as admin.
 
+**Tune the manager (optional):**
+
+The manager exposes process-level flags, including `--etcd-cpu-request` (CPU
+request on the etcd container, default `50m`, which makes etcd Burstable instead
+of BestEffort). See [docs/operator-flags.md](docs/operator-flags.md) for details
+and tuning guidance.
+
+
 **Create instances of your solution**
 You can apply the samples (examples) from the config/sample:
 

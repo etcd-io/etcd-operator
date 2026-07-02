@@ -37,7 +37,26 @@ import (
 const (
 	etcdDataDir = "/var/lib/etcd"
 	volumeName  = "etcd-data"
+
+	// DefaultEtcdCPURequest is the default CPU *request* applied to the etcd
+	// container. With no request the etcd pod lands in the BestEffort QoS class,
+	// which gives its cgroup the kernel-floor cpu.shares of 2 and makes it the
+	// first thing the kubelet evicts under node pressure. A request lifts the pod
+	// to Burstable, raises cpu.shares to ~51 (a scheduling floor that only bites
+	// under contention), and — because it is a request, not a limit — never
+	// throttles etcd. 50m is deliberately tiny: it is a floor, not a reservation.
+	DefaultEtcdCPURequest = "50m"
 )
+
+// EtcdCPURequest is the CPU request applied to the etcd container, settable from
+// the operator's --etcd-cpu-request flag. Defaults to DefaultEtcdCPURequest.
+//
+// An empty string or "0" disables the request entirely, restoring the original
+// BestEffort behavior so the effect can be A/B-measured and tuned per fleet.
+// This is intentionally a controller-level knob rather than a CRD field: it is
+// an operator tuning lever, identical for every cluster, so keeping it out of
+// the API avoids a CRD change.
+var EtcdCPURequest = DefaultEtcdCPURequest
 
 type etcdClusterState string
 
@@ -45,6 +64,29 @@ const (
 	etcdClusterStateNew      etcdClusterState = "new"
 	etcdClusterStateExisting etcdClusterState = "existing"
 )
+
+// etcdContainerResources builds the ResourceRequirements for the etcd container.
+//
+// When EtcdCPURequest is a non-empty, non-zero quantity it sets a CPU *request*
+// (never a limit) so the pod is Burstable rather than BestEffort. An empty or
+// "0" value yields zero-valued requirements, preserving the original BestEffort
+// behavior. A malformed quantity is treated the same as unset so a bad flag can
+// never wedge cluster creation.
+func etcdContainerResources() corev1.ResourceRequirements {
+	if EtcdCPURequest == "" || EtcdCPURequest == "0" {
+		return corev1.ResourceRequirements{}
+	}
+	qty, err := resource.ParseQuantity(EtcdCPURequest)
+	if err != nil || qty.IsZero() {
+		log.Printf("invalid --etcd-cpu-request %q, leaving etcd container without a CPU request: %v", EtcdCPURequest, err)
+		return corev1.ResourceRequirements{}
+	}
+	return corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU: qty,
+		},
+	}
+}
 
 func reconcileStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1alpha1.EtcdCluster, c client.Client, replicas int32, scheme *runtime.Scheme) (*appsv1.StatefulSet, error) {
 
@@ -143,10 +185,11 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 	podSpec := corev1.PodSpec{
 		Containers: []corev1.Container{
 			{
-				Name:    "etcd",
-				Command: []string{"/usr/local/bin/etcd"},
-				Args:    createArgs(ec.Name, ec.Spec.EtcdOptions),
-				Image:   fmt.Sprintf("%s:%s", ec.Spec.ImageRegistry, ec.Spec.Version),
+				Name:      "etcd",
+				Command:   []string{"/usr/local/bin/etcd"},
+				Args:      createArgs(ec.Name, ec.Spec.EtcdOptions),
+				Image:     fmt.Sprintf("%s:%s", ec.Spec.ImageRegistry, ec.Spec.Version),
+				Resources: etcdContainerResources(),
 				Env: []corev1.EnvVar{
 					{
 						Name: "POD_NAME",

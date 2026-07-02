@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -1086,6 +1087,107 @@ func TestCreateCMCertificateConfig(t *testing.T) {
 				assert.Equal(t, tt.expected.AltNames.DNSNames, result.AltNames.DNSNames)
 				assert.Equal(t, tt.expected.AltNames.IPs, result.AltNames.IPs)
 				assert.Equal(t, tt.expected.ExtraConfig, result.ExtraConfig)
+			}
+		})
+	}
+}
+
+// getEtcdContainer returns the etcd container from a StatefulSet, or fails the test.
+func getEtcdContainer(t *testing.T, sts *appsv1.StatefulSet) corev1.Container {
+	t.Helper()
+	for _, c := range sts.Spec.Template.Spec.Containers {
+		if c.Name == "etcd" {
+			return c
+		}
+	}
+	t.Fatalf("no etcd container found in StatefulSet %q", sts.Name)
+	return corev1.Container{}
+}
+
+func TestEtcdContainerCPURequest(t *testing.T) {
+	ctx := t.Context()
+	logger := log.FromContext(ctx)
+
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+	require.NoError(t, ecv1alpha1.AddToScheme(scheme))
+	require.NoError(t, appsv1.AddToScheme(scheme))
+
+	// Preserve and restore the package-level knob so this test does not leak
+	// state into other tests in the package.
+	orig := EtcdCPURequest
+	defer func() { EtcdCPURequest = orig }()
+
+	tests := []struct {
+		name        string
+		cpuRequest  string
+		wantRequest bool
+		wantQty     string
+	}{
+		{
+			name:        "default 50m sets a CPU request (Burstable)",
+			cpuRequest:  DefaultEtcdCPURequest,
+			wantRequest: true,
+			wantQty:     "50m",
+		},
+		{
+			name:        "explicit override is honored",
+			cpuRequest:  "100m",
+			wantRequest: true,
+			wantQty:     "100m",
+		},
+		{
+			name:        "empty string disables the request (BestEffort)",
+			cpuRequest:  "",
+			wantRequest: false,
+		},
+		{
+			name:        "zero disables the request (BestEffort)",
+			cpuRequest:  "0",
+			wantRequest: false,
+		},
+		{
+			name:        "malformed quantity is treated as unset (BestEffort)",
+			cpuRequest:  "not-a-quantity",
+			wantRequest: false,
+		},
+	}
+
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			EtcdCPURequest = tt.cpuRequest
+
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+			name := fmt.Sprintf("test-etcd-cpu-%d", i)
+			ec := &ecv1alpha1.EtcdCluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      name,
+					Namespace: "default",
+				},
+				Spec: ecv1alpha1.EtcdClusterSpec{
+					Size:    3,
+					Version: "3.5.17",
+				},
+			}
+
+			err := createOrPatchStatefulSet(ctx, logger, ec, fakeClient, 3, scheme)
+			require.NoError(t, err)
+
+			sts := &appsv1.StatefulSet{}
+			require.NoError(t, fakeClient.Get(ctx, client.ObjectKey{Name: name, Namespace: "default"}, sts))
+
+			c := getEtcdContainer(t, sts)
+			cpu, hasCPU := c.Resources.Requests[corev1.ResourceCPU]
+
+			if tt.wantRequest {
+				require.True(t, hasCPU, "expected etcd container to carry a CPU request")
+				assert.True(t, cpu.Equal(resource.MustParse(tt.wantQty)),
+					"expected CPU request %s, got %s", tt.wantQty, cpu.String())
+				// It is a request, never a limit: etcd must not be throttled.
+				_, hasLimit := c.Resources.Limits[corev1.ResourceCPU]
+				assert.False(t, hasLimit, "etcd container must not carry a CPU limit")
+			} else {
+				assert.False(t, hasCPU, "expected no CPU request (BestEffort), got %s", cpu.String())
 			}
 		})
 	}
