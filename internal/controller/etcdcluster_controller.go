@@ -89,7 +89,7 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	// Defer status update to ensure it's called regardless of return path
 	defer func() {
 		if state != nil {
-			if statusErr := r.updateStatus(ctx, state); statusErr != nil {
+			if statusErr := r.updateStatus(ctx, state, err); statusErr != nil {
 				// Log but don't override the main reconciliation error
 				log.FromContext(ctx).Error(statusErr, "Failed to update status")
 			}
@@ -109,7 +109,8 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, err
 	}
 
-	return r.reconcileClusterState(ctx, state)
+	res, err = r.reconcileClusterState(ctx, state)
+	return res, err
 }
 
 // fetchAndValidateState retrieves the EtcdCluster and its StatefulSet and ensures
@@ -161,7 +162,9 @@ func (r *EtcdClusterReconciler) fetchAndValidateState(ctx context.Context, req c
 	if sts != nil {
 		if err := checkStatefulSetControlledByEtcdOperator(ec, sts); err != nil {
 			logger.Error(err, "StatefulSet is not controlled by this EtcdCluster resource")
-			return nil, ctrl.Result{}, err
+			// Omit the foreign StatefulSet so the status update cannot derive
+			// replica counts or Progressing from a resource we do not manage.
+			return &reconcileState{cluster: ec}, ctrl.Result{}, err
 		}
 
 		// If the version to be reconciled is unsupported, throw an error.
@@ -202,7 +205,7 @@ func (r *EtcdClusterReconciler) fetchAndValidateState(ctx context.Context, req c
 						"current", currentVersion,
 						"target", targetVersion,
 					)
-					return nil, ctrl.Result{}, err
+					return &reconcileState{cluster: ec, sts: sts}, ctrl.Result{}, err
 				}
 				logger.Info("upgrade path between current and target versions is supported",
 					"current", currentVersion,
@@ -404,7 +407,7 @@ func (r *EtcdClusterReconciler) reconcileClusterState(ctx context.Context, s *re
 
 // updateStatus updates the EtcdCluster status based on observed state.
 // It is called at the end of each reconciliation cycle.
-func (r *EtcdClusterReconciler) updateStatus(ctx context.Context, s *reconcileState) error {
+func (r *EtcdClusterReconciler) updateStatus(ctx context.Context, s *reconcileState, reconcileErr error) error {
 	logger := log.FromContext(ctx)
 
 	// Update ObservedGeneration
@@ -459,7 +462,7 @@ func (r *EtcdClusterReconciler) updateStatus(ctx context.Context, s *reconcileSt
 	}
 
 	// Update conditions
-	r.updateConditions(s)
+	r.updateConditions(s, reconcileErr)
 
 	// Persist status update
 	if err := r.Status().Update(ctx, s.cluster); err != nil {
@@ -471,7 +474,8 @@ func (r *EtcdClusterReconciler) updateStatus(ctx context.Context, s *reconcileSt
 }
 
 // updateConditions sets the standard Kubernetes conditions based on observed state
-func (r *EtcdClusterReconciler) updateConditions(s *reconcileState) {
+// and on the error, if any, returned by the current reconciliation cycle.
+func (r *EtcdClusterReconciler) updateConditions(s *reconcileState, reconcileErr error) {
 	now := metav1.Now()
 
 	// Determine if cluster is available (has quorum and healthy members)
@@ -562,6 +566,13 @@ func (r *EtcdClusterReconciler) updateConditions(s *reconcileState) {
 			degradedCondition.Reason = "UnhealthyMembers"
 			degradedCondition.Message = fmt.Sprintf("Unhealthy members: %s", strings.Join(unhealthyMembers, ", "))
 		}
+	}
+
+	// Surface the reconcile error so a failing cluster is visible via kubectl.
+	if reconcileErr != nil {
+		degradedCondition.Status = metav1.ConditionTrue
+		degradedCondition.Reason = "ReconcileFailed"
+		degradedCondition.Message = reconcileErr.Error()
 	}
 
 	// Update or append conditions

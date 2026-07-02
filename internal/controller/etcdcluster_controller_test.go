@@ -17,12 +17,16 @@ limitations under the License.
 package controller
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.etcd.io/etcd/api/v3/etcdserverpb"
+	clientv3 "go.etcd.io/etcd/client/v3"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -31,6 +35,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
+	"go.etcd.io/etcd-operator/internal/etcdutils"
 )
 
 // TestFetchAndValidateState describes the scenarios for the fetchAndValidateState
@@ -130,7 +135,8 @@ func TestFetchAndValidateState(t *testing.T) {
 			},
 			req: ctrl.Request{NamespacedName: types.NamespacedName{Name: "etcd", Namespace: "default"}},
 			assert: func(t *testing.T, state *reconcileState, res ctrl.Result, err error, _ *ecv1alpha1.EtcdCluster, _ *appsv1.StatefulSet) {
-				assert.Nil(t, state)
+				require.NotNil(t, state)
+				assert.Nil(t, state.sts) // foreign StatefulSet must not leak into status
 				assert.Error(t, err)
 				assert.Contains(t, err.Error(), "not controlled")
 				assert.Equal(t, ctrl.Result{}, res)
@@ -254,7 +260,7 @@ func TestFetchAndValidateState(t *testing.T) {
 			},
 			req: ctrl.Request{NamespacedName: types.NamespacedName{Name: "etcd", Namespace: "default"}},
 			assert: func(t *testing.T, state *reconcileState, res ctrl.Result, err error, ec *ecv1alpha1.EtcdCluster, sts *appsv1.StatefulSet) {
-				require.Nil(t, state)
+				require.NotNil(t, state)
 				assert.Error(t, err)
 				assert.Equal(t, ctrl.Result{}, res)
 			},
@@ -295,7 +301,7 @@ func TestFetchAndValidateState(t *testing.T) {
 			},
 			req: ctrl.Request{NamespacedName: types.NamespacedName{Name: "etcd", Namespace: "default"}},
 			assert: func(t *testing.T, state *reconcileState, res ctrl.Result, err error, ec *ecv1alpha1.EtcdCluster, sts *appsv1.StatefulSet) {
-				require.Nil(t, state)
+				require.NotNil(t, state)
 				assert.Error(t, err)
 				assert.Equal(t, ctrl.Result{}, res)
 			},
@@ -570,4 +576,155 @@ func TestBootstrapStatefulSet(t *testing.T) {
 		assert.NoError(t, err)
 		assert.Equal(t, storedCM.Data, fetchedCM.Data)
 	})
+}
+
+// TestReconcileErrorSetsDegradedCondition verifies that a reconcile error is
+// surfaced on the EtcdCluster status as a Degraded=True condition instead of
+// leaving the status empty.
+func TestReconcileErrorSetsDegradedCondition(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = ecv1alpha1.AddToScheme(scheme)
+
+	ec := &ecv1alpha1.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "etcd",
+			Namespace: "default",
+			UID:       "1",
+		},
+		Spec: ecv1alpha1.EtcdClusterSpec{
+			Size:    1,
+			Version: "3.5.17",
+			TLS: &ecv1alpha1.TLSCertificate{
+				Provider: "auto",
+				ProviderCfg: ecv1alpha1.ProviderConfig{
+					AutoCfg: &ecv1alpha1.ProviderAutoConfig{
+						CommonConfig: ecv1alpha1.CommonConfig{
+							ValidityDuration: "90days", // not a valid time.Duration
+						},
+					},
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&ecv1alpha1.EtcdCluster{}).
+		WithObjects(ec).
+		Build()
+	r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
+
+	_, err := r.Reconcile(t.Context(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: ec.Name, Namespace: ec.Namespace},
+	})
+	require.Error(t, err)
+
+	updated := &ecv1alpha1.EtcdCluster{}
+	require.NoError(t, fakeClient.Get(t.Context(), client.ObjectKeyFromObject(ec), updated))
+
+	degraded := meta.FindStatusCondition(updated.Status.Conditions, "Degraded")
+	require.NotNil(t, degraded)
+	assert.Equal(t, metav1.ConditionTrue, degraded.Status)
+	assert.Equal(t, "ReconcileFailed", degraded.Reason)
+	assert.Contains(t, degraded.Message, "failed to parse ValidityDuration")
+}
+
+// TestReconcileNotOwnedStatefulSetStatus verifies that when reconciliation
+// fails because the StatefulSet is not owned by the EtcdCluster, the status
+// reports Degraded=ReconcileFailed without leaking the foreign StatefulSet's
+// replica counts or a Progressing=ScalingInProgress condition.
+func TestReconcileNotOwnedStatefulSetStatus(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = ecv1alpha1.AddToScheme(scheme)
+
+	ec := &ecv1alpha1.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "etcd",
+			Namespace: "default",
+			UID:       "1",
+		},
+		Spec: ecv1alpha1.EtcdClusterSpec{Size: 3, Version: "3.5.17"},
+	}
+	replicas := int32(5)
+	foreignSTS := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "etcd",
+			Namespace: "default",
+		},
+		Spec:   appsv1.StatefulSetSpec{Replicas: &replicas},
+		Status: appsv1.StatefulSetStatus{ReadyReplicas: replicas},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&ecv1alpha1.EtcdCluster{}).
+		WithObjects(ec, foreignSTS).
+		Build()
+	r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
+
+	_, err := r.Reconcile(t.Context(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: ec.Name, Namespace: ec.Namespace},
+	})
+	require.Error(t, err)
+
+	updated := &ecv1alpha1.EtcdCluster{}
+	require.NoError(t, fakeClient.Get(t.Context(), client.ObjectKeyFromObject(ec), updated))
+
+	degraded := meta.FindStatusCondition(updated.Status.Conditions, "Degraded")
+	require.NotNil(t, degraded)
+	assert.Equal(t, metav1.ConditionTrue, degraded.Status)
+	assert.Equal(t, "ReconcileFailed", degraded.Reason)
+
+	assert.Equal(t, int32(0), updated.Status.CurrentReplicas)
+	assert.Equal(t, int32(0), updated.Status.ReadyReplicas)
+	progressing := meta.FindStatusCondition(updated.Status.Conditions, "Progressing")
+	require.NotNil(t, progressing)
+	assert.Equal(t, metav1.ConditionFalse, progressing.Status)
+	assert.NotEqual(t, "ScalingInProgress", progressing.Reason)
+}
+
+// TestUpdateConditionsReconcileError verifies that a reconcile error forces
+// Degraded=ReconcileFailed even when all members are healthy, and that
+// Degraded reverts to False once the error clears.
+func TestUpdateConditionsReconcileError(t *testing.T) {
+	healthyState := func() *reconcileState {
+		return &reconcileState{
+			cluster: &ecv1alpha1.EtcdCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: "etcd", Namespace: "default"},
+				Spec:       ecv1alpha1.EtcdClusterSpec{Size: 1, Version: "3.5.17"},
+			},
+			memberListResp: &clientv3.MemberListResponse{
+				Members: []*etcdserverpb.Member{{ID: 1, Name: "etcd-0"}},
+			},
+			memberHealth: []etcdutils.EpHealth{
+				{
+					Ep:     "http://etcd-0:2379",
+					Health: true,
+					Status: &clientv3.StatusResponse{
+						Header: &etcdserverpb.ResponseHeader{MemberId: 1},
+						Leader: 1,
+					},
+				},
+			},
+		}
+	}
+	r := &EtcdClusterReconciler{}
+
+	s := healthyState()
+	r.updateConditions(s, errors.New("couldn't find leader"))
+	degraded := meta.FindStatusCondition(s.cluster.Status.Conditions, "Degraded")
+	require.NotNil(t, degraded)
+	assert.Equal(t, metav1.ConditionTrue, degraded.Status)
+	assert.Equal(t, "ReconcileFailed", degraded.Reason)
+	assert.Equal(t, "couldn't find leader", degraded.Message)
+
+	r.updateConditions(s, nil)
+	degraded = meta.FindStatusCondition(s.cluster.Status.Conditions, "Degraded")
+	require.NotNil(t, degraded)
+	assert.Equal(t, metav1.ConditionFalse, degraded.Status)
+	assert.Equal(t, "ClusterHealthy", degraded.Reason)
 }
