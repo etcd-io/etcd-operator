@@ -282,6 +282,15 @@ func (ac *Provider) createNewSecret(ctx context.Context, secretKey client.Object
 				hosts = append(hosts, hostPort)
 			}
 		}
+		// transport.SelfCert classifies IP-shaped hosts into the certificate's
+		// IPAddresses. Nil entries are rejected by the controller before
+		// reaching providers; skip them defensively here.
+		for _, ip := range cfg.AltNames.IPs {
+			if ip == nil {
+				continue
+			}
+			hosts = append(hosts, net.JoinHostPort(ip.String(), "5500"))
+		}
 	}
 
 	log.Printf("calling SelfCert with hosts: %v", hosts)
