@@ -44,7 +44,7 @@ func TestCreateNewSecretIncludesIPSANs(t *testing.T) {
 	cert, err := x509.ParseCertificate(block.Bytes)
 	require.NoError(t, err)
 
-	var ipStrings []string
+	ipStrings := make([]string, 0, len(cert.IPAddresses))
 	for _, ip := range cert.IPAddresses {
 		ipStrings = append(ipStrings, ip.String())
 	}
