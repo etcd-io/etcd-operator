@@ -15,11 +15,8 @@ spec:
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
-    - jsonPath: .spec.source.prefix
-      name: Source
-      type: string
-    - jsonPath: .spec.target.prefix
-      name: Target
+    - jsonPath: .status.conditions[?(@.type=="Available")].status
+      name: Available
       type: string
     - jsonPath: .status.phase
       name: Phase
@@ -27,6 +24,20 @@ spec:
     - jsonPath: .status.lastAppliedRevision
       name: Revision
       type: integer
+    - jsonPath: .status.sourceRevision
+      name: Source-Rev
+      type: integer
+    - jsonPath: .status.lastProgressTime
+      name: Last-Progress
+      type: date
+    - jsonPath: .spec.source.prefix
+      name: Source
+      priority: 1
+      type: string
+    - jsonPath: .spec.target.prefix
+      name: Target
+      priority: 1
+      type: string
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
@@ -34,15 +45,23 @@ spec:
     schema:
       openAPIV3Schema:
         description: |-
-          EtcdMirror is the Schema for the etcdmirrors API. It describes a continuous,
-          one-way key-range sync from a source etcd cluster to a target etcd cluster,
-          run as a single supervised pod (a size-1 StatefulSet) in this cluster.
+          EtcdMirror is the Schema for the etcdmirrors API. It describes a
+          continuous, one-way key-range sync from a source etcd cluster to a target
+          etcd cluster, run as a single supervised stateless pod (a size-1
+          Deployment; progress lives in a fenced checkpoint key in the target etcd,
+          not on a volume).
 
-          EtcdMirror is deliberately one-way only: clientv3/mirror.Syncer has no
-          bidirectional primitive, and etcd itself has no concept of "this write
-          originated from a mirror, don't re-mirror it back." Two opposite-direction
-          EtcdMirrors pointed at each other create an unbounded write-ping-pong with no
-          conflict resolution; see Non-Goals.
+          It is a byte-copy of keys and values, not a replica: revisions, versions,
+          and create/mod ordering are target-assigned, and leases are stripped. See
+          Fidelity Caveats in docs/etcdmirror.md before depending on anything but
+          key/value content.
+
+          Two-way sync: never — etcd revisions are cluster-local and there is no
+          per-key provenance channel, so bidirectional sync is structurally
+          inexpressible. Reversal for cutover/failback: yes — delete the CR and
+          create a new one with swapped endpoints, initialSync.mode
+          OverwriteAndPrune, only after the forward mirror reported CutoverReady.
+          See docs/etcdmirror.md.
         properties:
           apiVersion:
             description: |-
@@ -62,85 +81,95 @@ spec:
           metadata:
             type: object
           spec:
-            description: EtcdMirrorSpec defines the desired state of an EtcdMirror.
+            description: |-
+              EtcdMirrorSpec defines the desired state of an EtcdMirror.
+
+              Range-defining and rewrite fields are immutable (CEL transition rules
+              below): source.prefix, target.prefix, sync.destPrefix, sync.excludePrefixes
+              and checkpoint.key. Changing what range is mirrored, or where it lands,
+              mid-life silently diverges: a restarted agent resumes from its checkpoint
+              without a scan, so removing an exclusion never backfills pre-existing keys
+              and adding one strands already-mirrored keys as permanent orphans — all
+              with every condition green. Endpoints stay mutable — rotating an NLB DNS
+              name or adding a member to the same cluster is routine; pointing at a
+              different cluster is caught at runtime by the checkpoint's dual-cluster-ID
+              binding, not by spec validation.
+
+              The transition rules compare VALUES, presence-normalized: for these
+              fields the empty value and an absent field are semantically identical
+              (prefix "" = whole keyspace, destPrefix "" = strip the source prefix), and
+              Go typed clients drop explicit "" through omitempty — presence-based rules
+              would reject every typed-client update of a CR created with an explicit
+              empty string.
             properties:
               checkpoint:
-                description: Checkpoint configures the agent's local durable progress
-                  checkpoint.
+                description: Checkpoint configures the reserved checkpoint/fence key
+                  on the target.
                 properties:
-                  storageSpec:
+                  key:
                     description: |-
-                      StorageSpec requests persistent storage for the checkpoint file, reusing
-                      EtcdClusterSpec's StorageSpec shape. When nil the controller mounts an
-                      emptyDir instead. StorageSpec should be set for any production mirror; a
-                      small size (e.g. 64Mi) is sufficient.
-                    properties:
-                      accessModes:
-                        type: string
-                      pvcName:
-                        type: string
-                      storageClassName:
-                        type: string
-                      volumeSizeLimit:
-                        anyOf:
-                        - type: integer
-                        - type: string
-                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
-                        x-kubernetes-int-or-string: true
-                      volumeSizeRequest:
-                        anyOf:
-                        - type: integer
-                        - type: string
-                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
-                        x-kubernetes-int-or-string: true
-                    required:
-                    - volumeSizeRequest
-                    type: object
-                  syncInterval:
-                    description: |-
-                      SyncInterval controls how often the agent flushes its in-memory
-                      last-applied revision to the checkpoint file (atomic write: temp file +
-                      fsync + rename). Defaults to 5s when unset.
+                      Key overrides the reserved checkpoint key. Defaults to the effective
+                      destination prefix + "\x00etcdmirror-checkpoint" — the \x00 byte after
+                      the prefix cannot collide with any real key under it. MUST live under
+                      the effective destination prefix (target.prefix + sync.destPrefix,
+                      CEL-enforced): the range-scoped target credential covers it, and the
+                      exact-match exclusion from scans/counts/prune only works inside the
+                      mirrored range. Immutable after creation.
                     type: string
                 type: object
-              expectEmptyPrefix:
+              initialSync:
                 description: |-
-                  ExpectEmptyPrefix, when true, makes the controller verify the target's
-                  effective destination prefix has zero keys before the agent's FIRST-EVER
-                  SyncBase begins (i.e. no valid checkpoint exists yet for this source
-                  cluster identity), refusing to proceed (Phase -> Failed, condition
-                  EmptyTargetViolation) if it is already non-empty. Analogous to
-                  EtcdRestore's assertClusterEmpty guard.
-
-                  SCOPE, STATED PLAINLY: this is single-shot, genesis-only protection. It
-                  is checked exactly once, at the moment a fresh (or cluster-identity-
-                  invalidated, see Checkpoint Lifecycle) InitialSync begins. It does NOT
-                  re-arm on a compaction-triggered forced resync later in the CR's life
-                  (that resync reuses the already-established target prefix ownership),
-                  and it does NOT protect against a foreign writer landing keys under the
-                  same target prefix at any point AFTER the first successful sync -- there
-                  is no key-tagging/provenance marker in v1 that would let the agent
-                  distinguish "my own prior output" from "someone else's write" on a
-                  later re-check (see Non-Goals). Operators who need ongoing enforcement
-                  that nothing else writes to the target prefix must arrange that via
-                  etcd RBAC (grant only this mirror's target credential write access to
-                  the prefix) rather than relying on ExpectEmptyPrefix, which is a
-                  bring-up guard, not a standing invariant.
-                  Defaults to false; operators standing up a NEW mirror onto a fresh
-                  prefix should set this true.
-                type: boolean
+                  InitialSync governs genesis behavior: how pre-existing destination keys
+                  are treated (Mode) and optionally where replication starts
+                  (StartRevision).
+                properties:
+                  mode:
+                    default: RequireEmpty
+                    description: |-
+                      Mode governs pre-existing destination keys at genesis. Defaults to
+                      RequireEmpty (refuse a non-empty destination prefix).
+                    enum:
+                    - RequireEmpty
+                    - Overwrite
+                    - OverwriteAndPrune
+                    type: string
+                  startRevision:
+                    description: |-
+                      StartRevision, when > 0, skips the genesis scan entirely and starts
+                      watching from StartRevision+1. For fidelity-preserving seeds: restore
+                      the target from a source snapshot (`etcdutl snapshot restore
+                      --bump-revision --mark-compacted`), then mirror only the delta.
+                      Requires Mode Overwrite or OverwriteAndPrune (CEL-enforced).
+                    format: int64
+                    minimum: 0
+                    type: integer
+                type: object
+                x-kubernetes-validations:
+                - message: initialSync.startRevision requires initialSync.mode Overwrite
+                    or OverwriteAndPrune (a seeded target is not empty)
+                  rule: '!(has(self.startRevision) && self.startRevision > 0 && (!has(self.mode)
+                    || self.mode == ''RequireEmpty''))'
+              mode:
+                default: Sync
+                description: |-
+                  Mode selects continuous replication (Sync, the default) or a cutover
+                  drain (Drain). See EtcdMirrorModeDrain for the cutover contract.
+                enum:
+                - Sync
+                - Drain
+                type: string
               paused:
                 description: |-
-                  Paused, when true, tells the controller to scale the agent StatefulSet to
-                  zero replicas without deleting the CR or its checkpoint PVC. For planned
-                  maintenance windows on either cluster without losing sync position. The
-                  agent's own retry/backoff loop handles transient interruptions on its
-                  own; Paused is for deliberate, operator-initiated stops.
+                  Paused, when true, scales the agent Deployment to zero without deleting
+                  the CR or its checkpoint. The checkpoint lives in the target etcd, so
+                  resume picks up from the last fenced watermark. NOTE: pausing longer
+                  than the source's compaction retention guarantees a full forced resync
+                  on resume — there is no free lunch past the retention window.
                 type: boolean
               podTemplate:
                 description: |-
-                  PodTemplate carries scheduling/affinity/labels/annotations for the agent
-                  pod, reusing EtcdClusterSpec's PodTemplate shape verbatim.
+                  PodTemplate carries scheduling/affinity/labels/annotations for the
+                  agent pod, reusing EtcdClusterSpec's PodTemplate shape verbatim.
                 properties:
                   metadata:
                     description: Metadata is the metadata to add to the pod.
@@ -1128,43 +1157,116 @@ spec:
               reconciliation:
                 description: |-
                   Reconciliation optionally enables a periodic full diff-and-repair pass
-                  layered on top of the continuous watch-based mirror.
+                  layered on top of the continuous watch-based mirror. Independent of
+                  this setting, one reconciliation-with-delete pass always runs after any
+                  forced resync (mark-and-sweep), and as the OverwriteAndPrune genesis
+                  pass and the Drain verification pass.
                 properties:
                   deleteOrphans:
                     description: |-
-                      DeleteOrphans, when true, allows reconciliation to DELETE target keys
-                      under the destination prefix that have no corresponding source key.
-                      Defaults to false.
+                      DeleteOrphans, when true, allows the PERIODIC pass to delete target
+                      keys under the destination prefix that have no corresponding source
+                      key. Defaults to false. (Forced-resync sweeps and OverwriteAndPrune
+                      always delete orphans; this knob only governs the periodic pass.)
                     type: boolean
                   enabled:
                     description: |-
-                      Enabled toggles the periodic full reconciliation pass. Defaults to
-                      false: it is a diff of the full prefix contents on both sides
-                      (O(keyspace size)), so it is opt-in.
+                      Enabled toggles the PERIODIC pass. Defaults to false: it is a full
+                      diff of the prefix contents on both sides (O(keyspace)), so it is
+                      opt-in.
                     type: boolean
                   interval:
-                    description: |-
-                      Interval between reconciliation passes. Defaults to 1h when Enabled and
-                      unset.
+                    description: Interval between periodic passes. Defaults to 1h
+                      when Enabled.
                     type: string
+                type: object
+              resources:
+                description: |-
+                  Resources are the agent container's compute resources. The agent's
+                  memory model is bounded by Sync.PageBytes (single in-flight scan page,
+                  no unbounded read-ahead); size limits accordingly.
+                properties:
+                  claims:
+                    description: |-
+                      Claims lists the names of resources, defined in spec.resourceClaims,
+                      that are used by this container.
+
+                      This field depends on the
+                      DynamicResourceAllocation feature gate.
+
+                      This field is immutable. It can only be set for containers.
+                    items:
+                      description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                      properties:
+                        name:
+                          description: |-
+                            Name must match the name of one entry in pod.spec.resourceClaims of
+                            the Pod where this field is used. It makes that resource available
+                            inside a container.
+                          type: string
+                        request:
+                          description: |-
+                            Request is the name chosen for a request in the referenced claim.
+                            If empty, everything from the claim is made available, otherwise
+                            only the result of this request.
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  limits:
+                    additionalProperties:
+                      anyOf:
+                      - type: integer
+                      - type: string
+                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                      x-kubernetes-int-or-string: true
+                    description: |-
+                      Limits describes the maximum amount of compute resources allowed.
+                      More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                    type: object
+                  requests:
+                    additionalProperties:
+                      anyOf:
+                      - type: integer
+                      - type: string
+                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                      x-kubernetes-int-or-string: true
+                    description: |-
+                      Requests describes the minimum amount of compute resources required.
+                      If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                      otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                      More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                    type: object
                 type: object
               source:
                 description: |-
                   Source is the etcd cluster keys are read from. EtcdMirror never writes
                   back to Source; the agent's source-side client is only ever used for
                   Get/Watch, never Put/Delete/Txn.
+
+                  VERSION FLOOR: source etcd must be >= 3.4 (probed via maintenance
+                  Status() at connect; below the floor the mirror goes Failed with reason
+                  UnsupportedVersion). >= 3.4.25 / 3.5.8 is the recommended floor: below
+                  it, watch progress notifications are unreliable and the agent cannot
+                  trust the watermark machinery that drives lag, the checkpoint, and the
+                  Drain gate.
                 properties:
                   auth:
-                    description: |-
-                      Auth configures etcd username/password (RBAC) auth for THIS side,
-                      ambient-or-secretRef per the objectstore_creds.go pattern.
+                    description: Auth configures etcd username/password (RBAC) auth
+                      for THIS side.
                     properties:
                       secretRef:
                         description: |-
-                          SecretRef names a Secret holding "username" and "password" keys. If this
-                          whole Auth block is nil, the agent does not call etcd's Authenticate()
-                          at all. There is no ambient fallback for etcd username/password auth
-                          (unlike objectstore's IRSA/Workload Identity).
+                          SecretRef names a Secret holding "username" and "password" keys. If
+                          this whole Auth block is nil, the agent does not call etcd's
+                          Authenticate() at all; the pinned v3 client transparently re-auths on
+                          token expiry. PRECEDENCE: when both a client certificate and Auth are
+                          supplied, etcd uses the token identity, not the certificate CN — the
+                          Auth user must hold the range-scoped role.
                         properties:
                           name:
                             default: ""
@@ -1189,24 +1291,19 @@ spec:
                       EndpointList is a raw set of etcd client-URL host:port (or
                       scheme://host:port) strings, e.g. "https://etcd-rke1.example.com:2379".
                       This is the ONLY supported mechanism for a cluster external to this
-                      Kubernetes cluster (e.g. an RKE1/AWS source reached over a public NLB) --
-                      there is deliberately no "tunnel" or "port-forward" mode. A
-                      `kubectl port-forward` is a client-attached, ephemeral process tied to a
-                      human's terminal; it does not survive this mirror pod restarting,
-                      rescheduling, or the operator itself restarting, which defeats the
-                      entire point of a supervised, restart-tolerant workload. If you need a
-                      persistent tunnel, terminate it yourself (VPN, Interconnect, NLB)
-                      upstream of this CR and hand EtcdMirror the resulting stable
-                      endpoint(s); network reachability itself is out of scope for this CRD.
+                      Kubernetes cluster (e.g. an RKE1/AWS source reached over a public NLB);
+                      there is deliberately no tunnel/port-forward mode — terminate any
+                      tunnel upstream and hand EtcdMirror the resulting stable endpoint(s).
 
-                      IP-LITERAL ENDPOINTS: if any entry here is a bare IP literal (plausible
-                      for an NLB endpoint with no DNS name), Go's TLS stack requires an IP SAN
-                      (not a DNS SAN) on the peer certificate for verification to succeed.
-                      Either set the corresponding EtcdMirrorTLS.ServerName to a hostname that
-                      IS present as a DNS SAN on the certificate, or ensure the certificate
-                      carries an IP SAN matching the literal. Operators who hit a verification
-                      failure here should fix the SAN/ServerName mismatch, not reach for
-                      InsecureSkipVerify to work around it.
+                      Prefer listing per-member endpoints over a single load-balancer VIP: a
+                      TCP-health-checked VIP cannot see etcd quorum, and the client's own
+                      balancer handles per-member failover.
+
+                      IP-LITERAL ENDPOINTS: Go's TLS stack requires an IP SAN (not a DNS SAN)
+                      to verify a bare-IP endpoint. Either set EtcdMirrorTLS.ServerName to a
+                      hostname present as a DNS SAN on the certificate, or ensure the
+                      certificate carries a matching IP SAN. Fix the SAN/ServerName mismatch;
+                      do not reach for InsecureSkipVerify.
                     items:
                       type: string
                     type: array
@@ -1214,16 +1311,14 @@ spec:
                     description: |-
                       Prefix is the etcd key prefix on THIS side. On Source, only keys under
                       this prefix are synced; empty means the whole keyspace. On Target, this
-                      is the prefix under which the agent writes mirrored keys after any
-                      Sync.DestPrefix remap is applied.
+                      is the prefix under which mirrored keys land (see EtcdMirrorSyncSpec's
+                      rewrite formula). Immutable after creation.
                     type: string
                   serviceRef:
                     description: |-
-                      ServiceRef points at a Kubernetes Service in this cluster whose DNS name
-                      resolves the etcd client endpoint(s). The rarer same-cluster or
-                      co-located case (e.g. mirroring between two EtcdClusters both running in
-                      this GKE cluster). Namespace defaults to the EtcdMirror's own namespace
-                      when empty.
+                      ServiceRef points at a Kubernetes Service in this cluster whose DNS
+                      name resolves the etcd client endpoint(s), for the same-cluster case.
+                      Namespace defaults to the EtcdMirror's own namespace when empty.
                     properties:
                       name:
                         description: Name is the Service name.
@@ -1244,17 +1339,45 @@ spec:
                     type: object
                   tls:
                     description: |-
-                      TLS configures the agent's client TLS identity/trust for THIS side. Nil
-                      means the agent dials this side in cleartext.
+                      TLS configures the agent's client TLS for THIS side. Nil means the
+                      agent dials this side in cleartext (and https:// endpoints are
+                      CEL-rejected). An empty block means server-auth TLS verified against
+                      the system trust roots.
                     properties:
+                      caBundleRef:
+                        description: |-
+                          CABundleRef optionally sources the trust anchors from a separate
+                          Secret or ConfigMap key, decoupling trust from the identity Secret
+                          (Gateway API caCertificateRefs precedent). Takes precedence over
+                          SecretRef's ca.crt.
+                        properties:
+                          key:
+                            description: Key within the object. Defaults to "ca.crt".
+                            type: string
+                          kind:
+                            default: ConfigMap
+                            description: Kind is Secret or ConfigMap. Defaults to
+                              ConfigMap.
+                            enum:
+                            - Secret
+                            - ConfigMap
+                            type: string
+                          name:
+                            description: Name of the Secret or ConfigMap, in the EtcdMirror's
+                              namespace.
+                            minLength: 1
+                            type: string
+                        required:
+                        - name
+                        type: object
                       insecureSkipVerify:
                         default: false
                         description: |-
                           InsecureSkipVerify disables server certificate verification. Strongly
                           discouraged, especially for a source reached over the public internet.
                           Requires InsecureSkipVerifyAcknowledgeRisk to also be set true
-                          (CEL-enforced on this type). The controller additionally emits a
-                          standing Warning event whenever this is true.
+                          (CEL-enforced). The controller additionally emits a standing Warning
+                          event whenever this is true.
                         type: boolean
                       insecureSkipVerifyAcknowledgeRisk:
                         default: false
@@ -1268,15 +1391,15 @@ spec:
                         description: |-
                           SecretRef names a Secret (in the EtcdMirror's namespace) holding this
                           side's TLS material in the standard kubernetes.io/tls-compatible shape:
-                            - ca.crt:  PEM CA bundle used to verify the peer's server certificate.
-                              Required for TLS unless InsecureSkipVerify is true.
-                            - tls.crt / tls.key: PEM client certificate + key, for mTLS. Optional --
-                              omit both for server-auth-only TLS (verify the peer, authenticate to
-                              it via Auth instead, or not at all).
-                          This is the same key layout a cert-manager Certificate's spec.secretName
-                          Secret uses, so a cert-manager Certificate (or `kubectl create secret
-                          tls`, or any other issuance mechanism) can populate this Secret with zero
-                          coupling from this CRD to cert-manager.
+                            - ca.crt:  PEM CA bundle used to verify the peer's server certificate
+                              (unless CABundleRef overrides it, or InsecureSkipVerify is true).
+                            - tls.crt / tls.key: PEM client certificate + key, for mTLS.
+                              Optional — omit both for server-auth-only TLS.
+                          Nil means no client identity and verification against the system trust
+                          roots (the etcdctl default). Note a source running with
+                          --client-cert-auth (the RKE1 default) rejects certless clients at the
+                          handshake regardless of etcd RBAC auth; server-auth-only + Auth is not
+                          viable against such a source.
                         properties:
                           name:
                             default: ""
@@ -1291,111 +1414,176 @@ spec:
                         x-kubernetes-map-type: atomic
                       serverName:
                         description: |-
-                          ServerName overrides the TLS ServerName (SNI) used for verification, for
-                          cases where the dialed endpoint's address doesn't match a SAN on the
-                          certificate (e.g. dialing an NLB IP directly -- see EndpointList's
-                          IP-literal guidance).
+                          ServerName overrides the TLS ServerName (SNI) used for verification,
+                          for cases where the dialed address doesn't match a SAN on the
+                          certificate (e.g. dialing an NLB IP directly). Applies to EVERY
+                          endpoint in the list, so mixing endpoints with different certificates
+                          behind one ServerName will fail verification on the mismatched ones.
                         type: string
-                    required:
-                    - secretRef
                     type: object
                     x-kubernetes-validations:
                     - message: insecureSkipVerify requires insecureSkipVerifyAcknowledgeRisk
                         to also be true
                       rule: '!self.insecureSkipVerify || self.insecureSkipVerifyAcknowledgeRisk'
-                    - message: secretRef.name is required
-                      rule: has(self.secretRef.name) && size(self.secretRef.name)
-                        > 0
+                    - message: secretRef.name must be non-empty when secretRef is
+                        set
+                      rule: '!has(self.secretRef) || (has(self.secretRef.name) &&
+                        size(self.secretRef.name) > 0)'
                 type: object
                 x-kubernetes-validations:
                 - message: exactly one of endpointList or serviceRef must be set
                   rule: (has(self.endpointList) && size(self.endpointList) > 0) !=
                     has(self.serviceRef)
+                - message: 'http:// endpoints conflict with a tls block: use https://
+                    endpoints or remove tls'
+                  rule: '!(has(self.tls) && has(self.endpointList) && self.endpointList.exists(e,
+                    e.startsWith(''http://'')))'
+                - message: https:// endpoints require a tls block (an empty tls block
+                    selects server-auth TLS against system trust roots)
+                  rule: '!(!has(self.tls) && has(self.endpointList) && self.endpointList.exists(e,
+                    e.startsWith(''https://'')))'
               sync:
                 description: |-
-                  Sync tunes runtime sync behavior (batching, rate limiting, prefix
-                  rewrite, backoff).
+                  Sync tunes runtime sync behavior (batching, paging, rate limiting,
+                  prefix rewrite, timeouts, backoff).
                 properties:
                   destPrefix:
                     description: |-
-                      DestPrefix rewrites Source.Prefix to a different prefix on the target,
-                      via an anchored strip-and-reprefix (strings.TrimPrefix(key,
-                      source.Prefix), then destPrefix + rest) -- never make-mirror's naive
-                      first-occurrence strings.Replace. Mutually exclusive with NoDestPrefix.
-                      Empty (and NoDestPrefix false) means the source prefix is reused
-                      verbatim on the target, landing keys under Target.Prefix + the stripped
-                      key remainder.
+                      DestPrefix is the middle term of the rewrite formula above. Default ""
+                      means the source prefix is stripped and key remainders land directly
+                      under target.prefix. Immutable after creation.
                     type: string
                   dialTimeout:
                     description: |-
-                      DialTimeout bounds how long the agent waits to establish the initial
-                      client connection to each side. Defaults to 10s when unset.
+                      DialTimeout bounds establishing the initial client connection to each
+                      side. Defaults to 10s.
                     type: string
+                  excludePrefixes:
+                    description: |-
+                      ExcludePrefixes lists source key prefixes (full source-side keys, e.g.
+                      "/registry/events/") skipped entirely: not scanned, not watched, not
+                      counted, not pruned. Use to drop high-churn low-value ranges and cut
+                      WAN cost, or to skip lease-backed ranges that don't survive mirroring.
+                      Nested/duplicate entries are normalized by the agent (an entry covered
+                      by another is dropped). Immutable after creation (it defines the
+                      mirrored range): removing an exclusion would require a backfill scan
+                      the checkpoint-resume path never runs, and adding one would strand
+                      already-mirrored keys as permanent orphans — change it via
+                      delete-and-recreate with an appropriate initialSync.mode instead.
+                    items:
+                      type: string
+                    maxItems: 64
+                    type: array
                   maxOpsPerSecond:
                     description: |-
-                      MaxOpsPerSecond rate-limits the agent's destination write rate (a simple
-                      token bucket over puts+deletes/sec), applied to BOTH InitialSync's Txn
-                      stream and SyncUpdates. Zero (default) means unlimited.
+                      MaxOpsPerSecond rate-limits the agent's target write rate (a token
+                      bucket over puts+deletes/sec), applied to both the genesis scan and
+                      watch-driven applies. Zero (default) means unlimited. Mind the
+                      retention prerequisite above when throttling.
                     format: int32
                     minimum: 0
                     type: integer
                   maxTxnOps:
                     description: |-
-                      MaxTxnOps bounds how many put/delete operations the agent batches into a
-                      single destination Txn, applied uniformly to BOTH the initial SyncBase
-                      phase and the watch-driven SyncUpdates phase. Defaults to 128 when unset.
+                      MaxTxnOps bounds how many operations the agent batches into a single
+                      target Txn, including the reserved checkpoint-write slot. Must not
+                      exceed the target's --max-txn-ops (etcd default 128). Defaults to 128.
+                    format: int32
+                    minimum: 2
+                    type: integer
+                  pageBytes:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: PageBytes bounds bytes per source scan page. Defaults
+                      to 1Mi.
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
+                  pageKeyLimit:
+                    description: |-
+                      PageKeyLimit bounds keys per source scan page during InitialSync and
+                      reconciliation. The scan is pull-based, one page in flight — no
+                      read-ahead — so this and PageBytes bound agent memory. Defaults to 512.
                     format: int32
                     minimum: 1
                     type: integer
-                  noDestPrefix:
-                    description: |-
-                      NoDestPrefix strips Source.Prefix entirely rather than remapping it,
-                      mirroring make-mirror's --no-dest-prefix. Mutually exclusive with a
-                      non-empty DestPrefix (rejected by EtcdMirrorSpec's XValidation rule).
-                    type: boolean
                   reconnectBackoff:
                     description: |-
-                      ReconnectBackoff bounds the retry/backoff loop wrapping every Syncer call
-                      and every destination Txn call. Defaults to exponential backoff from 1s
-                      to 30s, uncapped in attempt count, when unset.
+                      ReconnectBackoff bounds the retry/backoff loop wrapping connection-class
+                      errors. Throttling-class errors (target rate rejection) use a more
+                      conservative curve derived from the same bounds; quota exhaustion
+                      (TargetQuotaExhausted) and permanent errors are never retried through
+                      this loop. Defaults to exponential backoff from 1s to 30s.
                     properties:
                       initialDelay:
                         type: string
                       maxDelay:
                         type: string
                     type: object
+                  requestTimeout:
+                    description: |-
+                      RequestTimeout is the per-RPC context deadline applied to every unary
+                      call on both sides (watches excluded — they are long-lived by design
+                      and covered by progress-notification liveness instead). Without it a
+                      blackholed call through an NLB never errors and backoff never engages.
+                      Defaults to 30s.
+                    type: string
+                  txnFlushBytes:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: |-
+                      TxnFlushBytes is the byte watermark at which a batch is flushed (at the
+                      next source-revision boundary). Keep well under etcd's request size
+                      limits: a Txn over ~1.5MiB is rejected by the server and one over 2MiB
+                      by the client send cap — both classified permanent errors, not
+                      throttling. Defaults to 1Mi.
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
+                  watchBufferBytes:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: |-
+                      WatchBufferBytes bounds the memory used to buffer watch events
+                      observed from R0 while the genesis scan runs (the reflector replay
+                      buffer). On overflow the agent cancels the source watch and restarts
+                      the scan from a fresh R0 (see the InitialSyncCompactionRaced event) —
+                      a bounded retry instead of unbounded growth when source churn outruns
+                      scan+apply throughput. Defaults to 16Mi (must stay in lockstep with
+                      pkg/mirroragent's DefaultWatchBufferBytes).
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
                 type: object
               target:
                 description: |-
                   Target is the etcd cluster keys are written into.
 
-                  SECURITY PREREQUISITE: Target.Auth's credential (and/or the target
-                  client certificate's associated etcd RBAC role) MUST be an etcd RBAC
-                  user restricted via a range-scoped grant-permission to Target.Prefix (or
-                  Sync.DestPrefix's resulting range) -- never a cluster-admin-equivalent
-                  credential. The agent's client-side rewriteKey/prefix logic is defense
-                  against bugs in the agent's own code; it is NOT a security boundary. A
-                  compromised agent process, a buggy rewriteKey, or an empty/typo'd prefix
-                  with an over-privileged credential can write or delete anywhere in the
-                  target cluster's entire keyspace. This is a deployment prerequisite the
-                  operator (human) must configure in etcd itself (via `etcdctl role
-                  grant-permission --prefix=true <role> readwrite <target-prefix>`) before
-                  pointing an EtcdMirror at it; the controller cannot create or enforce
-                  etcd-native RBAC roles itself, but it does check for and surface an
-                  unrestricted-looking target credential where etcd's auth API makes that
-                  detectable (see Safety Guards).
+                  SECURITY PREREQUISITE: Target's credential (etcd RBAC user and/or the
+                  client certificate's role) MUST be range-scoped to the effective
+                  destination prefix — never a cluster-admin-equivalent credential. The
+                  agent's client-side rewrite logic is defense against bugs in its own
+                  code, NOT a security boundary. The grant must also cover the reserved
+                  checkpoint key (see Checkpoint). Configure via `etcdctl role
+                  grant-permission --prefix=true <role> readwrite <dest-prefix>` before
+                  pointing an EtcdMirror at the cluster.
+
+                  The target must run with auto-compaction enabled: forced-resync churn
+                  and prune passes march an uncompacted target toward its storage quota
+                  (2GiB by default), which surfaces as TargetQuotaExhausted.
                 properties:
                   auth:
-                    description: |-
-                      Auth configures etcd username/password (RBAC) auth for THIS side,
-                      ambient-or-secretRef per the objectstore_creds.go pattern.
+                    description: Auth configures etcd username/password (RBAC) auth
+                      for THIS side.
                     properties:
                       secretRef:
                         description: |-
-                          SecretRef names a Secret holding "username" and "password" keys. If this
-                          whole Auth block is nil, the agent does not call etcd's Authenticate()
-                          at all. There is no ambient fallback for etcd username/password auth
-                          (unlike objectstore's IRSA/Workload Identity).
+                          SecretRef names a Secret holding "username" and "password" keys. If
+                          this whole Auth block is nil, the agent does not call etcd's
+                          Authenticate() at all; the pinned v3 client transparently re-auths on
+                          token expiry. PRECEDENCE: when both a client certificate and Auth are
+                          supplied, etcd uses the token identity, not the certificate CN — the
+                          Auth user must hold the range-scoped role.
                         properties:
                           name:
                             default: ""
@@ -1420,24 +1608,19 @@ spec:
                       EndpointList is a raw set of etcd client-URL host:port (or
                       scheme://host:port) strings, e.g. "https://etcd-rke1.example.com:2379".
                       This is the ONLY supported mechanism for a cluster external to this
-                      Kubernetes cluster (e.g. an RKE1/AWS source reached over a public NLB) --
-                      there is deliberately no "tunnel" or "port-forward" mode. A
-                      `kubectl port-forward` is a client-attached, ephemeral process tied to a
-                      human's terminal; it does not survive this mirror pod restarting,
-                      rescheduling, or the operator itself restarting, which defeats the
-                      entire point of a supervised, restart-tolerant workload. If you need a
-                      persistent tunnel, terminate it yourself (VPN, Interconnect, NLB)
-                      upstream of this CR and hand EtcdMirror the resulting stable
-                      endpoint(s); network reachability itself is out of scope for this CRD.
+                      Kubernetes cluster (e.g. an RKE1/AWS source reached over a public NLB);
+                      there is deliberately no tunnel/port-forward mode — terminate any
+                      tunnel upstream and hand EtcdMirror the resulting stable endpoint(s).
 
-                      IP-LITERAL ENDPOINTS: if any entry here is a bare IP literal (plausible
-                      for an NLB endpoint with no DNS name), Go's TLS stack requires an IP SAN
-                      (not a DNS SAN) on the peer certificate for verification to succeed.
-                      Either set the corresponding EtcdMirrorTLS.ServerName to a hostname that
-                      IS present as a DNS SAN on the certificate, or ensure the certificate
-                      carries an IP SAN matching the literal. Operators who hit a verification
-                      failure here should fix the SAN/ServerName mismatch, not reach for
-                      InsecureSkipVerify to work around it.
+                      Prefer listing per-member endpoints over a single load-balancer VIP: a
+                      TCP-health-checked VIP cannot see etcd quorum, and the client's own
+                      balancer handles per-member failover.
+
+                      IP-LITERAL ENDPOINTS: Go's TLS stack requires an IP SAN (not a DNS SAN)
+                      to verify a bare-IP endpoint. Either set EtcdMirrorTLS.ServerName to a
+                      hostname present as a DNS SAN on the certificate, or ensure the
+                      certificate carries a matching IP SAN. Fix the SAN/ServerName mismatch;
+                      do not reach for InsecureSkipVerify.
                     items:
                       type: string
                     type: array
@@ -1445,16 +1628,14 @@ spec:
                     description: |-
                       Prefix is the etcd key prefix on THIS side. On Source, only keys under
                       this prefix are synced; empty means the whole keyspace. On Target, this
-                      is the prefix under which the agent writes mirrored keys after any
-                      Sync.DestPrefix remap is applied.
+                      is the prefix under which mirrored keys land (see EtcdMirrorSyncSpec's
+                      rewrite formula). Immutable after creation.
                     type: string
                   serviceRef:
                     description: |-
-                      ServiceRef points at a Kubernetes Service in this cluster whose DNS name
-                      resolves the etcd client endpoint(s). The rarer same-cluster or
-                      co-located case (e.g. mirroring between two EtcdClusters both running in
-                      this GKE cluster). Namespace defaults to the EtcdMirror's own namespace
-                      when empty.
+                      ServiceRef points at a Kubernetes Service in this cluster whose DNS
+                      name resolves the etcd client endpoint(s), for the same-cluster case.
+                      Namespace defaults to the EtcdMirror's own namespace when empty.
                     properties:
                       name:
                         description: Name is the Service name.
@@ -1475,17 +1656,45 @@ spec:
                     type: object
                   tls:
                     description: |-
-                      TLS configures the agent's client TLS identity/trust for THIS side. Nil
-                      means the agent dials this side in cleartext.
+                      TLS configures the agent's client TLS for THIS side. Nil means the
+                      agent dials this side in cleartext (and https:// endpoints are
+                      CEL-rejected). An empty block means server-auth TLS verified against
+                      the system trust roots.
                     properties:
+                      caBundleRef:
+                        description: |-
+                          CABundleRef optionally sources the trust anchors from a separate
+                          Secret or ConfigMap key, decoupling trust from the identity Secret
+                          (Gateway API caCertificateRefs precedent). Takes precedence over
+                          SecretRef's ca.crt.
+                        properties:
+                          key:
+                            description: Key within the object. Defaults to "ca.crt".
+                            type: string
+                          kind:
+                            default: ConfigMap
+                            description: Kind is Secret or ConfigMap. Defaults to
+                              ConfigMap.
+                            enum:
+                            - Secret
+                            - ConfigMap
+                            type: string
+                          name:
+                            description: Name of the Secret or ConfigMap, in the EtcdMirror's
+                              namespace.
+                            minLength: 1
+                            type: string
+                        required:
+                        - name
+                        type: object
                       insecureSkipVerify:
                         default: false
                         description: |-
                           InsecureSkipVerify disables server certificate verification. Strongly
                           discouraged, especially for a source reached over the public internet.
                           Requires InsecureSkipVerifyAcknowledgeRisk to also be set true
-                          (CEL-enforced on this type). The controller additionally emits a
-                          standing Warning event whenever this is true.
+                          (CEL-enforced). The controller additionally emits a standing Warning
+                          event whenever this is true.
                         type: boolean
                       insecureSkipVerifyAcknowledgeRisk:
                         default: false
@@ -1499,15 +1708,15 @@ spec:
                         description: |-
                           SecretRef names a Secret (in the EtcdMirror's namespace) holding this
                           side's TLS material in the standard kubernetes.io/tls-compatible shape:
-                            - ca.crt:  PEM CA bundle used to verify the peer's server certificate.
-                              Required for TLS unless InsecureSkipVerify is true.
-                            - tls.crt / tls.key: PEM client certificate + key, for mTLS. Optional --
-                              omit both for server-auth-only TLS (verify the peer, authenticate to
-                              it via Auth instead, or not at all).
-                          This is the same key layout a cert-manager Certificate's spec.secretName
-                          Secret uses, so a cert-manager Certificate (or `kubectl create secret
-                          tls`, or any other issuance mechanism) can populate this Secret with zero
-                          coupling from this CRD to cert-manager.
+                            - ca.crt:  PEM CA bundle used to verify the peer's server certificate
+                              (unless CABundleRef overrides it, or InsecureSkipVerify is true).
+                            - tls.crt / tls.key: PEM client certificate + key, for mTLS.
+                              Optional — omit both for server-auth-only TLS.
+                          Nil means no client identity and verification against the system trust
+                          roots (the etcdctl default). Note a source running with
+                          --client-cert-auth (the RKE1 default) rejects certless clients at the
+                          handshake regardless of etcd RBAC auth; server-auth-only + Auth is not
+                          viable against such a source.
                         properties:
                           name:
                             default: ""
@@ -1522,45 +1731,83 @@ spec:
                         x-kubernetes-map-type: atomic
                       serverName:
                         description: |-
-                          ServerName overrides the TLS ServerName (SNI) used for verification, for
-                          cases where the dialed endpoint's address doesn't match a SAN on the
-                          certificate (e.g. dialing an NLB IP directly -- see EndpointList's
-                          IP-literal guidance).
+                          ServerName overrides the TLS ServerName (SNI) used for verification,
+                          for cases where the dialed address doesn't match a SAN on the
+                          certificate (e.g. dialing an NLB IP directly). Applies to EVERY
+                          endpoint in the list, so mixing endpoints with different certificates
+                          behind one ServerName will fail verification on the mismatched ones.
                         type: string
-                    required:
-                    - secretRef
                     type: object
                     x-kubernetes-validations:
                     - message: insecureSkipVerify requires insecureSkipVerifyAcknowledgeRisk
                         to also be true
                       rule: '!self.insecureSkipVerify || self.insecureSkipVerifyAcknowledgeRisk'
-                    - message: secretRef.name is required
-                      rule: has(self.secretRef.name) && size(self.secretRef.name)
-                        > 0
+                    - message: secretRef.name must be non-empty when secretRef is
+                        set
+                      rule: '!has(self.secretRef) || (has(self.secretRef.name) &&
+                        size(self.secretRef.name) > 0)'
                 type: object
                 x-kubernetes-validations:
                 - message: exactly one of endpointList or serviceRef must be set
                   rule: (has(self.endpointList) && size(self.endpointList) > 0) !=
                     has(self.serviceRef)
+                - message: 'http:// endpoints conflict with a tls block: use https://
+                    endpoints or remove tls'
+                  rule: '!(has(self.tls) && has(self.endpointList) && self.endpointList.exists(e,
+                    e.startsWith(''http://'')))'
+                - message: https:// endpoints require a tls block (an empty tls block
+                    selects server-auth TLS against system trust roots)
+                  rule: '!(!has(self.tls) && has(self.endpointList) && self.endpointList.exists(e,
+                    e.startsWith(''https://'')))'
             required:
             - source
             - target
             type: object
             x-kubernetes-validations:
-            - message: sync.destPrefix and sync.noDestPrefix are mutually exclusive
-              rule: '!(has(self.sync) && has(self.sync.destPrefix) && size(self.sync.destPrefix)
-                > 0 && has(self.sync.noDestPrefix) && self.sync.noDestPrefix)'
+            - message: source.prefix is immutable
+              rule: '(has(self.source.prefix) ? self.source.prefix : "") == (has(oldSelf.source.prefix)
+                ? oldSelf.source.prefix : "")'
+            - message: target.prefix is immutable
+              rule: '(has(self.target.prefix) ? self.target.prefix : "") == (has(oldSelf.target.prefix)
+                ? oldSelf.target.prefix : "")'
+            - message: sync.destPrefix is immutable
+              rule: '(has(self.sync) && has(self.sync.destPrefix) ? self.sync.destPrefix
+                : "") == (has(oldSelf.sync) && has(oldSelf.sync.destPrefix) ? oldSelf.sync.destPrefix
+                : "")'
+            - message: sync.excludePrefixes is immutable
+              rule: '(has(self.sync) && has(self.sync.excludePrefixes) ? self.sync.excludePrefixes
+                : []) == (has(oldSelf.sync) && has(oldSelf.sync.excludePrefixes) ?
+                oldSelf.sync.excludePrefixes : [])'
+            - message: checkpoint.key is immutable
+              rule: '(has(self.checkpoint) && has(self.checkpoint.key) ? self.checkpoint.key
+                : "") == (has(oldSelf.checkpoint) && has(oldSelf.checkpoint.key) ?
+                oldSelf.checkpoint.key : "")'
+            - message: checkpoint.key must live under the effective destination prefix
+                (target.prefix + sync.destPrefix)
+              rule: '!has(self.checkpoint) || !has(self.checkpoint.key) || self.checkpoint.key
+                == "" || self.checkpoint.key.startsWith((has(self.target.prefix) ?
+                self.target.prefix : "") + (has(self.sync) && has(self.sync.destPrefix)
+                ? self.sync.destPrefix : ""))'
           status:
             description: |-
               EtcdMirrorStatus defines the observed state of an EtcdMirror. Progress
               fields are synced periodically (not per-op), so they are a coarse,
-              point-in-time mirror of the agent's authoritative local checkpoint, useful
-              for kubectl/dashboards, not an audit log.
+              point-in-time mirror of the agent's authoritative checkpoint in the target
+              etcd, useful for kubectl/dashboards, not an audit log.
+
+              CUTOVER GATE CONTRACT: never compute "caught up" by comparing
+              SourceRevision to LastAppliedRevision — they snapshot at different
+              instants, and SourceRevision advances on out-of-prefix writes (revisions
+              are cluster-global). The manual gate is: quiesce source writers, read the
+              source's current revision R yourself (`etcdctl endpoint status`), then
+              poll until LastAppliedRevision >= R. The in-CR gate is spec.mode=Drain +
+              the CutoverReady condition. Relax target RBAC only after the mirror is
+              paused or deleted.
             properties:
               agentPod:
                 description: |-
                   AgentPod is the name of the current agent pod (the sole pod of the
-                  size-1 StatefulSet), for convenient kubectl logs/exec.
+                  size-1 Deployment), for convenient kubectl logs/exec.
                 type: string
               conditions:
                 items:
@@ -1621,12 +1868,47 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              cutover:
+                description: Cutover is populated while spec.mode is Drain.
+                properties:
+                  drainTargetRevision:
+                    description: |-
+                      DrainTargetRevision is the source revision observed when Drain was
+                      requested — the revision the watermark must reach.
+                    format: int64
+                    type: integer
+                  drainedRevision:
+                    description: DrainedRevision is the watermark at which the drain
+                      completed.
+                    format: int64
+                    type: integer
+                  leasedKeyCount:
+                    description: |-
+                      LeasedKeyCount is LeaseBackedKeyCount frozen at drain completion, for
+                      the runbook's purge/re-lease step.
+                    format: int64
+                    type: integer
+                  sourceKeyCount:
+                    description: |-
+                      SourceKeyCount and TargetKeyCount are the per-side key counts from the
+                      verification pass (source read pinned at the drained revision;
+                      reserved checkpoint key excluded).
+                    format: int64
+                    type: integer
+                  targetKeyCount:
+                    format: int64
+                    type: integer
+                  verifiedTime:
+                    description: VerifiedTime is when the post-drain verification
+                      pass succeeded.
+                    format: date-time
+                    type: string
+                type: object
               forcedResyncCount:
                 description: |-
-                  ForcedResyncCount counts how many times the agent has auto-healed from a
-                  source-compaction-raced-the-watch error, OR a cluster-identity-mismatch
-                  checkpoint invalidation, by re-running SyncBase. Monotonically
-                  increasing, never reset.
+                  ForcedResyncCount counts forced resyncs (compaction outran the watch,
+                  checkpoint invalidated by a cluster-ID mismatch, or checkpoint
+                  corrupt/unknown-version). Monotonic, never reset.
                 format: int32
                 type: integer
               initialSyncCompletionTime:
@@ -1634,80 +1916,135 @@ spec:
                 type: string
               initialSyncKeyCount:
                 description: |-
-                  InitialSyncKeyCount, InitialSyncStartTime, InitialSyncCompletionTime
-                  track the base-sync phase for observability.
+                  InitialSyncKeyCount is the number of keys applied so far by the
+                  current/last genesis scan. Live-updating during InitialSync (each
+                  status sync), so InitialSyncKeyCount/InitialSyncTotalKeyCount is a
+                  progress fraction.
                 format: int64
                 type: integer
               initialSyncStartTime:
                 format: date-time
                 type: string
+              initialSyncTotalKeyCount:
+                description: |-
+                  InitialSyncTotalKeyCount is the denominator: the source-side key count
+                  under the prefix observed at scan start (first page's RangeResponse
+                  count).
+                format: int64
+                type: integer
               lastAppliedRevision:
                 description: |-
-                  LastAppliedRevision is the source etcd revision through which the target
-                  is known to be caught up, as of the last periodic status sync. The
-                  agent's local checkpoint file is the authoritative, hot-path copy; this
-                  is a periodically-synced mirror of it for observability.
+                  LastAppliedRevision is the checkpoint watermark: the source revision
+                  through which the target is caught up, advanced by applies AND by
+                  watch progress notifications on idle prefixes. The fenced checkpoint
+                  key in the target etcd is the authoritative copy; this mirrors it.
                 format: int64
                 type: integer
               lastProgressTime:
                 description: |-
-                  LastProgressTime is when the agent last recorded ANY successful
-                  destination apply (a completed Txn during InitialSync, SyncUpdates, or
-                  reconciliation). Distinct from LastStatusSyncTime: /statusz can keep
-                  responding on-time from a wedged loop that has stopped applying writes,
-                  so this field is what ReplicationLagExceeded is actually derived from.
+                  LastProgressTime is when the watermark last advanced (apply or watch
+                  progress notification). Distinct from LastStatusSyncTime: status can
+                  keep syncing from a wedged loop; this field is what Available and
+                  ReplicationLagExceeded are derived from.
                 format: date-time
                 type: string
               lastReconciliationDrift:
                 properties:
+                  divergentKeys:
+                    description: |-
+                      DivergentKeys were present on both sides with different values —
+                      distinct from MissingKeys so "a resync dropped keys" is never
+                      conflated with "a blind window went stale".
+                    format: int64
+                    type: integer
                   missingKeys:
+                    description: MissingKeys were present on the source but absent
+                      on the target.
                     format: int64
                     type: integer
                   orphanKeys:
+                    description: OrphanKeys were present on the target with no source
+                      counterpart.
                     format: int64
                     type: integer
                   repaired:
+                    description: Repaired is true when the pass wrote fixes rather
+                      than only reporting.
                     type: boolean
                 type: object
               lastReconciliationTime:
                 description: |-
                   LastReconciliationTime and LastReconciliationDrift record the most
-                  recent periodic reconciliation pass, when spec.reconciliation.enabled.
+                  recent reconciliation pass (periodic or mandatory).
                 format: date-time
                 type: string
               lastStatusSyncTime:
                 description: |-
                   LastStatusSyncTime is when status was last refreshed from the agent, so
-                  staleness (e.g. a wedged agent that stopped responding but hasn't
-                  crashed) is directly observable.
+                  staleness of everything above is directly observable.
                 format: date-time
                 type: string
+              leaseBackedKeyCount:
+                description: |-
+                  LeaseBackedKeyCount is the number of mirrored keys whose source copy is
+                  lease-backed (kv.Lease != 0). Mirrored copies are NOT lease-backed —
+                  leases are stripped (see Fidelity Caveats in docs/etcdmirror.md) — so a
+                  nonzero count means the cutover runbook's purge/re-lease step applies.
+                format: int64
+                type: integer
               observedGeneration:
                 format: int64
                 type: integer
               phase:
                 description: |-
                   EtcdMirrorPhase is a high-level summary of an EtcdMirror's lifecycle.
-                  Unlike BackupPhase/RestorePhase, most phases here are NOT terminal -- a
-                  healthy mirror spends its life cycling between Syncing and (briefly, on
-                  transient errors) Degraded; there is no "Completed" state.
+                  Unlike BackupPhase/RestorePhase, most phases here are NOT terminal — a
+                  healthy mirror spends its life in Syncing; there is no "Completed" state.
                 type: string
               sourceClusterID:
                 description: |-
-                  SourceClusterID is the source etcd cluster's cluster ID, as observed on
-                  the response header of the agent's most recent successful call against
-                  Source. Surfaced for operator debugging of checkpoint-invalidation
-                  events -- a changed SourceClusterID across reconciles is the visible
-                  symptom of "source endpoint now points at a different cluster than the
-                  checkpoint was taken against."
+                  SourceClusterID and TargetClusterID are the cluster IDs both bound
+                  into the checkpoint. Either changing across reconciles is the visible
+                  symptom of an endpoint now pointing at a different cluster than the
+                  checkpoint was taken against (CheckpointInvalidated event, forced
+                  genesis, RequireEmpty re-armed).
                 type: string
+              sourceKeyCount:
+                description: |-
+                  SourceKeyCount and TargetKeyCount are the per-side key counts from the
+                  most recent diff/verification pass (reserved checkpoint key and
+                  excluded prefixes not counted; drain-verification source reads pinned
+                  at the drained revision with a compacted-fallback re-read). Populated
+                  by every pass that runs regardless of spec.reconciliation.enabled —
+                  the mandatory mark-and-sweep after any forced resync, the
+                  OverwriteAndPrune genesis pass, and the drain verification — plus the
+                  periodic pass when it is enabled. NOT refreshed on every status sync:
+                  a healthy RequireEmpty mirror that never forces a resync only gets
+                  counts from an enabled periodic pass. This is the equality signal
+                  InvariantsHeld reads; status.cutover's copies remain the frozen
+                  drain-time snapshot.
+                format: int64
+                type: integer
               sourceRevision:
                 description: |-
                   SourceRevision is the source cluster's revision as of the last status
-                  sync, for computing an approximate replication lag (SourceRevision -
-                  LastAppliedRevision) at a glance.
+                  sync. Cluster-global: it advances on writes outside the mirrored
+                  prefix, so SourceRevision - LastAppliedRevision OVERSTATES lag for
+                  prefix-scoped mirrors. See the cutover gate contract above.
                 format: int64
                 type: integer
+              sourceVersion:
+                description: |-
+                  SourceVersion and TargetVersion are the etcd server versions from the
+                  maintenance Status() probe at connect.
+                type: string
+              targetClusterID:
+                type: string
+              targetKeyCount:
+                format: int64
+                type: integer
+              targetVersion:
+                type: string
             type: object
         type: object
     served: true

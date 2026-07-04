@@ -6,8 +6,13 @@ metadata:
     app.kubernetes.io/managed-by: kustomize
   name: etcdmirror-sample
 spec:
+  # Sync = continuous replication; flip to Drain at cutover time and wait for
+  # the CutoverReady condition.
+  mode: Sync
+
   # External RKE1/AWS source reached over a public NLB, over TLS with a
-  # CA-verified server certificate.
+  # CA-verified server certificate. https:// endpoints require a tls block
+  # (an empty tls block would mean system trust roots).
   source:
     endpointList:
       - "https://etcd-rke1.example.com:2379"
@@ -24,25 +29,58 @@ spec:
     serviceRef:
       name: etcdcluster-sample-client
       port: client
-    prefix: "/mirrored/registry/"
+    prefix: "/mirrored/"
     tls:
       secretRef:
         name: etcdmirror-sample-target-tls
 
-  expectEmptyPrefix: true
+  initialSync:
+    # RequireEmpty (default): refuse a non-empty destination prefix at
+    # genesis. Overwrite / OverwriteAndPrune for re-pointing at a
+    # previously-populated prefix (e.g. failback).
+    mode: RequireEmpty
 
   sync:
-    maxTxnOps: 128
-    maxOpsPerSecond: 500
+    # Key rewrite — ONE formula:
+    #   key' = target.prefix + destPrefix + TrimPrefix(key, source.prefix)
+    #
+    #   source key            destPrefix    resulting target key
+    #   /registry/pods/x      ""            /mirrored/pods/x
+    #   /registry/pods/x      "registry/"   /mirrored/registry/pods/x
+    #   /registry/pods/x      "backup/"     /mirrored/backup/pods/x
+    #
+    # Default "" strips the source prefix. Immutable after creation. Leave
+    # unset for the default — an explicit destPrefix: "" is equivalent but
+    # pointless.
+    # destPrefix: "registry/"
+    # High-churn, lease-backed, or low-value ranges to skip entirely.
+    # Immutable after creation (it defines the mirrored range): change via
+    # delete-and-recreate with an appropriate initialSync.mode.
+    excludePrefixes:
+      - "/registry/events/"
+    maxTxnOps: 128 # includes one reserved slot for the checkpoint write
+    txnFlushBytes: 1Mi
+    pageKeyLimit: 512
+    pageBytes: 1Mi
+    # Replay-buffer bound during the genesis scan; raise for high-churn
+    # sources (overflow restarts the scan from a fresh revision, surfaced
+    # as the InitialSyncCompactionRaced event).
+    # watchBufferBytes: 16Mi
+    maxOpsPerSecond: 500 # keep source retention > scan+drain time at this rate
+    requestTimeout: 30s
     dialTimeout: 10s
     reconnectBackoff:
       initialDelay: 1s
       maxDelay: 30s
 
-  checkpoint:
-    storageSpec:
-      volumeSizeRequest: 64Mi
-    syncInterval: 5s
+  # The checkpoint lives in the TARGET etcd, fenced and written with each
+  # batch. Default key: <target.prefix + destPrefix> + "\x00etcdmirror-checkpoint".
+  # An override MUST stay under the effective destination prefix (the
+  # range-scoped target credential covers it; CEL-enforced) — pick a
+  # different suffix under it if the default collides with your own
+  # reserved-key scheme.
+  # checkpoint:
+  #   key: "/mirrored/\x00my-own-checkpoint-name"
 
   reconciliation:
     enabled: true
