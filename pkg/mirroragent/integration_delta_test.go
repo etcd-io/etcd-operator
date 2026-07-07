@@ -412,13 +412,21 @@ func TestResyncLoopLatch(t *testing.T) {
 	waitTargetData(t, dst, cfg, 30*time.Second, want)
 
 	// Steady state = a successfully applied TAIL response; only that clears
-	// the latch (scan convergence alone does not).
-	_, err = src.Put(t.Context(), "/src/steady", "ok")
-	require.NoError(t, err)
-	want["/dst/steady"] = "ok"
-	waitTargetData(t, dst, cfg, 20*time.Second, want)
+	// the latch (scan convergence alone does not). A single post-heal put can
+	// race the recovery attempt's restart backoff and land below the scan's
+	// R0 — applied by the scan, leaving the live tail with nothing to
+	// deliver — so write a fresh key per poll tick until one arrives live.
+	steady := 0
 	waitSnap(t, r.agent, 20*time.Second, "latch clears at steady state",
-		func(s mirroragent.Snapshot) bool { return !s.ResyncLoopDetected && !s.Compacted })
+		func(s mirroragent.Snapshot) bool {
+			if !s.ResyncLoopDetected && !s.Compacted {
+				return true
+			}
+			steady++
+			_, perr := src.Put(t.Context(), fmt.Sprintf("/src/steady-%d", steady), "ok")
+			require.NoError(t, perr)
+			return false
+		})
 }
 
 // rangeRecordingClient records every Get's [start, end) window, to prove
