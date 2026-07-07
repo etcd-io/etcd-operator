@@ -34,6 +34,11 @@ import (
 // apply can stop the source stream (bounded memory during target stalls).
 func (a *Agent) tail(ctx context.Context, wch clientv3.WatchChan, wcancel context.CancelFunc, fromRev int64) error {
 	a.setPhase(PhaseSyncing)
+	// Arm the periodic reconciliation deadline on first reaching steady
+	// state: one full interval out, never during or before a genesis scan.
+	if a.cfg.ReconcileInterval > 0 && a.nextReconcile.IsZero() {
+		a.scheduleNextReconcile()
+	}
 	srcStart, srcEnd := a.rw.sourceRange()
 	for {
 		if wch == nil {
@@ -77,6 +82,17 @@ func (a *Agent) tail(ctx context.Context, wch clientv3.WatchChan, wcancel contex
 func (a *Agent) consume(ctx context.Context, wch clientv3.WatchChan) error {
 	ticker := time.NewTicker(a.cfg.ProgressInterval)
 	defer ticker.Stop()
+	// The periodic reconciliation deadline rides the same select (nil channel
+	// when disabled, so the case never fires). The timer is rebuilt from the
+	// persistent deadline on every consume entry — a mandatory sweep between
+	// cycles re-armed it and is picked up automatically.
+	var reconcileC <-chan time.Time
+	var reconcileTimer *time.Timer
+	if a.cfg.ReconcileInterval > 0 {
+		reconcileTimer = time.NewTimer(time.Until(a.nextReconcile))
+		defer reconcileTimer.Stop()
+		reconcileC = reconcileTimer.C
+	}
 	for {
 		if err := a.maybeDrain(ctx); err != nil {
 			return err
@@ -84,6 +100,11 @@ func (a *Agent) consume(ctx context.Context, wch clientv3.WatchChan) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-reconcileC:
+			if err := a.maybeReconcile(ctx); err != nil {
+				return err
+			}
+			reconcileTimer.Reset(time.Until(a.nextReconcile))
 		case <-ticker.C:
 			// The progress request MUST carry the same outgoing metadata as
 			// the Watch call: clientv3 keys watcher gRPC streams by ctx
@@ -256,9 +277,11 @@ func (a *Agent) completeDrain(ctx context.Context) error {
 	if srcN != dstN {
 		// One repair+prune pass and a recount; a persisting mismatch is real
 		// divergence and must fail the drain rather than cut over.
-		if _, rerr := a.reconcilePass(ctx, true, true); rerr != nil {
+		drift, rerr := a.reconcilePass(ctx, true, true)
+		if rerr != nil {
 			return rerr
 		}
+		a.recordDrift(drift)
 		if srcN, dstN, err = a.verifyCounts(ctx); err != nil {
 			return err
 		}

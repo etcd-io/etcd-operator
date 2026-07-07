@@ -87,6 +87,11 @@ type Agent struct {
 	consecutiveResyncs int
 	restartBo          *backoff
 
+	// nextReconcile is the periodic pass's next deadline (zero until the
+	// first tail arms it); owned by the Run goroutine. Mandatory sweeps
+	// re-arm it — they produce the same signal.
+	nextReconcile time.Time
+
 	mu   sync.Mutex
 	snap Snapshot
 }

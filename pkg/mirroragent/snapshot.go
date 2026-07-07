@@ -150,7 +150,8 @@ type Snapshot struct {
 	// verification pass (excluded prefixes and the reserved checkpoint key
 	// not counted). Populated by every pass that runs regardless of config —
 	// forced-resync sweeps, the OverwriteAndPrune genesis pass, drain
-	// verification — but NOT refreshed outside those passes: a healthy
+	// verification, and the periodic pass when Config.ReconcileInterval
+	// enables it — but NOT refreshed outside those passes: a healthy
 	// mirror that never resyncs only gets counts from an enabled periodic
 	// pass. This is the equality signal the controller's InvariantsHeld
 	// condition reads.
@@ -162,6 +163,12 @@ type Snapshot struct {
 	QuotaExhausted bool
 	Compacted      bool
 
+	// LastReconcileTime is when the most recent reconciliation/verification
+	// pass completed — periodic or mandatory, including the count-only drain
+	// verification — the freshness input to the controller's InvariantsHeld
+	// condition. LastReconcileDrift is the most recent FULL diff's outcome;
+	// count-only verifications never overwrite it (a count check cannot
+	// attest DivergentKeys).
 	LastReconcileTime  time.Time
 	LastReconcileDrift *Drift
 

@@ -64,13 +64,16 @@ const DefaultCheckpointKeySuffix = "\x00etcdmirror-checkpoint"
 
 // Defaults, matching the CRD field defaults in api/v1alpha1.
 const (
-	DefaultMaxTxnOps       = 128
-	DefaultTxnFlushBytes   = 1 << 20 // 1Mi
-	DefaultPageKeyLimit    = 512
-	DefaultPageBytes       = 1 << 20 // 1Mi
-	DefaultRequestTimeout  = 30 * time.Second
-	DefaultBackoffInitial  = 1 * time.Second
-	DefaultBackoffMax      = 30 * time.Second
+	DefaultMaxTxnOps      = 128
+	DefaultTxnFlushBytes  = 1 << 20 // 1Mi
+	DefaultPageKeyLimit   = 512
+	DefaultPageBytes      = 1 << 20 // 1Mi
+	DefaultRequestTimeout = 30 * time.Second
+	DefaultBackoffInitial = 1 * time.Second
+	DefaultBackoffMax     = 30 * time.Second
+	// DefaultReconcilePeriod is the spec→Config translation default for
+	// spec.reconciliation.enabled with a nil interval (wired in the
+	// agent-binary rung); the engine itself treats 0 as disabled.
 	DefaultReconcilePeriod = time.Hour
 
 	// DefaultWatchBufferBytes bounds the in-memory replay buffer for watch
@@ -179,16 +182,23 @@ type Config struct {
 	BackoffInitialDelay time.Duration
 	BackoffMaxDelay     time.Duration
 
-	// ReconcileInterval will enable the periodic full diff-and-repair pass
-	// when > 0. NOT YET WIRED in this rung: no periodic scheduler exists
-	// until the reconciliation-promotion rung lands, so setting it is
-	// currently a no-op. Independent of this, one reconciliation-with-delete
-	// pass always runs after any forced resync (mark-and-sweep), as the
-	// OverwriteAndPrune genesis pass, and before the Drain verification.
+	// ReconcileInterval > 0 enables the periodic full diff-and-repair pass,
+	// executed inline on the steady-state tail loop — never concurrently
+	// with the genesis scan, a forced-resync sweep, or a drain (a requested
+	// drain's own verification supersedes it) — and re-scheduled a full
+	// interval after any pass (periodic or mandatory) completes, keeping the
+	// key counts within the CRD's 2x-interval freshness contract whenever
+	// passes complete faster than the interval. Independent of this, one
+	// reconciliation-with-delete pass always runs after any forced resync
+	// (mark-and-sweep), as the OverwriteAndPrune genesis pass, and before
+	// the Drain verification. 0 disables the periodic pass (the CRD's
+	// spec.reconciliation.enabled maps to this; DefaultReconcilePeriod is
+	// the translation default for Enabled with a nil interval).
 	ReconcileInterval time.Duration
-	// ReconcileDeleteOrphans will allow the PERIODIC pass to delete target
-	// keys with no source counterpart. NOT YET WIRED (see ReconcileInterval).
-	// Forced-resync sweeps and OverwriteAndPrune always delete orphans.
+	// ReconcileDeleteOrphans allows the PERIODIC pass to delete target keys
+	// with no source counterpart; when false the pass still repairs missing
+	// and divergent keys and reports orphans in the drift. Forced-resync
+	// sweeps and OverwriteAndPrune always delete orphans.
 	ReconcileDeleteOrphans bool
 
 	// WatchBufferBytes bounds the memory used to buffer watch events
@@ -308,6 +318,9 @@ func (c Config) Validate() error {
 	}
 	if c.MaxOpsPerSecond < 0 {
 		return fmt.Errorf("maxOpsPerSecond must be >= 0, got %d", c.MaxOpsPerSecond)
+	}
+	if c.ReconcileInterval < 0 {
+		return fmt.Errorf("reconcileInterval must be >= 0, got %v", c.ReconcileInterval)
 	}
 	if c.WatchBufferBytes < 0 {
 		return fmt.Errorf("watchBufferBytes must be >= 0, got %d", c.WatchBufferBytes)

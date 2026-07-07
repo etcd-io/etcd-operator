@@ -229,11 +229,10 @@ func (a *Agent) genesis(ctx context.Context, st startState) error {
 			return err
 		}
 		a.prunePending = false
-		a.update(func(s *Snapshot) {
-			s.LastReconcileTime = time.Now()
-			d := drift
-			s.LastReconcileDrift = &d
-		})
+		a.recordDrift(drift)
+		// This sweep produced the same signal as a periodic pass; push the
+		// next periodic deadline a full interval out.
+		a.scheduleNextReconcile()
 	}
 
 	// Scan complete: first revision-complete checkpoint at the scan base.

@@ -19,14 +19,16 @@ package mirroragent
 import (
 	"context"
 	"strings"
+	"time"
 
 	"go.etcd.io/etcd/api/v3/mvccpb"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 // reconcilePass is the shared diff-and-repair pass: the OverwriteAndPrune
-// genesis pass, the mandatory mark-and-sweep after any forced resync, and
-// the Drain verification repair. It merges bounded pages of BOTH sides in
+// genesis pass, the mandatory mark-and-sweep after any forced resync, the
+// periodic pass when Config.ReconcileInterval enables it, and the Drain
+// verification repair. It merges bounded pages of BOTH sides in
 // key order — the source via the excluded-range-elided scan windows (so
 // excluded data is never transferred, matching the genesis scan), the target
 // one page at a time — so agent memory stays bounded by two pages no matter
@@ -239,12 +241,66 @@ func (p *sourcePager) fetch(ctx context.Context) (*srcPage, error) {
 }
 
 // recordKeyCounts publishes the per-side in-scope key counts observed by a
-// reconciliation, prune, or drain verification pass.
+// reconciliation, prune, or drain verification pass. Counts are only ever
+// produced by such a pass, so the pass-completion timestamp rides along —
+// the freshness input to the controller's InvariantsHeld condition.
 func (a *Agent) recordKeyCounts(srcN, dstN int64) {
 	a.update(func(s *Snapshot) {
 		s.SourceKeyCount = srcN
 		s.TargetKeyCount = dstN
+		s.LastReconcileTime = time.Now()
 	})
+}
+
+// recordDrift publishes the outcome of a completed FULL diff pass. Count-only
+// verifications never call this: count equality cannot attest DivergentKeys.
+func (a *Agent) recordDrift(d Drift) {
+	a.update(func(s *Snapshot) { s.LastReconcileDrift = &d })
+}
+
+// reconcileDue reports whether the periodic pass should run at now: never
+// when disabled (ReconcileInterval <= 0), before the tail armed the deadline,
+// before the deadline itself, or once a drain is requested — the drain's own
+// verification pass (repair + prune + recount) supersedes the periodic pass.
+func (a *Agent) reconcileDue(now time.Time) bool {
+	return a.cfg.ReconcileInterval > 0 &&
+		!a.nextReconcile.IsZero() &&
+		!now.Before(a.nextReconcile) &&
+		a.cfg.Mode != ModeDrain &&
+		!a.drainReq.Load()
+}
+
+// scheduleNextReconcile pushes the periodic deadline one full interval out
+// from now; a no-op when the periodic pass is disabled. Mandatory sweeps call
+// this too — they just produced the same signal, so re-running the periodic
+// pass sooner adds cost without information.
+func (a *Agent) scheduleNextReconcile() {
+	if a.cfg.ReconcileInterval <= 0 {
+		return
+	}
+	a.nextReconcile = time.Now().Add(a.cfg.ReconcileInterval)
+}
+
+// maybeReconcile runs one periodic diff-and-repair pass when due, inline on
+// the Run goroutine — never concurrently with a genesis scan (consume is not
+// running), a forced-resync sweep (same), a drain (gated), or itself. A
+// drain-gated fire still re-arms the deadline so the tail's timer never spins
+// on a stale one. Errors propagate through consume → tail → Run so
+// periodic-pass failures ride the existing Classify taxonomy: transient and
+// throttle back off in tail (the pass retries at the still-due deadline),
+// Resync forces genesis, Permanent fails the agent.
+func (a *Agent) maybeReconcile(ctx context.Context) error {
+	if !a.reconcileDue(time.Now()) {
+		a.scheduleNextReconcile()
+		return nil
+	}
+	drift, err := a.reconcilePass(ctx, true, a.cfg.ReconcileDeleteOrphans)
+	if err != nil {
+		return err
+	}
+	a.recordDrift(drift)
+	a.scheduleNextReconcile()
+	return nil
 }
 
 // applyRepairFlush writes repair/prune ops under the fence without moving

@@ -18,6 +18,7 @@ package mirroragent
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -101,6 +102,29 @@ func TestConfigValidate(t *testing.T) {
 			assert.Contains(t, err.Error(), tc.wantErr)
 		})
 	}
+}
+
+// TestConfigValidateReconcileInterval: negative intervals are rejected, 0
+// (disabled) and positive intervals pass, and ReconcileDeleteOrphans with a
+// zero interval is accepted as the documented no-op.
+func TestConfigValidateReconcileInterval(t *testing.T) {
+	c := minimalCfg()
+	c.ReconcileInterval = -time.Second
+	err := c.withDefaults().Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "reconcileInterval")
+
+	c = minimalCfg()
+	assert.NoError(t, c.withDefaults().Validate(), "zero interval (disabled) must validate")
+
+	c = minimalCfg()
+	c.ReconcileInterval = time.Minute
+	assert.NoError(t, c.withDefaults().Validate())
+
+	c = minimalCfg()
+	c.ReconcileDeleteOrphans = true
+	assert.NoError(t, c.withDefaults().Validate(),
+		"deleteOrphans with the periodic pass disabled is a documented no-op, not an error")
 }
 
 // TestNormalizePrefixes: nested/duplicate exclude entries are collapsed at
