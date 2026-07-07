@@ -204,6 +204,45 @@ func (e *UnsupportedVersionError) Error() string {
 	return fmt.Sprintf("%s etcd version %s is below the supported floor %s", e.Side, e.Version, hardVersionFloor)
 }
 
+// ReasonFor maps a typed engine error to its API-aligned condition/phase
+// reason string ("" for untyped errors). The controller reads this off
+// Snapshot.LastErrorReason instead of matching LastError message substrings,
+// which would break on any message edit. Same errors.As ladder as Classify.
+func ReasonFor(err error) string {
+	if err == nil {
+		return ""
+	}
+	var (
+		cpInvalid    *CheckpointInvalidError
+		fenceErr     *FenceError
+		tooLarge     *TooLargeError
+		emptyTarget  *EmptyTargetViolationError
+		unsupportedV *UnsupportedVersionError
+		drainVerify  *DrainVerificationError
+		configErr    *ConfigError
+		prefixErr    *PrefixConflictError
+	)
+	switch {
+	case errors.As(err, &unsupportedV):
+		return "UnsupportedVersion"
+	case errors.As(err, &cpInvalid):
+		return "CheckpointInvalid"
+	case errors.As(err, &emptyTarget):
+		return "EmptyTargetViolation"
+	case errors.As(err, &prefixErr):
+		return "PrefixConflict"
+	case errors.As(err, &drainVerify):
+		return "DrainVerificationFailed"
+	case errors.As(err, &tooLarge):
+		return "RequestTooLarge"
+	case errors.As(err, &configErr):
+		return "InvalidConfig"
+	case errors.As(err, &fenceErr):
+		return "FenceLost"
+	}
+	return ""
+}
+
 // Classify maps any error the engine encounters to its taxonomy class.
 // Typed engine errors win; then etcd's typed rpc errors; then gRPC status
 // codes; unknown errors default to transient (retrying an unknown error is

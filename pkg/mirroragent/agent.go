@@ -269,6 +269,14 @@ func (a *Agent) probe(ctx context.Context, side string, cl Client) (versionInfo,
 			if verr != nil {
 				return versionInfo{}, 0, verr
 			}
+			learner := resp.IsLearner
+			a.update(func(s *Snapshot) {
+				if side == "source" {
+					s.SourceLearner = learner
+				} else {
+					s.TargetLearner = learner
+				}
+			})
 			return vi, resp.Header.ClusterId, nil
 		}
 		if ctx.Err() != nil {
@@ -475,9 +483,11 @@ func (a *Agent) fail(ctx context.Context, err error) error {
 		return ctx.Err()
 	}
 	class := Classify(err)
+	reason := ReasonFor(err)
 	a.update(func(s *Snapshot) {
 		s.LastError = err.Error()
 		s.LastErrorClass = class
+		s.LastErrorReason = reason
 		if s.Phase != PhaseDrained {
 			s.Phase = PhaseFailed
 		}
@@ -517,9 +527,11 @@ func (a *Agent) advanceWatermark(rev int64) {
 }
 
 func (a *Agent) recordErr(err error, class Class) {
+	reason := ReasonFor(err)
 	a.update(func(s *Snapshot) {
 		s.LastError = err.Error()
 		s.LastErrorClass = class
+		s.LastErrorReason = reason
 	})
 }
 

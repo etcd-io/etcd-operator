@@ -192,6 +192,16 @@ type Snapshot struct {
 	// failure ("" when the last attempt succeeded).
 	LastError      string `json:"lastError"`
 	LastErrorClass Class  `json:"lastErrorClass"`
+	// LastErrorReason is the typed-reason form of LastError ("" when untyped
+	// or the last attempt succeeded) — the controller's Failed-phase reason
+	// source, so it never string-matches error messages.
+	LastErrorReason string `json:"lastErrorReason"`
+
+	// SourceLearner / TargetLearner report IsLearner from the most recent
+	// maintenance Status() probe of that side (the LearnerEndpoint
+	// condition's input). Best-effort: reflects the probed endpoint only.
+	SourceLearner bool `json:"sourceLearner"`
+	TargetLearner bool `json:"targetLearner"`
 
 	// Cutover is populated once a drain starts; CutoverReady flips when the
 	// fence role is Primary.

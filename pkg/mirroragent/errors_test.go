@@ -108,6 +108,38 @@ func TestClassify(t *testing.T) {
 	}
 }
 
+func TestReasonFor(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{name: "unsupported version", err: &UnsupportedVersionError{Side: "source", Version: "3.3.0"},
+			want: "UnsupportedVersion"},
+		{name: "checkpoint invalid", err: &CheckpointInvalidError{Reason: "garbage"},
+			want: "CheckpointInvalid"},
+		{name: "empty target violation", err: &EmptyTargetViolationError{KeyCount: 3},
+			want: "EmptyTargetViolation"},
+		{name: "prefix conflict", err: &PrefixConflictError{Key: "/dst/…deadbeef", OwnerLinkUID: "other"},
+			want: "PrefixConflict"},
+		{name: "drain verification", err: &DrainVerificationError{SourceKeys: 1, TargetKeys: 2},
+			want: "DrainVerificationFailed"},
+		{name: "too large", err: &TooLargeError{Key: "/dst/…deadbeef"}, want: "RequestTooLarge"},
+		{name: "config error", err: &ConfigError{Detail: "no endpoints"}, want: "InvalidConfig"},
+		{name: "fence violation", err: &FenceError{Detail: "taken over"}, want: "FenceLost"},
+		{name: "wrapped typed error", err: fmt.Errorf("probing source: %w",
+			&UnsupportedVersionError{Side: "source", Version: "3.2.0"}), want: "UnsupportedVersion"},
+		{name: "plain error", err: errors.New("weather is bad"), want: ""},
+		{name: "etcd rpc error", err: rpctypes.ErrNoSpace, want: ""},
+		{name: "nil", err: nil, want: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, ReasonFor(tc.err))
+		})
+	}
+}
+
 func TestRedactKey(t *testing.T) {
 	secret := []byte("/dst/tenants/acme/api-token-primary")
 	got := RedactKey("/dst/", secret)

@@ -100,6 +100,9 @@ func TestSnapshotJSONWireNames(t *testing.T) {
 		LastReconcileDrift:        &Drift{MissingKeys: 1, DivergentKeys: 2, OrphanKeys: 3, Repaired: true},
 		LastError:                 "boom",
 		LastErrorClass:            ClassTransient,
+		LastErrorReason:           "InvalidConfig",
+		SourceLearner:             true,
+		TargetLearner:             true,
 		CutoverReady:              true,
 		Cutover: &CutoverStatus{
 			DrainTargetRevision: 1, DrainedRevision: 2, VerifiedTime: now,
@@ -130,6 +133,7 @@ func TestSnapshotJSONWireNames(t *testing.T) {
 		"resyncLoopDetected", "scanRestartCount", "lastScanRestartCause",
 		"sourceKeyCount", "targetKeyCount", "throttled", "quotaExhausted", "compacted",
 		"lastReconcileTime", "lastReconcileDrift", "lastError", "lastErrorClass",
+		"lastErrorReason", "sourceLearner", "targetLearner",
 		"cutoverReady", "cutover",
 	}
 	require.ElementsMatch(t, wantFull, mapKeys(fullKeys))
