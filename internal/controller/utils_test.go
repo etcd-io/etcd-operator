@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -699,6 +700,127 @@ func TestCreateOrPatchStatefulSetWithPodLabels(t *testing.T) {
 			require.Equal(t, sts.OwnerReferences[0].Name, ec.Name)
 		})
 	}
+}
+
+func TestCreateOrPatchStatefulSetWithSchedulingFields(t *testing.T) {
+	ctx := t.Context()
+	logger := log.FromContext(ctx)
+
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = ecv1alpha1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+
+	affinity := &corev1.Affinity{
+		NodeAffinity: &corev1.NodeAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+				NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+					MatchExpressions: []corev1.NodeSelectorRequirement{{
+						Key:      "node-role.kubernetes.io/etcd",
+						Operator: corev1.NodeSelectorOpExists,
+					}},
+				}},
+			},
+		},
+	}
+	nodeSelector := map[string]string{"disktype": "ssd"}
+	tolerations := []corev1.Toleration{{
+		Key:      "dedicated",
+		Operator: corev1.TolerationOpEqual,
+		Value:    "etcd",
+		Effect:   corev1.TaintEffectNoSchedule,
+	}}
+	topologySpreadConstraints := []corev1.TopologySpreadConstraint{{
+		MaxSkew:           1,
+		TopologyKey:       "topology.kubernetes.io/zone",
+		WhenUnsatisfiable: corev1.DoNotSchedule,
+		LabelSelector: &metav1.LabelSelector{
+			MatchLabels: map[string]string{"app": "test-etcd-scheduling"},
+		},
+	}}
+	resources := &corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("500m"),
+			corev1.ResourceMemory: resource.MustParse("1Gi"),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceMemory: resource.MustParse("2Gi"),
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	ec := &ecv1alpha1.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-etcd-scheduling",
+			Namespace: "default",
+		},
+		Spec: ecv1alpha1.EtcdClusterSpec{
+			Size:    3,
+			Version: "3.5.17",
+			PodTemplate: &ecv1alpha1.PodTemplate{
+				Spec: &ecv1alpha1.PodSpec{
+					Affinity:                  affinity,
+					NodeSelector:              nodeSelector,
+					Tolerations:               tolerations,
+					TopologySpreadConstraints: topologySpreadConstraints,
+					Resources:                 resources,
+					PriorityClassName:         "system-cluster-critical",
+					SchedulerName:             "custom-scheduler",
+				},
+			},
+		},
+	}
+
+	err := createOrPatchStatefulSet(ctx, logger, ec, fakeClient, 3, scheme)
+	assert.NoError(t, err)
+
+	sts := &appsv1.StatefulSet{}
+	err = fakeClient.Get(ctx, client.ObjectKey{Name: ec.Name, Namespace: "default"}, sts)
+	assert.NoError(t, err)
+
+	podSpec := sts.Spec.Template.Spec
+	assert.Equal(t, affinity, podSpec.Affinity)
+	assert.Equal(t, nodeSelector, podSpec.NodeSelector)
+	assert.Equal(t, tolerations, podSpec.Tolerations)
+	assert.Equal(t, topologySpreadConstraints, podSpec.TopologySpreadConstraints)
+	assert.Equal(t, "system-cluster-critical", podSpec.PriorityClassName)
+	assert.Equal(t, "custom-scheduler", podSpec.SchedulerName)
+	assert.Equal(t, *resources, podSpec.Containers[0].Resources)
+}
+
+func TestCreateOrPatchStatefulSetWithoutSchedulingFields(t *testing.T) {
+	ctx := t.Context()
+	logger := log.FromContext(ctx)
+
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = ecv1alpha1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	ec := &ecv1alpha1.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-etcd-no-scheduling",
+			Namespace: "default",
+		},
+		Spec: ecv1alpha1.EtcdClusterSpec{
+			Size:    3,
+			Version: "3.5.17",
+		},
+	}
+
+	err := createOrPatchStatefulSet(ctx, logger, ec, fakeClient, 3, scheme)
+	assert.NoError(t, err)
+
+	sts := &appsv1.StatefulSet{}
+	err = fakeClient.Get(ctx, client.ObjectKey{Name: ec.Name, Namespace: "default"}, sts)
+	assert.NoError(t, err)
+
+	podSpec := sts.Spec.Template.Spec
+	assert.Nil(t, podSpec.TopologySpreadConstraints)
+	assert.Empty(t, podSpec.PriorityClassName)
+	assert.Empty(t, podSpec.Containers[0].Resources.Requests)
+	assert.Empty(t, podSpec.Containers[0].Resources.Limits)
 }
 
 func TestCreatingArgs(t *testing.T) {

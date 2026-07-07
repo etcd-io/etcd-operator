@@ -61,6 +61,26 @@ type PodSpec struct {
 	Affinity     *corev1.Affinity    `json:"affinity,omitempty"`
 	NodeSelector map[string]string   `json:"nodeSelector,omitempty"`
 	Tolerations  []corev1.Toleration `json:"tolerations,omitempty"`
+
+	// TopologySpreadConstraints describes how member pods should spread across topology
+	// domains, typically zones or hosts. The labelSelector must match the member pod
+	// labels, e.g. "app: <cluster-name>".
+	// +optional
+	TopologySpreadConstraints []corev1.TopologySpreadConstraint `json:"topologySpreadConstraints,omitempty"`
+
+	// Resources describes the compute resource requirements of the etcd container.
+	// +optional
+	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
+
+	// PriorityClassName is the priority class of the member pods,
+	// e.g. "system-cluster-critical".
+	// +optional
+	PriorityClassName string `json:"priorityClassName,omitempty"`
+
+	// SchedulerName dispatches the member pods to a specific scheduler instead of the
+	// default one.
+	// +optional
+	SchedulerName string `json:"schedulerName,omitempty"`
 }
 
 type PodMetadata struct {
