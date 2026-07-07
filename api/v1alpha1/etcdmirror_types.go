@@ -618,7 +618,7 @@ const (
 	// current revision for a sustained duration. Both terms come from the
 	// same watch/progress machinery (never from comparing the two live
 	// status fields, which snapshot at different instants). Threshold and
-	// duration are agent-internal constants in v1.
+	// duration are controller-internal constants in v1.
 	EtcdMirrorConditionReplicationLagExceeded = "ReplicationLagExceeded"
 	// EtcdMirrorConditionDriftDetected is True when the last reconciliation
 	// pass found orphaned/missing keys. Carries counts in Message. Sticky
@@ -715,6 +715,13 @@ const (
 	// "compaction won a race the design eliminates". Repeated occurrences
 	// count toward ResyncLoopDetected.
 	EtcdMirrorEventInitialSyncCompactionRaced = "InitialSyncCompactionRaced"
+	// EtcdMirrorEventCertificateExpiringSoon warns that a referenced TLS
+	// certificate (client leaf or CA) expires within the controller's
+	// lead window; the agent's expiry gauge is the metric counterpart.
+	EtcdMirrorEventCertificateExpiringSoon = "CertificateExpiringSoon"
+	// EtcdMirrorEventInsecureSkipVerifyEnabled is the standing Warning
+	// promised by EtcdMirrorTLS.InsecureSkipVerify's contract.
+	EtcdMirrorEventInsecureSkipVerifyEnabled = "InsecureSkipVerifyEnabled"
 )
 
 // EtcdMirrorStatus defines the observed state of an EtcdMirror. Progress
@@ -796,6 +803,12 @@ type EtcdMirrorStatus struct {
 	// corrupt/unknown-version). Monotonic, never reset.
 	// +optional
 	ForcedResyncCount int32 `json:"forcedResyncCount,omitempty"`
+
+	// ScanRestartCount counts genesis-scan attempts aborted and restarted
+	// from a fresh R0 (watch-buffer overflow or a mid-scan watch compaction;
+	// see the InitialSyncCompactionRaced event). Monotonic, never reset.
+	// +optional
+	ScanRestartCount int64 `json:"scanRestartCount,omitempty"`
 
 	// LastReconciliationTime and LastReconciliationDrift record the most
 	// recent reconciliation pass (periodic or mandatory).

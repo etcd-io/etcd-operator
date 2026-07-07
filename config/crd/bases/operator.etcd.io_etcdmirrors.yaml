@@ -2001,6 +2001,13 @@ spec:
                   Unlike BackupPhase/RestorePhase, most phases here are NOT terminal — a
                   healthy mirror spends its life in Syncing; there is no "Completed" state.
                 type: string
+              scanRestartCount:
+                description: |-
+                  ScanRestartCount counts genesis-scan attempts aborted and restarted
+                  from a fresh R0 (watch-buffer overflow or a mid-scan watch compaction;
+                  see the InitialSyncCompactionRaced event). Monotonic, never reset.
+                format: int64
+                type: integer
               sourceClusterID:
                 description: |-
                   SourceClusterID and TargetClusterID are the cluster IDs both bound
