@@ -86,9 +86,10 @@ test: manifests generate fmt vet envtest ## Run tests.
 # Prometheus and CertManager are installed by default; skip with:
 # - PROMETHEUS_INSTALL_SKIP=true
 # - CERT_MANAGER_INSTALL_SKIP=true
+# Explicit -timeout: the features' worst-case wait ceilings sum past the go-test default of 10m.
 .PHONY: test-e2e
 test-e2e: generate fmt vet kind gofail-enable ## Run the e2e tests. Expected an isolated environment using Kind.
-	ETCD_VERSION="$(E2E_ETCD_VERSION)" PATH="$(LOCALBIN):$(PATH)" go test ./test/e2e/ -v
+	ETCD_VERSION="$(E2E_ETCD_VERSION)" PATH="$(LOCALBIN):$(PATH)" go test ./test/e2e/ -v -timeout 30m
 	$(MAKE) gofail-disable
 
 .PHONY: gofail-enable
