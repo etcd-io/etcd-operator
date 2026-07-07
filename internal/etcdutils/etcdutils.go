@@ -161,7 +161,7 @@ func ClusterHealth(eps []string) ([]EpHealth, error) {
 			}()
 			startTs := time.Now()
 			// get a random key. As long as we can get the response
-			// without an error, the endpoint is health.
+			// without an error, the endpoint is healthy.
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			_, err = cli.Get(ctx, "health", clientv3.WithSerializable())
@@ -198,6 +198,55 @@ func ClusterHealth(eps []string) ([]EpHealth, error) {
 	sort.Sort(healthReport(healthList))
 
 	return healthList, nil
+}
+
+// IsClusterAvailable issues a linearizable Get against each provided endpoint
+// in turn and returns true as soon as any one responds successfully.
+//
+// The loop distinguishes two classes of failure:
+//
+//   - Member unreachable (connection refused, pod down): the error comes back
+//     as rpctypes.ErrNoAvailableEndpoints from the client dial. Skip to the
+//     next endpoint — this says nothing about cluster health.
+//
+//   - Cluster-state error (no leader, leader not yet elected): the member was
+//     reachable but Raft reported ErrNoLeader or ErrNotLeader. Every other
+//     member will report the same thing, so return false immediately rather
+//     than probing the rest.
+//
+// ErrPermissionDenied is treated as success: the member completed the full
+// linearizable read path (quorum confirmed) before rejecting at the auth layer.
+func IsClusterAvailable(eps []string) bool {
+	for _, ep := range eps {
+		cfg := clientv3.Config{
+			Endpoints:            []string{ep},
+			DialTimeout:          2 * time.Second,
+			DialKeepAliveTime:    2 * time.Second,
+			DialKeepAliveTimeout: 6 * time.Second,
+		}
+		cli, err := clientv3.New(cfg)
+		if err != nil {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_, err = cli.Get(ctx, "health")
+		cancel()
+		_ = cli.Close()
+
+		if err == nil || errors.Is(err, rpctypes.ErrPermissionDenied) {
+			// Linearizable read succeeded (or auth denied but quorum confirmed).
+			return true
+		}
+
+		// No leader elected or leader not yet established, so fail fast.
+		if errors.Is(err, rpctypes.ErrNoLeader) || errors.Is(err, rpctypes.ErrNotLeader) {
+			return false
+		}
+
+		// Any other error (e.g. ErrNoAvailableEndpoints, dial timeout) means
+		// this specific member was unreachable. Try the next one.
+	}
+	return false
 }
 
 func AddMember(eps []string, peerURLs []string, learner bool) (*clientv3.MemberAddResponse, error) {

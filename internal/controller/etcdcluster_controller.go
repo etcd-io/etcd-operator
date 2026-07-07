@@ -481,24 +481,21 @@ func (r *EtcdClusterReconciler) updateConditions(s *reconcileState) {
 		ObservedGeneration: s.cluster.Generation,
 		LastTransitionTime: now,
 		Reason:             "ClusterNotReady",
-		Message:            "Etcd cluster is not yet available",
+		Message:            "Cluster is not yet available",
 	}
 
-	if s.memberListResp != nil && len(s.memberListResp.Members) > 0 {
-		healthyCount := 0
-		for _, health := range s.memberHealth {
-			if health.Health {
-				healthyCount++
-			}
-		}
-
-		quorum := (len(s.memberListResp.Members) / 2) + 1
-		if healthyCount >= quorum {
+	if s.sts != nil && s.memberListResp != nil && len(s.memberListResp.Members) > 0 {
+		// Issue a linearizable read against the cluster endpoints. A
+		// linearizable Get requires a Raft leader and quorum acknowledgement,
+		// so a successful response is sufficient proof that the cluster is
+		// available — no manual (N/2)+1 arithmetic needed.
+		eps := clientEndpointsFromStatefulsets(s.sts)
+		if etcdutils.IsClusterAvailable(eps) {
 			availableCondition.Status = metav1.ConditionTrue
 			availableCondition.Reason = "ClusterAvailable"
-			availableCondition.Message = fmt.Sprintf("Etcd cluster has %d/%d healthy members with quorum", healthyCount, len(s.memberListResp.Members))
+			availableCondition.Message = fmt.Sprintf("Cluster is available: linearizable read succeeded (%d members)", len(s.memberListResp.Members))
 		} else {
-			availableCondition.Message = fmt.Sprintf("Etcd cluster has %d/%d healthy members, quorum requires %d", healthyCount, len(s.memberListResp.Members), quorum)
+			availableCondition.Message = fmt.Sprintf("Cluster is unavailable: no member responded to a linearizable read (%d members)", len(s.memberListResp.Members))
 		}
 	}
 
@@ -509,7 +506,7 @@ func (r *EtcdClusterReconciler) updateConditions(s *reconcileState) {
 		ObservedGeneration: s.cluster.Generation,
 		LastTransitionTime: now,
 		Reason:             "ClusterStable",
-		Message:            "Etcd cluster is stable",
+		Message:            "Cluster is stable",
 	}
 
 	if s.sts != nil && s.sts.Spec.Replicas != nil {
@@ -552,8 +549,15 @@ func (r *EtcdClusterReconciler) updateConditions(s *reconcileState) {
 	if s.memberListResp != nil && len(s.memberHealth) > 0 {
 		unhealthyMembers := []string{}
 		for _, health := range s.memberHealth {
-			if !health.Health && health.Status != nil {
-				unhealthyMembers = append(unhealthyMembers, fmt.Sprintf("%x", health.Status.Header.MemberId))
+			if !health.Health {
+				// Prefer the member ID when Status is available; fall back to
+				// the endpoint so members that failed Status() are never
+				// silently omitted from the degraded report.
+				if health.Status != nil {
+					unhealthyMembers = append(unhealthyMembers, fmt.Sprintf("%x", health.Status.Header.MemberId))
+				} else {
+					unhealthyMembers = append(unhealthyMembers, health.Ep)
+				}
 			}
 		}
 

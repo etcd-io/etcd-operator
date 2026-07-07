@@ -323,6 +323,31 @@ func TestEpHealthString(t *testing.T) {
 	assert.Equal(t, expected, eh.String())
 }
 
+func TestIsClusterAvailable(t *testing.T) {
+	e := setupEtcdServer(t)
+	defer e.Close()
+
+	t.Run("ReturnsTrueForHealthyCluster", func(t *testing.T) {
+		eps := []string{"http://localhost:2379"}
+		assert.True(t, IsClusterAvailable(eps))
+	})
+
+	t.Run("ReturnsFalseForUnreachableEndpoint", func(t *testing.T) {
+		eps := []string{"http://invalid:2379"}
+		assert.False(t, IsClusterAvailable(eps))
+	})
+
+	t.Run("ReturnsFalseForEmptyEndpoints", func(t *testing.T) {
+		assert.False(t, IsClusterAvailable([]string{}))
+	})
+
+	t.Run("SkipsUnreachableMemberAndSucceedsOnHealthyOne", func(t *testing.T) {
+		// First endpoint is unreachable, second is the real cluster.
+		eps := []string{"http://invalid:2379", "http://localhost:2379"}
+		assert.True(t, IsClusterAvailable(eps))
+	})
+}
+
 func TestHealthReportSwap(t *testing.T) {
 	healthReports := healthReport{
 		{Ep: "http://localhost:2379", Health: true},
