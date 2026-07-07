@@ -159,9 +159,16 @@ func TestSnapshotCollectorConditionalAbsence(t *testing.T) {
 		metricPrefix+"drift_divergent_keys",
 		metricPrefix+"drift_orphan_keys",
 		metricPrefix+"last_reconcile_timestamp_seconds",
-		metricPrefix+"forced_resync_total",
 	))
 	// The one-hots are always fully emitted, even before Run sets a phase.
 	require.Equal(t, 6, testutil.CollectAndCount(c, metricPrefix+"phase"))
 	require.Equal(t, 5, testutil.CollectAndCount(c, metricPrefix+"last_error_class"))
+	// forced_resync_total is born at 0 for every known reason so increase()
+	// can see the first resync (a counter's first sample yields no delta).
+	require.NoError(t, testutil.CollectAndCompare(c, strings.NewReader(fmt.Sprintf(`
+# HELP %[1]sforced_resync_total Forced resyncs by trigger reason.
+# TYPE %[1]sforced_resync_total counter
+%[1]sforced_resync_total{reason="ClusterIDMismatch"} 0
+%[1]sforced_resync_total{reason="Compacted"} 0
+`, metricPrefix)), metricPrefix+"forced_resync_total"))
 }

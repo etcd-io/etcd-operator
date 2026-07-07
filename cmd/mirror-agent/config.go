@@ -260,9 +260,8 @@ func parseQuantityBytes(name, s string) (int64, error) {
 }
 
 // reconcilePeriod is the spec.reconciliation → Config.ReconcileInterval
-// translation assigned to this rung (see DefaultReconcilePeriod in
-// pkg/mirroragent): disabled → 0 regardless of interval; enabled with no
-// interval → the 1h default.
+// translation (see DefaultReconcilePeriod in pkg/mirroragent): disabled → 0
+// regardless of interval; enabled with no interval → the 1h default.
 func reconcilePeriod(enabled bool, interval time.Duration) time.Duration {
 	switch {
 	case !enabled:
@@ -332,6 +331,14 @@ func readAuthFiles(side, usernameFile, passwordFile string) (string, string, err
 	password, err := readSecretFile(passwordFile)
 	if err != nil {
 		return "", "", fmt.Errorf("--%s-password-file: %w", side, err)
+	}
+	// clientv3 silently skips authentication unless BOTH are non-empty, so an
+	// accidentally empty mounted file must fail here, not dial unauthenticated.
+	if username == "" {
+		return "", "", fmt.Errorf("--%s-username-file %s is empty", side, usernameFile)
+	}
+	if password == "" {
+		return "", "", fmt.Errorf("--%s-password-file %s is empty", side, passwordFile)
 	}
 	return username, password, nil
 }

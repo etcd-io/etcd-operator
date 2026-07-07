@@ -71,9 +71,9 @@ const (
 	DefaultRequestTimeout = 30 * time.Second
 	DefaultBackoffInitial = 1 * time.Second
 	DefaultBackoffMax     = 30 * time.Second
-	// DefaultReconcilePeriod is the spec→Config translation default for
-	// spec.reconciliation.enabled with a nil interval (wired in the
-	// agent-binary rung); the engine itself treats 0 as disabled.
+	// DefaultReconcilePeriod is the spec→Config translation default that
+	// cmd/mirror-agent applies for spec.reconciliation.enabled with a nil
+	// interval; the engine itself treats 0 as disabled.
 	DefaultReconcilePeriod = time.Hour
 
 	// DefaultWatchBufferBytes bounds the in-memory replay buffer for watch

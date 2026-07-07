@@ -96,6 +96,11 @@ func TestCertExpiryFilesOnlyConfigured(t *testing.T) {
 		&sideFlags{side: sideTarget},
 	)
 	require.Equal(t, []certFile{{side: sideSource, kind: certKindCA, path: "/mnt/ca.crt"}}, files)
+
+	// A tls=false side never feeds the gauge, even with file flags set
+	// (buildTLSInfo rejects that combination before the tracker exists).
+	require.Empty(t, certExpiryFiles(
+		&sideFlags{side: sideSource, certFile: "/mnt/tls.crt", caFile: "/mnt/ca.crt"}))
 }
 
 func TestEarliestNotAfterNoCertificate(t *testing.T) {

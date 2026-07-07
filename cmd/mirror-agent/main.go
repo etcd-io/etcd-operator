@@ -105,6 +105,10 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// Once the first signal cancels ctx, restore the default disposition so a
+	// second SIGINT/SIGTERM kills a wedged shutdown — the same escape hatch
+	// ctrl.SetupSignalHandler gives the manager binary.
+	context.AfterFunc(ctx, stop)
 	if err := run(ctx, f, nil); err != nil {
 		setupLog.Error(err, "mirror-agent failed")
 		os.Exit(1)
@@ -165,15 +169,20 @@ func run(ctx context.Context, f *agentFlags, onListen func(net.Addr)) error {
 	var runErr error
 	select {
 	case runErr = <-runDone:
-		// Terminal engine state (drained or permanent failure): LINGER,
-		// keep serving the observability surface until the supervisor
-		// signals — see the package doc's lifecycle contract.
-		if runErr == nil {
-			setupLog.Info("drain completed; serving terminal status until signalled")
-		} else {
-			setupLog.Error(runErr, "engine failed permanently; serving terminal status until signalled")
+		// Guard against the race where the signal and Run's return are
+		// simultaneous and select picked this branch: a cancelled run is a
+		// clean shutdown, not a terminal state to linger on and log about.
+		if ctx.Err() == nil && !isCancellation(runErr) {
+			// Terminal engine state (drained or permanent failure): LINGER,
+			// keep serving the observability surface until the supervisor
+			// signals — see the package doc's lifecycle contract.
+			if runErr == nil {
+				setupLog.Info("drain completed; serving terminal status until signalled")
+			} else {
+				setupLog.Error(runErr, "engine failed permanently; serving terminal status until signalled")
+			}
+			<-ctx.Done()
 		}
-		<-ctx.Done()
 	case <-ctx.Done():
 		runErr = <-runDone
 	}
@@ -182,10 +191,16 @@ func run(ctx context.Context, f *agentFlags, onListen func(net.Addr)) error {
 	defer cancel()
 	_ = srv.Shutdown(shutCtx)
 
-	if runErr != nil && !errors.Is(runErr, context.Canceled) && !errors.Is(runErr, context.DeadlineExceeded) {
+	if runErr != nil && !isCancellation(runErr) {
 		return fmt.Errorf("engine failed permanently: %w", runErr)
 	}
 	return nil
+}
+
+// isCancellation reports whether Run's error is context cancellation — a
+// clean signal shutdown, never a permanent engine failure.
+func isCancellation(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // buildClient dials one side per its flags: normalized endpoints, TLS from

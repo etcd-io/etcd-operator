@@ -48,6 +48,11 @@ type certFile struct {
 func certExpiryFiles(sides ...*sideFlags) []certFile {
 	var out []certFile
 	for _, s := range sides {
+		if !s.tls {
+			// buildTLSInfo rejects material flags without --<side>-tls; this
+			// guard keeps the gauge from ever vouching for unused files.
+			continue
+		}
 		if s.certFile != "" {
 			out = append(out, certFile{side: s.side, kind: certKindClient, path: s.certFile})
 		}

@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	crlog "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -105,11 +106,15 @@ func TestLiveAgentEndpoints(t *testing.T) {
 	}
 
 	// Poll /statusz until the engine reaches steady state with applies.
+	// assert (not require) so the failure message can read snap AFTER the
+	// polling — require.Eventually's msgAndArgs are copied before it.
 	var snap mirroragent.Snapshot
-	require.Eventually(t, func() bool {
+	if !assert.Eventually(t, func() bool {
 		snap = getStatusz(t, base)
 		return snap.Phase == mirroragent.PhaseSyncing && snap.Watermark > 0 && snap.KeysAppliedTotal > 0
-	}, 30*time.Second, 100*time.Millisecond, "last snapshot: %+v", snap)
+	}, 30*time.Second, 100*time.Millisecond) {
+		t.Fatalf("engine never reached steady state; last snapshot: %+v", snap)
+	}
 	require.NotZero(t, snap.SourceClusterID)
 	require.NotZero(t, snap.TargetClusterID)
 	require.False(t, snap.LastProgressTime.IsZero())

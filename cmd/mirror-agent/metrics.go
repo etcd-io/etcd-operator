@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"slices"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -39,6 +40,13 @@ var (
 		mirroragent.ClassTransient, mirroragent.ClassThrottle,
 		mirroragent.ClassResync, mirroragent.ClassQuota,
 		mirroragent.ClassPermanent,
+	}
+	// allResyncReasons pre-initializes every forced_resync_total series at 0:
+	// forced resyncs are rare singular events, and rate()/increase() cannot
+	// see a counter's first sample, so a series born at 1 hides the resync
+	// that usually matters most.
+	allResyncReasons = []mirroragent.ResyncReason{
+		mirroragent.ResyncReasonCompacted, mirroragent.ResyncReasonClusterIDMismatch,
 	}
 )
 
@@ -144,8 +152,13 @@ func (c *snapshotCollector) Collect(ch chan<- prometheus.Metric) {
 	gauge(descInitialSyncKeys, float64(s.InitialSyncKeyCount))
 	gauge(descInitialSyncExpected, float64(s.InitialSyncTotalKeyCount))
 	gauge(descLeaseBackedKeys, float64(s.LeaseBackedKeyCount))
+	for _, reason := range allResyncReasons {
+		counter(descForcedResync, float64(s.ForcedResyncCountByReason[reason]), string(reason))
+	}
 	for reason, n := range s.ForcedResyncCountByReason {
-		counter(descForcedResync, float64(n), string(reason))
+		if !slices.Contains(allResyncReasons, reason) { // a reason newer than this list
+			counter(descForcedResync, float64(n), string(reason))
+		}
 	}
 	counter(descScanRestart, float64(s.ScanRestartCount))
 	gauge(descResyncLoop, boolGauge(s.ResyncLoopDetected))

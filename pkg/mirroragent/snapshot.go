@@ -91,21 +91,24 @@ type CutoverStatus struct {
 }
 
 // Snapshot is a point-in-time copy of the agent's state, safe to retain.
-// Later rungs (the agent binary's /statusz, the controller's status sync)
-// poll this instead of scraping internals.
+// cmd/mirror-agent's /statusz and the controller's status sync poll this
+// instead of scraping internals.
 //
 // The JSON tags ARE the /statusz wire contract: the agent binary marshals a
 // Snapshot verbatim and the controller decodes into this same type, so the
-// two rungs cannot drift. Zero times are omitted (omitzero = "not yet").
+// two ends cannot drift. Zero times are omitted (omitzero = "not yet").
 type Snapshot struct {
 	Phase Phase `json:"phase"`
 
 	SourceVersion string `json:"sourceVersion"`
 	TargetVersion string `json:"targetVersion"`
 	// SourceClusterID / TargetClusterID as probed at connect (0 = not yet
-	// probed). Both are bound into the checkpoint.
-	SourceClusterID uint64 `json:"sourceClusterID"`
-	TargetClusterID uint64 `json:"targetClusterID"`
+	// probed). Both are bound into the checkpoint. JSON strings, not numbers:
+	// cluster IDs are random uint64s beyond 2^53, which float64-based JSON
+	// consumers (jq, JavaScript) would round — the same convention as the
+	// checkpoint and etcd's gRPC gateway.
+	SourceClusterID uint64 `json:"sourceClusterID,string"`
+	TargetClusterID uint64 `json:"targetClusterID,string"`
 
 	// Watermark is the checkpoint watermark: the source revision through
 	// which the target is caught up, advanced by applies AND by watch

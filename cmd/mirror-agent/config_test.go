@@ -172,4 +172,13 @@ func TestReadAuthFiles(t *testing.T) {
 
 	_, _, err = readAuthFiles(sideSource, filepath.Join(dir, "missing"), passFile)
 	require.Error(t, err)
+
+	// Empty content (or a lone newline) would make clientv3 silently skip
+	// authentication; it must fail startup instead.
+	emptyFile := filepath.Join(dir, "empty")
+	require.NoError(t, os.WriteFile(emptyFile, []byte("\n"), 0o600))
+	_, _, err = readAuthFiles(sideSource, emptyFile, passFile)
+	require.ErrorContains(t, err, "--source-username-file "+emptyFile+" is empty")
+	_, _, err = readAuthFiles(sideTarget, userFile, emptyFile)
+	require.ErrorContains(t, err, "--target-password-file "+emptyFile+" is empty")
 }

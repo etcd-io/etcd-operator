@@ -18,6 +18,7 @@ package main
 
 import (
 	"fmt"
+	"strings"
 
 	"go.etcd.io/etcd/client/pkg/v3/transport"
 )
@@ -37,6 +38,13 @@ import (
 // secretRef in the CRD.
 func buildTLSInfo(side *sideFlags) (transport.TLSInfo, bool, error) {
 	if !side.tls {
+		// TLS material without --<side>-tls would be silently dropped and the
+		// client would dial cleartext; fail fast instead, like the https://
+		// endpoint scheme check.
+		if flags := tlsMaterialFlags(side); len(flags) > 0 {
+			return transport.TLSInfo{}, false, fmt.Errorf(
+				"%s requires --%s-tls", strings.Join(flags, ", "), side.side)
+		}
 		return transport.TLSInfo{}, false, nil
 	}
 	if (side.certFile == "") != (side.keyFile == "") {
@@ -58,4 +66,22 @@ func buildTLSInfo(side *sideFlags) (transport.TLSInfo, bool, error) {
 		ServerName:         side.serverName,
 		InsecureSkipVerify: side.insecureSkipVerify,
 	}, true, nil
+}
+
+// tlsMaterialFlags names the TLS flags a side has set that are meaningless
+// without --<side>-tls.
+func tlsMaterialFlags(side *sideFlags) []string {
+	var out []string
+	add := func(set bool, name string) {
+		if set {
+			out = append(out, "--"+side.side+"-"+name)
+		}
+	}
+	add(side.certFile != "", "cert-file")
+	add(side.keyFile != "", "key-file")
+	add(side.caFile != "", "ca-file")
+	add(side.caBundleFile != "", "ca-bundle-file")
+	add(side.serverName != "", "server-name")
+	add(side.insecureSkipVerify, "insecure-skip-verify")
+	return out
 }

@@ -67,4 +67,23 @@ func TestBuildTLSInfo(t *testing.T) {
 		_, _, err := buildTLSInfo(&sideFlags{side: sideSource, tls: true, certFile: "/mnt/tls/tls.crt"})
 		require.ErrorContains(t, err, "must be set together")
 	})
+
+	// TLS material without --<side>-tls is a hard error, never a silent
+	// cleartext downgrade.
+	t.Run("material flags require tls", func(t *testing.T) {
+		_, _, err := buildTLSInfo(&sideFlags{
+			side:     sideSource,
+			certFile: "/mnt/tls/tls.crt", keyFile: "/mnt/tls/tls.key", caFile: "/mnt/tls/ca.crt",
+		})
+		require.ErrorContains(t, err, "--source-cert-file, --source-key-file, --source-ca-file requires --source-tls")
+
+		for _, side := range []*sideFlags{
+			{side: sideTarget, caBundleFile: "/mnt/bundle/ca.crt"},
+			{side: sideTarget, serverName: "etcd.example.com"},
+			{side: sideTarget, insecureSkipVerify: true},
+		} {
+			_, _, err := buildTLSInfo(side)
+			require.ErrorContains(t, err, "requires --target-tls")
+		}
+	})
 }

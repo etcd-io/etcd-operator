@@ -117,6 +117,10 @@ func TestSnapshotJSONWireNames(t *testing.T) {
 	}
 
 	fullKeys := keys(full)
+	// Cluster IDs are JSON strings: as uint64s beyond 2^53 they would round
+	// through float64-based consumers (jq, JavaScript) as plain numbers.
+	require.Equal(t, "1", fullKeys["sourceClusterID"])
+	require.Equal(t, "2", fullKeys["targetClusterID"])
 	wantFull := []string{
 		"phase", "sourceVersion", "targetVersion", "sourceClusterID", "targetClusterID",
 		"watermark", "sourceRevision", "lastProgressTime",
