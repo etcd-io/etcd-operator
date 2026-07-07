@@ -224,12 +224,12 @@ func (a *Agent) genesis(ctx context.Context, st startState) error {
 	// The mandatory mark-and-sweep: the OverwriteAndPrune genesis pass and
 	// every forced resync, cleared only once the pass completed.
 	if a.prunePending {
-		drift, err := a.reconcilePass(ctx, true, true)
-		if err != nil {
+		// No paced watch cancel: during genesis the watch drains into the
+		// byte-bounded replay buffer, so the pass cannot grow it unread.
+		if err := a.reconcilePass(ctx, true, true, false); err != nil {
 			return err
 		}
 		a.prunePending = false
-		a.recordDrift(drift)
 		// This sweep produced the same signal as a periodic pass; push the
 		// next periodic deadline a full interval out.
 		a.scheduleNextReconcile()

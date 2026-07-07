@@ -17,6 +17,7 @@ limitations under the License.
 package mirroragent_test
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -47,9 +48,13 @@ func TestPeriodicReconcileRepairsDrift(t *testing.T) {
 		func(s mirroragent.Snapshot) bool { return !s.LastReconcileTime.IsZero() })
 
 	ctx := t.Context()
-	_, err := dst.Put(ctx, "/dst/key-0000", "tampered")
-	require.NoError(t, err)
-	_, err = dst.Delete(ctx, "/dst/key-0001")
+	// One commit revision for both damages: drift is replaced wholesale each
+	// pass, so damages split across a pass boundary would never appear in
+	// the same drift and the conjunction below would time out.
+	_, err := dst.Txn(ctx).Then(
+		clientv3.OpPut("/dst/key-0000", "tampered"),
+		clientv3.OpDelete("/dst/key-0001"),
+	).Commit()
 	require.NoError(t, err)
 
 	snap := waitSnap(t, r.agent, 20*time.Second, "drift observed by the periodic pass",
@@ -145,6 +150,44 @@ func TestPeriodicReconcileAfterGenesisOnly(t *testing.T) {
 		"no periodic pass may run before the genesis scan completed")
 	assert.EqualValues(t, 300, snap.SourceKeyCount)
 	assert.EqualValues(t, 300, snap.TargetKeyCount)
+}
+
+// TestPeriodicReconcilePacedRepairRecovers: a periodic pass repairing more
+// than a few seconds' worth of MaxOpsPerSecond pacing cancels the live
+// source watch mid-pass (the bound on clientv3's unbounded per-watcher
+// buffer while the pass leaves the watch unread); the tail re-watches from
+// the checkpoint watermark, so the repair still converges and live
+// replication resumes afterwards.
+func TestPeriodicReconcilePacedRepairRecovers(t *testing.T) {
+	src := startEtcd(t, nil)
+	dst := startEtcd(t, nil)
+	cfg := baseCfg("/src/", "/dst/")
+	cfg.ReconcileInterval = 300 * time.Millisecond
+	cfg.MaxOpsPerSecond = 30 // 100 repairs > 3s of pacing: mid-pass cancel
+
+	const n = 100
+	want := putN(t, src, cfg.SourcePrefix, cfg.TargetPrefix, n)
+	r := startAgent(t, cfg, src, dst)
+	waitTargetData(t, dst, cfg, 30*time.Second, want)
+
+	// One commit revision so a single pass observes all n divergent keys and
+	// crosses the paced-repair cancel threshold within that pass.
+	ctx := t.Context()
+	ops := make([]clientv3.Op, 0, n)
+	for i := range n {
+		ops = append(ops, clientv3.OpPut(fmt.Sprintf("/dst/key-%04d", i), "tampered"))
+	}
+	_, err := dst.Txn(ctx).Then(ops...).Commit()
+	require.NoError(t, err)
+
+	waitTargetData(t, dst, cfg, 30*time.Second, want)
+	// The watch the pass cancelled was re-established from the watermark: a
+	// fresh source write still replicates.
+	_, err = src.Put(ctx, cfg.SourcePrefix+"after-repair", "live")
+	require.NoError(t, err)
+	want[cfg.TargetPrefix+"after-repair"] = "live"
+	waitTargetData(t, dst, cfg, 20*time.Second, want)
+	assert.NotEqual(t, mirroragent.PhaseFailed, r.agent.Snapshot().Phase)
 }
 
 // TestPeriodicReconcileFenceAbort: a fence taken over by a newer agent

@@ -72,10 +72,12 @@ type Agent struct {
 	prunePending bool
 
 	// watchCancel cancels the live source watch; applyFenced invokes it via
-	// cancelSourceWatch on sustained target backoff so clientv3's unbounded
+	// cancelSourceWatch on sustained target backoff, and a long paced diff
+	// pass via maybeCancelWatchForPacedRepair, so clientv3's unbounded
 	// per-watcher response buffer cannot grow for the duration of a target
-	// stall. Owned by the Run goroutine (set by genesis/tail, consumed by
-	// the apply path, which runs on the same goroutine).
+	// stall or a paced repair. Owned by the Run goroutine (set by
+	// genesis/tail, consumed by the apply path, which runs on the same
+	// goroutine).
 	watchCancel func()
 
 	drainReq atomic.Bool

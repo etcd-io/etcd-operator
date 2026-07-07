@@ -149,9 +149,9 @@ type Snapshot struct {
 	// observed by the most recent reconciliation, prune, or drain
 	// verification pass (excluded prefixes and the reserved checkpoint key
 	// not counted). Populated by every pass that runs regardless of config —
-	// forced-resync sweeps, the OverwriteAndPrune genesis pass, drain
-	// verification, and the periodic pass when Config.ReconcileInterval
-	// enables it — but NOT refreshed outside those passes: a healthy
+	// forced-resync sweeps, the OverwriteAndPrune genesis pass, and drain
+	// verification — plus the periodic pass when Config.ReconcileInterval
+	// enables it, but NOT refreshed outside those passes: a healthy
 	// mirror that never resyncs only gets counts from an enabled periodic
 	// pass. This is the equality signal the controller's InvariantsHeld
 	// condition reads.

@@ -38,18 +38,22 @@ import (
 // source counterpart. The reserved checkpoint key and images of excluded
 // prefixes are never touched, a sibling link's fence key aborts the pass
 // (PrefixConflictError) instead of being pruned, and every repair/delete
-// rides the same fenced Txn path as applies.
-func (a *Agent) reconcilePass(ctx context.Context, repair, deleteOrphans bool) (Drift, error) {
+// rides the same fenced Txn path as applies. cancelWatchWhenPaced is set by
+// callers running while the live source watch is open and unread (see
+// maybeCancelWatchForPacedRepair). On success the pass publishes its counts,
+// completion time, and drift in one Snapshot update.
+func (a *Agent) reconcilePass(ctx context.Context, repair, deleteOrphans, cancelWatchWhenPaced bool) error {
 	drift := Drift{Repaired: repair || deleteOrphans}
 	dstStart, dstEnd := a.rw.destRange()
 	b := newBatcher(a.cfg.MaxTxnOps, a.cfg.TxnFlushBytes)
 	dstCursor := dstStart
 	var srcSeen, dstSeen int64
+	var pacedOps int
 	pager := &sourcePager{a: a, ranges: a.rw.scanRanges()}
 	for {
 		spage, more, err := pager.next(ctx)
 		if err != nil {
-			return drift, err
+			return err
 		}
 		// The window of target keys this source page is authoritative for;
 		// the last page's window swallows the tail of the destination range.
@@ -72,7 +76,7 @@ func (a *Agent) reconcilePass(ctx context.Context, repair, deleteOrphans bool) (
 				clientv3.WithLimit(int64(a.cfg.PageKeyLimit)),
 				clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend))
 			if terr != nil {
-				return drift, terr
+				return terr
 			}
 			var ops []kvOp
 			for _, kv := range tresp.Kvs {
@@ -84,7 +88,7 @@ func (a *Agent) reconcilePass(ctx context.Context, repair, deleteOrphans bool) (
 				want, ok := expected[k]
 				if !ok {
 					if cerr := a.checkForeignFence(k, kv.Value); cerr != nil {
-						return drift, cerr
+						return cerr
 					}
 					drift.OrphanKeys++
 					if deleteOrphans {
@@ -101,8 +105,10 @@ func (a *Agent) reconcilePass(ctx context.Context, repair, deleteOrphans bool) (
 				}
 			}
 			if err := a.enqueueRepairs(ctx, b, ops); err != nil {
-				return drift, err
+				return err
 			}
+			pacedOps += len(ops)
+			a.maybeCancelWatchForPacedRepair(cancelWatchWhenPaced, pacedOps)
 			if len(tresp.Kvs) == 0 || !tresp.More {
 				break
 			}
@@ -117,8 +123,10 @@ func (a *Agent) reconcilePass(ctx context.Context, repair, deleteOrphans bool) (
 			}
 		}
 		if err := a.enqueueRepairs(ctx, b, missing); err != nil {
-			return drift, err
+			return err
 		}
+		pacedOps += len(missing)
+		a.maybeCancelWatchForPacedRepair(cancelWatchWhenPaced, pacedOps)
 		dstCursor = winEnd
 		if !more {
 			break
@@ -126,13 +134,47 @@ func (a *Agent) reconcilePass(ctx context.Context, repair, deleteOrphans bool) (
 	}
 	if fs := b.flush(); fs != nil {
 		if err := a.applyRepairFlush(ctx, fs); err != nil {
-			return drift, err
+			return err
 		}
 	}
-	// Per-side key counts as observed by this pass (pre-repair): the
-	// equality signal behind the InvariantsHeld condition.
-	a.recordKeyCounts(srcSeen, dstSeen)
-	return drift, nil
+	// Publish the pass outcome in ONE update: the per-side key counts as
+	// observed by this pass (pre-repair — the equality signal behind the
+	// InvariantsHeld condition), the completion timestamp, and the drift.
+	// The API contract binds the reconciliation time and drift as one
+	// record, so a concurrent Snapshot must never pair this pass's
+	// counts/timestamp with a previous pass's drift.
+	a.update(func(s *Snapshot) {
+		s.SourceKeyCount = srcSeen
+		s.TargetKeyCount = dstSeen
+		s.LastReconcileTime = time.Now()
+		s.LastReconcileDrift = &drift
+	})
+	return nil
+}
+
+// pacedRepairSecondsBeforeWatchCancel is how many seconds' worth of
+// MaxOpsPerSecond pacing a diff pass may queue as repairs before the live
+// source watch is cancelled (maybeCancelWatchForPacedRepair).
+const pacedRepairSecondsBeforeWatchCancel = 3
+
+// maybeCancelWatchForPacedRepair bounds clientv3's unbounded per-watcher
+// buffer during a diff pass that runs while the live source watch is open
+// and UNREAD — the periodic pass and the drain repair, both inline in
+// consume; the genesis sweep's watch drains into the byte-bounded replay
+// buffer instead and passes enabled=false. applyOps paces every repair
+// flush by MaxOpsPerSecond, so a healthy pass repairing D keys leaves the
+// watch unread for ~D/MaxOpsPerSecond seconds while the source keeps
+// writing — a stall the backoff-driven cancels in applyFenced never see.
+// Once the queued repairs exceed a few seconds of pacing, cancel the watch:
+// the tail re-watches from the checkpoint watermark (the pass never moves
+// it), and a compacted resume revision escalates to a forced resync whose
+// mandatory sweep supersedes the pass anyway.
+func (a *Agent) maybeCancelWatchForPacedRepair(enabled bool, pacedOps int) {
+	if !enabled || a.cfg.MaxOpsPerSecond <= 0 ||
+		pacedOps <= pacedRepairSecondsBeforeWatchCancel*a.cfg.MaxOpsPerSecond {
+		return
+	}
+	a.cancelSourceWatch()
 }
 
 // enqueueRepairs pushes repair/prune ops through the shared batcher,
@@ -241,21 +283,19 @@ func (p *sourcePager) fetch(ctx context.Context) (*srcPage, error) {
 }
 
 // recordKeyCounts publishes the per-side in-scope key counts observed by a
-// reconciliation, prune, or drain verification pass. Counts are only ever
-// produced by such a pass, so the pass-completion timestamp rides along —
-// the freshness input to the controller's InvariantsHeld condition.
+// count-only drain verification, timestamped as a pass completion — the
+// freshness input to the controller's InvariantsHeld condition. It never
+// touches LastReconcileDrift (count equality cannot attest DivergentKeys);
+// full diff passes publish counts, timestamp, and drift atomically inside
+// reconcilePass instead. completeDrain stamps counts BEFORE its equality
+// check, so a failed drain leaves a fresh timestamp beside unequal counts:
+// freshness alone never attests a healthy pass.
 func (a *Agent) recordKeyCounts(srcN, dstN int64) {
 	a.update(func(s *Snapshot) {
 		s.SourceKeyCount = srcN
 		s.TargetKeyCount = dstN
 		s.LastReconcileTime = time.Now()
 	})
-}
-
-// recordDrift publishes the outcome of a completed FULL diff pass. Count-only
-// verifications never call this: count equality cannot attest DivergentKeys.
-func (a *Agent) recordDrift(d Drift) {
-	a.update(func(s *Snapshot) { s.LastReconcileDrift = &d })
 }
 
 // reconcileDue reports whether the periodic pass should run at now: never
@@ -285,20 +325,23 @@ func (a *Agent) scheduleNextReconcile() {
 // the Run goroutine — never concurrently with a genesis scan (consume is not
 // running), a forced-resync sweep (same), a drain (gated), or itself. A
 // drain-gated fire still re-arms the deadline so the tail's timer never spins
-// on a stale one. Errors propagate through consume → tail → Run so
-// periodic-pass failures ride the existing Classify taxonomy: transient and
-// throttle back off in tail (the pass retries at the still-due deadline),
-// Resync forces genesis, Permanent fails the agent.
+// on a stale one. Error flow: transient, throttle, and quota errors are
+// absorbed INSIDE the pass by getRetry/applyFenced — the pass blocks until
+// they heal or ctx cancels (a wedged pass cannot be preempted by a drain
+// check) — and no pass read is revision-pinned, so what actually escapes
+// through consume → tail → Run is ClassPermanent (fails the agent) or ctx
+// cancellation. tail's transient/Resync arms remain as taxonomy-consistent
+// safety nets; the transient arm also recovers the watch-closed error after
+// a pass cancelled the source watch (maybeCancelWatchForPacedRepair) by
+// re-watching from the checkpoint watermark.
 func (a *Agent) maybeReconcile(ctx context.Context) error {
 	if !a.reconcileDue(time.Now()) {
 		a.scheduleNextReconcile()
 		return nil
 	}
-	drift, err := a.reconcilePass(ctx, true, a.cfg.ReconcileDeleteOrphans)
-	if err != nil {
+	if err := a.reconcilePass(ctx, true, a.cfg.ReconcileDeleteOrphans, true); err != nil {
 		return err
 	}
-	a.recordDrift(drift)
 	a.scheduleNextReconcile()
 	return nil
 }

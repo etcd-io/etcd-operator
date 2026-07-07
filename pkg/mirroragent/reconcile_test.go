@@ -93,3 +93,33 @@ func TestScheduleNextReconcile(t *testing.T) {
 	a.scheduleNextReconcile()
 	assert.False(t, a.nextReconcile.Before(first), "re-scheduling must push the deadline out")
 }
+
+// TestMaybeCancelWatchForPacedRepair: the paced-repair watch cancel fires
+// only for a pass that enabled it (not the genesis sweep, whose watch drains
+// into the replay buffer), only under a MaxOpsPerSecond pacer, and only past
+// the threshold's worth of queued repair ops.
+func TestMaybeCancelWatchForPacedRepair(t *testing.T) {
+	const rate = 100
+	threshold := pacedRepairSecondsBeforeWatchCancel * rate
+	cases := []struct {
+		name    string
+		enabled bool
+		maxOps  int
+		ops     int
+		want    bool
+	}{
+		{name: "past threshold", enabled: true, maxOps: rate, ops: threshold + 1, want: true},
+		{name: "at threshold", enabled: true, maxOps: rate, ops: threshold, want: false},
+		{name: "disabled for the pass", enabled: false, maxOps: rate, ops: threshold + 1, want: false},
+		{name: "unpaced config", enabled: true, maxOps: 0, ops: threshold + 1, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := &Agent{cfg: Config{MaxOpsPerSecond: tc.maxOps}}
+			var cancelled bool
+			a.watchCancel = func() { cancelled = true }
+			a.maybeCancelWatchForPacedRepair(tc.enabled, tc.ops)
+			assert.Equal(t, tc.want, cancelled)
+		})
+	}
+}

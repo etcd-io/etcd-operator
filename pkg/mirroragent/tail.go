@@ -277,11 +277,9 @@ func (a *Agent) completeDrain(ctx context.Context) error {
 	if srcN != dstN {
 		// One repair+prune pass and a recount; a persisting mismatch is real
 		// divergence and must fail the drain rather than cut over.
-		drift, rerr := a.reconcilePass(ctx, true, true)
-		if rerr != nil {
+		if rerr := a.reconcilePass(ctx, true, true, true); rerr != nil {
 			return rerr
 		}
-		a.recordDrift(drift)
 		if srcN, dstN, err = a.verifyCounts(ctx); err != nil {
 			return err
 		}

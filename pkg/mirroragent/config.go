@@ -186,8 +186,10 @@ type Config struct {
 	// executed inline on the steady-state tail loop — never concurrently
 	// with the genesis scan, a forced-resync sweep, or a drain (a requested
 	// drain's own verification supersedes it) — and re-scheduled a full
-	// interval after any pass (periodic or mandatory) completes, keeping the
-	// key counts within the CRD's 2x-interval freshness contract whenever
+	// interval after each periodic pass and after the genesis/forced-resync
+	// sweep (a drain's verification is terminal and never re-arms; a
+	// requested drain gates the periodic pass anyway), keeping the key
+	// counts within the CRD's 2x-interval freshness contract whenever
 	// passes complete faster than the interval. Independent of this, one
 	// reconciliation-with-delete pass always runs after any forced resync
 	// (mark-and-sweep), as the OverwriteAndPrune genesis pass, and before
