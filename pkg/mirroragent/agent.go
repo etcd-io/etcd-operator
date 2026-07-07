@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -147,6 +148,7 @@ func (a *Agent) Snapshot() Snapshot {
 		d := *a.snap.LastReconcileDrift
 		s.LastReconcileDrift = &d
 	}
+	s.ForcedResyncCountByReason = maps.Clone(a.snap.ForcedResyncCountByReason)
 	return s
 }
 
@@ -410,6 +412,10 @@ func (a *Agent) noteResync(err error) {
 	loop := a.consecutiveResyncs >= a.cfg.ResyncLoopThreshold
 	a.update(func(s *Snapshot) {
 		s.ForcedResyncCount++
+		if s.ForcedResyncCountByReason == nil {
+			s.ForcedResyncCountByReason = make(map[ResyncReason]int64, 2)
+		}
+		s.ForcedResyncCountByReason[reason]++
 		s.LastResyncReason = reason
 		s.Compacted = reason == ResyncReasonCompacted
 		if loop {

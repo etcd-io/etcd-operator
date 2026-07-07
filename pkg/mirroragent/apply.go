@@ -104,6 +104,7 @@ func (a *Agent) applyFenced(
 		if err == nil {
 			a.bo.noteSuccess()
 			a.update(func(s *Snapshot) {
+				s.KeysAppliedTotal += int64(len(ops))
 				s.Throttled = false
 				s.QuotaExhausted = false
 				s.LastError = ""
