@@ -60,6 +60,10 @@ func TestReconcileStatefulSet(t *testing.T) {
 	if *sts.Spec.Replicas != 3 {
 		t.Fatalf("expected 3 replicas, got %d", *sts.Spec.Replicas)
 	}
+
+	if sts.Spec.UpdateStrategy.Type != appsv1.OnDeleteStatefulSetStrategyType {
+		t.Fatalf("expected OnDelete update strategy, got %q", sts.Spec.UpdateStrategy.Type)
+	}
 }
 
 func TestWaitForStatefulSetReady(t *testing.T) {
@@ -580,6 +584,7 @@ func TestCreateOrPatchStatefulSetWithPodAnnotations(t *testing.T) {
 			} else {
 				assert.Equal(t, tt.expectedAnnotations, sts.Spec.Template.Annotations)
 			}
+			assert.Equal(t, appsv1.OnDeleteStatefulSetStrategyType, sts.Spec.UpdateStrategy.Type)
 			// Verify statefulset is controlled by EtcdCluster
 			require.Len(t, sts.OwnerReferences, 1)
 			require.Equal(t, sts.OwnerReferences[0].Name, ec.Name)
@@ -694,6 +699,7 @@ func TestCreateOrPatchStatefulSetWithPodLabels(t *testing.T) {
 			assert.NoError(t, err)
 			// Check that pod template has the expected labels
 			assert.Equal(t, tt.expectedLabels, sts.Spec.Template.Labels)
+			assert.Equal(t, appsv1.OnDeleteStatefulSetStrategyType, sts.Spec.UpdateStrategy.Type)
 			// Verify statefulset is controlled by EtcdCluster
 			require.Len(t, sts.OwnerReferences, 1)
 			require.Equal(t, sts.OwnerReferences[0].Name, ec.Name)
