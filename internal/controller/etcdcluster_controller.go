@@ -109,18 +109,25 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 	// Reconcile the PDB even when the health check errors: healthCheck still
 	// returns the member list for unhealthy clusters, which is exactly when
-	// disruption protection matters most.
+	// disruption protection matters most. A PDB write failure is logged but
+	// never blocks health handling or cluster reconciliation.
 	healthErr := r.performHealthChecks(ctx, state)
-	if pdbErr := reconcilePodDisruptionBudget(
+	pdbErr := reconcilePodDisruptionBudget(
 		ctx, log.FromContext(ctx), r.Client, state.cluster, state.memberListResp, r.Scheme,
-	); pdbErr != nil {
-		return ctrl.Result{}, pdbErr
+	)
+	if pdbErr != nil {
+		log.FromContext(ctx).Error(pdbErr, "Failed to reconcile PodDisruptionBudget")
 	}
 	if healthErr != nil {
 		return ctrl.Result{}, healthErr
 	}
 
-	return r.reconcileClusterState(ctx, state)
+	res, err = r.reconcileClusterState(ctx, state)
+	if err == nil && res.IsZero() && pdbErr != nil {
+		// Nothing else requeues; surface the PDB failure for backoff.
+		return res, pdbErr
+	}
+	return res, err
 }
 
 // fetchAndValidateState retrieves the EtcdCluster and its StatefulSet and ensures
