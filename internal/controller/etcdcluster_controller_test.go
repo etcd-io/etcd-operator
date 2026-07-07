@@ -27,11 +27,13 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
+	"go.etcd.io/etcd-operator/internal/etcdutils"
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
@@ -635,7 +637,8 @@ func TestReconcileClusterStateGates(t *testing.T) {
 		ec := newCluster(5)
 		sts := newSTS(1, 1, 3, 2)
 		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ec, sts).Build()
-		r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
+		recorder := events.NewFakeRecorder(10)
+		r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme, Recorder: recorder}
 
 		stored := &appsv1.StatefulSet{}
 		require.NoError(t, fakeClient.Get(ctx, client.ObjectKey{Name: ec.Name, Namespace: ec.Namespace}, stored))
@@ -649,6 +652,42 @@ func TestReconcileClusterStateGates(t *testing.T) {
 		after := &appsv1.StatefulSet{}
 		require.NoError(t, fakeClient.Get(ctx, client.ObjectKey{Name: ec.Name, Namespace: ec.Namespace}, after))
 		assert.Equal(t, oldRV, after.ResourceVersion)
+
+		select {
+		case ev := <-recorder.Events:
+			assert.Contains(t, ev, "StatefulSetNotSettled")
+		default:
+			t.Fatal("expected a StatefulSetNotSettled warning event")
+		}
+	})
+
+	t.Run("spec-driven scale-in is exempt from the settled gate", func(t *testing.T) {
+		ctx := t.Context()
+		ec := newCluster(1)
+		sts := newSTS(1, 1, 3, 2) // e.g. last pod NotReady while its etcd still answers
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ec, sts).Build()
+		r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
+
+		stored := &appsv1.StatefulSet{}
+		require.NoError(t, fakeClient.Get(ctx, client.ObjectKey{Name: ec.Name, Namespace: ec.Namespace}, stored))
+
+		// Leaderless health data: reconcile must pass the gate and fail on the leader
+		// lookup, proving the gate did not requeue the scale-in.
+		health := make([]etcdutils.EpHealth, 3)
+		for i := range health {
+			health[i] = etcdutils.EpHealth{
+				Health: true,
+				Status: &clientv3.StatusResponse{
+					Header: &etcdserverpb.ResponseHeader{MemberId: uint64(i + 1)},
+					Leader: 99,
+				},
+			}
+		}
+
+		state := &reconcileState{cluster: ec, sts: stored, memberListResp: memberListRespWithCount(3), memberHealth: health}
+		_, err := r.reconcileClusterState(ctx, state)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "couldn't find leader")
 	})
 
 	t.Run("interrupted scale-in recovery is not gated", func(t *testing.T) {
