@@ -305,7 +305,7 @@ func (r *EtcdClusterReconciler) reportNospaceAlarms(s *reconcileState) {
 		}
 		name := memberNameForID(s.memberListResp, a.MemberID)
 		r.Recorder.Eventf(s.cluster, nil, corev1.EventTypeWarning, "DatabaseQuotaExceeded", "AlarmDetected",
-			"etcd member %s has an active NOSPACE alarm; cluster is read-only. Compact and defragment, then `etcdctl alarm disarm`. Consider raising spec.quotaBackendBytes.", name)
+			"etcd member %s has an active NOSPACE alarm; cluster is read-only. Compact and defragment, then `etcdctl alarm disarm`. Consider raising spec.quotaBackendBytes; the new quota only takes effect on the next StatefulSet rollout.", name)
 	}
 }
 

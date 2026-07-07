@@ -8,3 +8,5 @@ Information about the different configuration options is available from the etcd
 ## Database size and compaction
 
 `spec.quotaBackendBytes`, `spec.autoCompactionMode` and `spec.autoCompactionRetention` render the `--quota-backend-bytes`, `--auto-compaction-mode` and `--auto-compaction-retention` flags. When unset, no flag is rendered and etcd defaults apply. A conflicting flag in `etcdOptions` still wins, following the precedence above.
+
+The operator only writes these flags when it creates or scales the StatefulSet, so changing them on a running cluster takes effect on the next StatefulSet rollout — not immediately. In particular, raising `quotaBackendBytes` alone does not clear an active NOSPACE alarm: compact, defragment and `etcdctl alarm disarm` first.
