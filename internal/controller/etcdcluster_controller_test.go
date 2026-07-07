@@ -178,6 +178,51 @@ func TestFetchAndValidateState(t *testing.T) {
 			},
 		},
 		{
+			// The template may name a version that never ran (phantom patch
+			// tag); validation runs against the observed cluster version so
+			// reverting spec.version is not misread as a downgrade.
+			name: "Rollback to observed version allowed despite bad template tag",
+			ec: &ecv1alpha1.EtcdCluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "etcd",
+					Namespace: "default",
+					UID:       "2",
+				},
+				Spec:   ecv1alpha1.EtcdClusterSpec{Size: 1, Version: "3.5.17"},
+				Status: ecv1alpha1.EtcdClusterStatus{CurrentVersion: "3.5.17"},
+			},
+			sts: &appsv1.StatefulSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "etcd",
+					Namespace: "default",
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: ecv1alpha1.GroupVersion.String(),
+							Kind:       "EtcdCluster",
+							Name:       "etcd",
+							UID:        "2",
+							Controller: pointerToBool(true),
+						},
+					},
+				},
+				Spec: appsv1.StatefulSetSpec{
+					Template: corev1.PodTemplateSpec{
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{
+								{Image: "gcr.io/etcd-development/etcd:3.6.99"},
+							},
+						},
+					},
+				},
+			},
+			req: ctrl.Request{NamespacedName: types.NamespacedName{Name: "etcd", Namespace: "default"}},
+			assert: func(t *testing.T, state *reconcileState, res ctrl.Result, err error, ec *ecv1alpha1.EtcdCluster, sts *appsv1.StatefulSet) {
+				require.NotNil(t, state)
+				assert.NoError(t, err)
+				assert.Equal(t, ctrl.Result{}, res)
+			},
+		},
+		{
 			name: "Cannot parse StatefulSet image tag",
 			ec: &ecv1alpha1.EtcdCluster{
 				ObjectMeta: metav1.ObjectMeta{

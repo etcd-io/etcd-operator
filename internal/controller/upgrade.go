@@ -65,12 +65,12 @@ func isPodReady(pod *corev1.Pod) bool {
 	return false
 }
 
-// reconcileVersionUpgrade rolls the cluster to spec.version one pod per
-// reconcile. The StatefulSet uses the OnDelete update strategy, so
+// reconcileVersionUpgrade rolls the cluster to the current template one pod
+// per reconcile. The StatefulSet uses the OnDelete update strategy, so
 // re-rendering the template never restarts pods by itself; each pod is only
 // deleted once every member is healthy, a leader exists, all member revisions
-// are within 90% of the leader's, and every pod is Ready. The leader's pod is
-// replaced last.
+// are within 90% of the leader's, and every up-to-date pod is Ready. The
+// leader's pod is replaced last.
 func (r *EtcdClusterReconciler) reconcileVersionUpgrade(ctx context.Context, s *reconcileState) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
@@ -125,8 +125,15 @@ func (r *EtcdClusterReconciler) reconcileVersionUpgrade(ctx context.Context, s *
 		return ctrl.Result{}, nil
 	}
 
+	// Every up-to-date pod must be Ready before touching anything. A not-Ready
+	// pod that is itself outdated is exempt: requiring it Ready would block
+	// its own replacement (rollback from a version that never becomes Ready).
+	outdatedOrdinals := make(map[int]bool, len(outdated))
+	for _, p := range outdated {
+		outdatedOrdinals[p.ordinal] = true
+	}
 	for _, p := range pods {
-		if !isPodReady(p.pod) {
+		if !outdatedOrdinals[p.ordinal] && !isPodReady(p.pod) {
 			logger.Info("Pod is not ready. Deferring upgrade step", "pod", p.pod.Name)
 			return ctrl.Result{RequeueAfter: requeueDuration}, nil
 		}
@@ -158,10 +165,22 @@ func (r *EtcdClusterReconciler) reconcileVersionUpgrade(ctx context.Context, s *
 		}
 	}
 
-	// Lowest-ordinal outdated pod first; the leader's pod goes last.
-	victim := outdated[0]
-	if victim.ordinal == leaderOrdinal && len(outdated) > 1 {
-		victim = outdated[1]
+	// Not-Ready outdated pods go first (they hold no quorum weight), then
+	// lowest ordinal; the leader's pod goes last.
+	candidates := make([]ordinalPod, 0, len(outdated))
+	for _, p := range outdated {
+		if !isPodReady(p.pod) {
+			candidates = append(candidates, p)
+		}
+	}
+	for _, p := range outdated {
+		if isPodReady(p.pod) {
+			candidates = append(candidates, p)
+		}
+	}
+	victim := candidates[0]
+	if victim.ordinal == leaderOrdinal && len(candidates) > 1 {
+		victim = candidates[1]
 	}
 
 	logger.Info("Deleting pod so the StatefulSet recreates it with the new image",
@@ -170,4 +189,79 @@ func (r *EtcdClusterReconciler) reconcileVersionUpgrade(ctx context.Context, s *
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{RequeueAfter: requeueDuration}, nil
+}
+
+// recoverDegradedUpgrade runs when the member health check fails, which
+// otherwise blocks reconciliation before any template or pod convergence: a
+// pod replaced with a broken image (bad tag, incompatible flags) would wedge
+// the cluster at N-1 members forever. It re-syncs the StatefulSet template
+// from the spec so a version rollback or option fix can land, and, while the
+// remaining members still hold quorum, deletes one not-Ready outdated pod so
+// the StatefulSet recreates it from the fixed template. Returns handled=false
+// when the degradation is not something template convergence can repair.
+func (r *EtcdClusterReconciler) recoverDegradedUpgrade(ctx context.Context, s *reconcileState) (ctrl.Result, bool) {
+	logger := log.FromContext(ctx)
+
+	if s.sts == nil || s.sts.Spec.Replicas == nil || len(s.sts.Spec.Template.Spec.Containers) == 0 {
+		return ctrl.Result{}, false
+	}
+
+	// waitForStatefulSetReady can never succeed with a member down, so sync
+	// without it.
+	sts, err := syncStatefulSet(ctx, logger, s.cluster, r.Client, *s.sts.Spec.Replicas, r.Scheme)
+	if err != nil {
+		logger.Error(err, "Failed to re-sync StatefulSet template while degraded")
+		return ctrl.Result{}, false
+	}
+	s.sts = sts
+
+	healthy := 0
+	for i := range s.memberHealth {
+		if s.memberHealth[i].Health {
+			healthy++
+		}
+	}
+	replicas := int(*sts.Spec.Replicas)
+	if healthy < replicas/2+1 {
+		// Quorum is already lost; deleting anything can only make it worse.
+		return ctrl.Result{}, false
+	}
+
+	desiredImage := desiredEtcdImage(s.cluster)
+	var victim *corev1.Pod
+	for i := 0; i < replicas; i++ {
+		pod := &corev1.Pod{}
+		podName := fmt.Sprintf("%s-%d", s.cluster.Name, i)
+		if err := r.PodReader.Get(ctx, client.ObjectKey{Name: podName, Namespace: s.cluster.Namespace}, pod); err != nil {
+			if errors.IsNotFound(err) {
+				// A replacement is already in flight.
+				return ctrl.Result{RequeueAfter: requeueDuration}, true
+			}
+			return ctrl.Result{}, false
+		}
+		if pod.DeletionTimestamp != nil {
+			return ctrl.Result{RequeueAfter: requeueDuration}, true
+		}
+		if isPodReady(pod) {
+			continue
+		}
+		if !isPodOutdated(pod, sts, desiredImage) {
+			// Broken but already on the current template: recreating it would
+			// change nothing.
+			return ctrl.Result{}, false
+		}
+		if victim == nil {
+			victim = pod
+		}
+	}
+	if victim == nil {
+		return ctrl.Result{}, false
+	}
+
+	logger.Info("Replacing broken outdated pod while quorum holds", "pod", victim.Name)
+	if err := r.Delete(ctx, victim); err != nil {
+		logger.Error(err, "Failed to delete broken outdated pod", "pod", victim.Name)
+		return ctrl.Result{}, false
+	}
+	return ctrl.Result{RequeueAfter: requeueDuration}, true
 }

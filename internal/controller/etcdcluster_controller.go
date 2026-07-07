@@ -110,6 +110,12 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	if err = r.performHealthChecks(ctx, state); err != nil {
+		// A pod replaced during an upgrade may never come back healthy;
+		// without this the failed health check would keep template and pod
+		// convergence unreachable forever.
+		if res, handled := r.recoverDegradedUpgrade(ctx, state); handled {
+			return res, nil
+		}
 		return ctrl.Result{}, err
 	}
 
@@ -184,6 +190,12 @@ func (r *EtcdClusterReconciler) fetchAndValidateState(ctx context.Context, req c
 			return &reconcileState{cluster: ec, sts: sts}, ctrl.Result{}, nil
 		}
 		currentVersion := stsImage[idx+1:]
+		// Prefer the observed cluster version: the template tag may name an
+		// image that never ran (e.g. a nonexistent patch release), which would
+		// make every rollback look like a downgrade and wedge the cluster.
+		if ec.Status.CurrentVersion != "" {
+			currentVersion = ec.Status.CurrentVersion
+		}
 		targetVersion := ec.Spec.Version
 
 		// Only handle cases when there is a version change.

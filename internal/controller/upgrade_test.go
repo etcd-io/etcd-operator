@@ -422,6 +422,122 @@ func TestUpgradeRerendersOnUnobservedSpecChange(t *testing.T) {
 	assert.Equal(t, ctrl.Result{RequeueAfter: requeueDuration}, res, "unobserved spec change must re-render and requeue")
 }
 
+// Rollback deadlock (healthy-members case): the sole outdated pod is itself
+// not Ready; requiring it Ready would block its own replacement forever.
+func TestUpgradeReplacesNotReadyOutdatedPod(t *testing.T) {
+	ec := upgradeTestCluster()
+	sts := upgradeTestStatefulSet(ec, upgradeNewImage)
+	r, fakeClient := upgradeTestReconciler(t, ec, sts,
+		upgradeTestPod(ec, 0, upgradeOldImage, false),
+		upgradeTestPod(ec, 1, upgradeNewImage, true),
+		upgradeTestPod(ec, 2, upgradeNewImage, true),
+	)
+
+	memberList, health := upgradeTestHealth(ec, []int64{100, 100, 100}, 1)
+	state := &reconcileState{cluster: ec, sts: sts, memberListResp: memberList, memberHealth: health}
+
+	res, err := r.reconcileVersionUpgrade(t.Context(), state)
+	require.NoError(t, err)
+	assert.Equal(t, ctrl.Result{RequeueAfter: requeueDuration}, res)
+	assert.ElementsMatch(t, []string{"test-etcd-1", "test-etcd-2"}, podNames(t, fakeClient, ec.Namespace))
+}
+
+func upgradeDegradedHealth(ec *ecv1alpha1.EtcdCluster, healthyOrdinals ...int) []etcdutils.EpHealth {
+	_, health := upgradeTestHealth(ec, []int64{100, 100, 100}, healthyOrdinals[0])
+	healthySet := map[int]bool{}
+	for _, o := range healthyOrdinals {
+		healthySet[o] = true
+	}
+	for i := range health {
+		if !healthySet[i] {
+			health[i].Health = false
+		}
+	}
+	return health
+}
+
+// Failed-upgrade wedge: the replacement pod crashloops, the health check
+// fails every reconcile, and the normal upgrade path is unreachable. Recovery
+// must re-sync the template and replace the broken pod while quorum holds.
+func TestRecoverDegradedUpgrade(t *testing.T) {
+	t.Run("replaces broken outdated pod while quorum holds", func(t *testing.T) {
+		ec := upgradeTestCluster()
+		// Spec already rolled back: template re-renders to the old image, and
+		// the crashlooping pod still carries the bad revision.
+		ec.Spec.Version = "3.5.17"
+		sts := upgradeTestStatefulSet(ec, upgradeOldImage)
+		sts.Status.UpdateRevision = "rev-1"
+		r, fakeClient := upgradeTestReconciler(t, ec, sts,
+			withRevisionHash(upgradeTestPod(ec, 0, upgradeNewImage, false), "rev-2"),
+			withRevisionHash(upgradeTestPod(ec, 1, upgradeOldImage, true), "rev-1"),
+			withRevisionHash(upgradeTestPod(ec, 2, upgradeOldImage, true), "rev-1"),
+		)
+
+		state := &reconcileState{cluster: ec, sts: sts, memberHealth: upgradeDegradedHealth(ec, 1, 2)}
+
+		res, handled := r.recoverDegradedUpgrade(t.Context(), state)
+		assert.True(t, handled)
+		assert.Equal(t, ctrl.Result{RequeueAfter: requeueDuration}, res)
+		assert.ElementsMatch(t, []string{"test-etcd-1", "test-etcd-2"}, podNames(t, fakeClient, ec.Namespace))
+	})
+
+	t.Run("re-syncs template from spec while degraded", func(t *testing.T) {
+		ec := upgradeTestCluster()
+		ec.Spec.Version = "3.5.17"
+		// Template still carries the bad image; only the sync can fix it.
+		sts := upgradeTestStatefulSet(ec, upgradeNewImage)
+		sts.Status.UpdateRevision = "rev-2"
+		r, fakeClient := upgradeTestReconciler(t, ec, sts,
+			withRevisionHash(upgradeTestPod(ec, 0, upgradeNewImage, false), "rev-2"),
+			withRevisionHash(upgradeTestPod(ec, 1, upgradeOldImage, true), "rev-1"),
+			withRevisionHash(upgradeTestPod(ec, 2, upgradeOldImage, true), "rev-1"),
+		)
+
+		state := &reconcileState{cluster: ec, sts: sts, memberHealth: upgradeDegradedHealth(ec, 1, 2)}
+
+		_, _ = r.recoverDegradedUpgrade(t.Context(), state)
+
+		got := &appsv1.StatefulSet{}
+		require.NoError(t, fakeClient.Get(t.Context(), client.ObjectKey{Name: ec.Name, Namespace: ec.Namespace}, got))
+		assert.Equal(t, upgradeOldImage, got.Spec.Template.Spec.Containers[0].Image)
+	})
+
+	t.Run("refuses to delete when quorum is lost", func(t *testing.T) {
+		ec := upgradeTestCluster()
+		ec.Spec.Version = "3.5.17"
+		sts := upgradeTestStatefulSet(ec, upgradeOldImage)
+		sts.Status.UpdateRevision = "rev-1"
+		r, fakeClient := upgradeTestReconciler(t, ec, sts,
+			withRevisionHash(upgradeTestPod(ec, 0, upgradeNewImage, false), "rev-2"),
+			withRevisionHash(upgradeTestPod(ec, 1, upgradeNewImage, false), "rev-2"),
+			withRevisionHash(upgradeTestPod(ec, 2, upgradeOldImage, true), "rev-1"),
+		)
+
+		state := &reconcileState{cluster: ec, sts: sts, memberHealth: upgradeDegradedHealth(ec, 2)}
+
+		_, handled := r.recoverDegradedUpgrade(t.Context(), state)
+		assert.False(t, handled)
+		assert.Len(t, podNames(t, fakeClient, ec.Namespace), 3, "no pod may be deleted without quorum")
+	})
+
+	t.Run("refuses when broken pod is already on current template", func(t *testing.T) {
+		ec := upgradeTestCluster()
+		sts := upgradeTestStatefulSet(ec, upgradeNewImage)
+		sts.Status.UpdateRevision = "rev-2"
+		r, fakeClient := upgradeTestReconciler(t, ec, sts,
+			withRevisionHash(upgradeTestPod(ec, 0, upgradeNewImage, false), "rev-2"),
+			withRevisionHash(upgradeTestPod(ec, 1, upgradeNewImage, true), "rev-2"),
+			withRevisionHash(upgradeTestPod(ec, 2, upgradeNewImage, true), "rev-2"),
+		)
+
+		state := &reconcileState{cluster: ec, sts: sts, memberHealth: upgradeDegradedHealth(ec, 1, 2)}
+
+		_, handled := r.recoverDegradedUpgrade(t.Context(), state)
+		assert.False(t, handled, "recreating a pod from the same template cannot help")
+		assert.Len(t, podNames(t, fakeClient, ec.Namespace), 3)
+	})
+}
+
 func TestOrdinalFromPeerEp(t *testing.T) {
 	tests := []struct {
 		ep       string
