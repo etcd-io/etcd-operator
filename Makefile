@@ -125,8 +125,9 @@ verify: verify-mod-tidy lint ## Run static checks against the code.
 ##@ Build
 
 .PHONY: build
-build: manifests generate fmt vet ## Build manager binary.
+build: manifests generate fmt vet ## Build manager and mirror-agent binaries.
 	go build -o bin/manager cmd/main.go
+	go build -o bin/mirror-agent ./cmd/mirror-agent
 
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.
