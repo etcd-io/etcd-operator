@@ -371,7 +371,8 @@ func (r *EtcdClusterReconciler) reconcileClusterState(ctx context.Context, s *re
 		logger = logger.WithValues("targetReplica", targetReplica, "expectedSize", s.cluster.Spec.Size)
 
 		eps = eps[:targetReplica]
-		if err := removeScaleInMember(logger, s.memberHealth, leaderStatus.Header.MemberId, eps); err != nil {
+		if err := removeScaleInMember(logger, s, leaderStatus.Header.MemberId, eps,
+			etcdutils.MoveLeader, etcdutils.RemoveMember); err != nil {
 			return ctrl.Result{}, err
 		}
 
