@@ -349,6 +349,79 @@ func TestUpgradeRequeuesWhenPodMissing(t *testing.T) {
 	assert.True(t, k8serrors.IsNotFound(err))
 }
 
+func withRevisionHash(pod *corev1.Pod, revision string) *corev1.Pod {
+	if pod.Labels == nil {
+		pod.Labels = map[string]string{}
+	}
+	pod.Labels[appsv1.ControllerRevisionHashLabelKey] = revision
+	return pod
+}
+
+// A pod-mutating admission webhook may rewrite pod images (mirror registry,
+// tag-to-digest pinning); matching revision hashes must win over the image
+// string, or every reconcile would delete a healthy up-to-date pod.
+func TestUpgradeIgnoresWebhookMutatedPodImage(t *testing.T) {
+	ec := upgradeTestCluster()
+	sts := upgradeTestStatefulSet(ec, upgradeNewImage)
+	sts.Status.UpdateRevision = "rev-2"
+	mutatedImage := "mirror.local/etcd@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+	r, fakeClient := upgradeTestReconciler(t, ec, sts,
+		withRevisionHash(upgradeTestPod(ec, 0, mutatedImage, true), "rev-2"),
+		withRevisionHash(upgradeTestPod(ec, 1, mutatedImage, true), "rev-2"),
+		withRevisionHash(upgradeTestPod(ec, 2, mutatedImage, true), "rev-2"),
+	)
+
+	memberList, health := upgradeTestHealth(ec, []int64{100, 100, 100}, 0)
+	state := &reconcileState{cluster: ec, sts: sts, memberListResp: memberList, memberHealth: health}
+
+	res, err := r.reconcileVersionUpgrade(t.Context(), state)
+	require.NoError(t, err)
+	assert.Equal(t, ctrl.Result{}, res)
+	assert.Len(t, podNames(t, fakeClient, ec.Namespace), 3, "no pod may be deleted when revision hashes match")
+}
+
+// Non-image template drift (etcdOptions, podTemplate, TLS volumes) changes the
+// update revision without changing the image; the stale pod must still roll.
+func TestUpgradeRollsPodOnNonImageTemplateChange(t *testing.T) {
+	ec := upgradeTestCluster()
+	sts := upgradeTestStatefulSet(ec, upgradeNewImage)
+	sts.Status.UpdateRevision = "rev-2"
+	r, fakeClient := upgradeTestReconciler(t, ec, sts,
+		withRevisionHash(upgradeTestPod(ec, 0, upgradeNewImage, true), "rev-1"),
+		withRevisionHash(upgradeTestPod(ec, 1, upgradeNewImage, true), "rev-2"),
+		withRevisionHash(upgradeTestPod(ec, 2, upgradeNewImage, true), "rev-2"),
+	)
+
+	memberList, health := upgradeTestHealth(ec, []int64{100, 100, 100}, 2)
+	state := &reconcileState{cluster: ec, sts: sts, memberListResp: memberList, memberHealth: health}
+
+	res, err := r.reconcileVersionUpgrade(t.Context(), state)
+	require.NoError(t, err)
+	assert.Equal(t, ctrl.Result{RequeueAfter: requeueDuration}, res)
+	assert.ElementsMatch(t, []string{"test-etcd-1", "test-etcd-2"}, podNames(t, fakeClient, ec.Namespace))
+}
+
+// A spec edit that doesn't touch the image (observed via generation lag) must
+// re-render the template; OnDelete otherwise leaves it stale forever.
+func TestUpgradeRerendersOnUnobservedSpecChange(t *testing.T) {
+	ec := upgradeTestCluster()
+	ec.Generation = 2
+	ec.Status.ObservedGeneration = 1
+	sts := upgradeTestStatefulSet(ec, upgradeNewImage)
+	r, _ := upgradeTestReconciler(t, ec, sts,
+		upgradeTestPod(ec, 0, upgradeNewImage, true),
+		upgradeTestPod(ec, 1, upgradeNewImage, true),
+		upgradeTestPod(ec, 2, upgradeNewImage, true),
+	)
+
+	memberList, health := upgradeTestHealth(ec, []int64{100, 100, 100}, 0)
+	state := &reconcileState{cluster: ec, sts: sts, memberListResp: memberList, memberHealth: health}
+
+	res, err := r.reconcileVersionUpgrade(t.Context(), state)
+	require.NoError(t, err)
+	assert.Equal(t, ctrl.Result{RequeueAfter: requeueDuration}, res, "unobserved spec change must re-render and requeue")
+}
+
 func TestOrdinalFromPeerEp(t *testing.T) {
 	tests := []struct {
 		ep       string

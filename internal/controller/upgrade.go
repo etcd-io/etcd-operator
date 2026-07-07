@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -43,6 +44,18 @@ func ordinalFromPeerEp(stsName, ep string) (int, bool) {
 	return ordinal, true
 }
 
+// isPodOutdated reports whether the pod predates the StatefulSet's current
+// template. The controller-revision-hash label catches any template drift
+// (args, labels, volumes, ...) and stays valid when admission webhooks
+// rewrite pod images; the image comparison is only a fallback for the window
+// before the StatefulSet controller publishes an update revision.
+func isPodOutdated(pod *corev1.Pod, sts *appsv1.StatefulSet, desiredImage string) bool {
+	if rev := sts.Status.UpdateRevision; rev != "" {
+		return pod.Labels[appsv1.ControllerRevisionHashLabelKey] != rev
+	}
+	return len(pod.Spec.Containers) == 0 || pod.Spec.Containers[0].Image != desiredImage
+}
+
 func isPodReady(pod *corev1.Pod) bool {
 	for _, cond := range pod.Status.Conditions {
 		if cond.Type == corev1.PodReady {
@@ -65,9 +78,12 @@ func (r *EtcdClusterReconciler) reconcileVersionUpgrade(ctx context.Context, s *
 		return ctrl.Result{}, nil
 	}
 
+	// Re-render on image drift or on any spec edit not yet observed, so
+	// non-image template changes (etcdOptions, podTemplate, TLS) roll out too.
 	desiredImage := desiredEtcdImage(s.cluster)
-	if s.sts.Spec.Template.Spec.Containers[0].Image != desiredImage {
-		logger.Info("Version change detected. Re-rendering StatefulSet template", "desiredImage", desiredImage)
+	if s.sts.Spec.Template.Spec.Containers[0].Image != desiredImage ||
+		s.cluster.Generation != s.cluster.Status.ObservedGeneration {
+		logger.Info("Spec change detected. Re-rendering StatefulSet template", "desiredImage", desiredImage)
 		var err error
 		s.sts, err = reconcileStatefulSet(ctx, logger, s.cluster, r.Client, *s.sts.Spec.Replicas, r.Scheme)
 		return ctrl.Result{RequeueAfter: requeueDuration}, err
@@ -100,7 +116,7 @@ func (r *EtcdClusterReconciler) reconcileVersionUpgrade(ctx context.Context, s *
 
 	var outdated []ordinalPod
 	for _, p := range pods {
-		if len(p.pod.Spec.Containers) == 0 || p.pod.Spec.Containers[0].Image != desiredImage {
+		if isPodOutdated(p.pod, s.sts, desiredImage) {
 			outdated = append(outdated, p)
 		}
 	}
