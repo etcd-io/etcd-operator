@@ -7,6 +7,7 @@ import (
 	"log"
 	"maps"
 	"net"
+	"net/url"
 	"slices"
 	"strconv"
 	"strings"
@@ -481,6 +482,103 @@ func applyEtcdClusterState(ctx context.Context, ec *ecv1alpha1.EtcdCluster, repl
 func clientEndpointForOrdinalIndex(sts *appsv1.StatefulSet, index int) string {
 	return fmt.Sprintf("http://%s-%d.%s.%s.svc.cluster.local:2379",
 		sts.Name, index, sts.Name, sts.Namespace)
+}
+
+// ordinalFromEndpoint parses the STS ordinal from a member client endpoint,
+// e.g. http://name-3.name.ns.svc.cluster.local:2379 -> 3.
+func ordinalFromEndpoint(ep string) (int, error) {
+	u, err := url.Parse(ep)
+	if err != nil {
+		return 0, err
+	}
+	podName, _, _ := strings.Cut(u.Hostname(), ".")
+	// Ordinal is the segment after the last '-'; cluster names may contain dashes.
+	idx := strings.LastIndex(podName, "-")
+	if idx < 0 {
+		return 0, fmt.Errorf("no ordinal in endpoint %q", ep)
+	}
+	ordinal, err := strconv.Atoi(podName[idx+1:])
+	if err != nil {
+		return 0, fmt.Errorf("invalid ordinal in endpoint %q: %w", ep, err)
+	}
+	return ordinal, nil
+}
+
+// scaleInTarget returns the member with the highest STS ordinal. memberHealth
+// is sorted lexically by endpoint, so the last element is wrong once ordinals
+// reach 10.
+func scaleInTarget(healthInfos []etcdutils.EpHealth) (etcdutils.EpHealth, error) {
+	if len(healthInfos) == 0 {
+		return etcdutils.EpHealth{}, errors.New("no members eligible for scale-in")
+	}
+	maxIdx, maxOrdinal := 0, -1
+	for i := range healthInfos {
+		ordinal, err := ordinalFromEndpoint(healthInfos[i].Ep)
+		if err != nil {
+			return etcdutils.EpHealth{}, err
+		}
+		if ordinal > maxOrdinal {
+			maxOrdinal = ordinal
+			maxIdx = i
+		}
+	}
+	target := healthInfos[maxIdx]
+	if target.Status == nil || target.Status.Header == nil {
+		return etcdutils.EpHealth{}, fmt.Errorf("scale-in target %s has no status", target.Ep)
+	}
+	return target, nil
+}
+
+// transfereeForScaleIn returns the lowest-ordinal healthy voting member other
+// than removeID; ok=false when none exists.
+func transfereeForScaleIn(healthInfos []etcdutils.EpHealth, removeID uint64) (uint64, bool) {
+	var transferee uint64
+	bestOrdinal := -1
+	for i := range healthInfos {
+		h := healthInfos[i]
+		if !h.Health || h.Status == nil || h.Status.Header == nil ||
+			h.Status.IsLearner || h.Status.Header.MemberId == removeID {
+			continue
+		}
+		ordinal, err := ordinalFromEndpoint(h.Ep)
+		if err != nil {
+			continue
+		}
+		if bestOrdinal == -1 || ordinal < bestOrdinal {
+			bestOrdinal = ordinal
+			transferee = h.Status.Header.MemberId
+		}
+	}
+	return transferee, bestOrdinal >= 0
+}
+
+// Test seams.
+var (
+	moveLeaderFn   = etcdutils.MoveLeader
+	removeMemberFn = etcdutils.RemoveMember
+)
+
+// removeScaleInMember transfers leadership away from the removal target when
+// it is the leader (best-effort), then removes it from the etcd cluster.
+func removeScaleInMember(logger logr.Logger, healthInfos []etcdutils.EpHealth, leaderID uint64, eps []string) error {
+	target, err := scaleInTarget(healthInfos)
+	if err != nil {
+		return err
+	}
+	memberID := target.Status.Header.MemberId
+	if memberID == leaderID {
+		if transferee, ok := transfereeForScaleIn(healthInfos, memberID); ok {
+			logger.Info("[Scale in] transferring leadership off removal target",
+				"leaderID", memberID, "transfereeID", transferee)
+			// MoveLeader must be served by the leader itself.
+			if err := moveLeaderFn([]string{target.Ep}, transferee); err != nil {
+				// Best-effort: removing a leader is legal; the transfer only avoids an election stall.
+				logger.Error(err, "leadership transfer failed, proceeding with removal")
+			}
+		}
+	}
+	logger.Info("[Scale in] removing one member", "memberID", memberID)
+	return removeMemberFn(eps, memberID)
 }
 
 func getStatefulSet(ctx context.Context, c client.Client, name, namespace string) (*appsv1.StatefulSet, error) {

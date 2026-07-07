@@ -283,3 +283,32 @@ func RemoveMember(eps []string, memberID uint64) error {
 	_, err = c.MemberRemove(ctx, memberID)
 	return err
 }
+
+// MoveLeader transfers leadership to transfereeID. eps must contain the
+// current leader's client endpoint; etcd only serves MoveLeader on the leader.
+func MoveLeader(eps []string, transfereeID uint64) error {
+	cfg := clientv3.Config{
+		Endpoints:            eps,
+		DialTimeout:          2 * time.Second,
+		DialKeepAliveTime:    2 * time.Second,
+		DialKeepAliveTimeout: 6 * time.Second,
+	}
+
+	c, err := clientv3.New(cfg)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer func() {
+		err := c.Close()
+		if err != nil {
+			cancel()
+			return
+		}
+		cancel()
+	}()
+
+	_, err = c.MoveLeader(ctx, transfereeID)
+	return err
+}

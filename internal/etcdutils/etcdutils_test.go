@@ -336,3 +336,20 @@ func TestHealthReportSwap(t *testing.T) {
 	assert.Equal(t, "http://localhost:2380", healthReports[0].Ep)
 	assert.Equal(t, "http://localhost:2379", healthReports[1].Ep)
 }
+
+func TestMoveLeader(t *testing.T) {
+	e := setupEtcdServer(t)
+	defer e.Close()
+
+	t.Run("ReturnsErrorForInvalidEndpoint", func(t *testing.T) {
+		eps := []string{"http://invalid:2379"}
+		err := MoveLeader(eps, 12345)
+		assert.Error(t, err)
+	})
+
+	t.Run("ReturnsErrorForBogusTransferee", func(t *testing.T) {
+		eps := []string{"http://localhost:2379"}
+		err := MoveLeader(eps, 12345)
+		assert.Error(t, err)
+	})
+}

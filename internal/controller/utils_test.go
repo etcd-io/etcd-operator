@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sort"
 	"testing"
 	"time"
 
@@ -1089,4 +1090,274 @@ func TestCreateCMCertificateConfig(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestOrdinalFromEndpoint(t *testing.T) {
+	tests := []struct {
+		name      string
+		ep        string
+		expected  int
+		expectErr bool
+	}{
+		{
+			name:     "ordinal 0",
+			ep:       "http://test-sts-0.test-sts.default.svc.cluster.local:2379",
+			expected: 0,
+		},
+		{
+			name:     "ordinal 9",
+			ep:       "http://test-sts-9.test-sts.default.svc.cluster.local:2379",
+			expected: 9,
+		},
+		{
+			name:     "ordinal 10",
+			ep:       "http://test-sts-10.test-sts.default.svc.cluster.local:2379",
+			expected: 10,
+		},
+		{
+			name:     "multi-dash cluster name",
+			ep:       "http://my-etcd-12.my-etcd.ns.svc.cluster.local:2379",
+			expected: 12,
+		},
+		{
+			name:     "https scheme",
+			ep:       "https://test-sts-3.test-sts.default.svc.cluster.local:2379",
+			expected: 3,
+		},
+		{
+			name:      "no dash in pod name",
+			ep:        "http://podname.ns.svc.cluster.local:2379",
+			expectErr: true,
+		},
+		{
+			name:      "non-numeric suffix",
+			ep:        "http://test-sts-abc.test-sts.default.svc.cluster.local:2379",
+			expectErr: true,
+		},
+		{
+			name:      "empty string",
+			ep:        "",
+			expectErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ordinal, err := ordinalFromEndpoint(tt.ep)
+			if tt.expectErr {
+				assert.Error(t, err)
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, tt.expected, ordinal)
+			}
+		})
+	}
+}
+
+// scaleInEpHealth builds an EpHealth for the given ordinal using the real
+// endpoint format produced by clientEndpointForOrdinalIndex.
+func scaleInEpHealth(ordinal int, memberID uint64, healthy, learner bool) etcdutils.EpHealth {
+	return etcdutils.EpHealth{
+		Ep:     fmt.Sprintf("http://test-etcd-%d.test-etcd.default.svc.cluster.local:2379", ordinal),
+		Health: healthy,
+		Status: &clientv3.StatusResponse{
+			Header:    &etcdserverpb.ResponseHeader{MemberId: memberID},
+			IsLearner: learner,
+		},
+	}
+}
+
+// sortLexically reproduces etcdutils.ClusterHealth's healthReport sort order.
+func sortLexically(infos []etcdutils.EpHealth) {
+	sort.Slice(infos, func(i, j int) bool { return infos[i].Ep < infos[j].Ep })
+}
+
+func TestScaleInTarget(t *testing.T) {
+	t.Run("11 members: lexical order misleads, ordinal wins", func(t *testing.T) {
+		var infos []etcdutils.EpHealth
+		for i := 0; i <= 10; i++ {
+			infos = append(infos, scaleInEpHealth(i, uint64(100+i), true, false))
+		}
+		sortLexically(infos)
+
+		// The lexically-last entry is ordinal 9 — the old memberHealth[memberCnt-1]
+		// selection would remove the wrong member.
+		lastOrdinal, err := ordinalFromEndpoint(infos[len(infos)-1].Ep)
+		require.NoError(t, err)
+		assert.Equal(t, 9, lastOrdinal)
+
+		target, err := scaleInTarget(infos)
+		require.NoError(t, err)
+		assert.Equal(t, uint64(110), target.Status.Header.MemberId)
+		assert.Equal(t, "http://test-etcd-10.test-etcd.default.svc.cluster.local:2379", target.Ep)
+	})
+
+	t.Run("3 members happy path", func(t *testing.T) {
+		infos := []etcdutils.EpHealth{
+			scaleInEpHealth(0, 100, true, false),
+			scaleInEpHealth(1, 101, true, false),
+			scaleInEpHealth(2, 102, true, false),
+		}
+		target, err := scaleInTarget(infos)
+		require.NoError(t, err)
+		assert.Equal(t, uint64(102), target.Status.Header.MemberId)
+	})
+
+	t.Run("empty slice", func(t *testing.T) {
+		_, err := scaleInTarget(nil)
+		assert.Error(t, err)
+	})
+
+	t.Run("nil status on max-ordinal entry", func(t *testing.T) {
+		infos := []etcdutils.EpHealth{
+			scaleInEpHealth(0, 100, true, false),
+			{Ep: "http://test-etcd-1.test-etcd.default.svc.cluster.local:2379", Health: true},
+		}
+		_, err := scaleInTarget(infos)
+		assert.Error(t, err)
+	})
+}
+
+func TestTransfereeForScaleIn(t *testing.T) {
+	t.Run("returns lowest ordinal voting member", func(t *testing.T) {
+		infos := []etcdutils.EpHealth{
+			scaleInEpHealth(0, 100, true, false),
+			scaleInEpHealth(1, 101, true, false),
+			scaleInEpHealth(2, 102, true, false),
+		}
+		transferee, ok := transfereeForScaleIn(infos, 102)
+		assert.True(t, ok)
+		assert.Equal(t, uint64(100), transferee)
+	})
+
+	t.Run("skips learner at ordinal 0", func(t *testing.T) {
+		infos := []etcdutils.EpHealth{
+			scaleInEpHealth(0, 100, true, true),
+			scaleInEpHealth(1, 101, true, false),
+			scaleInEpHealth(2, 102, true, false),
+		}
+		transferee, ok := transfereeForScaleIn(infos, 102)
+		assert.True(t, ok)
+		assert.Equal(t, uint64(101), transferee)
+	})
+
+	t.Run("only remaining member is a learner", func(t *testing.T) {
+		infos := []etcdutils.EpHealth{
+			scaleInEpHealth(0, 100, true, true),
+			scaleInEpHealth(1, 101, true, false),
+		}
+		_, ok := transfereeForScaleIn(infos, 101)
+		assert.False(t, ok)
+	})
+
+	t.Run("skips unhealthy members", func(t *testing.T) {
+		infos := []etcdutils.EpHealth{
+			scaleInEpHealth(0, 100, false, false),
+			scaleInEpHealth(1, 101, true, false),
+			scaleInEpHealth(2, 102, true, false),
+		}
+		transferee, ok := transfereeForScaleIn(infos, 102)
+		assert.True(t, ok)
+		assert.Equal(t, uint64(101), transferee)
+	})
+
+	t.Run("never returns the removal target", func(t *testing.T) {
+		infos := []etcdutils.EpHealth{
+			scaleInEpHealth(0, 100, true, false),
+		}
+		_, ok := transfereeForScaleIn(infos, 100)
+		assert.False(t, ok)
+	})
+}
+
+func TestRemoveScaleInMember(t *testing.T) {
+	logger := logr.Discard()
+
+	type call struct {
+		fn  string
+		eps []string
+		id  uint64
+	}
+
+	var calls []call
+	var moveErr error
+
+	origMove, origRemove := moveLeaderFn, removeMemberFn
+	t.Cleanup(func() { moveLeaderFn, removeMemberFn = origMove, origRemove })
+	moveLeaderFn = func(eps []string, transfereeID uint64) error {
+		calls = append(calls, call{fn: "move", eps: eps, id: transfereeID})
+		return moveErr
+	}
+	removeMemberFn = func(eps []string, memberID uint64) error {
+		calls = append(calls, call{fn: "remove", eps: eps, id: memberID})
+		return nil
+	}
+
+	threeMembers := []etcdutils.EpHealth{
+		scaleInEpHealth(0, 100, true, false),
+		scaleInEpHealth(1, 101, true, false),
+		scaleInEpHealth(2, 102, true, false),
+	}
+	eps := []string{"ep0", "ep1"}
+
+	t.Run("target is leader: transfer before removal", func(t *testing.T) {
+		calls, moveErr = nil, nil
+		err := removeScaleInMember(logger, threeMembers, 102, eps)
+		require.NoError(t, err)
+		require.Len(t, calls, 2)
+		assert.Equal(t, "move", calls[0].fn)
+		assert.Equal(t, []string{threeMembers[2].Ep}, calls[0].eps)
+		assert.Equal(t, uint64(100), calls[0].id)
+		assert.Equal(t, "remove", calls[1].fn)
+		assert.Equal(t, eps, calls[1].eps)
+		assert.Equal(t, uint64(102), calls[1].id)
+	})
+
+	t.Run("target not leader: no transfer", func(t *testing.T) {
+		calls, moveErr = nil, nil
+		err := removeScaleInMember(logger, threeMembers, 100, eps)
+		require.NoError(t, err)
+		require.Len(t, calls, 1)
+		assert.Equal(t, "remove", calls[0].fn)
+		assert.Equal(t, uint64(102), calls[0].id)
+	})
+
+	t.Run("transfer failure does not block removal", func(t *testing.T) {
+		calls, moveErr = nil, errors.New("transfer failed")
+		err := removeScaleInMember(logger, threeMembers, 102, eps)
+		require.NoError(t, err)
+		require.Len(t, calls, 2)
+		assert.Equal(t, "move", calls[0].fn)
+		assert.Equal(t, "remove", calls[1].fn)
+	})
+
+	t.Run("leader target with no eligible transferee", func(t *testing.T) {
+		calls, moveErr = nil, nil
+		infos := []etcdutils.EpHealth{
+			scaleInEpHealth(0, 100, true, true), // learner survivor
+			scaleInEpHealth(1, 101, true, false),
+		}
+		err := removeScaleInMember(logger, infos, 101, eps)
+		require.NoError(t, err)
+		require.Len(t, calls, 1)
+		assert.Equal(t, "remove", calls[0].fn)
+		assert.Equal(t, uint64(101), calls[0].id)
+	})
+
+	t.Run("11 members lexical order, leader at ordinal 10", func(t *testing.T) {
+		calls, moveErr = nil, nil
+		var infos []etcdutils.EpHealth
+		for i := 0; i <= 10; i++ {
+			infos = append(infos, scaleInEpHealth(i, uint64(100+i), true, false))
+		}
+		sortLexically(infos)
+		err := removeScaleInMember(logger, infos, 110, eps)
+		require.NoError(t, err)
+		require.Len(t, calls, 2)
+		assert.Equal(t, "move", calls[0].fn)
+		assert.Equal(t, []string{"http://test-etcd-10.test-etcd.default.svc.cluster.local:2379"}, calls[0].eps)
+		assert.Equal(t, uint64(100), calls[0].id)
+		assert.Equal(t, "remove", calls[1].fn)
+		assert.Equal(t, uint64(110), calls[1].id) // ordinal 10, not the lexically-last ordinal 9
+	})
 }
