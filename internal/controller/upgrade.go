@@ -83,7 +83,7 @@ func (r *EtcdClusterReconciler) reconcileVersionUpgrade(ctx context.Context, s *
 	for i := 0; i < replicas; i++ {
 		pod := &corev1.Pod{}
 		podName := fmt.Sprintf("%s-%d", s.cluster.Name, i)
-		if err := r.Get(ctx, client.ObjectKey{Name: podName, Namespace: s.cluster.Namespace}, pod); err != nil {
+		if err := r.PodReader.Get(ctx, client.ObjectKey{Name: podName, Namespace: s.cluster.Namespace}, pod); err != nil {
 			if errors.IsNotFound(err) {
 				// A replacement is in flight; wait for the StatefulSet controller.
 				logger.Info("Pod not found. Waiting for it to be recreated", "pod", podName)

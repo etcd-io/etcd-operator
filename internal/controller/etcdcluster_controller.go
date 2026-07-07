@@ -47,7 +47,10 @@ const (
 // EtcdClusterReconciler reconciles a EtcdCluster object
 type EtcdClusterReconciler struct {
 	client.Client
-	Scheme        *runtime.Scheme
+	Scheme *runtime.Scheme
+	// PodReader reads pods straight from the API server. Reading pods through
+	// the cached client would lazily start a cluster-wide pod informer.
+	PodReader     client.Reader
 	Recorder      events.EventRecorder
 	ImageRegistry string
 }
@@ -69,7 +72,7 @@ type reconcileState struct {
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch;get;list;update
-// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;delete
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;delete
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;patch;update;delete
 // +kubebuilder:rbac:groups="cert-manager.io",resources=certificates,verbs=get;list;watch;create;patch;update;delete
 // +kubebuilder:rbac:groups="cert-manager.io",resources=clusterissuers,verbs=get;list;watch
@@ -580,6 +583,9 @@ func isCertManagerCRDPresent(mgr ctrl.Manager) bool {
 // SetupWithManager sets up the controller with the Manager.
 func (r *EtcdClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.Recorder = mgr.GetEventRecorder("etcdcluster-controller")
+	if r.PodReader == nil {
+		r.PodReader = mgr.GetAPIReader()
+	}
 	setupLog := ctrl.Log.WithName("setup")
 
 	builder := ctrl.NewControllerManagedBy(mgr).

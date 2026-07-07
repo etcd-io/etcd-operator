@@ -127,7 +127,7 @@ func upgradeTestReconciler(t *testing.T, objs ...client.Object) (*EtcdClusterRec
 	t.Helper()
 	scheme := upgradeTestScheme(t)
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
-	return &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}, fakeClient
+	return &EtcdClusterReconciler{Client: fakeClient, PodReader: fakeClient, Scheme: scheme}, fakeClient
 }
 
 func podNames(t *testing.T, c client.Client, namespace string) []string {
