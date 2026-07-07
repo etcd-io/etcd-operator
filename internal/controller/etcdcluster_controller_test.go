@@ -23,14 +23,19 @@ import (
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
+	"go.etcd.io/etcd-operator/internal/etcdutils"
+	"go.etcd.io/etcd/api/v3/etcdserverpb"
+	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 // TestFetchAndValidateState describes the scenarios for the fetchAndValidateState
@@ -569,5 +574,85 @@ func TestBootstrapStatefulSet(t *testing.T) {
 		err = fakeClient.Get(ctx, client.ObjectKey{Name: configMapNameForEtcdCluster(ec), Namespace: ec.Namespace}, fetchedCM)
 		assert.NoError(t, err)
 		assert.Equal(t, storedCM.Data, fetchedCM.Data)
+	})
+}
+
+func nospaceTestState(alarms []etcdutils.MemberAlarm) *reconcileState {
+	return &reconcileState{
+		cluster: &ecv1alpha1.EtcdCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: "etcd", Namespace: "default"},
+		},
+		memberListResp: &clientv3.MemberListResponse{
+			Members: []*etcdserverpb.Member{
+				{ID: 1, Name: "etcd-0"},
+				{ID: 2, Name: "etcd-1"},
+			},
+		},
+		memberHealth: []etcdutils.EpHealth{
+			{Ep: "ep0", Health: false, Status: &clientv3.StatusResponse{
+				Header: &etcdserverpb.ResponseHeader{MemberId: 1},
+			}},
+			{Ep: "ep1", Health: true, Status: &clientv3.StatusResponse{
+				Header: &etcdserverpb.ResponseHeader{MemberId: 2},
+			}},
+		},
+		alarms: alarms,
+	}
+}
+
+func TestUpdateConditionsNospaceAlarm(t *testing.T) {
+	r := &EtcdClusterReconciler{}
+
+	t.Run("NospaceAlarmSetsDistinctReason", func(t *testing.T) {
+		s := nospaceTestState([]etcdutils.MemberAlarm{{MemberID: 1, Type: "NOSPACE"}})
+		r.updateConditions(s)
+
+		cond := meta.FindStatusCondition(s.cluster.Status.Conditions, "Degraded")
+		require.NotNil(t, cond)
+		assert.Equal(t, metav1.ConditionTrue, cond.Status)
+		assert.Equal(t, "DatabaseQuotaExceeded", cond.Reason)
+		assert.Contains(t, cond.Message, "etcd-0")
+	})
+
+	t.Run("UnhealthyWithoutAlarmKeepsGenericReason", func(t *testing.T) {
+		s := nospaceTestState(nil)
+		r.updateConditions(s)
+
+		cond := meta.FindStatusCondition(s.cluster.Status.Conditions, "Degraded")
+		require.NotNil(t, cond)
+		assert.Equal(t, metav1.ConditionTrue, cond.Status)
+		assert.Equal(t, "UnhealthyMembers", cond.Reason)
+	})
+}
+
+func TestReportNospaceAlarms(t *testing.T) {
+	t.Run("EmitsWarningEvent", func(t *testing.T) {
+		rec := events.NewFakeRecorder(10)
+		r := &EtcdClusterReconciler{Recorder: rec}
+		s := nospaceTestState([]etcdutils.MemberAlarm{{MemberID: 1, Type: "NOSPACE"}})
+
+		r.reportNospaceAlarms(s)
+
+		require.Len(t, rec.Events, 1)
+		ev := <-rec.Events
+		assert.Contains(t, ev, corev1.EventTypeWarning)
+		assert.Contains(t, ev, "DatabaseQuotaExceeded")
+		assert.Contains(t, ev, "etcd-0")
+	})
+
+	t.Run("NilRecorderDoesNotPanic", func(t *testing.T) {
+		r := &EtcdClusterReconciler{}
+		s := nospaceTestState([]etcdutils.MemberAlarm{{MemberID: 1, Type: "NOSPACE"}})
+		assert.NotPanics(t, func() { r.reportNospaceAlarms(s) })
+	})
+
+	t.Run("NonNospaceAlarmEmitsNothing", func(t *testing.T) {
+		rec := events.NewFakeRecorder(10)
+		r := &EtcdClusterReconciler{Recorder: rec}
+		s := nospaceTestState([]etcdutils.MemberAlarm{{MemberID: 2, Type: "CORRUPT"}})
+
+		r.reportNospaceAlarms(s)
+
+		assert.Empty(t, rec.Events)
 	})
 }

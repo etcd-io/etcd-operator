@@ -336,3 +336,20 @@ func TestHealthReportSwap(t *testing.T) {
 	assert.Equal(t, "http://localhost:2380", healthReports[0].Ep)
 	assert.Equal(t, "http://localhost:2379", healthReports[1].Ep)
 }
+
+func TestAlarmList(t *testing.T) {
+	e := setupEtcdServer(t)
+	defer e.Close()
+
+	t.Run("NoActiveAlarms", func(t *testing.T) {
+		alarms, err := AlarmList([]string{"http://localhost:2379"})
+		assert.NoError(t, err)
+		assert.Empty(t, alarms)
+	})
+
+	t.Run("ReturnsErrorForInvalidEndpoint", func(t *testing.T) {
+		alarms, err := AlarmList([]string{"http://invalid:2379"})
+		assert.Error(t, err)
+		assert.Nil(t, alarms)
+	})
+}
