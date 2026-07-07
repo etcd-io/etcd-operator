@@ -28,6 +28,7 @@ import (
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
 
 // EtcdClusterSpec defines the desired state of EtcdCluster.
+// +kubebuilder:validation:XValidation:rule="!has(self.autoCompactionMode) || has(self.autoCompactionRetention)",message="autoCompactionRetention must be set when autoCompactionMode is set"
 type EtcdClusterSpec struct {
 	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
@@ -47,6 +48,21 @@ type EtcdClusterSpec struct {
 	TLS *TLSCertificate `json:"tls,omitempty"`
 	// etcd configuration options are passed as command line arguments to the etcd container, refer to etcd documentation for configuration options applicable for the version of etcd being used.
 	EtcdOptions []string `json:"etcdOptions,omitempty"`
+	// QuotaBackendBytes is the etcd backend storage quota (--quota-backend-bytes).
+	// When exceeded etcd raises a NOSPACE alarm and becomes read-only.
+	// Unset means the etcd default (2GiB). etcd recommends at most 8GiB.
+	// +optional
+	QuotaBackendBytes *resource.Quantity `json:"quotaBackendBytes,omitempty"`
+	// AutoCompactionMode selects the MVCC auto-compaction policy (--auto-compaction-mode).
+	// +kubebuilder:validation:Enum=periodic;revision
+	// +optional
+	AutoCompactionMode string `json:"autoCompactionMode,omitempty"`
+	// AutoCompactionRetention is the retention window for auto compaction
+	// (--auto-compaction-retention): a duration such as "5m"/"1h" in periodic
+	// mode, or a revision count in revision mode. "0" disables auto compaction.
+	// +kubebuilder:validation:Pattern=`^([0-9]+[smh])+$|^[0-9]+$`
+	// +optional
+	AutoCompactionRetention string `json:"autoCompactionRetention,omitempty"`
 	// PodTemplate is the pod template to use for the etcd cluster.
 	PodTemplate *PodTemplate `json:"podTemplate,omitempty"`
 }
