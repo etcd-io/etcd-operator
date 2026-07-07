@@ -49,10 +49,14 @@ func TestReconcileStatefulSet(t *testing.T) {
 		},
 	}
 
-	_, _ = reconcileStatefulSet(t.Context(), logger, ec, fakeClient, 3, scheme)
+	returned, err := reconcileStatefulSet(t.Context(), logger, ec, fakeClient, 3, scheme)
+	require.NoError(t, err)
+	// Returned object is the CreateOrPatch response, no post-write Get.
+	require.NotNil(t, returned)
+	assert.Equal(t, int32(3), *returned.Spec.Replicas)
 
 	sts := &appsv1.StatefulSet{}
-	err := fakeClient.Get(t.Context(), client.ObjectKey{Name: "test-etcd", Namespace: "default"}, sts)
+	err = fakeClient.Get(t.Context(), client.ObjectKey{Name: "test-etcd", Namespace: "default"}, sts)
 	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
 	}
@@ -62,81 +66,56 @@ func TestReconcileStatefulSet(t *testing.T) {
 	}
 }
 
-func TestWaitForStatefulSetReady(t *testing.T) {
-	// Create a scheme and register the necessary types
-	scheme := runtime.NewScheme()
-	_ = corev1.AddToScheme(scheme)
-	_ = ecv1alpha1.AddToScheme(scheme)
-	_ = appsv1.AddToScheme(scheme)
-
+func TestStatefulSetSpecObserved(t *testing.T) {
 	tests := []struct {
-		name           string
-		statefulSet    *appsv1.StatefulSet
-		expectedResult bool
-		expectedError  error
+		name        string
+		generation  int64
+		observedGen int64
+		expected    bool
 	}{
-		{
-			name: "StatefulSet is ready",
-			statefulSet: &appsv1.StatefulSet{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test-sts",
-					Namespace: "default",
-				},
-				Spec: appsv1.StatefulSetSpec{
-					Replicas: pointerToInt32(3),
-				},
-				Status: appsv1.StatefulSetStatus{
-					ReadyReplicas: 3,
-				},
-			},
-			expectedResult: true,
-			expectedError:  nil,
-		},
-		{
-			name: "StatefulSet is not ready",
-			statefulSet: &appsv1.StatefulSet{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test-sts",
-					Namespace: "default",
-				},
-				Spec: appsv1.StatefulSetSpec{
-					Replicas: pointerToInt32(3),
-				},
-				Status: appsv1.StatefulSetStatus{
-					ReadyReplicas: 2,
-				},
-			},
-			expectedResult: false,
-			expectedError:  errors.New("StatefulSet default/test-sts did not become ready: timed out waiting for the condition"),
-		},
-		{
-			name:           "StatefulSet does not exist",
-			statefulSet:    nil,
-			expectedResult: false,
-			expectedError:  errors.New("statefulsets.apps \"test-sts\" not found"),
-		},
+		{name: "observed behind generation", generation: 2, observedGen: 1, expected: false},
+		{name: "observed equals generation", generation: 2, observedGen: 2, expected: true},
+		{name: "observed ahead of generation", generation: 1, observedGen: 2, expected: true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var clientBuilder *fake.ClientBuilder
-			if tt.statefulSet != nil {
-				clientBuilder = fake.NewClientBuilder().WithScheme(scheme).WithObjects(tt.statefulSet)
-			} else {
-				clientBuilder = fake.NewClientBuilder().WithScheme(scheme)
+			sts := &appsv1.StatefulSet{
+				ObjectMeta: metav1.ObjectMeta{Generation: tt.generation},
+				Status:     appsv1.StatefulSetStatus{ObservedGeneration: tt.observedGen},
 			}
-			fakeClient := clientBuilder.Build()
+			assert.Equal(t, tt.expected, statefulSetSpecObserved(sts))
+		})
+	}
+}
 
-			ctx := t.Context()
-			logger := log.FromContext(ctx)
+func TestIsStatefulSetSettled(t *testing.T) {
+	tests := []struct {
+		name          string
+		generation    int64
+		observedGen   int64
+		replicas      *int32
+		readyReplicas int32
+		expected      bool
+	}{
+		{name: "spec not observed", generation: 2, observedGen: 1, replicas: pointerToInt32(3), readyReplicas: 3, expected: false},
+		{name: "observed and all ready", generation: 2, observedGen: 2, replicas: pointerToInt32(3), readyReplicas: 3, expected: true},
+		{name: "observed ahead and all ready", generation: 1, observedGen: 2, replicas: pointerToInt32(3), readyReplicas: 3, expected: true},
+		{name: "ready below replicas", generation: 1, observedGen: 1, replicas: pointerToInt32(3), readyReplicas: 2, expected: false},
+		{name: "nil replicas", generation: 1, observedGen: 1, replicas: nil, readyReplicas: 0, expected: false},
+	}
 
-			err := waitForStatefulSetReady(ctx, logger, fakeClient, "test-sts", "default")
-			if tt.expectedError != nil {
-				assert.Error(t, err)
-				assert.Contains(t, err.Error(), tt.expectedError.Error())
-			} else {
-				assert.NoError(t, err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sts := &appsv1.StatefulSet{
+				ObjectMeta: metav1.ObjectMeta{Generation: tt.generation},
+				Spec:       appsv1.StatefulSetSpec{Replicas: tt.replicas},
+				Status: appsv1.StatefulSetStatus{
+					ObservedGeneration: tt.observedGen,
+					ReadyReplicas:      tt.readyReplicas,
+				},
 			}
+			assert.Equal(t, tt.expected, isStatefulSetSettled(sts))
 		})
 	}
 }
@@ -567,7 +546,7 @@ func TestCreateOrPatchStatefulSetWithPodAnnotations(t *testing.T) {
 				},
 			}
 
-			err := createOrPatchStatefulSet(ctx, logger, ec, fakeClient, 3, scheme)
+			_, err := createOrPatchStatefulSet(ctx, logger, ec, fakeClient, 3, scheme)
 			assert.NoError(t, err)
 
 			// Verify that the StatefulSet was created
@@ -685,7 +664,7 @@ func TestCreateOrPatchStatefulSetWithPodLabels(t *testing.T) {
 				},
 			}
 
-			err := createOrPatchStatefulSet(ctx, logger, ec, fakeClient, 3, scheme)
+			_, err := createOrPatchStatefulSet(ctx, logger, ec, fakeClient, 3, scheme)
 			assert.NoError(t, err)
 
 			// Verify that the StatefulSet was created with correct labels

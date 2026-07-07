@@ -277,6 +277,14 @@ func (r *EtcdClusterReconciler) reconcileClusterState(ctx context.Context, s *re
 	if s.memberListResp != nil {
 		memberCnt = len(s.memberListResp.Members)
 	}
+
+	// Don't act on a spec the StatefulSet controller hasn't observed yet (stale cache after our own write).
+	if !statefulSetSpecObserved(s.sts) {
+		logger.Info("StatefulSet spec not observed by its controller yet, requeuing",
+			"generation", s.sts.Generation, "observedGeneration", s.sts.Status.ObservedGeneration)
+		return ctrl.Result{RequeueAfter: requeueDuration}, nil
+	}
+
 	targetReplica := *s.sts.Spec.Replicas
 	var err error
 
@@ -298,6 +306,15 @@ func (r *EtcdClusterReconciler) reconcileClusterState(ctx context.Context, s *re
 				return ctrl.Result{}, err
 			}
 		}
+		return ctrl.Result{RequeueAfter: requeueDuration}, nil
+	}
+
+	// Membership mutations below must only run against a settled StatefulSet. This gate sits
+	// after mismatch recovery on purpose: an interrupted scale-in leaves an orphaned pod whose
+	// etcd has exited, so the StatefulSet can never settle until recovery shrinks it.
+	if !isStatefulSetSettled(s.sts) {
+		logger.Info("StatefulSet replicas not ready yet, requeuing",
+			"readyReplicas", s.sts.Status.ReadyReplicas, "replicas", targetReplica)
 		return ctrl.Result{RequeueAfter: requeueDuration}, nil
 	}
 
