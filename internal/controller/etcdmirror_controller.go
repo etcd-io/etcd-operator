@@ -126,6 +126,9 @@ type agentCounterBase struct {
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// The manager's recorder emits events.k8s.io/v1 Events; the core-group grant
+// alone silently drops them on a real apiserver (invisible in envtest).
+// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
 // Reconcile drives one EtcdMirror: finalize on delete, otherwise validate,
 // guard, render the agent Deployment, poll /statusz, and mirror the snapshot

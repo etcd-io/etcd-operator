@@ -258,7 +258,7 @@ func TestMirrorDeploymentRender(t *testing.T) {
 	// auth rotation annotation (source RV, empty target RV)
 	assert.Equal(t, "41/", pod.Annotations[authSecretsRVAnnotation])
 
-	// volumes: source tls + source auth, 0400
+	// volumes: source tls + source auth, 0440
 	names := map[string]corev1.Volume{}
 	for _, v := range pod.Spec.Volumes {
 		names[v.Name] = v
@@ -266,8 +266,12 @@ func TestMirrorDeploymentRender(t *testing.T) {
 	require.Contains(t, names, "source-tls")
 	require.Contains(t, names, "source-auth")
 	assert.NotContains(t, names, "target-tls")
-	assert.Equal(t, int32(0o400), *names["source-tls"].Secret.DefaultMode)
+	assert.Equal(t, int32(0o440), *names["source-tls"].Secret.DefaultMode)
 	assert.Equal(t, "src-tls", names["source-tls"].Secret.SecretName)
+
+	// non-root readability: fsGroup pairs with the 0440 mount mode
+	require.NotNil(t, pod.Spec.SecurityContext)
+	assert.Equal(t, int64(65532), *pod.Spec.SecurityContext.FSGroup)
 
 	// paused render
 	pausedDep := renderAgentDeployment(em, in, 0)

@@ -222,7 +222,10 @@ func sideVolumes(side string, ep ecv1alpha1.EtcdMirrorEndpoint) ([]corev1.Volume
 	var vols []corev1.Volume
 	var mounts []corev1.VolumeMount
 	base := sideMountBase(side)
-	mode := ptr.To[int32](0o400)
+	// 0440 + the pod-level fsGroup: Secret files stay root-owned, and the
+	// non-root agent reads them through group ownership. 0400 is unreadable
+	// for the distroless user (uid 65532) — caught by the TLS e2e.
+	mode := ptr.To[int32](0o440)
 	if ep.TLS != nil && ep.TLS.SecretRef != nil {
 		vols = append(vols, corev1.Volume{
 			Name: side + "-tls",
@@ -307,6 +310,12 @@ func renderAgentDeployment(em *ecv1alpha1.EtcdMirror, in agentWorkloadInput, rep
 		Volumes:    append(srcVols, tgtVols...),
 		// The agent has zero Kubernetes API dependency; don't hand it a token.
 		AutomountServiceAccountToken: ptr.To(false),
+		// The agent image runs as a non-root distroless user; Secret volume
+		// files are root-owned, so group ownership (fsGroup) plus the 0440
+		// mount mode is what makes the mounted TLS/auth material readable.
+		SecurityContext: &corev1.PodSecurityContext{
+			FSGroup: ptr.To[int64](65532),
+		},
 	}
 
 	podMeta := metav1.ObjectMeta{
