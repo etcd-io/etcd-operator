@@ -18,22 +18,17 @@ package e2e
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	"k8s.io/client-go/kubernetes"
-	"sigs.k8s.io/e2e-framework/klient/k8s"
 	"sigs.k8s.io/e2e-framework/klient/wait"
-	"sigs.k8s.io/e2e-framework/klient/wait/conditions"
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
 	"sigs.k8s.io/e2e-framework/pkg/envfuncs"
 	"sigs.k8s.io/e2e-framework/pkg/features"
@@ -56,65 +51,6 @@ const (
 	replicationWait = 10 * time.Second
 	replicationPoll = 250 * time.Millisecond
 )
-
-// createMirrorEtcdCluster creates a size-1 cleartext EtcdCluster in
-// mirrorNamespace.
-func createMirrorEtcdCluster(ctx context.Context, t *testing.T, cfg *envconf.Config, name string) {
-	t.Helper()
-	ec := &ecv1alpha1.EtcdCluster{
-		TypeMeta:   metav1.TypeMeta{APIVersion: "operator.etcd.io/v1alpha1", Kind: "EtcdCluster"},
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: mirrorNamespace},
-		Spec:       ecv1alpha1.EtcdClusterSpec{Size: 1, Version: etcdVersion},
-	}
-	if err := cfg.Client().Resources().Create(ctx, ec); err != nil {
-		t.Fatalf("failed to create EtcdCluster %s/%s: %v", mirrorNamespace, name, err)
-	}
-}
-
-// waitForMirrorSTSReady waits for the cluster's StatefulSet in
-// mirrorNamespace to report one ready replica.
-func waitForMirrorSTSReady(ctx context.Context, t *testing.T, cfg *envconf.Config, name string) {
-	t.Helper()
-	client := cfg.Client()
-	sts := appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: mirrorNamespace}}
-	// Not utils.GetKubernetesResource: its poll aborts on the first NotFound
-	// instead of waiting out the timeout. ResourceMatch swallows Get errors.
-	if err := wait.For(
-		conditions.New(client.Resources()).ResourceMatch(&sts, func(k8s.Object) bool { return true }),
-		wait.WithContext(ctx),
-		wait.WithTimeout(3*time.Minute),
-		wait.WithInterval(5*time.Second),
-	); err != nil {
-		t.Fatalf("StatefulSet %s never appeared: %v", name, err)
-	}
-	if err := wait.For(
-		conditions.New(client.Resources()).ResourceScaled(&sts, func(k8s.Object) int32 {
-			return sts.Status.ReadyReplicas
-		}, 1),
-		wait.WithContext(ctx),
-		wait.WithTimeout(3*time.Minute),
-		wait.WithInterval(5*time.Second),
-	); err != nil {
-		t.Fatalf("StatefulSet %s never reached 1 ready replica: %v", name, err)
-	}
-}
-
-// execInPodRetried retries transient exec failures (the SPDY stream setup is
-// a known flake mode under CI load). Only for idempotent commands.
-func execInPodRetried(t *testing.T, cfg *envconf.Config, podName string, command []string) (string, error) {
-	t.Helper()
-	var stderr string
-	var err error
-	for attempt := 0; attempt < 3; attempt++ {
-		if attempt > 0 {
-			time.Sleep(250 * time.Millisecond)
-		}
-		if _, stderr, err = execInPod(t, cfg, podName, mirrorNamespace, command); err == nil {
-			return "", nil
-		}
-	}
-	return stderr, err
-}
 
 // deleteMirrorResources best-effort deletes everything the feature creates.
 // Shared by the feature Teardown and a Setup t.Cleanup: a t.Fatalf in Setup
@@ -145,12 +81,6 @@ func deleteMirrorResources(ctx context.Context, t *testing.T, cfg *envconf.Confi
 	}
 }
 
-// etcdClientEndpoint is the per-pod DNS client URL the operator itself
-// advertises for member 0 of a size-1 cluster.
-func etcdClientEndpoint(name string) string {
-	return fmt.Sprintf("http://%s-0.%s.%s.svc.cluster.local:2379", name, name, mirrorNamespace)
-}
-
 // mirrorAgentPod renders the agent pod wired source→target, cleartext, with
 // the observability listener exposed on mirrorAgentPort.
 func mirrorAgentPod() *corev1.Pod {
@@ -171,8 +101,8 @@ func mirrorAgentPod() *corev1.Pod {
 				Args: []string{
 					"--link-uid=mirror-e2e-link",
 					"--epoch=1",
-					"--source-endpoints=" + etcdClientEndpoint(mirrorSourceName),
-					"--target-endpoints=" + etcdClientEndpoint(mirrorTargetName),
+					"--source-endpoints=" + etcdClientEndpointNS(mirrorNamespace, mirrorSourceName),
+					"--target-endpoints=" + etcdClientEndpointNS(mirrorNamespace, mirrorTargetName),
 					"--source-prefix=" + mirrorKeyPrefix,
 					"--target-prefix=" + mirrorKeyPrefix,
 					"--http-bind-address=:8080",
@@ -190,41 +120,24 @@ func mirrorAgentPod() *corev1.Pod {
 	}
 }
 
-// getViaPodProxy GETs a path on the agent pod's HTTP port through the
-// API-server pod proxy (the pod image is distroless — nothing can be exec'd).
-func getViaPodProxy(ctx context.Context, cfg *envconf.Config, path string) ([]byte, error) {
-	client := kubernetes.NewForConfigOrDie(cfg.Client().RESTConfig())
-	return client.CoreV1().RESTClient().Get().
-		Namespace(mirrorNamespace).
-		Resource("pods").
-		SubResource("proxy").
-		Name(fmt.Sprintf("%s:%d", mirrorAgentName, mirrorAgentPort)).
-		Suffix(path).
-		Do(ctx).Raw()
-}
-
-// getStatusz decodes /statusz into mirroragent.Snapshot — the JSON tags on
-// that type are the wire contract, so decoding into it cannot drift.
-func getStatusz(ctx context.Context, cfg *envconf.Config) (mirroragent.Snapshot, error) {
-	raw, err := getViaPodProxy(ctx, cfg, "statusz")
-	if err != nil {
-		return mirroragent.Snapshot{}, err
-	}
-	var s mirroragent.Snapshot
-	if err := json.Unmarshal(raw, &s); err != nil {
-		return mirroragent.Snapshot{}, fmt.Errorf("decoding /statusz %q: %w", raw, err)
-	}
-	return s, nil
-}
-
 // scrapeKeysAppliedMetric returns the unlabeled
 // etcd_mirror_agent_keys_applied_total sample from /metrics. Parsed by hand
 // to avoid promoting prometheus/common to a direct dependency.
 func scrapeKeysAppliedMetric(ctx context.Context, t *testing.T, cfg *envconf.Config) float64 {
 	t.Helper()
-	raw, err := getViaPodProxy(ctx, cfg, "metrics")
-	if err != nil {
-		t.Fatalf("failed to scrape /metrics: %v", err)
+	// Polled, not one-shot: the API-server proxy 503s transiently on a
+	// just-settled pod.
+	var raw []byte
+	if err := wait.For(func(ctx context.Context) (bool, error) {
+		b, gerr := getViaPodProxyNS(ctx, cfg, mirrorNamespace, mirrorAgentName, mirrorAgentPort, "metrics")
+		if gerr != nil {
+			return false, nil //nolint:nilerr // transient proxy failure; keep polling
+		}
+		raw = b
+		return true, nil
+	}, wait.WithContext(ctx), wait.WithTimeout(30*time.Second),
+		wait.WithInterval(2*time.Second)); err != nil {
+		t.Fatalf("failed to scrape /metrics within 30s: %v", err)
 	}
 	for _, line := range strings.Split(string(raw), "\n") {
 		if strings.HasPrefix(line, "#") {
@@ -241,25 +154,6 @@ func scrapeKeysAppliedMetric(ctx context.Context, t *testing.T, cfg *envconf.Con
 	}
 	t.Fatalf("etcd_mirror_agent_keys_applied_total absent from /metrics:\n%s", raw)
 	return 0
-}
-
-// dumpAgentDiagnostics logs the raw /statusz body and the agent pod logs so
-// a failed poll is debuggable from CI output alone.
-func dumpAgentDiagnostics(ctx context.Context, t *testing.T, cfg *envconf.Config) {
-	t.Helper()
-	if raw, err := getViaPodProxy(ctx, cfg, "statusz"); err != nil {
-		t.Logf("statusz unavailable: %v", err)
-	} else {
-		t.Logf("last /statusz: %s", raw)
-	}
-	client := kubernetes.NewForConfigOrDie(cfg.Client().RESTConfig())
-	logs, err := client.CoreV1().Pods(mirrorNamespace).
-		GetLogs(mirrorAgentName, &corev1.PodLogOptions{}).Do(ctx).Raw()
-	if err != nil {
-		t.Logf("agent pod logs unavailable: %v", err)
-		return
-	}
-	t.Logf("mirror-agent pod logs:\n%s", logs)
 }
 
 // hasAllMirrorKeys reports whether plain etcdctl get output (alternating
@@ -315,10 +209,10 @@ func TestMirrorAgent(t *testing.T) {
 			deleteMirrorResources(context.Background(), t, cfg)
 		})
 
-		createMirrorEtcdCluster(ctx, t, cfg, mirrorSourceName)
-		createMirrorEtcdCluster(ctx, t, cfg, mirrorTargetName)
-		waitForMirrorSTSReady(ctx, t, cfg, mirrorSourceName)
-		waitForMirrorSTSReady(ctx, t, cfg, mirrorTargetName)
+		createEtcdClusterInNS(ctx, t, cfg, mirrorNamespace, mirrorSourceName)
+		createEtcdClusterInNS(ctx, t, cfg, mirrorNamespace, mirrorTargetName)
+		waitForSTSReadyInNS(ctx, t, cfg, mirrorNamespace, mirrorSourceName)
+		waitForSTSReadyInNS(ctx, t, cfg, mirrorNamespace, mirrorTargetName)
 
 		// Both sides are up, so the agent never lingers in Connecting.
 		pod := mirrorAgentPod()
@@ -343,7 +237,7 @@ func TestMirrorAgent(t *testing.T) {
 			}
 			return false, nil
 		}, wait.WithTimeout(3*time.Minute), wait.WithInterval(2*time.Second)); err != nil {
-			dumpAgentDiagnostics(ctx, t, cfg)
+			dumpAgentDiagnosticsFor(ctx, t, cfg, mirrorNamespace, mirrorAgentName)
 			t.Fatalf("mirror-agent pod never became ready: %v", err)
 		}
 		return ctx
@@ -354,14 +248,14 @@ func TestMirrorAgent(t *testing.T) {
 			// readyz turns ready at InitialSync already, so gate on the
 			// statusz phase rather than pod readiness alone.
 			if err := wait.For(func(ctx context.Context) (bool, error) {
-				s, err := getStatusz(ctx, cfg)
+				s, err := getStatuszFor(ctx, cfg, mirrorNamespace, mirrorAgentName)
 				if err != nil {
 					return false, nil //nolint:nilerr // proxy may 503 while the pod settles; keep polling
 				}
 				baseline = s
 				return s.Phase == mirroragent.PhaseSyncing, nil
 			}, wait.WithTimeout(2*time.Minute), wait.WithInterval(time.Second)); err != nil {
-				dumpAgentDiagnostics(ctx, t, cfg)
+				dumpAgentDiagnosticsFor(ctx, t, cfg, mirrorNamespace, mirrorAgentName)
 				t.Fatalf("agent never reached phase %s (last snapshot: %+v): %v",
 					mirroragent.PhaseSyncing, baseline, err)
 			}
@@ -374,15 +268,8 @@ func TestMirrorAgent(t *testing.T) {
 
 	feature.Assess("writes replicate source to target",
 		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
-			sourcePod := mirrorSourceName + "-0"
-			for i := range mirrorKeyCount {
-				key := fmt.Sprintf("%skey-%02d", mirrorKeyPrefix, i)
-				val := fmt.Sprintf("val-%02d", i)
-				if stderr, err := execInPodRetried(t, cfg, sourcePod,
-					[]string{"etcdctl", "put", key, val}); err != nil {
-					t.Fatalf("failed to put %s on source: %v, stderr: %s", key, err, stderr)
-				}
-			}
+			sourceRef := etcdPodRef{ns: mirrorNamespace, pod: mirrorSourceName + "-0"}
+			putKeys(t, cfg, sourceRef, mirrorKeyPrefix+"key-", "val-", 0, mirrorKeyCount)
 			writeTime = time.Now()
 
 			// Range over key- specifically: a bare prefix get would also
@@ -396,7 +283,7 @@ func TestMirrorAgent(t *testing.T) {
 				}
 				return hasAllMirrorKeys(stdout), nil
 			}, wait.WithTimeout(replicationWait), wait.WithInterval(replicationPoll)); err != nil {
-				dumpAgentDiagnostics(ctx, t, cfg)
+				dumpAgentDiagnosticsFor(ctx, t, cfg, mirrorNamespace, mirrorAgentName)
 				t.Fatalf("target never showed all %d keys within %s: %v", mirrorKeyCount, replicationWait, err)
 			}
 			t.Logf("all %d keys visible on target after %s", mirrorKeyCount, time.Since(writeTime))
@@ -406,9 +293,9 @@ func TestMirrorAgent(t *testing.T) {
 	feature.Assess("delete replicates",
 		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
 			key := mirrorKeyPrefix + "key-00"
-			if stderr, err := execInPodRetried(t, cfg, mirrorSourceName+"-0",
-				[]string{"etcdctl", "del", key}); err != nil {
-				t.Fatalf("failed to delete %s on source: %v, stderr: %s", key, err, stderr)
+			sourceRef := etcdPodRef{ns: mirrorNamespace, pod: mirrorSourceName + "-0"}
+			if _, err := execEtcdctl(t, cfg, sourceRef, "del", key); err != nil {
+				t.Fatalf("failed to delete %s on source: %v", key, err)
 			}
 			delTime := time.Now()
 
@@ -420,7 +307,7 @@ func TestMirrorAgent(t *testing.T) {
 				}
 				return strings.TrimSpace(stdout) == "", nil
 			}, wait.WithTimeout(replicationWait), wait.WithInterval(replicationPoll)); err != nil {
-				dumpAgentDiagnostics(ctx, t, cfg)
+				dumpAgentDiagnosticsFor(ctx, t, cfg, mirrorNamespace, mirrorAgentName)
 				t.Fatalf("delete of %s never reached the target within %s: %v", key, replicationWait, err)
 			}
 			t.Logf("delete visible on target after %s", time.Since(delTime))
@@ -433,7 +320,7 @@ func TestMirrorAgent(t *testing.T) {
 			// updated atomically with the txn our read-back observed.
 			var last mirroragent.Snapshot
 			if err := wait.For(func(ctx context.Context) (bool, error) {
-				s, err := getStatusz(ctx, cfg)
+				s, err := getStatuszFor(ctx, cfg, mirrorNamespace, mirrorAgentName)
 				if err != nil {
 					return false, nil //nolint:nilerr // transient proxy failure; keep polling
 				}
@@ -444,7 +331,7 @@ func TestMirrorAgent(t *testing.T) {
 					s.LastProgressTime.After(baseline.LastProgressTime) &&
 					s.Phase == mirroragent.PhaseSyncing, nil
 			}, wait.WithTimeout(replicationWait), wait.WithInterval(replicationPoll)); err != nil {
-				dumpAgentDiagnostics(ctx, t, cfg)
+				dumpAgentDiagnosticsFor(ctx, t, cfg, mirrorNamespace, mirrorAgentName)
 				t.Fatalf("statusz never advanced past baseline\nbaseline: %+v\nlast: %+v\nerror: %v",
 					baseline, last, err)
 			}
