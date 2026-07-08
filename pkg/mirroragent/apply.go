@@ -87,6 +87,24 @@ func (a *Agent) applyFlushSet(ctx context.Context, fs *flushSet, f FenceValue) e
 	return a.applyFenced(ctx, ops, f, fs.ops[0].key, nBytes)
 }
 
+// noteApplySuccess records one successful fenced commit: counters advance and
+// every last-error field clears — including LastErrorReason, whose wire
+// contract is "" once the last attempt succeeded.
+func (a *Agent) noteApplySuccess(nOps int, prior Phase) {
+	a.bo.noteSuccess()
+	a.update(func(s *Snapshot) {
+		s.KeysAppliedTotal += int64(nOps)
+		s.Throttled = false
+		s.QuotaExhausted = false
+		s.LastError = ""
+		s.LastErrorClass = ""
+		s.LastErrorReason = ""
+		if s.Phase == PhaseDegraded && prior != PhaseDegraded {
+			s.Phase = prior
+		}
+	})
+}
+
 // applyFenced commits ops plus the checkpoint write under the fence compare,
 // retrying per class: transient and throttle back off on their own curves,
 // quota parks on the flat probe interval (never backoff — quota only heals
@@ -102,17 +120,7 @@ func (a *Agent) applyFenced(
 	for {
 		err := a.commitFenced(ctx, ops, f)
 		if err == nil {
-			a.bo.noteSuccess()
-			a.update(func(s *Snapshot) {
-				s.KeysAppliedTotal += int64(len(ops))
-				s.Throttled = false
-				s.QuotaExhausted = false
-				s.LastError = ""
-				s.LastErrorClass = ""
-				if s.Phase == PhaseDegraded && prior != PhaseDegraded {
-					s.Phase = prior
-				}
-			})
+			a.noteApplySuccess(len(ops), prior)
 			return nil
 		}
 		if ctx.Err() != nil {

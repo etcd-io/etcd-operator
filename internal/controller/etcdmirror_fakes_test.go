@@ -73,14 +73,15 @@ func (f *fakeStatusClient) callCount() int {
 type fakeCleaner struct {
 	mu    sync.Mutex
 	err   error
+	skip  string
 	calls []CheckpointTarget
 }
 
-func (f *fakeCleaner) DeleteCheckpoint(_ context.Context, tgt CheckpointTarget) error {
+func (f *fakeCleaner) DeleteCheckpoint(_ context.Context, tgt CheckpointTarget) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, tgt)
-	return f.err
+	return f.skip, f.err
 }
 
 func (f *fakeCleaner) setErr(err error) {

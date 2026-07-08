@@ -139,15 +139,20 @@ func TestEtcdMirrorReconcile_ConditionFixtures(t *testing.T) {
 	})
 
 	t.Run("forced resync reports InitialSync plus Compacted", func(t *testing.T) {
-		sc := &fakeStatusClient{}
+		sc := &fakeStatusClient{snap: healthySnapshot()}
 		r, _ := newTestMirrorReconciler(sc, &fakeCleaner{})
+		em := setupActiveMirror(t, r, ns, nil)
+		reconcileMirrorOnce(t, r, em) // one healthy poll: InitialSyncComplete=True
+
+		// The agent's fresh scan zeroes its process-local completion time —
+		// the state a real forced resync serves on the wire.
 		snap := healthySnapshot()
 		snap.Phase = mirroragent.PhaseInitialSync
 		snap.Compacted = true
 		snap.ForcedResyncCount = 1
 		snap.LastResyncReason = mirroragent.ResyncReasonCompacted
+		snap.InitialSyncCompletionTime = time.Time{}
 		sc.set(snap, nil)
-		em := setupActiveMirror(t, r, ns, nil)
 
 		reconcileMirrorOnce(t, r, em)
 		got := refreshMirror(t, em)
@@ -155,6 +160,8 @@ func TestEtcdMirrorReconcile_ConditionFixtures(t *testing.T) {
 		requireCond(t, got, ecv1alpha1.EtcdMirrorConditionCompacted, metav1.ConditionTrue,
 			ecv1alpha1.EtcdMirrorReasonForcedResync)
 		assert.Equal(t, int32(1), got.Status.ForcedResyncCount)
+		// Durable across forced resyncs (Compacted covers those).
+		requireCond(t, got, ecv1alpha1.EtcdMirrorConditionInitialSyncComplete, metav1.ConditionTrue, reasonComplete)
 	})
 
 	t.Run("throttled while degraded", func(t *testing.T) {
@@ -390,11 +397,12 @@ func TestEtcdMirrorReconcile_StatuszTimeout(t *testing.T) {
 	res := reconcileMirrorOnce(t, r, em)
 	assert.Equal(t, statusPollInterval, res.RequeueAfter)
 	got = refreshMirror(t, em)
-	assert.Equal(t, ecv1alpha1.EtcdMirrorPhaseDegraded, got.Status.Phase)
 	cond := requireCond(t, got, ecv1alpha1.EtcdMirrorConditionAvailable, metav1.ConditionUnknown,
 		reasonAgentStatusUnreachable)
 	assert.Contains(t, cond.Message, "i/o timeout")
-	// Prior fields retained; staleness observable.
+	// ALL prior fields retained, including phase: Degraded is the agent's
+	// backoff state, which a controller-side poll failure says nothing about.
+	assert.Equal(t, ecv1alpha1.EtcdMirrorPhaseSyncing, got.Status.Phase)
 	assert.Equal(t, int64(1200), got.Status.LastAppliedRevision)
 	assert.True(t, got.Status.LastStatusSyncTime.Equal(syncTime), "LastStatusSyncTime must not advance")
 }
@@ -408,10 +416,12 @@ func TestEtcdMirrorReconcile_SnapshotDecodeFailure(t *testing.T) {
 	ns := createTestNamespace(t)
 	em := setupActiveMirror(t, r, ns, nil)
 
+	// A healthy poll first, so the retained phase is observable.
+	reconcileMirrorOnce(t, r, em)
 	sc.set(nil, &snapshotDecodeError{err: errors.New("invalid character '<'")})
 	reconcileMirrorOnce(t, r, em)
 	got := refreshMirror(t, em)
-	assert.Equal(t, ecv1alpha1.EtcdMirrorPhaseDegraded, got.Status.Phase)
+	assert.Equal(t, ecv1alpha1.EtcdMirrorPhaseSyncing, got.Status.Phase, "poll failure must not fabricate Degraded")
 	requireCond(t, got, ecv1alpha1.EtcdMirrorConditionAvailable, metav1.ConditionUnknown, reasonSnapshotDecodeFailed)
 }
 
@@ -445,6 +455,9 @@ func TestEtcdMirrorReconcile_PrefixConflict(t *testing.T) {
 	assert.Equal(t, ecv1alpha1.EtcdMirrorPhasePending, got.Status.Phase)
 	cond := requireCond(t, got, ecv1alpha1.EtcdMirrorConditionPrefixConflict, metav1.ConditionTrue, reasonConflict)
 	assert.Contains(t, cond.Message, older.Name)
+	// The loser's OTHER guard condition is still evaluated (a stale True from
+	// a since-deleted reverse sibling must not survive the early block).
+	requireCond(t, got, ecv1alpha1.EtcdMirrorConditionDirectionConflict, metav1.ConditionFalse, reasonNoConflict)
 	dep := getAgentDeployment(t, newer)
 	assert.Equal(t, int32(0), *dep.Spec.Replicas, "the loser's Deployment must be scaled to zero")
 	require.Equal(t, 1, rec.countReason(ecv1alpha1.EtcdMirrorConditionPrefixConflict))
@@ -453,10 +466,13 @@ func TestEtcdMirrorReconcile_PrefixConflict(t *testing.T) {
 	reconcileMirrorOnce(t, r, newer)
 	assert.Equal(t, 1, rec.countReason(ecv1alpha1.EtcdMirrorConditionPrefixConflict))
 
-	// The older CR is unaffected.
+	// The older CR keeps running; its False honestly names the parked loser
+	// instead of claiming nothing overlaps.
 	reconcileMirrorOnce(t, r, older)
 	gotOlder := refreshMirror(t, older)
-	requireCond(t, gotOlder, ecv1alpha1.EtcdMirrorConditionPrefixConflict, metav1.ConditionFalse, reasonNoConflict)
+	condOlder := requireCond(t, gotOlder, ecv1alpha1.EtcdMirrorConditionPrefixConflict,
+		metav1.ConditionFalse, reasonConflictWinner)
+	assert.Contains(t, condOlder.Message, newer.Name)
 	assert.NotEqual(t, ecv1alpha1.EtcdMirrorPhaseFailed, gotOlder.Status.Phase)
 
 	// Deleting the older clears the conflict on the next reconcile.
@@ -617,6 +633,27 @@ func TestEtcdMirrorReconcile_Finalizer(t *testing.T) {
 		assert.Equal(t, "/mirrored/\x00custom-cp", cleaner.calls[0].Key)
 	})
 
+	t.Run("foreign-owned fence is left in place and finalization completes", func(t *testing.T) {
+		sc := &fakeStatusClient{snap: healthySnapshot()}
+		cleaner := &fakeCleaner{skip: `the stored fence is owned by link "other-uid", not this mirror; leaving the key in place`}
+		r, rec := newTestMirrorReconciler(sc, cleaner)
+		ns := createTestNamespace(t)
+		em := newEnvtestMirror(t, ns, nil)
+		reconcileMirrorOnce(t, r, em)
+		reconcileMirrorOnce(t, r, em) // Deployment exists, no pods
+		require.NoError(t, k8sClient.Delete(t.Context(), refreshMirror(t, em)))
+
+		reconcileMirrorOnce(t, r, em)
+		require.Equal(t, 1, cleaner.callCount())
+		assert.Equal(t, string(em.UID), cleaner.calls[0].LinkUID,
+			"the cleaner must receive this CR's link UID for the ownership check")
+		assert.Equal(t, 1, rec.countReason("CheckpointNotOwned"))
+		assert.Contains(t, rec.lastNote("CheckpointNotOwned"), "other-uid")
+		err := k8sClient.Get(t.Context(),
+			types.NamespacedName{Namespace: em.Namespace, Name: em.Name}, &ecv1alpha1.EtcdMirror{})
+		assert.True(t, apierrors.IsNotFound(err), "a foreign fence must not block deletion")
+	})
+
 	t.Run("skip annotation is the escape hatch", func(t *testing.T) {
 		sc := &fakeStatusClient{snap: healthySnapshot()}
 		cleaner := &fakeCleaner{}
@@ -770,6 +807,21 @@ func TestEtcdMirrorReconcile_InsecureSkipVerifyWarning(t *testing.T) {
 	reconcileMirrorOnce(t, r, em)
 	require.Equal(t, 1, rec.countReason(ecv1alpha1.EtcdMirrorEventInsecureSkipVerifyEnabled))
 	assert.Contains(t, rec.lastNote(ecv1alpha1.EtcdMirrorEventInsecureSkipVerifyEnabled), "target")
+
+	// The standing warning has no reachability qualifier: a mirror that
+	// never passes validation (here: no agent image) must still warn.
+	rBlocked, recBlocked := newTestMirrorReconciler(sc, &fakeCleaner{})
+	rBlocked.AgentImage = ""
+	emBlocked := newEnvtestMirror(t, ns, func(em *ecv1alpha1.EtcdMirror) {
+		em.Spec.Source.TLS = &ecv1alpha1.EtcdMirrorTLS{
+			InsecureSkipVerify:                true,
+			InsecureSkipVerifyAcknowledgeRisk: true,
+		}
+	})
+	reconcileMirrorOnce(t, rBlocked, emBlocked)
+	reconcileMirrorOnce(t, rBlocked, emBlocked)
+	require.Equal(t, 1, recBlocked.countReason(ecv1alpha1.EtcdMirrorEventInsecureSkipVerifyEnabled))
+	assert.Contains(t, recBlocked.lastNote(ecv1alpha1.EtcdMirrorEventInsecureSkipVerifyEnabled), "source")
 }
 
 func TestEtcdMirrorReconcile_ServiceRefPortResolution(t *testing.T) {
@@ -813,6 +865,93 @@ func TestEtcdMirrorReconcile_ServiceRefPortResolution(t *testing.T) {
 		requireCond(t, got, ecv1alpha1.EtcdMirrorConditionAvailable, metav1.ConditionFalse, reasonServiceNotFound)
 		assert.Equal(t, 1, rec.countReason(reasonServiceNotFound))
 	})
+}
+
+// TestEtcdMirrorReconcile_CountersSurvivePodRestart pins the "Monotonic,
+// never reset" status contract: the agent's counters are process memory, so a
+// pod restart reports 0 and the controller must rebase, not regress.
+func TestEtcdMirrorReconcile_CountersSurvivePodRestart(t *testing.T) {
+	if k8sClient == nil {
+		t.Skip("envtest apiserver not available")
+	}
+	sc := &fakeStatusClient{}
+	r, rec := newTestMirrorReconciler(sc, &fakeCleaner{})
+	snap := healthySnapshot()
+	snap.ForcedResyncCount = 2
+	snap.LastResyncReason = mirroragent.ResyncReasonCompacted
+	snap.ScanRestartCount = 3
+	snap.LastScanRestartCause = mirroragent.ScanRestartWatchBufferOverflow
+	sc.set(snap, nil)
+	ns := createTestNamespace(t)
+	em := setupActiveMirror(t, r, ns, nil)
+
+	reconcileMirrorOnce(t, r, em)
+	got := refreshMirror(t, em)
+	require.Equal(t, int32(2), got.Status.ForcedResyncCount)
+	require.Equal(t, int64(3), got.Status.ScanRestartCount)
+
+	// The pod restarts: fresh process, counters back to zero on the wire.
+	pods := &corev1.PodList{}
+	require.NoError(t, k8sClient.List(t.Context(), pods,
+		client.InNamespace(em.Namespace), client.MatchingLabels(etcdMirrorAgentLabels(em))))
+	for i := range pods.Items {
+		require.NoError(t, k8sClient.Delete(t.Context(), &pods.Items[i], client.GracePeriodSeconds(0)))
+	}
+	makeAgentPodReady(t, em)
+	restarted := *snap
+	restarted.ForcedResyncCount = 0
+	restarted.ScanRestartCount = 0
+	sc.set(&restarted, nil)
+
+	events := rec.countReason(ecv1alpha1.EtcdMirrorEventForcedResyncStarted)
+	reconcileMirrorOnce(t, r, em)
+	got = refreshMirror(t, em)
+	assert.Equal(t, int32(2), got.Status.ForcedResyncCount, "a pod restart must never regress the counter")
+	assert.Equal(t, int64(3), got.Status.ScanRestartCount)
+	assert.Equal(t, events, rec.countReason(ecv1alpha1.EtcdMirrorEventForcedResyncStarted),
+		"a rebased counter must not re-fire events")
+
+	// A real resync in the new process still advances and still fires.
+	resynced := restarted
+	resynced.ForcedResyncCount = 1
+	sc.set(&resynced, nil)
+	reconcileMirrorOnce(t, r, em)
+	got = refreshMirror(t, em)
+	assert.Equal(t, int32(3), got.Status.ForcedResyncCount)
+	assert.Equal(t, events+1, rec.countReason(ecv1alpha1.EtcdMirrorEventForcedResyncStarted))
+}
+
+// TestEtcdMirrorReconcile_ValidationAfterWorkloadExists: deleting a
+// referenced Secret must not claim Pending ("workload not created yet") for a
+// mirror whose agent keeps running on mounted material.
+func TestEtcdMirrorReconcile_ValidationAfterWorkloadExists(t *testing.T) {
+	if k8sClient == nil {
+		t.Skip("envtest apiserver not available")
+	}
+	sc := &fakeStatusClient{snap: healthySnapshot()}
+	r, _ := newTestMirrorReconciler(sc, &fakeCleaner{})
+	ns := createTestNamespace(t)
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "vanishing-auth", Namespace: ns},
+		Data:       map[string][]byte{"username": []byte("u"), "password": []byte("p")},
+	}
+	require.NoError(t, k8sClient.Create(t.Context(), secret))
+	em := setupActiveMirror(t, r, ns, func(em *ecv1alpha1.EtcdMirror) {
+		em.Spec.Source.Auth = &ecv1alpha1.EtcdMirrorAuth{
+			SecretRef: corev1.LocalObjectReference{Name: "vanishing-auth"},
+		}
+	})
+	reconcileMirrorOnce(t, r, em)
+	got := refreshMirror(t, em)
+	require.Equal(t, ecv1alpha1.EtcdMirrorPhaseSyncing, got.Status.Phase)
+
+	require.NoError(t, k8sClient.Delete(t.Context(), secret))
+	reconcileMirrorOnce(t, r, em)
+	got = refreshMirror(t, em)
+	assert.Equal(t, ecv1alpha1.EtcdMirrorPhaseSyncing, got.Status.Phase,
+		"an existing workload's phase must be retained, not overwritten with Pending")
+	cond := requireCond(t, got, ecv1alpha1.EtcdMirrorConditionAvailable, metav1.ConditionFalse, reasonSecretNotFound)
+	assert.Contains(t, cond.Message, "keeps running")
 }
 
 func TestEtcdMirrorReconcile_AgentImageNotConfigured(t *testing.T) {

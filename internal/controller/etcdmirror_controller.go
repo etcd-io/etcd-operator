@@ -36,9 +36,11 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 	"go.etcd.io/etcd-operator/pkg/mirroragent"
@@ -93,12 +95,26 @@ type EtcdMirrorReconciler struct {
 	Cleaner CheckpointCleaner
 
 	// In-memory ledgers (lost on restart, which is acceptable: the lag window
-	// restarts and standing warnings conservatively re-emit).
+	// restarts, standing warnings conservatively re-emit, and counter bases
+	// re-derive from persisted status).
 	mu sync.Mutex
 	// lagSince: when the watermark gap first exceeded the lag threshold.
 	lagSince map[types.UID]time.Time
-	// warnedAt: last emission per damped-warning key.
+	// warnedAt: last emission per damped-warning key ("<cr-uid>/<key>").
 	warnedAt map[string]time.Time
+	// counterBases: per-CR offsets rebasing the agent's process-local
+	// monotonic counters onto persisted status across pod restarts.
+	counterBases map[types.UID]agentCounterBase
+}
+
+// agentCounterBase carries the persisted-counter offset for one agent pod so
+// forcedResyncCount/scanRestartCount never regress when the pod restarts (the
+// status contract declares both "Monotonic, never reset"; the agent's copies
+// are process memory).
+type agentCounterBase struct {
+	podUID       types.UID
+	forcedResync int64
+	scanRestart  int64
 }
 
 // +kubebuilder:rbac:groups=operator.etcd.io,resources=etcdmirrors,verbs=get;list;watch;create;update;patch;delete
@@ -157,10 +173,16 @@ func (r *EtcdMirrorReconciler) reconcileMirror(
 ) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
+	// Standing spec warnings (cert expiry lead window, insecureSkipVerify)
+	// are spec/Secret-derived and independent of agent state: emit on every
+	// non-finalizing reconcile so Pending/Paused/guard-blocked mirrors warn
+	// too (the InsecureSkipVerify contract has no reachability qualifier).
+	r.emitSpecWarnings(ctx, em, time.Now())
+
 	// Validate: agent image, credential Secrets, serviceRef resolution. Any
 	// failure is an environment/spec problem, not an agent failure: Pending.
 	if r.AgentImage == "" {
-		r.blockPending(em, prior, reasonAgentImageNotConfigured,
+		r.blockValidation(ctx, em, prior, reasonAgentImageNotConfigured,
 			"the operator was started without --mirror-agent-image; EtcdMirror CRs stay Pending until it is set")
 		return ctrl.Result{RequeueAfter: validationRetryBackoff}, nil
 	}
@@ -177,7 +199,7 @@ func (r *EtcdMirrorReconciler) reconcileMirror(
 	if err != nil {
 		var ce *credsError
 		if errors.As(err, &ce) {
-			r.blockPending(em, prior, ce.Reason, ce.Error())
+			r.blockValidation(ctx, em, prior, ce.Reason, ce.Error())
 			return ctrl.Result{RequeueAfter: validationRetryBackoff}, nil
 		}
 		return ctrl.Result{}, err
@@ -237,19 +259,24 @@ func (r *EtcdMirrorReconciler) reconcileMirror(
 	// Poll /statusz through the seam.
 	snap, err := r.StatusClient.Snapshot(ctx, net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(agentHTTPPort)))
 	if err != nil {
-		// Degraded, prior status fields retained, LastStatusSyncTime NOT
-		// advanced — staleness stays observable.
+		// ALL prior status fields retained — including phase: Degraded is
+		// reserved for the agent's own retry/backoff loop and a poll failure
+		// says nothing about the agent (a controller-side route blip must not
+		// flip a healthy mirror, nor mask a terminal Failed). Staleness stays
+		// observable via LastStatusSyncTime not advancing.
 		reason := reasonAgentStatusUnreachable
 		var decodeErr *snapshotDecodeError
 		if errors.As(err, &decodeErr) {
 			reason = reasonSnapshotDecodeFailed
 		}
-		em.Status.Phase = ecv1alpha1.EtcdMirrorPhaseDegraded
 		em.Status.ObservedGeneration = em.Generation
 		setMirrorCondition(em, ecv1alpha1.EtcdMirrorConditionAvailable, metav1.ConditionUnknown,
 			reason, fmt.Sprintf("polling agent /statusz: %v", err))
 		return ctrl.Result{RequeueAfter: statusPollInterval}, nil
 	}
+
+	// Rebase the process-local monotonic counters before anything reads them.
+	r.adjustSnapshotCounters(em, prior, pod.UID, snap)
 
 	// Events first (the persisted counters/conditions are the dedup ledger,
 	// so emit before the snapshot overwrites them), then the mapping.
@@ -270,27 +297,65 @@ func (r *EtcdMirrorReconciler) reconcileMirror(
 	}
 	r.mu.Unlock()
 
-	// Standing spec warnings: cert expiry lead window, insecureSkipVerify.
-	r.emitSpecWarnings(ctx, em, now)
-
 	if em.Status.Phase == ecv1alpha1.EtcdMirrorPhaseFailed {
 		return ctrl.Result{RequeueAfter: slowRequeueInterval}, nil
 	}
 	return ctrl.Result{RequeueAfter: statusPollInterval}, nil
 }
 
-// blockPending parks the CR in Pending with a specific Available reason and
-// emits one Warning per transition into that reason.
-func (r *EtcdMirrorReconciler) blockPending(
-	em *ecv1alpha1.EtcdMirror, prior *ecv1alpha1.EtcdMirrorStatus, reason, message string,
+// blockValidation parks the CR on a validation failure with a specific
+// Available reason, emitting one Warning per transition into that reason.
+// Phase drops to Pending ("the agent workload has not been created yet") only
+// when that is true: a Deployment rendered before the failure (a referenced
+// Secret/Service deleted later, an operator restart without the image flag)
+// keeps its pod running on mounted material, so the prior phase is retained
+// and only the condition carries the failure — status is stale until
+// validation passes, observable via LastStatusSyncTime.
+func (r *EtcdMirrorReconciler) blockValidation(
+	ctx context.Context, em *ecv1alpha1.EtcdMirror, prior *ecv1alpha1.EtcdMirrorStatus, reason, message string,
 ) {
-	em.Status.Phase = ecv1alpha1.EtcdMirrorPhasePending
+	dep := &appsv1.Deployment{}
+	err := r.Get(ctx, types.NamespacedName{Namespace: em.Namespace, Name: deploymentNameForEtcdMirror(em)}, dep)
+	if err != nil || em.Status.Phase == "" {
+		em.Status.Phase = ecv1alpha1.EtcdMirrorPhasePending
+	} else {
+		message += "; the existing agent Deployment keeps running on previously mounted material" +
+			" and its status mirror is stale until validation passes"
+	}
 	em.Status.ObservedGeneration = em.Generation
 	priorCond := meta.FindStatusCondition(prior.Conditions, ecv1alpha1.EtcdMirrorConditionAvailable)
 	if priorCond == nil || priorCond.Reason != reason {
 		r.Recorder.Eventf(em, nil, corev1.EventTypeWarning, reason, eventActionReconcile, "%s", message)
 	}
 	setMirrorCondition(em, ecv1alpha1.EtcdMirrorConditionAvailable, metav1.ConditionFalse, reason, message)
+}
+
+// adjustSnapshotCounters rebases the agent's process-local monotonic counters
+// onto the persisted status so a pod restart never regresses them (nor
+// re-fires the counter-keyed events). First sight of a pod assumes the
+// persisted counters already include the snapshot's — true after a controller
+// restart, and a fresh pod reports 0; increments that land between pod start
+// and its first poll are absorbed into the base. The max clamps cover a
+// container restart inside one pod.
+func (r *EtcdMirrorReconciler) adjustSnapshotCounters(
+	em *ecv1alpha1.EtcdMirror, prior *ecv1alpha1.EtcdMirrorStatus, podUID types.UID, snap *mirroragent.Snapshot,
+) {
+	r.mu.Lock()
+	if r.counterBases == nil {
+		r.counterBases = make(map[types.UID]agentCounterBase)
+	}
+	b, ok := r.counterBases[em.UID]
+	if !ok || b.podUID != podUID {
+		b = agentCounterBase{
+			podUID:       podUID,
+			forcedResync: max(int64(prior.ForcedResyncCount)-snap.ForcedResyncCount, 0),
+			scanRestart:  max(prior.ScanRestartCount-snap.ScanRestartCount, 0),
+		}
+		r.counterBases[em.UID] = b
+	}
+	r.mu.Unlock()
+	snap.ForcedResyncCount = max(b.forcedResync+snap.ForcedResyncCount, int64(prior.ForcedResyncCount))
+	snap.ScanRestartCount = max(b.scanRestart+snap.ScanRestartCount, prior.ScanRestartCount)
 }
 
 // endpointsForSide resolves one side to the comma-joined --<side>-endpoints
@@ -322,23 +387,34 @@ func (r *EtcdMirrorReconciler) applyGuards(
 	prefixConflict := findPrefixConflict(em, all.Items)
 	directionConflict := findDirectionConflict(em, all.Items)
 
-	// PrefixConflict: only the loser reports it (the winner keeps its range).
-	if prefixConflict != nil && isConflictLoser(em, prefixConflict.sibling) {
-		return true, r.blockOnConflict(ctx, em, prior, in, prefixConflict), nil
-	}
-	setMirrorCondition(em, ecv1alpha1.EtcdMirrorConditionPrefixConflict, metav1.ConditionFalse,
-		reasonNoConflict, "no other EtcdMirror overlaps this effective destination range on the same target cluster")
-
-	// DirectionConflict is a mutual property: True on both CRs, but only the
-	// loser is stopped.
+	// Both conditions are (re)evaluated on every reconcile — even when the
+	// other guard blocks — so a True left by a since-deleted sibling clears.
+	// DirectionConflict is a mutual property: True on both CRs.
 	if directionConflict != nil {
 		r.setConflictCondition(em, prior, directionConflict)
-		if isConflictLoser(em, directionConflict.sibling) {
-			return true, r.blockOnConflict(ctx, em, prior, in, nil), nil
-		}
 	} else {
 		setMirrorCondition(em, ecv1alpha1.EtcdMirrorConditionDirectionConflict, metav1.ConditionFalse,
 			reasonNoConflict, "no other EtcdMirror mirrors the opposite direction between these clusters")
+	}
+	// PrefixConflict: only the loser reports True (the winner keeps its
+	// range), but the winner's False names the parked sibling honestly.
+	switch {
+	case prefixConflict == nil:
+		setMirrorCondition(em, ecv1alpha1.EtcdMirrorConditionPrefixConflict, metav1.ConditionFalse,
+			reasonNoConflict, "no other EtcdMirror overlaps this effective destination range on the same target cluster")
+	case !isConflictLoser(em, prefixConflict.sibling):
+		setMirrorCondition(em, ecv1alpha1.EtcdMirrorConditionPrefixConflict, metav1.ConditionFalse,
+			reasonConflictWinner, fmt.Sprintf(
+				"EtcdMirror %s/%s overlaps this effective destination range but is the newer CR: it is parked, this mirror keeps the range",
+				prefixConflict.sibling.Namespace, prefixConflict.sibling.Name))
+		prefixConflict = nil
+	}
+
+	if prefixConflict != nil {
+		return true, r.blockOnConflict(ctx, em, prior, in, prefixConflict), nil
+	}
+	if directionConflict != nil && isConflictLoser(em, directionConflict.sibling) {
+		return true, r.blockOnConflict(ctx, em, prior, in, nil), nil
 	}
 	return false, ctrl.Result{}, nil
 }
@@ -542,9 +618,10 @@ func (r *EtcdMirrorReconciler) finalize(ctx context.Context, em *ecv1alpha1.Etcd
 		return ctrl.Result{RequeueAfter: finalizerPodWait}, nil
 	}
 
+	var skipReason string
 	tgt, err := resolveFinalizerTarget(ctx, r.Client, logger, em)
 	if err == nil {
-		err = r.Cleaner.DeleteCheckpoint(ctx, tgt)
+		skipReason, err = r.Cleaner.DeleteCheckpoint(ctx, tgt)
 	}
 	if err != nil {
 		// Bounded-backoff retries forever; the annotation is the exit.
@@ -556,6 +633,13 @@ func (r *EtcdMirrorReconciler) finalize(ctx context.Context, em *ecv1alpha1.Etcd
 		logger.Error(err, "checkpoint cleanup failed", "retryAfter", backoff)
 		return ctrl.Result{RequeueAfter: backoff}, nil
 	}
+	if skipReason != "" {
+		// A foreign or undecodable fence is provably not this CR's state
+		// (e.g. this CR was a parked PrefixConflict loser and the key is the
+		// winner's live fence): nothing of ours to clean, deletion proceeds.
+		r.Recorder.Eventf(em, nil, corev1.EventTypeNormal, "CheckpointNotOwned", eventActionFinalize,
+			"reserved key %q left in place: %s", tgt.Key, skipReason)
+	}
 	return r.removeFinalizer(ctx, em)
 }
 
@@ -566,6 +650,13 @@ func (r *EtcdMirrorReconciler) removeFinalizer(ctx context.Context, em *ecv1alph
 	}
 	r.mu.Lock()
 	delete(r.lagSince, em.UID)
+	delete(r.counterBases, em.UID)
+	prefix := string(em.UID) + "/"
+	for k := range r.warnedAt {
+		if strings.HasPrefix(k, prefix) {
+			delete(r.warnedAt, k)
+		}
+	}
 	r.mu.Unlock()
 	return ctrl.Result{}, nil
 }
@@ -592,8 +683,17 @@ func (r *EtcdMirrorReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.Cleaner == nil {
 		r.Cleaner = etcdCheckpointCleaner{}
 	}
+	// The controller's own status writes must not re-enqueue the CR: every
+	// healthy poll advances LastStatusSyncTime, so an unfiltered watch turns
+	// the poll cadence into a self-triggering hot loop. Generation covers
+	// spec changes and deletion; annotations keep the skip-checkpoint-cleanup
+	// escape hatch responsive. Poll cadence rests on the returned
+	// RequeueAfter values, which is the design.
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&ecv1alpha1.EtcdMirror{}).
+		For(&ecv1alpha1.EtcdMirror{}, builder.WithPredicates(predicate.Or(
+			predicate.GenerationChangedPredicate{},
+			predicate.AnnotationChangedPredicate{},
+		))).
 		Owns(&appsv1.Deployment{}).
 		Complete(r)
 }

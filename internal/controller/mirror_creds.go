@@ -196,7 +196,7 @@ func checkpointKeyForMirror(em *ecv1alpha1.EtcdMirror) string {
 func resolveFinalizerTarget(
 	ctx context.Context, c client.Client, logger logr.Logger, em *ecv1alpha1.EtcdMirror,
 ) (CheckpointTarget, error) {
-	tgt := CheckpointTarget{Key: checkpointKeyForMirror(em)}
+	tgt := CheckpointTarget{Key: checkpointKeyForMirror(em), LinkUID: string(em.UID)}
 	ep := em.Spec.Target
 
 	switch {

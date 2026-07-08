@@ -71,6 +71,7 @@ const (
 	reasonBackoff                 = "Backoff"
 
 	reasonNoConflict            = "NoConflict"
+	reasonConflictWinner        = "ConflictWinner"
 	reasonNotThrottled          = "NotThrottled"
 	reasonQuotaOK               = "QuotaOK"
 	reasonSteadyState           = "SteadyState"
@@ -166,18 +167,35 @@ func applySnapshotToStatus(
 	st.Phase = phaseFromSnapshot(snap.Phase)
 	st.LastAppliedRevision = snap.Watermark
 	st.SourceRevision = snap.SourceRevision
-	st.SourceClusterID = hexClusterID(snap.SourceClusterID)
-	st.TargetClusterID = hexClusterID(snap.TargetClusterID)
+	// Cluster IDs are latched last-known identities: a fresh agent serves
+	// zero IDs until its connect-time probe, and blanking the persisted IDs
+	// in that window would disarm the runtime guard comparisons (sameCluster
+	// falls back to spec identity), transiently unparking a conflict loser.
+	if id := hexClusterID(snap.SourceClusterID); id != "" {
+		st.SourceClusterID = id
+	}
+	if id := hexClusterID(snap.TargetClusterID); id != "" {
+		st.TargetClusterID = id
+	}
 	st.SourceVersion = snap.SourceVersion
 	st.TargetVersion = snap.TargetVersion
-	st.InitialSyncKeyCount = snap.InitialSyncKeyCount
-	st.InitialSyncTotalKeyCount = snap.InitialSyncTotalKeyCount
-	st.InitialSyncStartTime = metaTimeOrNil(snap.InitialSyncStartTime)
-	st.InitialSyncCompletionTime = metaTimeOrNil(snap.InitialSyncCompletionTime)
+	// A resumed agent (valid checkpoint -> straight to tail) never sets the
+	// initialSync* snapshot fields; only a live or completed scan may
+	// overwrite the persisted values, or a pod restart would wipe them.
+	if !snap.InitialSyncStartTime.IsZero() || snap.Phase == mirroragent.PhaseInitialSync {
+		st.InitialSyncKeyCount = snap.InitialSyncKeyCount
+		st.InitialSyncTotalKeyCount = snap.InitialSyncTotalKeyCount
+		st.InitialSyncStartTime = metaTimeOrNil(snap.InitialSyncStartTime)
+	}
+	if !snap.InitialSyncCompletionTime.IsZero() {
+		st.InitialSyncCompletionTime = metaTimeOrNil(snap.InitialSyncCompletionTime)
+	}
 	st.LeaseBackedKeyCount = snap.LeaseBackedKeyCount
 	st.ForcedResyncCount = int32(snap.ForcedResyncCount)
 	st.ScanRestartCount = snap.ScanRestartCount
-	st.LastReconciliationTime = metaTimeOrNil(snap.LastReconcileTime)
+	if !snap.LastReconcileTime.IsZero() {
+		st.LastReconciliationTime = metaTimeOrNil(snap.LastReconcileTime)
+	}
 	if snap.LastReconcileDrift != nil {
 		st.LastReconciliationDrift = &ecv1alpha1.EtcdMirrorDriftInfo{
 			MissingKeys:   snap.LastReconcileDrift.MissingKeys,
@@ -190,8 +208,11 @@ func applySnapshotToStatus(
 		st.SourceKeyCount = snap.SourceKeyCount
 		st.TargetKeyCount = snap.TargetKeyCount
 	}
-	st.LastProgressTime = metaTimeOrNil(snap.LastProgressTime)
-	if snap.Cutover != nil {
+	if !snap.LastProgressTime.IsZero() {
+		st.LastProgressTime = metaTimeOrNil(snap.LastProgressTime)
+	}
+	switch {
+	case snap.Cutover != nil:
 		st.Cutover = &ecv1alpha1.EtcdMirrorCutoverStatus{
 			DrainTargetRevision: snap.Cutover.DrainTargetRevision,
 			DrainedRevision:     snap.Cutover.DrainedRevision,
@@ -200,6 +221,12 @@ func applySnapshotToStatus(
 			TargetKeyCount:      snap.Cutover.TargetKeyCount,
 			LeasedKeyCount:      snap.Cutover.LeasedKeyCount,
 		}
+	case em.Spec.Mode != ecv1alpha1.EtcdMirrorModeDrain:
+		// Contract: cutover is populated while spec.mode is Drain. A Drain ->
+		// Sync flip rolls a fresh agent whose snapshot carries no cutover;
+		// the stale block must not linger. Mid-drain restarts (mode still
+		// Drain, cutover transiently absent) retain the last-known values.
+		st.Cutover = nil
 	}
 	st.LastStatusSyncTime = metaTimeOrNil(now)
 
@@ -314,8 +341,18 @@ func setSnapshotFlagConditions(em *ecv1alpha1.EtcdMirror, snap *mirroragent.Snap
 			reasonNoDrift, "last reconciliation pass found no drift")
 	}
 
-	setBoolCondition(em, ecv1alpha1.EtcdMirrorConditionInitialSyncComplete,
-		!snap.InitialSyncCompletionTime.IsZero(),
+	// InitialSyncComplete is durable: the completion time is process memory,
+	// zeroed by any fresh scan (a Compacted forced resync) and never set by a
+	// resumed-checkpoint agent (pod restart), yet the contract keeps the
+	// condition True through both. Only a checkpoint invalidation — a
+	// cluster-ID mismatch resync or a corrupt checkpoint — resets it.
+	complete := !snap.InitialSyncCompletionTime.IsZero()
+	if !complete && meta.IsStatusConditionTrue(em.Status.Conditions, ecv1alpha1.EtcdMirrorConditionInitialSyncComplete) {
+		invalidated := snap.LastResyncReason == mirroragent.ResyncReasonClusterIDMismatch ||
+			snap.LastErrorReason == ecv1alpha1.EtcdMirrorReasonCheckpointInvalid
+		complete = !invalidated
+	}
+	setBoolCondition(em, ecv1alpha1.EtcdMirrorConditionInitialSyncComplete, complete,
 		reasonComplete, "genesis scan completed against the checkpointed cluster identities",
 		reasonInProgress, "genesis scan has not completed")
 

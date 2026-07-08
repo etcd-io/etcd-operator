@@ -308,3 +308,105 @@ func TestConditionsFromSnapshot(t *testing.T) {
 		assert.Zero(t, em.Status.TargetKeyCount)
 	})
 }
+
+// restartedAgentSnapshot is what a resumed-from-checkpoint agent process
+// serves for its whole life: tailing, with every scan-related field and
+// last-resync field at its process-local zero.
+func restartedAgentSnapshot(now time.Time) *mirroragent.Snapshot {
+	snap := healthySnapshot()
+	snap.InitialSyncKeyCount = 0
+	snap.InitialSyncTotalKeyCount = 0
+	snap.InitialSyncStartTime = time.Time{}
+	snap.InitialSyncCompletionTime = time.Time{}
+	snap.ForcedResyncCount = 0
+	snap.ScanRestartCount = 0
+	snap.LastResyncReason = ""
+	snap.LastReconcileTime = time.Time{}
+	snap.LastReconcileDrift = nil
+	snap.LastProgressTime = now
+	return snap
+}
+
+// TestSnapshotRegressionGuards pins the durability contracts: fields the
+// agent only knows in process memory must not wipe persisted status when the
+// pod restarts, and InitialSyncComplete resets only on checkpoint
+// invalidation.
+func TestSnapshotRegressionGuards(t *testing.T) {
+	now := time.Now()
+
+	healthyStatus := func(t *testing.T) *ecv1alpha1.EtcdMirror {
+		t.Helper()
+		em := statusFixtureMirror()
+		applySnapshotToStatus(em, healthySnapshot(), now.Add(-time.Minute), time.Time{})
+		requireCond(t, em, ecv1alpha1.EtcdMirrorConditionInitialSyncComplete, metav1.ConditionTrue, reasonComplete)
+		return em
+	}
+
+	t.Run("pod restart does not regress InitialSyncComplete or wipe initialSync fields", func(t *testing.T) {
+		em := healthyStatus(t)
+		wantStart, wantCompletion := em.Status.InitialSyncStartTime, em.Status.InitialSyncCompletionTime
+		require.NotNil(t, wantCompletion)
+
+		applySnapshotToStatus(em, restartedAgentSnapshot(now), now, time.Time{})
+		requireCond(t, em, ecv1alpha1.EtcdMirrorConditionInitialSyncComplete, metav1.ConditionTrue, reasonComplete)
+		assert.Equal(t, wantStart, em.Status.InitialSyncStartTime)
+		assert.Equal(t, wantCompletion, em.Status.InitialSyncCompletionTime)
+		assert.Equal(t, int64(500), em.Status.InitialSyncKeyCount)
+		assert.NotNil(t, em.Status.LastReconciliationTime, "a zero LastReconcileTime must not null the persisted pass time")
+	})
+
+	t.Run("Compacted forced resync keeps InitialSyncComplete True", func(t *testing.T) {
+		em := healthyStatus(t)
+		snap := healthySnapshot()
+		snap.Phase = mirroragent.PhaseInitialSync
+		snap.Compacted = true
+		snap.LastResyncReason = mirroragent.ResyncReasonCompacted
+		snap.InitialSyncCompletionTime = time.Time{} // fresh scan zeroes it
+		snap.InitialSyncKeyCount = 10
+		applySnapshotToStatus(em, snap, now, time.Time{})
+		requireCond(t, em, ecv1alpha1.EtcdMirrorConditionInitialSyncComplete, metav1.ConditionTrue, reasonComplete)
+		assert.Equal(t, int64(10), em.Status.InitialSyncKeyCount, "a live scan's progress fraction still updates")
+	})
+
+	t.Run("cluster-ID mismatch resync resets InitialSyncComplete", func(t *testing.T) {
+		em := healthyStatus(t)
+		snap := healthySnapshot()
+		snap.Phase = mirroragent.PhaseInitialSync
+		snap.LastResyncReason = mirroragent.ResyncReasonClusterIDMismatch
+		snap.InitialSyncCompletionTime = time.Time{}
+		applySnapshotToStatus(em, snap, now, time.Time{})
+		requireCond(t, em, ecv1alpha1.EtcdMirrorConditionInitialSyncComplete, metav1.ConditionFalse, reasonInProgress)
+	})
+
+	t.Run("Connecting snapshot does not blank the latched cluster IDs", func(t *testing.T) {
+		em := healthyStatus(t)
+		srcID, tgtID := em.Status.SourceClusterID, em.Status.TargetClusterID
+		require.NotEmpty(t, srcID)
+
+		snap := restartedAgentSnapshot(now)
+		snap.Phase = mirroragent.PhaseConnecting
+		snap.SourceClusterID, snap.TargetClusterID = 0, 0
+		applySnapshotToStatus(em, snap, now, time.Time{})
+		assert.Equal(t, srcID, em.Status.SourceClusterID, "zero means 'not yet probed', never 'forget the identity'")
+		assert.Equal(t, tgtID, em.Status.TargetClusterID)
+	})
+
+	t.Run("cutover clears once spec.mode leaves Drain", func(t *testing.T) {
+		em := healthyStatus(t)
+		em.Spec.Mode = ecv1alpha1.EtcdMirrorModeDrain
+		snap := healthySnapshot()
+		snap.Cutover = &mirroragent.CutoverStatus{DrainTargetRevision: 9, DrainedRevision: 9}
+		applySnapshotToStatus(em, snap, now, time.Time{})
+		require.NotNil(t, em.Status.Cutover)
+
+		// Mid-drain restart (mode still Drain, snapshot briefly without
+		// cutover): last-known values retained.
+		applySnapshotToStatus(em, restartedAgentSnapshot(now), now, time.Time{})
+		require.NotNil(t, em.Status.Cutover)
+
+		// Drain -> Sync flip: the stale block clears.
+		em.Spec.Mode = ecv1alpha1.EtcdMirrorModeSync
+		applySnapshotToStatus(em, restartedAgentSnapshot(now), now, time.Time{})
+		assert.Nil(t, em.Status.Cutover)
+	})
+}

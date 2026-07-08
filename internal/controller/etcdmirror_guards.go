@@ -147,15 +147,29 @@ func findPrefixConflict(em *ecv1alpha1.EtcdMirror, all []ecv1alpha1.EtcdMirror) 
 	return nil
 }
 
+// selfMirror reports whether em's source and target resolve to the same
+// cluster (an intra-cluster prefix copy). Cluster-level inversion is
+// trivially true between any two such mirrors on one cluster — all four
+// identities equal — yet no two-way loop exists, so the direction guard
+// excludes them. (An intra-cluster loop through overlapping prefixes needs
+// prefix awareness the cluster-level check cannot express; the agent-side
+// fence-ownership backstop still catches destructive overlaps.)
+func selfMirror(em *ecv1alpha1.EtcdMirror) bool {
+	return sameCluster(sourceIdentity(em), targetIdentity(em))
+}
+
 // findDirectionConflict returns the first other EtcdMirror forming a two-way
 // loop with em: runtime check first (both bound cluster-ID pairs known and
 // exact inverses — catches respelled endpoints), then the spec-identity
 // pre-runtime check (source/target identities crosswise equal).
 func findDirectionConflict(em *ecv1alpha1.EtcdMirror, all []ecv1alpha1.EtcdMirror) *mirrorConflict {
+	if selfMirror(em) {
+		return nil
+	}
 	emSource, emTarget := sourceIdentity(em), targetIdentity(em)
 	for i := range all {
 		other := &all[i]
-		if other.UID == em.UID {
+		if other.UID == em.UID || selfMirror(other) {
 			continue
 		}
 		runtimeInverse := em.Status.SourceClusterID != "" && em.Status.TargetClusterID != "" &&

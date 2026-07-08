@@ -20,7 +20,9 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 )
@@ -119,6 +121,44 @@ func TestSameTargetClusterHeuristic(t *testing.T) {
 			assert.Equal(t, tc.want, got)
 		})
 	}
+}
+
+// TestDirectionConflictSkipsIntraClusterMirrors: two disjoint-prefix A->A
+// copies satisfy cluster-level inversion trivially (all four IDs equal) but
+// form no loop; the guard must not park either.
+func TestDirectionConflictSkipsIntraClusterMirrors(t *testing.T) {
+	intra := func(name, uid, srcPrefix, dstPrefix string) ecv1alpha1.EtcdMirror {
+		return ecv1alpha1.EtcdMirror{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "ns", UID: types.UID(uid)},
+			Spec: ecv1alpha1.EtcdMirrorSpec{
+				Source: ecv1alpha1.EtcdMirrorEndpoint{
+					EndpointList: []string{"etcd-a:2379"}, Prefix: srcPrefix,
+				},
+				Target: ecv1alpha1.EtcdMirrorEndpoint{
+					EndpointList: []string{"etcd-a:2379"}, Prefix: dstPrefix,
+				},
+			},
+			Status: ecv1alpha1.EtcdMirrorStatus{SourceClusterID: "aaaa", TargetClusterID: "aaaa"},
+		}
+	}
+	all := []ecv1alpha1.EtcdMirror{
+		intra("copy1", "uid-1", "/x/", "/y/"),
+		intra("copy2", "uid-2", "/p/", "/q/"),
+	}
+	assert.Nil(t, findDirectionConflict(&all[0], all))
+	assert.Nil(t, findDirectionConflict(&all[1], all))
+
+	// A genuine cross-cluster inverse pair still trips the guard.
+	fwd := ecv1alpha1.EtcdMirror{
+		ObjectMeta: metav1.ObjectMeta{Name: "fwd", Namespace: "ns", UID: "uid-f"},
+		Status:     ecv1alpha1.EtcdMirrorStatus{SourceClusterID: "aaaa", TargetClusterID: "bbbb"},
+	}
+	rev := ecv1alpha1.EtcdMirror{
+		ObjectMeta: metav1.ObjectMeta{Name: "rev", Namespace: "ns", UID: "uid-r"},
+		Status:     ecv1alpha1.EtcdMirrorStatus{SourceClusterID: "bbbb", TargetClusterID: "aaaa"},
+	}
+	pair := []ecv1alpha1.EtcdMirror{fwd, rev}
+	require.NotNil(t, findDirectionConflict(&pair[0], pair))
 }
 
 func TestSameTargetClusterConflictLoser(t *testing.T) {

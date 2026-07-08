@@ -544,7 +544,10 @@ const (
 	// a forced resync (then with condition Compacted=True/Reason=ForcedResync).
 	EtcdMirrorPhaseInitialSync EtcdMirrorPhase = "InitialSync"
 	// EtcdMirrorPhaseSyncing is the steady state: watching and applying live
-	// changes, watermark advancing via progress notifications.
+	// changes, watermark advancing via progress notifications. A completed
+	// drain also reports Syncing (there is no Drained phase — a finished
+	// cutover is not page-worthy); the CutoverReady condition carries the
+	// drain outcome.
 	EtcdMirrorPhaseSyncing EtcdMirrorPhase = "Syncing"
 	// EtcdMirrorPhaseDegraded means the agent is in a retry/backoff loop
 	// (connection or throttling class) and is expected to self-heal. Forced
@@ -573,7 +576,10 @@ const (
 	// advancing (via applies or watch progress notifications) within the
 	// staleness threshold. Watermark-derived, not apply-derived: an idle
 	// prefix on a live watch stays Available; a wedged loop that stops
-	// confirming progress does not.
+	// confirming progress does not. Exception: after a completed, verified
+	// drain the watermark never advances again by design, and Available
+	// stays True with reason DrainComplete (phase remains Syncing;
+	// CutoverReady carries the outcome — a finished cutover must not page).
 	EtcdMirrorConditionAvailable = "Available"
 	// EtcdMirrorConditionSourceReachable is True when the agent's last
 	// attempt to reach Source succeeded. Split from TargetReachable because

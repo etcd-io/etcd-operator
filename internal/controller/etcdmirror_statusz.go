@@ -87,13 +87,20 @@ type CheckpointTarget struct {
 	Password string
 	// Key is the reserved checkpoint key (exactly one key, never a prefix).
 	Key string
+	// LinkUID is the deleted CR's UID — the fence owner the cleaner requires
+	// before deleting anything (a PrefixConflict loser's default key is the
+	// WINNER's live fence; a blind delete would destroy it).
+	LinkUID string
 }
 
 // CheckpointCleaner deletes the reserved checkpoint key from the target etcd
 // during finalization — a short-lived client per call, seamed for envtest
-// (no reachable target etcd there).
+// (no reachable target etcd there). The key is deleted only when its stored
+// fence is owned by tgt.LinkUID; an absent key is success, and a foreign or
+// undecodable fence is left in place with the reason returned in skipReason
+// ("" when the key was deleted or already absent).
 type CheckpointCleaner interface {
-	DeleteCheckpoint(ctx context.Context, tgt CheckpointTarget) error
+	DeleteCheckpoint(ctx context.Context, tgt CheckpointTarget) (skipReason string, err error)
 }
 
 const (
@@ -102,23 +109,49 @@ const (
 )
 
 // etcdCheckpointCleaner is the production CheckpointCleaner: one clientv3
-// client per call, one exact-key Delete (0 deleted keys — already gone — is
-// success), Close.
+// client per call, an ownership-checked exact-key delete, Close.
 type etcdCheckpointCleaner struct{}
 
-func (etcdCheckpointCleaner) DeleteCheckpoint(ctx context.Context, tgt CheckpointTarget) error {
+func (etcdCheckpointCleaner) DeleteCheckpoint(ctx context.Context, tgt CheckpointTarget) (string, error) {
 	cfg := mirroragent.NewClientConfig(tgt.Endpoints, tgt.TLS, checkpointCleanerDialTimeout)
 	cfg.Username, cfg.Password = tgt.Username, tgt.Password
 	cfg.Context = ctx
 	cli, err := clientv3.New(cfg)
 	if err != nil {
-		return fmt.Errorf("creating target client: %w", err)
+		return "", fmt.Errorf("creating target client: %w", err)
 	}
 	defer func() { _ = cli.Close() }()
 	rctx, cancel := context.WithTimeout(ctx, checkpointCleanerRequestTimeout)
 	defer cancel()
-	if _, err := cli.Delete(rctx, tgt.Key); err != nil {
-		return fmt.Errorf("deleting checkpoint key: %w", err)
+
+	resp, err := cli.Get(rctx, tgt.Key)
+	if err != nil {
+		return "", fmt.Errorf("reading checkpoint key: %w", err)
 	}
-	return nil
+	if len(resp.Kvs) == 0 {
+		return "", nil
+	}
+	kv := resp.Kvs[0]
+	stored, derr := mirroragent.DecodeFenceValue(kv.Value)
+	if derr != nil {
+		return "the stored fence is undecodable, so ownership is unprovable; " +
+			"leaving the key in place (fail-closed, matching the agent)", nil
+	}
+	if stored.LinkUID != tgt.LinkUID {
+		return fmt.Sprintf("the stored fence is owned by link %q, not this mirror; "+
+			"leaving the key in place", stored.LinkUID), nil
+	}
+	// Mod-revision compare so a fence written between the ownership check and
+	// the delete (an agent straggler, a takeover) is never deleted blind.
+	txn, err := cli.Txn(rctx).
+		If(clientv3.Compare(clientv3.ModRevision(tgt.Key), "=", kv.ModRevision)).
+		Then(clientv3.OpDelete(tgt.Key)).
+		Commit()
+	if err != nil {
+		return "", fmt.Errorf("deleting checkpoint key: %w", err)
+	}
+	if !txn.Succeeded {
+		return "", fmt.Errorf("checkpoint key moved between ownership check and delete; retrying")
+	}
+	return "", nil
 }
