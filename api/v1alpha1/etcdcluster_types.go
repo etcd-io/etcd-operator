@@ -29,6 +29,7 @@ import (
 
 // EtcdClusterSpec defines the desired state of EtcdCluster.
 // +kubebuilder:validation:XValidation:rule="!has(self.autoCompactionMode) || has(self.autoCompactionRetention)",message="autoCompactionRetention must be set when autoCompactionMode is set"
+// +kubebuilder:validation:XValidation:rule="!has(self.autoCompactionMode) || self.autoCompactionMode != 'revision' || (has(self.autoCompactionRetention) && self.autoCompactionRetention.matches('^[0-9]+$'))",message="autoCompactionRetention must be an integer revision count when autoCompactionMode is 'revision'"
 type EtcdClusterSpec struct {
 	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
@@ -51,6 +52,11 @@ type EtcdClusterSpec struct {
 	// QuotaBackendBytes is the etcd backend storage quota (--quota-backend-bytes).
 	// When exceeded etcd raises a NOSPACE alarm and becomes read-only.
 	// Unset means the etcd default (2GiB). etcd recommends at most 8GiB.
+	// Must be at least 100Mi: etcd disables the quota for non-positive
+	// values, and a byte-scale typo ("8" instead of "8Gi") would alarm the
+	// whole cluster read-only on the first pod restart. Lowering the quota
+	// below the current DB size has the same read-only effect.
+	// +kubebuilder:validation:XValidation:rule="!quantity(string(self)).isLessThan(quantity('100Mi'))",message="quotaBackendBytes must be at least 100Mi"
 	// +optional
 	QuotaBackendBytes *resource.Quantity `json:"quotaBackendBytes,omitempty"`
 	// AutoCompactionMode selects the MVCC auto-compaction policy (--auto-compaction-mode).
