@@ -139,6 +139,9 @@ func (r *EtcdMirrorReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	em := &ecv1alpha1.EtcdMirror{}
 	if err := r.Get(ctx, req.NamespacedName, em); err != nil {
 		if apierrors.IsNotFound(err) {
+			// Covers deletions observed after finalizer removal and
+			// controller-restart races: no stale series for a gone CR.
+			deleteEtcdMirrorMetrics(req.Namespace, req.Name)
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
@@ -166,6 +169,9 @@ func (r *EtcdMirrorReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			}
 		}
 	}
+	// Unconditionally: every reconcile outcome keeps the gauges honest,
+	// including failed /statusz polls (which set Available=Unknown above).
+	updateEtcdMirrorMetrics(em)
 	return res, err
 }
 
@@ -651,6 +657,7 @@ func (r *EtcdMirrorReconciler) removeFinalizer(ctx context.Context, em *ecv1alph
 	if err := r.Update(ctx, em); err != nil {
 		return ctrl.Result{}, err
 	}
+	deleteEtcdMirrorMetrics(em.Namespace, em.Name)
 	r.mu.Lock()
 	delete(r.lagSince, em.UID)
 	delete(r.counterBases, em.UID)

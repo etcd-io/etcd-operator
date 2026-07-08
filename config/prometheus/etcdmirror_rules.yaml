@@ -1,0 +1,72 @@
+# EtcdMirror alerts on the CONTROLLER-side gauges (etcd_mirror_phase,
+# etcd_mirror_condition, served by the manager /metrics endpoint), so a mirror
+# whose agent pod never scheduled or stopped answering still pages.
+# Fuller paging algebra: docs/etcdmirror.md "Monitoring / paging algebra" and
+# the condition-type comments in api/v1alpha1/etcdmirror_types.go. The
+# "unless Compacted=True and progress advancing" refinement is deliberately
+# omitted: it needs the agent-side
+# etcd_mirror_agent_seconds_since_last_progress (agent scrape), and a
+# suppressed wedged resync must still page.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  labels:
+    control-plane: controller-manager
+    app.kubernetes.io/name: etcd-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: etcdmirror-alerts
+  namespace: system
+spec:
+  groups:
+    - name: etcdmirror.rules
+      rules:
+        - alert: EtcdMirrorUnavailable
+          expr: |
+            etcd_mirror_condition{type="Available",status="true"} == 0
+              unless on (namespace, name) etcd_mirror_phase{phase="Paused"} == 1
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: 'EtcdMirror {{ $labels.namespace }}/{{ $labels.name }} not Available for 10m'
+            description: >-
+              Available has not been True for 10m and the mirror is not Paused.
+              status="true" == 0 covers both False and Unknown (the controller
+              sets Unknown when the agent /statusz poll fails).
+            runbook_url: https://github.com/etcd-io/etcd-operator/blob/main/docs/etcdmirror.md#monitoring--paging-algebra
+        - alert: EtcdMirrorTargetQuotaExhausted
+          expr: etcd_mirror_condition{type="TargetQuotaExhausted",status="true"} == 1
+          labels:
+            severity: critical
+          annotations:
+            summary: 'EtcdMirror {{ $labels.namespace }}/{{ $labels.name }}: target etcd quota exhausted (NOSPACE)'
+            description: >-
+              A target write failed with NOSPACE; the agent stopped writing.
+              Does not self-heal: compact/defrag/disarm the target.
+            runbook_url: https://github.com/etcd-io/etcd-operator/blob/main/docs/etcdmirror.md#operations-error-taxonomy-and-runbook
+        - alert: EtcdMirrorResyncLoopDetected
+          expr: etcd_mirror_condition{type="ResyncLoopDetected",status="true"} == 1
+          labels:
+            severity: critical
+          annotations:
+            summary: 'EtcdMirror {{ $labels.namespace }}/{{ $labels.name }}: forced-resync livelock'
+            description: >-
+              Consecutive forced resyncs never reached steady state — source
+              compaction retention < scan+drain time. Does not self-heal:
+              raise retention, raise sync.maxOpsPerSecond, or shrink the prefix.
+            runbook_url: https://github.com/etcd-io/etcd-operator/blob/main/docs/etcdmirror.md#operations-error-taxonomy-and-runbook
+        - alert: EtcdMirrorCertificateExpiringSoon
+          # Agent-side metric: requires scraping the agent pod's http port
+          # (8080). 14d matches the controller's certExpiryLeadWindow (the
+          # controller also emits CertificateExpiringSoon Warning events).
+          expr: (etcd_mirror_agent_tls_cert_expiry_timestamp_seconds - time()) < (14 * 86400)
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: 'EtcdMirror agent cert {{ $labels.side }}/{{ $labels.kind }} expires in under 14d'
+            description: >-
+              A certificate referenced by the mirror expires within 14 days —
+              the renewal machinery (cert-manager renews ~30d out) has already
+              failed.
+            runbook_url: https://github.com/etcd-io/etcd-operator/blob/main/docs/etcdmirror.md#prerequisites-summary

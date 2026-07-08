@@ -62,6 +62,20 @@ Page on `Available=False` sustained, **unless** `Compacted=True` and progress
 fields are advancing (a forced resync healing itself). `TargetQuotaExhausted`
 and `ResyncLoopDetected` page immediately — neither self-heals.
 
+### Metrics
+
+The controller serves `etcd_mirror_phase{namespace,name,phase}` and
+`etcd_mirror_condition{namespace,name,type,status}` one-hot gauges on the
+manager `/metrics` endpoint — updated on every reconcile (including failed
+agent `/statusz` polls) and present even when the agent pod never scheduled,
+so absent agents still alert. The agent itself exposes the
+`etcd_mirror_agent_*` family on its `http` port (8080); scraping it is not
+wired by the operator. Shipped assets:
+`config/prometheus/etcdmirror_rules.yaml` (PrometheusRule implementing the
+paging algebra above, minus the Compacted-and-progressing suppression — that
+refinement needs agent scrape, and a suppressed wedged resync must still
+page) and `docs/etcdmirror-dashboard.json` (Grafana).
+
 Never compute lag as `status.sourceRevision - status.lastAppliedRevision`:
 revisions are cluster-global, so out-of-prefix source writes inflate the
 difference, and the two fields snapshot at different instants.

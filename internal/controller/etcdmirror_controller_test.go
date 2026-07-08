@@ -976,3 +976,35 @@ func TestEtcdMirrorReconcile_AgentImageNotConfigured(t *testing.T) {
 		types.NamespacedName{Namespace: ns, Name: deploymentNameForEtcdMirror(em)}, &appsv1.Deployment{})
 	assert.True(t, apierrors.IsNotFound(err), "no Deployment may be created without an agent image")
 }
+
+func TestEtcdMirrorReconcile_MetricsLifecycle(t *testing.T) {
+	if k8sClient == nil {
+		t.Skip("envtest apiserver not available")
+	}
+	sc := &fakeStatusClient{snap: healthySnapshot()}
+	r, _ := newTestMirrorReconciler(sc, &fakeCleaner{})
+	ns := createTestNamespace(t)
+	em := setupActiveMirror(t, r, ns, nil)
+
+	// A failed /statusz poll must still update the gauges: the controller-side
+	// series are the alerting surface when the agent is absent or unreachable.
+	sc.set(nil, errors.New("dial tcp 10.1.2.3:8080: i/o timeout"))
+	reconcileMirrorOnce(t, r, em)
+	got := refreshMirror(t, em)
+	assert.Equal(t, 1.0, conditionValue(got, ecv1alpha1.EtcdMirrorConditionAvailable, "unknown"))
+	assert.Zero(t, conditionValue(got, ecv1alpha1.EtcdMirrorConditionAvailable, "true"))
+	assert.Equal(t, 1.0, phaseValue(got, got.Status.Phase))
+
+	// Delete the CR and drive Reconcile through finalization: series vanish.
+	require.NoError(t, k8sClient.Delete(t.Context(), got))
+	reconcileMirrorOnce(t, r, em) // deletes the Deployment, waits for pods
+	pods := &corev1.PodList{}
+	require.NoError(t, k8sClient.List(t.Context(), pods,
+		client.InNamespace(em.Namespace), client.MatchingLabels(etcdMirrorAgentLabels(em))))
+	for i := range pods.Items {
+		require.NoError(t, k8sClient.Delete(t.Context(), &pods.Items[i], client.GracePeriodSeconds(0)))
+	}
+	reconcileMirrorOnce(t, r, em) // checkpoint cleanup + finalizer removal
+	assert.Zero(t, mirrorSeriesCount(t, "etcd_mirror_phase", em.Namespace, em.Name))
+	assert.Zero(t, mirrorSeriesCount(t, "etcd_mirror_condition", em.Namespace, em.Name))
+}
