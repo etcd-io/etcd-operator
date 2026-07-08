@@ -53,6 +53,8 @@ func TestPDBMinAvailable(t *testing.T) {
 		{"scale-in pending 5->2", 5, 5, 2, 4},
 		{"scale-in pending 4->3", 4, 4, 3, 3},
 		{"scale-in pending 2->1", 2, 2, 1, 2},
+		{"interrupted scale-in 3->2 (orphan pod)", 3, 2, 2, 3},
+		{"interrupted scale-in 5->4 (orphan pod)", 5, 4, 4, 4},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -91,7 +93,7 @@ func TestReconcilePodDisruptionBudget(t *testing.T) {
 	t.Run("creates PDB with single voting member", func(t *testing.T) {
 		ec := newEtcdCluster(t, "pdb-single-voter", 1)
 
-		err := reconcilePodDisruptionBudget(ctx, logger, k8sClient, ec, memberList(1, 0), scheme.Scheme)
+		err := reconcilePodDisruptionBudget(ctx, logger, k8sClient, ec, memberList(1, 0), 1, scheme.Scheme)
 		require.NoError(t, err)
 
 		pdb := getPDB(t, ec.Name)
@@ -112,14 +114,14 @@ func TestReconcilePodDisruptionBudget(t *testing.T) {
 	t.Run("three voting members", func(t *testing.T) {
 		ec := newEtcdCluster(t, "pdb-three-voters", 3)
 
-		require.NoError(t, reconcilePodDisruptionBudget(ctx, logger, k8sClient, ec, memberList(3, 0), scheme.Scheme))
+		require.NoError(t, reconcilePodDisruptionBudget(ctx, logger, k8sClient, ec, memberList(3, 0), 3, scheme.Scheme))
 		assert.Equal(t, intstr.FromInt32(2), *getPDB(t, ec.Name).Spec.MinAvailable)
 	})
 
 	t.Run("five voting members", func(t *testing.T) {
 		ec := newEtcdCluster(t, "pdb-five-voters", 5)
 
-		require.NoError(t, reconcilePodDisruptionBudget(ctx, logger, k8sClient, ec, memberList(5, 0), scheme.Scheme))
+		require.NoError(t, reconcilePodDisruptionBudget(ctx, logger, k8sClient, ec, memberList(5, 0), 5, scheme.Scheme))
 		assert.Equal(t, intstr.FromInt32(3), *getPDB(t, ec.Name).Spec.MinAvailable)
 	})
 
@@ -128,38 +130,47 @@ func TestReconcilePodDisruptionBudget(t *testing.T) {
 		// must not widen the eviction budget for voters.
 		ec := newEtcdCluster(t, "pdb-with-learner", 4)
 
-		require.NoError(t, reconcilePodDisruptionBudget(ctx, logger, k8sClient, ec, memberList(3, 1), scheme.Scheme))
+		require.NoError(t, reconcilePodDisruptionBudget(ctx, logger, k8sClient, ec, memberList(3, 1), 4, scheme.Scheme))
 		assert.Equal(t, intstr.FromInt32(3), *getPDB(t, ec.Name).Spec.MinAvailable)
 	})
 
 	t.Run("scale-in pending sizes for post-removal membership", func(t *testing.T) {
 		ec := newEtcdCluster(t, "pdb-scale-in", 2)
 
-		require.NoError(t, reconcilePodDisruptionBudget(ctx, logger, k8sClient, ec, memberList(3, 0), scheme.Scheme))
+		require.NoError(t, reconcilePodDisruptionBudget(ctx, logger, k8sClient, ec, memberList(3, 0), 3, scheme.Scheme))
+		assert.Equal(t, intstr.FromInt32(3), *getPDB(t, ec.Name).Spec.MinAvailable)
+	})
+
+	t.Run("interrupted scale-in keeps the orphan pod priced in", func(t *testing.T) {
+		// After RemoveMember but before the StatefulSet shrinks, only 2
+		// members remain while 3 pods still match the selector.
+		ec := newEtcdCluster(t, "pdb-interrupted-scale-in", 2)
+
+		require.NoError(t, reconcilePodDisruptionBudget(ctx, logger, k8sClient, ec, memberList(2, 0), 3, scheme.Scheme))
 		assert.Equal(t, intstr.FromInt32(3), *getPDB(t, ec.Name).Spec.MinAvailable)
 	})
 
 	t.Run("scale-out pending reserves the incoming learner pod", func(t *testing.T) {
 		ec := newEtcdCluster(t, "pdb-scale-out", 3)
 
-		require.NoError(t, reconcilePodDisruptionBudget(ctx, logger, k8sClient, ec, memberList(1, 0), scheme.Scheme))
+		require.NoError(t, reconcilePodDisruptionBudget(ctx, logger, k8sClient, ec, memberList(1, 0), 1, scheme.Scheme))
 		assert.Equal(t, intstr.FromInt32(2), *getPDB(t, ec.Name).Spec.MinAvailable)
 	})
 
 	t.Run("updates PDB on membership change (scale)", func(t *testing.T) {
 		ec := newEtcdCluster(t, "pdb-scale", 5)
 
-		require.NoError(t, reconcilePodDisruptionBudget(ctx, logger, k8sClient, ec, memberList(1, 0), scheme.Scheme))
+		require.NoError(t, reconcilePodDisruptionBudget(ctx, logger, k8sClient, ec, memberList(1, 0), 1, scheme.Scheme))
 		pdb := getPDB(t, ec.Name)
 		uid := pdb.UID
 		assert.Equal(t, intstr.FromInt32(2), *pdb.Spec.MinAvailable)
 
-		require.NoError(t, reconcilePodDisruptionBudget(ctx, logger, k8sClient, ec, memberList(3, 0), scheme.Scheme))
+		require.NoError(t, reconcilePodDisruptionBudget(ctx, logger, k8sClient, ec, memberList(3, 0), 3, scheme.Scheme))
 		pdb = getPDB(t, ec.Name)
 		assert.Equal(t, uid, pdb.UID)
 		assert.Equal(t, intstr.FromInt32(3), *pdb.Spec.MinAvailable)
 
-		require.NoError(t, reconcilePodDisruptionBudget(ctx, logger, k8sClient, ec, memberList(5, 0), scheme.Scheme))
+		require.NoError(t, reconcilePodDisruptionBudget(ctx, logger, k8sClient, ec, memberList(5, 0), 5, scheme.Scheme))
 		pdb = getPDB(t, ec.Name)
 		assert.Equal(t, uid, pdb.UID)
 		assert.Equal(t, intstr.FromInt32(3), *pdb.Spec.MinAvailable)
@@ -168,15 +179,15 @@ func TestReconcilePodDisruptionBudget(t *testing.T) {
 	t.Run("no members observed", func(t *testing.T) {
 		ec := newEtcdCluster(t, "pdb-no-members", 3)
 
-		require.NoError(t, reconcilePodDisruptionBudget(ctx, logger, k8sClient, ec, nil, scheme.Scheme))
+		require.NoError(t, reconcilePodDisruptionBudget(ctx, logger, k8sClient, ec, nil, 3, scheme.Scheme))
 		err := k8sClient.Get(ctx, client.ObjectKey{Name: ec.Name, Namespace: "default"},
 			&policyv1.PodDisruptionBudget{})
 		assert.True(t, client.IgnoreNotFound(err) == nil && err != nil, "expected NotFound, got %v", err)
 
 		// A pre-existing PDB must survive a loop that observes no members.
-		require.NoError(t, reconcilePodDisruptionBudget(ctx, logger, k8sClient, ec, memberList(3, 0), scheme.Scheme))
+		require.NoError(t, reconcilePodDisruptionBudget(ctx, logger, k8sClient, ec, memberList(3, 0), 3, scheme.Scheme))
 		before := getPDB(t, ec.Name)
-		require.NoError(t, reconcilePodDisruptionBudget(ctx, logger, k8sClient, ec, nil, scheme.Scheme))
+		require.NoError(t, reconcilePodDisruptionBudget(ctx, logger, k8sClient, ec, nil, 3, scheme.Scheme))
 		after := getPDB(t, ec.Name)
 		assert.Equal(t, before.UID, after.UID)
 		assert.Equal(t, intstr.FromInt32(2), *after.Spec.MinAvailable)
@@ -195,7 +206,7 @@ func TestReconcilePodDisruptionBudget(t *testing.T) {
 		}
 		require.NoError(t, k8sClient.Create(ctx, userPDB))
 
-		require.NoError(t, reconcilePodDisruptionBudget(ctx, logger, k8sClient, ec, memberList(3, 0), scheme.Scheme))
+		require.NoError(t, reconcilePodDisruptionBudget(ctx, logger, k8sClient, ec, memberList(3, 0), 3, scheme.Scheme))
 
 		pdb := getPDB(t, ec.Name)
 		assert.Empty(t, pdb.OwnerReferences)

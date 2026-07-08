@@ -62,7 +62,7 @@ func evictableVoterCount(voting int) int {
 // pdbMinAvailable sizes minAvailable for a selector matching every cluster
 // pod. A label selector cannot tell voters from learners (or from the pod of
 // a just-removed member), so the budget must assume every permitted eviction
-// lands on a voter: minAvailable = total members - evictable voters.
+// lands on a voter: minAvailable = total pods - evictable voters.
 //
 // The loop reconciles the PDB before mutating membership, so pending scale
 // steps are priced in ahead of time:
@@ -88,12 +88,19 @@ func pdbMinAvailable(total, voting, desiredSize int) int32 {
 // never break quorum (see pdbMinAvailable). With no observed members it
 // leaves any existing PDB alone: a stale-but-protective PDB during an outage
 // beats deleting it, and minAvailable 0 protects nothing.
+//
+// stsReplicas floors the pod total: after RemoveMember but before the
+// StatefulSet shrinks (a crash can freeze that state), the removed member's
+// pod still matches the selector while it is gone from the member list, and
+// sizing off members alone would re-widen the eviction budget over a smaller
+// voter set.
 func reconcilePodDisruptionBudget(
 	ctx context.Context,
 	logger logr.Logger,
 	c client.Client,
 	ec *ecv1alpha1.EtcdCluster,
 	memberListResp *clientv3.MemberListResponse,
+	stsReplicas int32,
 	scheme *runtime.Scheme,
 ) error {
 	voting := votingMemberCount(memberListResp)
@@ -101,6 +108,9 @@ func reconcilePodDisruptionBudget(
 		return nil
 	}
 	total := len(memberListResp.Members)
+	if int(stsReplicas) > total {
+		total = int(stsReplicas)
+	}
 
 	pdb := &policyv1.PodDisruptionBudget{
 		ObjectMeta: metav1.ObjectMeta{
