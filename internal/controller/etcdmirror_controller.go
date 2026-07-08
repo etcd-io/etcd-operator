@@ -148,6 +148,14 @@ func (r *EtcdMirrorReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 
 	if !em.DeletionTimestamp.IsZero() {
+		// Deletion is irreversible, so drop the series now: finalization can
+		// retry checkpoint cleanup for an unbounded window (unreachable
+		// target), during which frozen pre-delete gauges would either keep
+		// paging for an intentionally deleted mirror or keep reporting
+		// Available=true for an agent already gone. Idempotent across
+		// finalize retries; the NotFound and removeFinalizer deletes remain
+		// as backstops.
+		deleteEtcdMirrorMetrics(em.Namespace, em.Name)
 		return r.finalize(ctx, em)
 	}
 

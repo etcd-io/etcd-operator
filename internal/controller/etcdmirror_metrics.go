@@ -49,9 +49,11 @@ var (
 		ecv1alpha1.EtcdMirrorPhaseFailed,
 	}
 	// conditionStatusValues one-hots each condition across the three
-	// metav1.ConditionStatus values (lowercase, kube-state-metrics
-	// convention), so `status="true"} == 0` distinguishes False/Unknown from
-	// series absence.
+	// metav1.ConditionStatus values (lowercased), so `status="true"} == 0`
+	// distinguishes False/Unknown from series absence. The `type` label
+	// deliberately mirrors the metav1.Condition field name — NOT
+	// kube-state-metrics, whose analogous metrics call this label
+	// `condition`.
 	conditionStatusValues = []string{"true", "false", "unknown"}
 
 	etcdMirrorPhaseGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{

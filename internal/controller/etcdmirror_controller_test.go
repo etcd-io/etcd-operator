@@ -995,9 +995,13 @@ func TestEtcdMirrorReconcile_MetricsLifecycle(t *testing.T) {
 	assert.Zero(t, conditionValue(got, ecv1alpha1.EtcdMirrorConditionAvailable, "true"))
 	assert.Equal(t, 1.0, phaseValue(got, got.Status.Phase))
 
-	// Delete the CR and drive Reconcile through finalization: series vanish.
+	// Delete the CR: series must vanish on the FIRST finalize reconcile (the
+	// pod-wait requeue) — checkpoint cleanup can retry unboundedly and
+	// frozen pre-delete gauges would misreport for that whole window.
 	require.NoError(t, k8sClient.Delete(t.Context(), got))
 	reconcileMirrorOnce(t, r, em) // deletes the Deployment, waits for pods
+	assert.Zero(t, mirrorSeriesCount(t, "etcd_mirror_phase", em.Namespace, em.Name))
+	assert.Zero(t, mirrorSeriesCount(t, "etcd_mirror_condition", em.Namespace, em.Name))
 	pods := &corev1.PodList{}
 	require.NoError(t, k8sClient.List(t.Context(), pods,
 		client.InNamespace(em.Namespace), client.MatchingLabels(etcdMirrorAgentLabels(em))))

@@ -7,6 +7,11 @@
 # omitted: it needs the agent-side
 # etcd_mirror_agent_seconds_since_last_progress (agent scrape), and a
 # suppressed wedged resync must still page.
+#
+# The manager scrape MUST set honor_labels: true (the shipped monitor.yaml
+# does): the gauges carry metric-level namespace/name identifying the CR, and
+# the prometheus-operator default rewrites namespace to exported_namespace —
+# breaking the `on (namespace, name)` join below and the alert annotations.
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata:
@@ -56,17 +61,22 @@ spec:
               raise retention, raise sync.maxOpsPerSecond, or shrink the prefix.
             runbook_url: https://github.com/etcd-io/etcd-operator/blob/main/docs/etcdmirror.md#operations-error-taxonomy-and-runbook
         - alert: EtcdMirrorCertificateExpiringSoon
-          # Agent-side metric: requires scraping the agent pod's http port
-          # (8080). 14d matches the controller's certExpiryLeadWindow (the
+          # Agent-side metric: INERT unless you scrape the agent pod's http
+          # port (8080) yourself — no agent scrape object ships with the
+          # operator. 14d matches the controller's certExpiryLeadWindow (the
           # controller also emits CertificateExpiringSoon Warning events).
           expr: (etcd_mirror_agent_tls_cert_expiry_timestamp_seconds - time()) < (14 * 86400)
           for: 15m
           labels:
             severity: warning
           annotations:
-            summary: 'EtcdMirror agent cert {{ $labels.side }}/{{ $labels.kind }} expires in under 14d'
+            summary: >-
+              EtcdMirror agent cert {{ $labels.side }}/{{ $labels.kind }}
+              ({{ $labels.namespace }}/{{ $labels.pod }}) expires in under 14d
             description: >-
               A certificate referenced by the mirror expires within 14 days —
               the renewal machinery (cert-manager renews ~30d out) has already
-              failed.
+              failed. The metric carries only side/kind labels; the mirror is
+              identified by the scrape target's namespace/pod labels. Requires
+              a user-provided agent scrape — inert otherwise.
             runbook_url: https://github.com/etcd-io/etcd-operator/blob/main/docs/etcdmirror.md#prerequisites-summary
