@@ -1,0 +1,14 @@
+# Must match imageName in test/e2e/e2e_suite_test.go (the operator image
+# ships /mirror-agent; it is built and kind-loaded, never pulled).
+- op: add
+  path: /spec/template/spec/containers/0/args/-
+  value: --mirror-agent-image=etcd-operator:v0.1
+# Serve /metrics as plain HTTP so the e2e suite can pod-proxy GET it without
+# token/RBAC/port-forward machinery. Appending works because std flag parsing
+# is last-occurrence-wins over the default overlay's --metrics-bind-address=:8443.
+- op: add
+  path: /spec/template/spec/containers/0/args/-
+  value: --metrics-secure=false
+- op: add
+  path: /spec/template/spec/containers/0/args/-
+  value: --metrics-bind-address=:8080
