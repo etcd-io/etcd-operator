@@ -9,4 +9,8 @@ Information about the different configuration options is available from the etcd
 
 `spec.quotaBackendBytes`, `spec.autoCompactionMode` and `spec.autoCompactionRetention` render the `--quota-backend-bytes`, `--auto-compaction-mode` and `--auto-compaction-retention` flags. When unset, no flag is rendered and etcd defaults apply. A conflicting flag in `etcdOptions` still wins, following the precedence above.
 
-The operator only writes these flags when it creates or scales the StatefulSet, so changing them on a running cluster takes effect on the next StatefulSet rollout — not immediately. In particular, raising `quotaBackendBytes` alone does not clear an active NOSPACE alarm: compact, defragment and `etcdctl alarm disarm` first.
+Changing these fields on a running, healthy cluster is not inert: the operator re-renders the StatefulSet template and immediately starts a rolling restart, replacing one pod at a time behind quorum and health gates (all members healthy, revisions caught up, every up-to-date pod Ready). Only apply such changes when a member-by-member restart is acceptable.
+
+While a NOSPACE alarm is active those health gates hold the rollout, and raising `quotaBackendBytes` alone does not clear the alarm: compact, defragment and `etcdctl alarm disarm` first — the rollout then proceeds automatically. If space cannot be freed, delete pods one at a time (`kubectl delete pod`); the StatefulSet uses the OnDelete strategy, so each replacement starts from the already-rendered template carrying the new quota.
+
+Rollback caveat: do not downgrade the operator below the version that introduced these fields while any cluster's DB exceeds etcd's 2GiB default quota. The older operator re-renders the template without `--quota-backend-bytes`, and the restarted pods raise a cluster-wide NOSPACE.
