@@ -139,3 +139,6 @@ Only reverse after the forward mirror reached CutoverReady.
   clients at the handshake: supply a client certificate; username/password
   auth alone is not viable there. When both are supplied, the token identity
   wins and must hold the range-scoped role.
+- The agent Deployment runs on the namespace default ServiceAccount with
+  `automountServiceAccountToken: false`; it needs zero Kubernetes API access,
+  so no ServiceAccount/Role/RoleBinding is installed for it.
