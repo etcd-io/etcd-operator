@@ -329,7 +329,15 @@ func TestClusterIDMismatchRearm(t *testing.T) {
 		waitTargetData(t, dst, cfg, 30*time.Second, map[string]string{"/dst/fresh": "new-world"})
 		snap := r2.agent.Snapshot()
 		assert.Equal(t, mirroragent.ResyncReasonClusterIDMismatch, snap.LastResyncReason)
+		// Data convergence and the checkpoint write that clears PrunePending
+		// are separate Txns; under load the fence read can land between them,
+		// so poll the fence rather than reading it once.
+		deadline := time.Now().Add(10 * time.Second)
 		f, _ := readFence(t, dst, cfg)
+		for f.PrunePending && time.Now().Before(deadline) {
+			time.Sleep(100 * time.Millisecond)
+			f, _ = readFence(t, dst, cfg)
+		}
 		assert.False(t, f.PrunePending)
 		assert.Equal(t, snap.SourceClusterID, f.SourceClusterID,
 			"the checkpoint must re-bind to the new source cluster identity")
