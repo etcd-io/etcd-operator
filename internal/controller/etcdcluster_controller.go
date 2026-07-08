@@ -128,8 +128,9 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 	res, err = r.reconcileClusterState(ctx, state)
 	if err == nil && res.IsZero() && pdbErr != nil {
-		// Nothing else requeues; surface the PDB failure for backoff.
-		return res, pdbErr
+		// Nothing else requeues; surface the PDB failure for backoff. Assign
+		// to err so the deferred status/metrics closure observes it too.
+		err = pdbErr
 	}
 	return res, err
 }
