@@ -1,0 +1,65 @@
+# Sample EtcdRestore CRs.
+#
+# An EtcdRestore is a one-shot job: it downloads a snapshot from object storage
+# and bootstraps a NEW, empty EtcdCluster from it. It never restores over a
+# cluster that already has members. Credentials follow the same rules as
+# EtcdBackup: they come ONLY from the destination's secretRef (or the operator's
+# ambient identity when secretRef is omitted) and are never logged.
+---
+# Restore from a completed EtcdBackup by reference. The destination, snapshot
+# key, and (best-effort) etcd version are derived from the referenced backup.
+apiVersion: operator.etcd.io/v1alpha1
+kind: EtcdRestore
+metadata:
+  labels:
+    app.kubernetes.io/name: etcd-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: etcdrestore-from-backup-sample
+spec:
+  source:
+    backupRef:
+      # Name of a completed EtcdBackup in the same namespace.
+      name: etcdbackup-s3-sample
+  target:
+    # The EtcdCluster to create and restore into. Must not already exist with
+    # members; the operator creates it as a fresh, single-member cluster.
+    name: etcdcluster-restored
+    size: 1
+    # version is optional here: it is inherited from the source cluster when it
+    # still exists. Set it explicitly to pin the restored cluster's etcd version.
+    # version: v3.6.1
+  # Bound the download+restore step (defaults to 10m if omitted).
+  restoreTimeout: 10m
+---
+# Restore from an explicit object-storage location, independent of any
+# EtcdBackup resource (e.g. the originating backup was deleted).
+apiVersion: operator.etcd.io/v1alpha1
+kind: EtcdRestore
+metadata:
+  labels:
+    app.kubernetes.io/name: etcd-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: etcdrestore-from-location-sample
+spec:
+  source:
+    location:
+      destination:
+        provider: s3
+        prefix: etcd/backups
+        s3:
+          bucket: my-etcd-backups
+          region: us-east-1
+        # Credentials secret. Keys: accessKeyID / secretAccessKey (and optionally
+        # sessionToken). Omit to use ambient credentials (IRSA). The same secret
+        # used for backups is reused here; restore needs only read access.
+        secretRef:
+          name: s3-backup-credentials
+      # Object key relative to the destination prefix. Copy this verbatim from a
+      # backup's .status.snapshotLocation (the part after the bucket/prefix).
+      key: etcdcluster-sample/etcdbackup-s3-sample-20260617T010203Z.db
+  target:
+    name: etcdcluster-restored-from-location
+    size: 1
+    # version is REQUIRED on the explicit-location path (no source cluster to
+    # inherit from).
+    version: v3.6.1

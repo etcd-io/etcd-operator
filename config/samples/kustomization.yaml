@@ -2,4 +2,5 @@
 resources:
 - operator_v1alpha1_etcdcluster.yaml
 - operator_v1alpha1_etcdbackup.yaml
+- operator_v1alpha1_etcdrestore.yaml
 # +kubebuilder:scaffold:manifestskustomizesamples

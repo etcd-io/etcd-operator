@@ -1,0 +1,342 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: etcdrestores.operator.etcd.io
+spec:
+  group: operator.etcd.io
+  names:
+    kind: EtcdRestore
+    listKind: EtcdRestoreList
+    plural: etcdrestores
+    singular: etcdrestore
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.target.name
+      name: Target
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.snapshotLocation
+      name: Source
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          EtcdRestore is the Schema for the etcdrestores API. It represents restoring a
+          snapshot from object storage into a new EtcdCluster.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              EtcdRestoreSpec defines the desired state of an EtcdRestore: take a snapshot
+              from object storage and bootstrap a new EtcdCluster from it.
+            properties:
+              restoreTimeout:
+                description: |-
+                  RestoreTimeout bounds how long the download+restore step may run before it
+                  is considered failed. Defaults to 10m if unset.
+                type: string
+              source:
+                description: Source selects the snapshot to restore.
+                properties:
+                  backupRef:
+                    description: |-
+                      BackupRef names a completed EtcdBackup in the same namespace whose
+                      uploaded snapshot should be restored. The controller reads that backup's
+                      destination (bucket/prefix/provider/secretRef) and recorded
+                      snapshotLocation, so this is the convenient path when restoring a backup
+                      the operator itself produced.
+                    properties:
+                      name:
+                        description: Name is the metadata.name of the EtcdBackup to
+                          restore from.
+                        minLength: 1
+                        type: string
+                    required:
+                    - name
+                    type: object
+                  location:
+                    description: |-
+                      Location fully describes a snapshot object independently of any
+                      EtcdBackup resource. Use this to restore a snapshot taken out-of-band or
+                      after the originating EtcdBackup has been deleted.
+                    properties:
+                      destination:
+                        description: |-
+                          Destination is the object-storage location (provider, bucket, prefix and
+                          optional secretRef) the snapshot lives in. The same secretRef semantics
+                          as EtcdBackup apply: omit it to use ambient credentials.
+                        properties:
+                          gcs:
+                            description: |-
+                              GCS holds GCS-specific destination configuration. Required when
+                              Provider is "gcs".
+                            properties:
+                              bucket:
+                                description: Bucket is the destination GCS bucket
+                                  name.
+                                minLength: 1
+                                type: string
+                              endpoint:
+                                description: |-
+                                  Endpoint overrides the GCS endpoint, enabling GCS-compatible emulators
+                                  such as fake-gcs-server or the gcloud storage testbench for hermetic,
+                                  credential-free testing. It must point at the JSON API root the emulator
+                                  serves (e.g. "http://fake-gcs:9000/storage/v1/"). When set, the client is
+                                  pointed at this endpoint and runs unauthenticated, mirroring the S3
+                                  endpoint override that targets MinIO. If empty, the real Google endpoint
+                                  and the normal credential chain are used.
+                                type: string
+                            required:
+                            - bucket
+                            type: object
+                          prefix:
+                            description: |-
+                              Prefix is an optional key prefix (a.k.a. "folder") within the bucket
+                              under which the snapshot object is written. A trailing slash is optional.
+                            type: string
+                          provider:
+                            description: Provider selects the object-storage backend.
+                            enum:
+                            - s3
+                            - gcs
+                            type: string
+                          s3:
+                            description: |-
+                              S3 holds S3-specific destination configuration. Required when
+                              Provider is "s3".
+                            properties:
+                              bucket:
+                                description: Bucket is the destination S3 bucket name.
+                                minLength: 1
+                                type: string
+                              endpoint:
+                                description: |-
+                                  Endpoint overrides the S3 endpoint, enabling S3-compatible stores such
+                                  as MinIO or Ceph RGW. If empty, the default AWS endpoint for the region
+                                  is used.
+                                type: string
+                              forcePathStyle:
+                                description: |-
+                                  ForcePathStyle forces path-style addressing (bucket in the path rather
+                                  than the host). Required by most S3-compatible stores.
+                                type: boolean
+                              region:
+                                description: Region is the AWS region the bucket resides
+                                  in (e.g. "us-east-1").
+                                type: string
+                            required:
+                            - bucket
+                            type: object
+                          secretRef:
+                            description: |-
+                              SecretRef references a Secret in the EtcdBackup's namespace holding the
+                              credentials for the provider. The expected keys depend on the provider:
+                                - s3:  accessKeyID / secretAccessKey (and optionally sessionToken)
+                                - gcs: serviceAccountJSON (a GCP service-account key)
+                              If unset, the controller falls back to ambient credentials available to
+                              the operator pod (e.g. IRSA / Workload Identity), which is the
+                              recommended production posture.
+                            properties:
+                              name:
+                                default: ""
+                                description: |-
+                                  Name of the referent.
+                                  This field is effectively required, but due to backwards compatibility is
+                                  allowed to be empty. Instances of this type with an empty value here are
+                                  almost certainly wrong.
+                                  More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                                type: string
+                            type: object
+                            x-kubernetes-map-type: atomic
+                        required:
+                        - provider
+                        type: object
+                      key:
+                        description: |-
+                          Key is the object key of the snapshot, relative to the destination
+                          Prefix (e.g. "my-cluster/backup-1-20260617T010203Z.db"). It is joined
+                          with the destination prefix exactly as the backup path joins them, so a
+                          value copied verbatim from an EtcdBackup's status round-trips.
+                        minLength: 1
+                        type: string
+                    required:
+                    - destination
+                    - key
+                    type: object
+                type: object
+              target:
+                description: Target describes the EtcdCluster to create and restore
+                  into.
+                properties:
+                  name:
+                    description: |-
+                      Name is the metadata.name of the EtcdCluster to create (in the
+                      EtcdRestore's namespace) and restore into. It must not already exist
+                      unless it exists and reports zero ready members (an empty shell).
+                    minLength: 1
+                    type: string
+                  size:
+                    description: |-
+                      Size is the desired size of the restored cluster. Defaults to 1 if unset;
+                      a single-member restore is the safest default because etcd's snapshot
+                      restore bootstraps a single-node cluster which is then grown.
+                    minimum: 1
+                    type: integer
+                  storageSpec:
+                    description: |-
+                      StorageSpec optionally requests persistent storage for the restored
+                      cluster, mirroring EtcdClusterSpec.StorageSpec. When omitted the restored
+                      cluster uses ephemeral container storage.
+                    properties:
+                      accessModes:
+                        type: string
+                      pvcName:
+                        type: string
+                      storageClassName:
+                        type: string
+                      volumeSizeLimit:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                      volumeSizeRequest:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                    required:
+                    - volumeSizeRequest
+                    type: object
+                  version:
+                    description: |-
+                      Version is the etcd version for the restored cluster. If empty, the
+                      controller inherits the version recorded on the source EtcdBackup (when
+                      restoring via backupRef) or requires it to be set explicitly.
+                    type: string
+                required:
+                - name
+                type: object
+            required:
+            - source
+            - target
+            type: object
+          status:
+            description: EtcdRestoreStatus defines the observed state of an EtcdRestore.
+            properties:
+              completionTime:
+                description: CompletionTime is when the restore finished successfully.
+                format: date-time
+                type: string
+              conditions:
+                description: Conditions represent the latest available observations
+                  of the restore's state.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              observedGeneration:
+                description: ObservedGeneration is the most recent generation observed
+                  by the controller.
+                format: int64
+                type: integer
+              phase:
+                description: Phase is a high-level summary of the restore lifecycle.
+                type: string
+              restoredCluster:
+                description: |-
+                  RestoredCluster is the name of the EtcdCluster the snapshot was restored
+                  into, once created.
+                type: string
+              snapshotLocation:
+                description: |-
+                  SnapshotLocation is the fully-qualified URI of the snapshot that was
+                  restored (e.g. "s3://my-bucket/etcd/backups/...db").
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
