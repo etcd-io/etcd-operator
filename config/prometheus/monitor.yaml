@@ -13,6 +13,11 @@ spec:
     - path: /metrics
       port: https # Ensure this is the name of the port that exposes HTTPS metrics
       scheme: https
+      # etcd_mirror_* gauges carry a metric-level `namespace` (the CR's).
+      # Without honorLabels the target label overwrites it (renamed to
+      # exported_namespace) and the rules' `on (namespace, name)` joins
+      # collapse to name-only — cross-namespace alert suppression.
+      honorLabels: true
       bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
       tlsConfig:
         # TODO(user): The option insecureSkipVerify: true is not recommended for production since it disables

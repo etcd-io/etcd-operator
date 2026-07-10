@@ -29,8 +29,17 @@ rules:
   - patch
   - update
 - apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
   - apps
   resources:
+  - deployments
   - statefulsets
   verbs:
   - create
@@ -62,9 +71,17 @@ rules:
   - list
   - watch
 - apiGroups:
+  - events.k8s.io
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
   - operator.etcd.io
   resources:
   - etcdclusters
+  - etcdmirrors
   verbs:
   - create
   - delete
@@ -77,12 +94,14 @@ rules:
   - operator.etcd.io
   resources:
   - etcdclusters/finalizers
+  - etcdmirrors/finalizers
   verbs:
   - update
 - apiGroups:
   - operator.etcd.io
   resources:
   - etcdclusters/status
+  - etcdmirrors/status
   verbs:
   - get
   - patch

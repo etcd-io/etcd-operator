@@ -1,0 +1,249 @@
+{
+  "title": "EtcdMirror",
+  "uid": "etcd-mirror",
+  "tags": ["etcd", "etcd-operator", "etcdmirror"],
+  "schemaVersion": 39,
+  "editable": true,
+  "graphTooltip": 1,
+  "time": {"from": "now-6h", "to": "now"},
+  "refresh": "30s",
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Data source",
+        "type": "datasource",
+        "query": "prometheus"
+      },
+      {
+        "name": "namespace",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "${datasource}"},
+        "query": "label_values(etcd_mirror_phase, namespace)",
+        "refresh": 2,
+        "sort": 1
+      },
+      {
+        "name": "name",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "${datasource}"},
+        "query": "label_values(etcd_mirror_phase{namespace=\"$namespace\"}, name)",
+        "refresh": 2,
+        "sort": 1
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "text",
+      "title": "",
+      "gridPos": {"h": 3, "w": 24, "x": 0, "y": 0},
+      "options": {
+        "mode": "markdown",
+        "content": "**Phase** and **Conditions** are controller-side (manager `/metrics`): present even when the agent pod never scheduled. All other panels use `etcd_mirror_agent_*` metrics and require the agent pods' `http` port (8080) to be scraped with `namespace`/`pod` labels — no scrape object ships with the operator. Paging algebra: `docs/etcdmirror.md`."
+      }
+    },
+    {
+      "id": 2,
+      "type": "state-timeline",
+      "title": "Phase (controller-side)",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 7, "w": 12, "x": 0, "y": 3},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "etcd_mirror_phase{namespace=\"$namespace\",name=\"$name\"} == 1",
+          "legendFormat": "{{phase}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {"custom": {"fillOpacity": 70, "lineWidth": 0}, "mappings": []},
+        "overrides": []
+      },
+      "options": {"showValue": "never", "legend": {"displayMode": "list", "placement": "bottom"}}
+    },
+    {
+      "id": 3,
+      "type": "table",
+      "title": "Conditions (controller-side)",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 7, "w": 12, "x": 12, "y": 3},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "etcd_mirror_condition{namespace=\"$namespace\",name=\"$name\"} == 1",
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {"Time": true, "Value": true, "__name__": true, "instance": true, "job": true, "namespace": true, "name": true, "pod": true, "service": true, "endpoint": true, "container": true},
+            "indexByName": {"type": 0, "status": 1}
+          }
+        }
+      ],
+      "fieldConfig": {"defaults": {"mappings": []}, "overrides": []},
+      "options": {"footer": {"show": false}}
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Replication lag (revisions)",
+      "description": "max(0, source_revision - watermark). Overstates lag for prefix-scoped mirrors: revisions are cluster-global.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 7, "w": 8, "x": 0, "y": 10},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "etcd_mirror_agent_lag_revisions{namespace=\"$namespace\",pod=~\"$name-mirror-agent-.*\"}",
+          "legendFormat": "{{pod}}"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "short", "min": 0}, "overrides": []}
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Seconds since last progress",
+      "description": "Watermark staleness. The controller marks Available=False (ProgressStalled) past 3x the progress-notification interval.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 7, "w": 8, "x": 8, "y": 10},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "etcd_mirror_agent_seconds_since_last_progress{namespace=\"$namespace\",pod=~\"$name-mirror-agent-.*\"}",
+          "legendFormat": "{{pod}}"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "s", "min": 0}, "overrides": []}
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Apply rate (ops/s)",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 7, "w": 8, "x": 16, "y": 10},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(etcd_mirror_agent_keys_applied_total{namespace=\"$namespace\",pod=~\"$name-mirror-agent-.*\"}[5m])",
+          "legendFormat": "{{pod}}"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "ops", "min": 0}, "overrides": []}
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Initial sync progress",
+      "description": "initial_sync_keys / initial_sync_expected_keys. Only meaningful during a genesis scan or forced resync.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 7, "w": 6, "x": 0, "y": 17},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "etcd_mirror_agent_initial_sync_keys{namespace=\"$namespace\",pod=~\"$name-mirror-agent-.*\"} / etcd_mirror_agent_initial_sync_expected_keys{namespace=\"$namespace\",pod=~\"$name-mirror-agent-.*\"}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {"unit": "percentunit", "min": 0, "max": 1, "mappings": []},
+        "overrides": []
+      },
+      "options": {"colorMode": "value", "graphMode": "area", "reduceOptions": {"calcs": ["lastNotNull"]}}
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Forced resyncs by reason (1h)",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 7, "w": 9, "x": 6, "y": 17},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "increase(etcd_mirror_agent_forced_resync_total{namespace=\"$namespace\",pod=~\"$name-mirror-agent-.*\"}[1h])",
+          "legendFormat": "{{reason}}"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "short", "min": 0}, "overrides": []}
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Drift (last full reconciliation diff)",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 7, "w": 9, "x": 15, "y": 17},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "etcd_mirror_agent_drift_missing_keys{namespace=\"$namespace\",pod=~\"$name-mirror-agent-.*\"}",
+          "legendFormat": "missing"
+        },
+        {
+          "refId": "B",
+          "expr": "etcd_mirror_agent_drift_divergent_keys{namespace=\"$namespace\",pod=~\"$name-mirror-agent-.*\"}",
+          "legendFormat": "divergent"
+        },
+        {
+          "refId": "C",
+          "expr": "etcd_mirror_agent_drift_orphan_keys{namespace=\"$namespace\",pod=~\"$name-mirror-agent-.*\"}",
+          "legendFormat": "orphan"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "short", "min": 0}, "overrides": []}
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Source vs target key counts",
+      "description": "In-scope counts from the most recent reconciliation/verification pass (reserved checkpoint key excluded).",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 7, "w": 12, "x": 0, "y": 24},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "etcd_mirror_agent_source_keys{namespace=\"$namespace\",pod=~\"$name-mirror-agent-.*\"}",
+          "legendFormat": "source"
+        },
+        {
+          "refId": "B",
+          "expr": "etcd_mirror_agent_target_keys{namespace=\"$namespace\",pod=~\"$name-mirror-agent-.*\"}",
+          "legendFormat": "target"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "short", "min": 0}, "overrides": []}
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "TLS cert expiry (days remaining)",
+      "description": "Warning alert fires under 14d — the controller's certExpiryLeadWindow.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "gridPos": {"h": 7, "w": 12, "x": 12, "y": 24},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(etcd_mirror_agent_tls_cert_expiry_timestamp_seconds{namespace=\"$namespace\",pod=~\"$name-mirror-agent-.*\"} - time()) / 86400",
+          "legendFormat": "{{side}}/{{kind}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "d",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "yellow", "value": 14},
+              {"color": "green", "value": 30}
+            ]
+          }
+        },
+        "overrides": []
+      }
+    }
+  ]
+}
