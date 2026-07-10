@@ -86,9 +86,14 @@ test: manifests generate fmt vet envtest ## Run tests.
 # Prometheus and CertManager are installed by default; skip with:
 # - PROMETHEUS_INSTALL_SKIP=true
 # - CERT_MANAGER_INSTALL_SKIP=true
+# Explicit -timeout: the features' worst-case wait ceilings sum past the go-test default of 10m,
+# and the EtcdMirror lifecycle scenarios push the sum past 30m. A pathologically slow run can
+# still exceed 75m while every wait is inside its ceiling; go-test then panics with no teardown
+# or diagnostics. Reruns self-heal (each feature Setup purges its leftover namespace), but the
+# kind cluster leaks — delete it manually.
 .PHONY: test-e2e
 test-e2e: generate fmt vet kind gofail-enable ## Run the e2e tests. Expected an isolated environment using Kind.
-	ETCD_VERSION="$(E2E_ETCD_VERSION)" PATH="$(LOCALBIN):$(PATH)" go test ./test/e2e/ -v
+	ETCD_VERSION="$(E2E_ETCD_VERSION)" PATH="$(LOCALBIN):$(PATH)" go test ./test/e2e/ -v -timeout 75m
 	$(MAKE) gofail-disable
 
 .PHONY: gofail-enable
@@ -125,8 +130,9 @@ verify: verify-mod-tidy lint ## Run static checks against the code.
 ##@ Build
 
 .PHONY: build
-build: manifests generate fmt vet ## Build manager binary.
+build: manifests generate fmt vet ## Build manager and mirror-agent binaries.
 	go build -o bin/manager cmd/main.go
+	go build -o bin/mirror-agent ./cmd/mirror-agent
 
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.
