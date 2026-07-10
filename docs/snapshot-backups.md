@@ -49,9 +49,7 @@ provider package**, wired into the existing operator binary:
 
 ```
 api/v1alpha1/etcdbackup_types.go        # EtcdBackup CRD
-api/v1alpha1/etcdrestore_types.go       # EtcdRestore CRD
 internal/controller/etcdbackup_*.go     # backup reconciler + snapshotter (no cloud SDK imports)
-internal/controller/etcdrestore_*.go    # restore reconciler + restorer (no cloud SDK imports)
 internal/controller/objectstore_creds.go # shared, audit-logged credential seam
 pkg/objectstore/{interface,s3,gcs}.go   # cloud SDKs isolated behind a Store interface
 ```
@@ -90,74 +88,6 @@ production posture. When present, the expected secret keys are:
 
 - **s3**: `accessKeyID`, `secretAccessKey`, and optionally `sessionToken`
 - **gcs**: `serviceAccountJSON` (a GCP service-account key)
-
-# EtcdRestore: restore a snapshot into a new cluster
-
-`EtcdRestore` implements the roadmap item *"Create a new cluster from a
-backup"*: it downloads a snapshot from object storage and bootstraps a **new,
-empty** `EtcdCluster` from it. A restore is always a genesis — it never overlays
-a snapshot onto a cluster that already has members.
-
-## Custom resource
-
-The snapshot source is one of two mutually-exclusive forms:
-
-- **`backupRef`** — the name of a completed `EtcdBackup` in the same namespace.
-  The destination (bucket/prefix/provider/secretRef), the object key, and a
-  best-effort etcd version (inherited from the still-existing source cluster)
-  are all derived from that backup. This is the convenient path for restoring a
-  backup the operator itself produced.
-- **`location`** — an explicit object-storage destination plus the object
-  `key`, independent of any `EtcdBackup` (e.g. the originating backup was
-  deleted). On this path `target.version` is required.
-
-```yaml
-apiVersion: operator.etcd.io/v1alpha1
-kind: EtcdRestore
-metadata:
-  name: restore-2026-06-18
-spec:
-  source:
-    backupRef:
-      name: nightly-2026-06-17       # a Completed EtcdBackup
-  target:
-    name: my-cluster-restored        # NEW EtcdCluster to create
-    size: 1                           # restore bootstraps a single seed member
-    # version: v3.6.1                 # optional; inherited from source cluster
-  restoreTimeout: 10m                 # optional, bounds download+restore
-status:
-  phase: Completed                    # Pending | Downloading | Restoring | Completed | Failed
-  snapshotLocation: s3://my-etcd-backups/etcd/backups/my-cluster/nightly-...db
-  restoredCluster: my-cluster-restored
-  conditions:
-    - type: Succeeded
-      status: "True"
-      reason: SnapshotRestored
-```
-
-## How it works
-
-The restore controller mirrors the backup controller's two-seam design so its
-orchestration is unit-testable with no cloud creds and no live etcd:
-
-1. **`pkg/objectstore.Store.Download`** streams the snapshot back out of the
-   bucket. Unlike the upload path (which spools to a temp file because S3
-   `PutObject` needs a known length), `Download` streams the body, so the
-   snapshot is never staged on the operator's disk on the read path.
-2. **`Restorer`** writes the snapshot into the target member and bootstraps the
-   new cluster. The default implementation streams the snapshot bytes into the
-   genesis pod (`<cluster>-0`) over the exec subresource's stdin and runs
-   `etcdctl snapshot restore` into a fresh data directory, stamping the member
-   identity (`--name` / `--initial-advertise-peer-urls` / `--initial-cluster`)
-   with the exact name and peer URL the bootstrapping pod will advertise.
-   `etcdctl snapshot restore` refuses to overwrite a populated data directory,
-   which is a second line of defence behind the controller's empty-target check.
-
-**Empty-target guarantee.** Before restoring, the controller either creates the
-target `EtcdCluster` fresh (owning it, so deleting the `EtcdRestore` can GC the
-restored cluster) or, if a cluster of that name already exists, verifies its
-backing StatefulSet reports **zero** ready members. Any ready member aborts the
-restore — a restore must never silently diverge from a live cluster.
 
 # Security
 

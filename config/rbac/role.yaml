@@ -80,7 +80,6 @@ rules:
   resources:
   - etcdbackups
   - etcdclusters
-  - etcdrestores
   verbs:
   - create
   - delete
@@ -94,7 +93,6 @@ rules:
   resources:
   - etcdbackups/finalizers
   - etcdclusters/finalizers
-  - etcdrestores/finalizers
   verbs:
   - update
 - apiGroups:
@@ -102,7 +100,6 @@ rules:
   resources:
   - etcdbackups/status
   - etcdclusters/status
-  - etcdrestores/status
   verbs:
   - get
   - patch
