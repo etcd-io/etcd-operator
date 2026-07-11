@@ -65,18 +65,19 @@ spec:
   # cleartext, or pointed at a different issuer.
   tls:
     peer:
-      provider: "cert-manager"
-      providerCfg:
-        certManagerCfg:
-          commonName: "etcd-operator-system"
-          validityDuration: "365d"
-          issuerKind: "ClusterIssuer"
-          issuerName: "etcd-ca-issuer"
+      provider: "cert-manager.io"
+      certManager:
+        commonName: "etcd-operator-system"
+        # Go duration units only (h/m/s); day suffixes like "365d" are rejected.
+        duration: "8760h"
+        issuerRef:
+          kind: ClusterIssuer
+          name: etcd-ca-issuer
     client:
-      provider: "cert-manager"
-      providerCfg:
-        certManagerCfg:
-          commonName: "etcd-operator-system"
-          validityDuration: "365d"
-          issuerKind: "ClusterIssuer"
-          issuerName: "etcd-ca-issuer"
+      provider: "cert-manager.io"
+      certManager:
+        commonName: "etcd-operator-system"
+        duration: "8760h"
+        issuerRef:
+          kind: ClusterIssuer
+          name: etcd-ca-issuer

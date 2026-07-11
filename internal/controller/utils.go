@@ -13,7 +13,6 @@ import (
 	"strings"
 	"time"
 
-	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	"github.com/coreos/go-semver/semver"
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
@@ -111,9 +110,10 @@ func clientCertAuthEnabled(s *ecv1alpha1.TLSSurface) bool {
 // (e.g. pre-1.25, CEL feature-gated off, or a CR written directly to a fake client
 // in tests). These are the spec-derivable rules ONLY:
 //
-//   - provider 'cert-manager'  => providerCfg.certManagerCfg must be set
-//   - provider auto/empty      => providerCfg.certManagerCfg must NOT be set
-//   - clientCertAuth (mTLS) with cert-manager => issuerName must be set (a CA source)
+//   - provider 'cert-manager.io' => the certManager block must be set
+//   - provider auto/empty        => the certManager block must NOT be set
+//   - provider 'cert-manager.io' => the auto block must NOT be set (and vice versa)
+//   - clientCertAuth (mTLS) with cert-manager => issuerRef.name must be set (a CA source)
 //
 // Rules that require reading cluster objects are intentionally NOT here: issuer
 // existence and kind are enforced when the cert is provisioned (the cert-manager
@@ -141,20 +141,24 @@ func validateTLSSurface(path *field.Path, s *ecv1alpha1.TLSSurface) field.ErrorL
 	if s == nil {
 		return errs
 	}
-	hasCM := s.ProviderCfg.CertManagerCfg != nil
-	isCertManager := s.Provider == string(certificate.CertManager)
+	hasCM := s.CertManager != nil
+	isCertManager := s.EffectiveProvider() == ecv1alpha1.TLSProviderCertManager
 	switch {
 	case isCertManager && !hasCM:
-		errs = append(errs, field.Required(path.Child("providerCfg", "certManagerCfg"),
-			"provider 'cert-manager' requires providerCfg.certManagerCfg"))
+		errs = append(errs, field.Required(path.Child("certManager"),
+			"provider 'cert-manager.io' requires the certManager block"))
 	case !isCertManager && hasCM:
-		errs = append(errs, field.Invalid(path.Child("providerCfg", "certManagerCfg"), "<set>",
-			"providerCfg.certManagerCfg may only be set when provider is 'cert-manager'"))
+		errs = append(errs, field.Invalid(path.Child("certManager"), "<set>",
+			"certManager may only be set when provider is 'cert-manager.io'"))
 	}
-	// mTLS requires a resolvable CA. With cert-manager that means an issuerName.
-	if clientCertAuthEnabled(s) && isCertManager && hasCM && s.ProviderCfg.CertManagerCfg.IssuerName == "" {
-		errs = append(errs, field.Required(path.Child("providerCfg", "certManagerCfg", "issuerName"),
-			"clientCertAuth requires a trusted CA: set providerCfg.certManagerCfg.issuerName"))
+	if isCertManager && s.Auto != nil {
+		errs = append(errs, field.Invalid(path.Child("auto"), "<set>",
+			"auto may only be set when provider is 'auto'"))
+	}
+	// mTLS requires a resolvable CA. With cert-manager that means an issuerRef.name.
+	if clientCertAuthEnabled(s) && isCertManager && hasCM && s.CertManager.IssuerRef.Name == "" {
+		errs = append(errs, field.Required(path.Child("certManager", "issuerRef", "name"),
+			"clientCertAuth requires a trusted CA: set certManager.issuerRef.name"))
 	}
 	return errs
 }
@@ -801,20 +805,6 @@ func getPeerCertName(etcdClusterName string) string {
 	return peerCertName
 }
 
-// parseValidityDuration parses a duration string and returns the parsed duration.
-// If the customizedDuration is empty, it returns the defaultDuration.
-// Returns an error if the duration string cannot be parsed.
-func parseValidityDuration(customizedDuration string, defaultDuration time.Duration) (time.Duration, error) {
-	if customizedDuration == "" {
-		return defaultDuration, nil
-	}
-	duration, err := time.ParseDuration(customizedDuration)
-	if err != nil {
-		return 0, fmt.Errorf("failed to parse ValidityDuration: %w", err)
-	}
-	return duration, nil
-}
-
 // defaultCertDNSNames returns the user-provided DNS SANs, or wildcard DNS for
 // the cluster's headless service to cover all pods (pod-0, pod-1, etc.).
 func defaultCertDNSNames(ec *ecv1alpha1.EtcdCluster, dnsNames []string) []string {
@@ -827,70 +817,68 @@ func defaultCertDNSNames(ec *ecv1alpha1.EtcdCluster, dnsNames []string) []string
 	}
 }
 
-// certIPStrings renders the CRD's parsed IP SANs to the literal-string form
-// used by certInterface.Config, preserving nil when none are set.
-func certIPStrings(ips []net.IP) []string {
-	if len(ips) == 0 {
-		return nil
-	}
-	out := make([]string, 0, len(ips))
+// validateCertIPAddresses rejects IP SANs that do not parse as literal IPs.
+// This runs at reconcile time because the CRD cannot use CEL's isIP() on the
+// apiserver versions the operator still supports.
+func validateCertIPAddresses(ips []string) error {
 	for _, ip := range ips {
-		out = append(out, ip.String())
+		if net.ParseIP(ip) == nil {
+			return field.Invalid(field.NewPath("ipAddresses"), ip, "must be a literal IP address")
+		}
 	}
-	return out
+	return nil
+}
+
+// resolveCertDuration resolves an optional CR duration against the provider
+// default.
+func resolveCertDuration(d *metav1.Duration, defaultDuration time.Duration) time.Duration {
+	if d == nil {
+		return defaultDuration
+	}
+	return d.Duration
 }
 
 func createCMCertificateConfig(ec *ecv1alpha1.EtcdCluster, surface *ecv1alpha1.TLSSurface) (*certInterface.Config, error) {
-	cmConfig := surface.ProviderCfg.CertManagerCfg
+	cmConfig := surface.CertManager
 	if cmConfig == nil {
 		return nil, fmt.Errorf("cert-manager configuration is not present")
 	}
-
-	// Set default duration to 90 days for cert-manager if not provided
-	duration, err := parseValidityDuration(cmConfig.ValidityDuration, certInterface.DefaultCertManagerValidity)
-	if err != nil {
+	if err := validateCertIPAddresses(cmConfig.IPAddresses); err != nil {
 		return nil, err
 	}
 
+	issuerRef := cmConfig.IssuerRef
 	config := &certInterface.Config{
 		CommonName:    cmConfig.CommonName,
-		Organizations: cmConfig.Organization,
-		DNSNames:      defaultCertDNSNames(ec, cmConfig.AltNames.DNSNames),
-		IPAddresses:   certIPStrings(cmConfig.AltNames.IPs),
-		Duration:      duration,
-		IssuerRef: &cmmeta.IssuerReference{
-			Name:  cmConfig.IssuerName,
-			Kind:  cmConfig.IssuerKind,
-			Group: cmConfig.IssuerGroup,
-		},
+		Organizations: cmConfig.Organizations,
+		DNSNames:      defaultCertDNSNames(ec, cmConfig.DNSNames),
+		IPAddresses:   cmConfig.IPAddresses,
+		Duration:      resolveCertDuration(cmConfig.Duration, certInterface.DefaultCertManagerValidity),
+		RenewBefore:   cmConfig.RenewBefore,
+		IssuerRef:     &issuerRef,
 	}
 	return config, nil
 }
 
 func createAutoCertificateConfig(ec *ecv1alpha1.EtcdCluster, surface *ecv1alpha1.TLSSurface) (*certInterface.Config, error) {
-	autoConfig := surface.ProviderCfg.AutoCfg
-	// Set default values for auto configuration if not present
+	autoConfig := surface.Auto
+	// The auto block is optional: defaults are derived from the cluster.
 	if autoConfig == nil {
-		autoConfig = &ecv1alpha1.ProviderAutoConfig{
-			CommonConfig: ecv1alpha1.CommonConfig{
-				CommonName:       fmt.Sprintf("%s.%s.%s", ec.Name, ec.Namespace, certInterface.DefaultDomainName),
-				ValidityDuration: certInterface.DefaultAutoValidity.String(),
-			},
+		autoConfig = &ecv1alpha1.TLSAutoProvider{
+			CommonName: fmt.Sprintf("%s.%s.%s", ec.Name, ec.Namespace, certInterface.DefaultDomainName),
 		}
 	}
-
-	// Set default duration to 365 days for auto provider if not provided
-	duration, err := parseValidityDuration(autoConfig.ValidityDuration, certInterface.DefaultAutoValidity)
-	if err != nil {
+	if err := validateCertIPAddresses(autoConfig.IPAddresses); err != nil {
 		return nil, err
 	}
 
 	config := &certInterface.Config{
 		CommonName:    autoConfig.CommonName,
-		Organizations: autoConfig.Organization,
-		DNSNames:      defaultCertDNSNames(ec, autoConfig.AltNames.DNSNames),
-		IPAddresses:   certIPStrings(autoConfig.AltNames.IPs),
-		Duration:      duration,
+		Organizations: autoConfig.Organizations,
+		DNSNames:      defaultCertDNSNames(ec, autoConfig.DNSNames),
+		IPAddresses:   autoConfig.IPAddresses,
+		Duration:      resolveCertDuration(autoConfig.Duration, certInterface.DefaultAutoValidity),
+		RenewBefore:   autoConfig.RenewBefore,
 	}
 	return config, nil
 }
@@ -902,10 +890,7 @@ func createCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client
 	logger := log.FromContext(ctx)
 
 	// An empty provider on the surface defaults to the auto provider.
-	providerName := surface.Provider
-	if providerName == "" {
-		providerName = string(certificate.Auto)
-	}
+	providerName := surface.EffectiveProvider()
 
 	cert, certErr := certificate.NewProvider(certificate.ProviderType(providerName), c)
 	if certErr != nil {

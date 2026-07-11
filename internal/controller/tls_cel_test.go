@@ -2,10 +2,13 @@ package controller
 
 import (
 	"testing"
+	"time"
 
+	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
@@ -21,14 +24,15 @@ func TestTLSCELValidation(t *testing.T) {
 		t.Skip("envtest apiserver not available")
 	}
 
-	cm := func(issuerName string) ecv1alpha1.ProviderConfig {
-		return ecv1alpha1.ProviderConfig{
-			CertManagerCfg: &ecv1alpha1.ProviderCertManagerConfig{
-				IssuerKind: "ClusterIssuer",
-				IssuerName: issuerName,
+	cm := func(issuerName string) *ecv1alpha1.TLSCertManagerProvider {
+		return &ecv1alpha1.TLSCertManagerProvider{
+			IssuerRef: cmmeta.IssuerReference{
+				Kind: "ClusterIssuer",
+				Name: issuerName,
 			},
 		}
 	}
+	dur := func(d time.Duration) *metav1.Duration { return &metav1.Duration{Duration: d} }
 
 	tests := []struct {
 		name      string
@@ -37,51 +41,67 @@ func TestTLSCELValidation(t *testing.T) {
 	}{
 		{
 			name:      "valid cert-manager mTLS surface accepted",
-			surface:   ecv1alpha1.TLSSurface{Provider: "cert-manager", ProviderCfg: cm("etcd-ca-issuer")},
+			surface:   ecv1alpha1.TLSSurface{Provider: ecv1alpha1.TLSProviderCertManager, CertManager: cm("etcd-ca-issuer")},
 			wantApply: true,
 		},
 		{
 			name:      "auto provider surface accepted",
-			surface:   ecv1alpha1.TLSSurface{Provider: "auto"},
+			surface:   ecv1alpha1.TLSSurface{Provider: ecv1alpha1.TLSProviderAuto},
 			wantApply: true,
 		},
 		{
-			name:      "cert-manager provider without certManagerCfg rejected",
-			surface:   ecv1alpha1.TLSSurface{Provider: "cert-manager"},
+			name:      "cert-manager provider without the certManager block rejected",
+			surface:   ecv1alpha1.TLSSurface{Provider: ecv1alpha1.TLSProviderCertManager},
 			wantApply: false,
 		},
 		{
-			name:      "certManagerCfg under auto provider rejected",
-			surface:   ecv1alpha1.TLSSurface{Provider: "auto", ProviderCfg: cm("etcd-ca-issuer")},
+			name:      "certManager block under auto provider rejected",
+			surface:   ecv1alpha1.TLSSurface{Provider: ecv1alpha1.TLSProviderAuto, CertManager: cm("etcd-ca-issuer")},
 			wantApply: false,
 		},
 		{
-			name: "clientCertAuth true with cert-manager but empty issuerName rejected",
+			name: "auto block under cert-manager provider rejected",
 			surface: ecv1alpha1.TLSSurface{
-				Provider:       "cert-manager",
+				Provider:    ecv1alpha1.TLSProviderCertManager,
+				CertManager: cm("etcd-ca-issuer"),
+				Auto:        &ecv1alpha1.TLSAutoProvider{},
+			},
+			wantApply: false,
+		},
+		{
+			name: "clientCertAuth true with cert-manager but empty issuerRef.name rejected",
+			surface: ecv1alpha1.TLSSurface{
+				Provider:       ecv1alpha1.TLSProviderCertManager,
 				ClientCertAuth: boolPtr(true),
-				ProviderCfg:    cm(""),
+				CertManager:    cm(""),
 			},
 			wantApply: false,
 		},
 		{
-			name: "server-only TLS (clientCertAuth false) without issuerName accepted",
+			name: "server-only TLS (clientCertAuth false) accepted",
 			surface: ecv1alpha1.TLSSurface{
-				Provider:       "cert-manager",
+				Provider:       ecv1alpha1.TLSProviderCertManager,
 				ClientCertAuth: boolPtr(false),
-				ProviderCfg:    cm("etcd-ca-issuer"),
+				CertManager:    cm("etcd-ca-issuer"),
 			},
 			wantApply: true,
 		},
 		{
-			name: "bad issuerKind rejected by enum",
+			name: "issuerRef.kind omitted accepted (defaults to Issuer)",
 			surface: ecv1alpha1.TLSSurface{
-				Provider: "cert-manager",
-				ProviderCfg: ecv1alpha1.ProviderConfig{
-					CertManagerCfg: &ecv1alpha1.ProviderCertManagerConfig{
-						IssuerKind: "Bogus",
-						IssuerName: "etcd-ca-issuer",
-					},
+				Provider: ecv1alpha1.TLSProviderCertManager,
+				CertManager: &ecv1alpha1.TLSCertManagerProvider{
+					IssuerRef: cmmeta.IssuerReference{Name: "etcd-ca-issuer"},
+				},
+			},
+			wantApply: true,
+		},
+		{
+			name: "bad issuerRef.kind rejected by CEL",
+			surface: ecv1alpha1.TLSSurface{
+				Provider: ecv1alpha1.TLSProviderCertManager,
+				CertManager: &ecv1alpha1.TLSCertManagerProvider{
+					IssuerRef: cmmeta.IssuerReference{Kind: "Bogus", Name: "etcd-ca-issuer"},
 				},
 			},
 			wantApply: false,
@@ -90,6 +110,48 @@ func TestTLSCELValidation(t *testing.T) {
 			name: "bad provider rejected by enum",
 			surface: ecv1alpha1.TLSSurface{
 				Provider: "vault",
+			},
+			wantApply: false,
+		},
+		{
+			name: "cert-manager duration below 1h rejected",
+			surface: func() ecv1alpha1.TLSSurface {
+				s := ecv1alpha1.TLSSurface{Provider: ecv1alpha1.TLSProviderCertManager, CertManager: cm("etcd-ca-issuer")}
+				s.CertManager.Duration = dur(30 * time.Minute)
+				return s
+			}(),
+			wantApply: false,
+		},
+		{
+			name: "cert-manager duration of 90 days accepted",
+			surface: func() ecv1alpha1.TLSSurface {
+				s := ecv1alpha1.TLSSurface{Provider: ecv1alpha1.TLSProviderCertManager, CertManager: cm("etcd-ca-issuer")}
+				s.CertManager.Duration = dur(2160 * time.Hour)
+				return s
+			}(),
+			wantApply: true,
+		},
+		{
+			name: "auto duration below 365 days rejected",
+			surface: ecv1alpha1.TLSSurface{
+				Provider: ecv1alpha1.TLSProviderAuto,
+				Auto:     &ecv1alpha1.TLSAutoProvider{Duration: dur(720 * time.Hour)},
+			},
+			wantApply: false,
+		},
+		{
+			name: "auto duration of 365 days accepted",
+			surface: ecv1alpha1.TLSSurface{
+				Provider: ecv1alpha1.TLSProviderAuto,
+				Auto:     &ecv1alpha1.TLSAutoProvider{Duration: dur(8760 * time.Hour)},
+			},
+			wantApply: true,
+		},
+		{
+			name: "zero renewBefore rejected",
+			surface: ecv1alpha1.TLSSurface{
+				Provider: ecv1alpha1.TLSProviderAuto,
+				Auto:     &ecv1alpha1.TLSAutoProvider{RenewBefore: dur(0)},
 			},
 			wantApply: false,
 		},
@@ -118,6 +180,41 @@ func TestTLSCELValidation(t *testing.T) {
 			} else {
 				assert.Error(t, err, "apiserver should reject an invalid surface via CEL")
 			}
+		})
+	}
+}
+
+// TestTLSDaySuffixDurationRejected asserts the CEL duration() guards reject
+// day-suffix strings at ADMISSION. The CRD renders *metav1.Duration as a bare
+// string schema, so without these guards "365d" would be admitted and stored,
+// then wedge the controller's typed decode (time.ParseDuration has no 'd'
+// unit). Raw JSON is used because the Go client cannot even marshal an
+// unparseable metav1.Duration.
+func TestTLSDaySuffixDurationRejected(t *testing.T) {
+	if k8sClient == nil {
+		t.Skip("envtest apiserver not available")
+	}
+
+	for _, tc := range []struct {
+		name  string
+		block string
+	}{
+		{"auto 365d", `"provider":"auto","auto":{"duration":"365d"}`},
+		{"certManager 90d", `"provider":"cert-manager.io","certManager":{"issuerRef":{"name":"x"},"duration":"90d"}`},
+		{"renewBefore 30d", `"provider":"auto","auto":{"renewBefore":"30d"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			u := &unstructured.Unstructured{}
+			raw := `{
+				"apiVersion": "operator.etcd.io/v1alpha1",
+				"kind": "EtcdCluster",
+				"metadata": {"generateName": "cel-day-", "namespace": "default"},
+				"spec": {"size": 3, "version": "v3.6.12",
+					"tls": {"client": {` + tc.block + `}}}
+			}`
+			require.NoError(t, u.UnmarshalJSON([]byte(raw)))
+			err := k8sClient.Create(t.Context(), u)
+			assert.Error(t, err, "day-suffix duration must be rejected at admission")
 		})
 	}
 }

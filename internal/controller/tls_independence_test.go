@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -71,11 +72,11 @@ func boolPtr(b bool) *bool { return &b }
 // cmSurface builds a cert-manager TLSSurface with mTLS on by default.
 func cmSurface(clientCertAuth *bool) *ecv1alpha1.TLSSurface {
 	return &ecv1alpha1.TLSSurface{
-		Provider: "cert-manager",
-		ProviderCfg: ecv1alpha1.ProviderConfig{
-			CertManagerCfg: &ecv1alpha1.ProviderCertManagerConfig{
-				IssuerKind: "ClusterIssuer",
-				IssuerName: "etcd-ca-issuer",
+		Provider: ecv1alpha1.TLSProviderCertManager,
+		CertManager: &ecv1alpha1.TLSCertManagerProvider{
+			IssuerRef: cmmeta.IssuerReference{
+				Kind: "ClusterIssuer",
+				Name: "etcd-ca-issuer",
 			},
 		},
 		ClientCertAuth: clientCertAuth,
@@ -370,47 +371,58 @@ func TestValidateTLS(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "cert-manager provider without certManagerCfg is rejected",
+			name: "cert-manager provider without the certManager block is rejected",
 			tls: &ecv1alpha1.EtcdClusterTLS{
-				Client: &ecv1alpha1.TLSSurface{Provider: "cert-manager"},
+				Client: &ecv1alpha1.TLSSurface{Provider: ecv1alpha1.TLSProviderCertManager},
 			},
 			wantErr: true,
 		},
 		{
-			name: "certManagerCfg under auto provider is rejected",
+			name: "certManager block under auto provider is rejected",
 			tls: &ecv1alpha1.EtcdClusterTLS{
 				Client: &ecv1alpha1.TLSSurface{
-					Provider: "auto",
-					ProviderCfg: ecv1alpha1.ProviderConfig{
-						CertManagerCfg: &ecv1alpha1.ProviderCertManagerConfig{
-							IssuerKind: "ClusterIssuer", IssuerName: "x",
-						},
+					Provider: ecv1alpha1.TLSProviderAuto,
+					CertManager: &ecv1alpha1.TLSCertManagerProvider{
+						IssuerRef: cmmeta.IssuerReference{Kind: "ClusterIssuer", Name: "x"},
 					},
 				},
 			},
 			wantErr: true,
 		},
 		{
-			name: "clientCertAuth (mTLS) with cert-manager but no issuerName is rejected",
+			name: "auto block under cert-manager provider is rejected",
 			tls: &ecv1alpha1.EtcdClusterTLS{
 				Client: &ecv1alpha1.TLSSurface{
-					Provider:       "cert-manager",
+					Provider: ecv1alpha1.TLSProviderCertManager,
+					CertManager: &ecv1alpha1.TLSCertManagerProvider{
+						IssuerRef: cmmeta.IssuerReference{Kind: "ClusterIssuer", Name: "x"},
+					},
+					Auto: &ecv1alpha1.TLSAutoProvider{},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "clientCertAuth (mTLS) with cert-manager but no issuerRef.name is rejected",
+			tls: &ecv1alpha1.EtcdClusterTLS{
+				Client: &ecv1alpha1.TLSSurface{
+					Provider:       ecv1alpha1.TLSProviderCertManager,
 					ClientCertAuth: boolPtr(true),
-					ProviderCfg: ecv1alpha1.ProviderConfig{
-						CertManagerCfg: &ecv1alpha1.ProviderCertManagerConfig{IssuerKind: "ClusterIssuer"},
+					CertManager: &ecv1alpha1.TLSCertManagerProvider{
+						IssuerRef: cmmeta.IssuerReference{Kind: "ClusterIssuer"},
 					},
 				},
 			},
 			wantErr: true,
 		},
 		{
-			name: "server-only TLS (clientCertAuth false) without issuerName is allowed",
+			name: "server-only TLS (clientCertAuth false) with an issuerRef is allowed",
 			tls: &ecv1alpha1.EtcdClusterTLS{
 				Client: &ecv1alpha1.TLSSurface{
-					Provider:       "cert-manager",
+					Provider:       ecv1alpha1.TLSProviderCertManager,
 					ClientCertAuth: boolPtr(false),
-					ProviderCfg: ecv1alpha1.ProviderConfig{
-						CertManagerCfg: &ecv1alpha1.ProviderCertManagerConfig{IssuerKind: "ClusterIssuer", IssuerName: "x"},
+					CertManager: &ecv1alpha1.TLSCertManagerProvider{
+						IssuerRef: cmmeta.IssuerReference{Kind: "ClusterIssuer", Name: "x"},
 					},
 				},
 			},
@@ -419,8 +431,8 @@ func TestValidateTLS(t *testing.T) {
 		{
 			name: "auto provider on both surfaces is valid",
 			tls: &ecv1alpha1.EtcdClusterTLS{
-				Peer:   &ecv1alpha1.TLSSurface{Provider: "auto"},
-				Client: &ecv1alpha1.TLSSurface{Provider: "auto"},
+				Peer:   &ecv1alpha1.TLSSurface{Provider: ecv1alpha1.TLSProviderAuto},
+				Client: &ecv1alpha1.TLSSurface{Provider: ecv1alpha1.TLSProviderAuto},
 			},
 			wantErr: false,
 		},

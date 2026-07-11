@@ -21,7 +21,6 @@ import (
 
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 	"go.etcd.io/etcd-operator/internal/etcdutils"
-	"go.etcd.io/etcd-operator/pkg/certificate"
 	certInterface "go.etcd.io/etcd-operator/pkg/certificate/interfaces"
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -933,18 +932,13 @@ func TestCreateAutoCertificateConfig(t *testing.T) {
 				},
 			},
 			surface: &ecv1alpha1.TLSSurface{
-				Provider: string(certificate.Auto),
-				ProviderCfg: ecv1alpha1.ProviderConfig{
-					AutoCfg: &ecv1alpha1.ProviderAutoConfig{
-						CommonConfig: ecv1alpha1.CommonConfig{
-							CommonName:       "custom.example.com",
-							Organization:     []string{"Test Org"},
-							ValidityDuration: "720h", // 30 days
-							AltNames: ecv1alpha1.AltNames{
-								DNSNames: []string{"custom1.example.com", "custom2.example.com"},
-							},
-						},
-					},
+				Provider: ecv1alpha1.TLSProviderAuto,
+				Auto: &ecv1alpha1.TLSAutoProvider{
+					CommonName:    "custom.example.com",
+					Organizations: []string{"Test Org"},
+					Duration:      &metav1.Duration{Duration: 720 * time.Hour}, // 30 days
+					DNSNames:      []string{"custom1.example.com", "custom2.example.com"},
+					IPAddresses:   []string{"10.0.0.9"},
 				},
 			},
 			expected: &certInterface.Config{
@@ -952,8 +946,24 @@ func TestCreateAutoCertificateConfig(t *testing.T) {
 				Organizations: []string{"Test Org"},
 				Duration:      720 * time.Hour, // 30 days
 				DNSNames:      []string{"custom1.example.com", "custom2.example.com"},
+				IPAddresses:   []string{"10.0.0.9"},
 			},
 			wantErr: false,
+		},
+		{
+			name: "auto config with a malformed IP SAN is rejected",
+			ec: &ecv1alpha1.EtcdCluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-cluster",
+					Namespace: "test-namespace",
+				},
+			},
+			surface: &ecv1alpha1.TLSSurface{
+				Provider: ecv1alpha1.TLSProviderAuto,
+				Auto:     &ecv1alpha1.TLSAutoProvider{IPAddresses: []string{"not-an-ip"}},
+			},
+			expected: nil,
+			wantErr:  true,
 		},
 		{
 			name: "auto config with nil AutoCfg - should use defaults",
@@ -964,10 +974,7 @@ func TestCreateAutoCertificateConfig(t *testing.T) {
 				},
 			},
 			surface: &ecv1alpha1.TLSSurface{
-				Provider: string(certificate.Auto),
-				ProviderCfg: ecv1alpha1.ProviderConfig{
-					AutoCfg: nil,
-				},
+				Provider: ecv1alpha1.TLSProviderAuto,
 			},
 			expected: &certInterface.Config{
 				CommonName:    "test-cluster.test-namespace.svc.cluster.local",
@@ -1015,20 +1022,17 @@ func TestCreateCMCertificateConfig(t *testing.T) {
 				},
 			},
 			surface: &ecv1alpha1.TLSSurface{
-				Provider: string(certificate.CertManager),
-				ProviderCfg: ecv1alpha1.ProviderConfig{
-					CertManagerCfg: &ecv1alpha1.ProviderCertManagerConfig{
-						CommonConfig: ecv1alpha1.CommonConfig{
-							CommonName:       "cm.example.com",
-							Organization:     []string{"CM Org"},
-							ValidityDuration: "1440h", // 60 days
-							AltNames: ecv1alpha1.AltNames{
-								DNSNames: []string{"cm1.example.com", "cm2.example.com"},
-							},
-						},
-						IssuerName:  "test-issuer",
-						IssuerKind:  "ClusterIssuer",
-						IssuerGroup: "example.io",
+				Provider: ecv1alpha1.TLSProviderCertManager,
+				CertManager: &ecv1alpha1.TLSCertManagerProvider{
+					CommonName:    "cm.example.com",
+					Organizations: []string{"CM Org"},
+					Duration:      &metav1.Duration{Duration: 1440 * time.Hour}, // 60 days
+					RenewBefore:   &metav1.Duration{Duration: 360 * time.Hour},
+					DNSNames:      []string{"cm1.example.com", "cm2.example.com"},
+					IssuerRef: cmmeta.IssuerReference{
+						Name:  "test-issuer",
+						Kind:  "ClusterIssuer",
+						Group: "example.io",
 					},
 				},
 			},
@@ -1036,6 +1040,7 @@ func TestCreateCMCertificateConfig(t *testing.T) {
 				CommonName:    "cm.example.com",
 				Organizations: []string{"CM Org"},
 				Duration:      1440 * time.Hour, // 60 days
+				RenewBefore:   &metav1.Duration{Duration: 360 * time.Hour},
 				DNSNames:      []string{"cm1.example.com", "cm2.example.com"},
 				IssuerRef: &cmmeta.IssuerReference{
 					Name:  "test-issuer",
@@ -1046,7 +1051,7 @@ func TestCreateCMCertificateConfig(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "cert-manager config with nil CertManagerCfg",
+			name: "cert-manager config with defaulted duration",
 			ec: &ecv1alpha1.EtcdCluster{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "test-cluster",
@@ -1054,10 +1059,31 @@ func TestCreateCMCertificateConfig(t *testing.T) {
 				},
 			},
 			surface: &ecv1alpha1.TLSSurface{
-				Provider: string(certificate.CertManager),
-				ProviderCfg: ecv1alpha1.ProviderConfig{
-					CertManagerCfg: nil,
+				Provider: ecv1alpha1.TLSProviderCertManager,
+				CertManager: &ecv1alpha1.TLSCertManagerProvider{
+					IssuerRef: cmmeta.IssuerReference{Name: "test-issuer"},
 				},
+			},
+			expected: &certInterface.Config{
+				Duration: certInterface.DefaultCertManagerValidity,
+				DNSNames: []string{
+					"*.test-cluster.test-namespace.svc.cluster.local",
+					"test-cluster.test-namespace.svc.cluster.local",
+				},
+				IssuerRef: &cmmeta.IssuerReference{Name: "test-issuer"},
+			},
+			wantErr: false,
+		},
+		{
+			name: "cert-manager config with nil certManager block",
+			ec: &ecv1alpha1.EtcdCluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-cluster",
+					Namespace: "test-namespace",
+				},
+			},
+			surface: &ecv1alpha1.TLSSurface{
+				Provider: ecv1alpha1.TLSProviderCertManager,
 			},
 			expected: nil,
 			wantErr:  true,

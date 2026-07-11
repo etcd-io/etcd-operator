@@ -13,8 +13,10 @@ import (
 type ProviderType string
 
 const (
-	Auto        ProviderType = "auto"
-	CertManager ProviderType = "cert-manager"
+	Auto ProviderType = "auto"
+	// CertManager is addressed by cert-manager's API group, matching the CRD's
+	// spec.tls.{peer,client}.provider enum.
+	CertManager ProviderType = "cert-manager.io"
 	// add more ...
 )
 

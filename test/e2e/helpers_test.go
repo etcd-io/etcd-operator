@@ -26,6 +26,7 @@ import (
 	"testing"
 	"time"
 
+	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
@@ -345,15 +346,13 @@ func httpViaProxy(ctx context.Context, r *rest.Request, pod corev1.Pod, failpoin
 // pre-split single-toggle behaviour.
 func certManagerSurface(issuerKind, issuerName string) *ecv1alpha1.TLSSurface {
 	return &ecv1alpha1.TLSSurface{
-		Provider: "cert-manager",
-		ProviderCfg: ecv1alpha1.ProviderConfig{
-			CertManagerCfg: &ecv1alpha1.ProviderCertManagerConfig{
-				CommonConfig: ecv1alpha1.CommonConfig{
-					CommonName:       "etcd-operator-system",
-					ValidityDuration: "90h",
-				},
-				IssuerKind: issuerKind,
-				IssuerName: issuerName,
+		Provider: ecv1alpha1.TLSProviderCertManager,
+		CertManager: &ecv1alpha1.TLSCertManagerProvider{
+			CommonName: "etcd-operator-system",
+			Duration:   &metav1.Duration{Duration: 90 * time.Hour},
+			IssuerRef: cmmeta.IssuerReference{
+				Kind: issuerKind,
+				Name: issuerName,
 			},
 		},
 	}
@@ -362,14 +361,10 @@ func certManagerSurface(issuerKind, issuerName string) *ecv1alpha1.TLSSurface {
 // autoSurface returns an auto-provider TLSSurface for one TLS surface.
 func autoSurface() *ecv1alpha1.TLSSurface {
 	return &ecv1alpha1.TLSSurface{
-		Provider: "auto",
-		ProviderCfg: ecv1alpha1.ProviderConfig{
-			AutoCfg: &ecv1alpha1.ProviderAutoConfig{
-				CommonConfig: ecv1alpha1.CommonConfig{
-					CommonName:       "etcd-operator-system",
-					ValidityDuration: "8760h",
-				},
-			},
+		Provider: ecv1alpha1.TLSProviderAuto,
+		Auto: &ecv1alpha1.TLSAutoProvider{
+			CommonName: "etcd-operator-system",
+			Duration:   &metav1.Duration{Duration: 8760 * time.Hour},
 		},
 	}
 }
