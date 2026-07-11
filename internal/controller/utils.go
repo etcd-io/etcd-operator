@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	"github.com/coreos/go-semver/semver"
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
@@ -814,6 +815,31 @@ func parseValidityDuration(customizedDuration string, defaultDuration time.Durat
 	return duration, nil
 }
 
+// defaultCertDNSNames returns the user-provided DNS SANs, or wildcard DNS for
+// the cluster's headless service to cover all pods (pod-0, pod-1, etc.).
+func defaultCertDNSNames(ec *ecv1alpha1.EtcdCluster, dnsNames []string) []string {
+	if dnsNames != nil {
+		return dnsNames
+	}
+	return []string{
+		fmt.Sprintf("*.%s.%s.%s", ec.Name, ec.Namespace, certInterface.DefaultDomainName),
+		fmt.Sprintf("%s.%s.%s", ec.Name, ec.Namespace, certInterface.DefaultDomainName),
+	}
+}
+
+// certIPStrings renders the CRD's parsed IP SANs to the literal-string form
+// used by certInterface.Config, preserving nil when none are set.
+func certIPStrings(ips []net.IP) []string {
+	if len(ips) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(ips))
+	for _, ip := range ips {
+		out = append(out, ip.String())
+	}
+	return out
+}
+
 func createCMCertificateConfig(ec *ecv1alpha1.EtcdCluster, surface *ecv1alpha1.TLSSurface) (*certInterface.Config, error) {
 	cmConfig := surface.ProviderCfg.CertManagerCfg
 	if cmConfig == nil {
@@ -826,33 +852,16 @@ func createCMCertificateConfig(ec *ecv1alpha1.EtcdCluster, surface *ecv1alpha1.T
 		return nil, err
 	}
 
-	var getAltNames certInterface.AltNames
-	if cmConfig.AltNames.DNSNames != nil {
-		getAltNames = certInterface.AltNames{
-			DNSNames: cmConfig.AltNames.DNSNames,
-			IPs:      make([]net.IP, len(cmConfig.AltNames.DNSNames)),
-		}
-	} else {
-		// Use wildcard DNS for the cluster's headless service to cover all pods
-		// This allows the certificate to work for pod-0, pod-1, etc.
-		defaultDNSNames := []string{
-			fmt.Sprintf("*.%s.%s.%s", ec.Name, ec.Namespace, certInterface.DefaultDomainName),
-			fmt.Sprintf("%s.%s.%s", ec.Name, ec.Namespace, certInterface.DefaultDomainName),
-		}
-		getAltNames = certInterface.AltNames{
-			DNSNames: defaultDNSNames,
-		}
-	}
-
 	config := &certInterface.Config{
-		CommonName:       cmConfig.CommonName,
-		Organization:     cmConfig.Organization,
-		ValidityDuration: duration,
-		AltNames:         getAltNames,
-		ExtraConfig: map[string]any{
-			"issuerName":  cmConfig.IssuerName,
-			"issuerKind":  cmConfig.IssuerKind,
-			"issuerGroup": cmConfig.IssuerGroup,
+		CommonName:    cmConfig.CommonName,
+		Organizations: cmConfig.Organization,
+		DNSNames:      defaultCertDNSNames(ec, cmConfig.AltNames.DNSNames),
+		IPAddresses:   certIPStrings(cmConfig.AltNames.IPs),
+		Duration:      duration,
+		IssuerRef: &cmmeta.IssuerReference{
+			Name:  cmConfig.IssuerName,
+			Kind:  cmConfig.IssuerKind,
+			Group: cmConfig.IssuerGroup,
 		},
 	}
 	return config, nil
@@ -876,29 +885,12 @@ func createAutoCertificateConfig(ec *ecv1alpha1.EtcdCluster, surface *ecv1alpha1
 		return nil, err
 	}
 
-	var altNames certInterface.AltNames
-	if autoConfig.AltNames.DNSNames != nil {
-		altNames = certInterface.AltNames{
-			DNSNames: autoConfig.AltNames.DNSNames,
-			IPs:      make([]net.IP, len(autoConfig.AltNames.DNSNames)),
-		}
-	} else {
-		// Use wildcard DNS for the cluster's headless service to cover all pods
-		// This allows the certificate to work for pod-0, pod-1, etc.
-		defaultDNSNames := []string{
-			fmt.Sprintf("*.%s.%s.%s", ec.Name, ec.Namespace, certInterface.DefaultDomainName),
-			fmt.Sprintf("%s.%s.%s", ec.Name, ec.Namespace, certInterface.DefaultDomainName),
-		}
-		altNames = certInterface.AltNames{
-			DNSNames: defaultDNSNames,
-		}
-	}
-
 	config := &certInterface.Config{
-		CommonName:       autoConfig.CommonName,
-		Organization:     autoConfig.Organization,
-		ValidityDuration: duration,
-		AltNames:         altNames,
+		CommonName:    autoConfig.CommonName,
+		Organizations: autoConfig.Organization,
+		DNSNames:      defaultCertDNSNames(ec, autoConfig.AltNames.DNSNames),
+		IPAddresses:   certIPStrings(autoConfig.AltNames.IPs),
+		Duration:      duration,
 	}
 	return config, nil
 }

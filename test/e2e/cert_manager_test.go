@@ -9,6 +9,7 @@ import (
 	"time"
 
 	certv1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
+	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsV1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
@@ -53,15 +54,13 @@ func TestCertManagerProvider(t *testing.T) {
 	feature := features.New("Cert-Manager Certificate").WithLabel("app", "cert-manager")
 
 	cmConfig := &interfaces.Config{
-		CommonName:       cmCertificateName,
-		ValidityDuration: cmCertificateValidity,
-		ExtraConfig: map[string]any{
-			"issuerName": cmIssuerName,
-			"issuerKind": cmIssuerType,
-			// issuerGroup is optional; with no group set, cert-manager leaves
-			// IssuerRef.Group == "" and GetCertificateConfig echoes that back, so
-			// the expected ExtraConfig must include the empty key to DeepEqual-match.
-			"issuerGroup": "",
+		CommonName: cmCertificateName,
+		Duration:   cmCertificateValidity,
+		// Group is optional; cert-manager stores IssuerRef.Group == "" and
+		// GetCertificateConfig echoes that back, so the zero value DeepEqual-matches.
+		IssuerRef: &cmmeta.IssuerReference{
+			Name: cmIssuerName,
+			Kind: cmIssuerType,
 		},
 	}
 

@@ -35,8 +35,8 @@ func TestAutoProvider(t *testing.T) {
 	feature := features.New("Auto Provider Certificate").WithLabel("app", string(certificate.Auto))
 
 	cmConfig := &interfaces.Config{
-		CommonName:       autoCertificateName,
-		ValidityDuration: autoCertificateValidity,
+		CommonName: autoCertificateName,
+		Duration:   autoCertificateValidity,
 	}
 
 	feature.Setup(

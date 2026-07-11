@@ -3,10 +3,10 @@ package controller
 import (
 	"errors"
 	"fmt"
-	"net"
 	"testing"
 	"time"
 
+	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	"github.com/coreos/go-semver/semver"
 	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/assert"
@@ -948,13 +948,10 @@ func TestCreateAutoCertificateConfig(t *testing.T) {
 				},
 			},
 			expected: &certInterface.Config{
-				CommonName:       "custom.example.com",
-				Organization:     []string{"Test Org"},
-				ValidityDuration: 720 * time.Hour, // 30 days
-				AltNames: certInterface.AltNames{
-					DNSNames: []string{"custom1.example.com", "custom2.example.com"},
-					IPs:      make([]net.IP, 2),
-				},
+				CommonName:    "custom.example.com",
+				Organizations: []string{"Test Org"},
+				Duration:      720 * time.Hour, // 30 days
+				DNSNames:      []string{"custom1.example.com", "custom2.example.com"},
 			},
 			wantErr: false,
 		},
@@ -973,14 +970,12 @@ func TestCreateAutoCertificateConfig(t *testing.T) {
 				},
 			},
 			expected: &certInterface.Config{
-				CommonName:       "test-cluster.test-namespace.svc.cluster.local",
-				Organization:     nil,
-				ValidityDuration: certInterface.DefaultAutoValidity,
-				AltNames: certInterface.AltNames{
-					DNSNames: []string{
-						"*.test-cluster.test-namespace.svc.cluster.local",
-						"test-cluster.test-namespace.svc.cluster.local",
-					},
+				CommonName:    "test-cluster.test-namespace.svc.cluster.local",
+				Organizations: nil,
+				Duration:      certInterface.DefaultAutoValidity,
+				DNSNames: []string{
+					"*.test-cluster.test-namespace.svc.cluster.local",
+					"test-cluster.test-namespace.svc.cluster.local",
 				},
 			},
 			wantErr: false,
@@ -997,11 +992,7 @@ func TestCreateAutoCertificateConfig(t *testing.T) {
 			} else {
 				require.NoError(t, err)
 				require.NotNil(t, result)
-				assert.Equal(t, tt.expected.CommonName, result.CommonName)
-				assert.Equal(t, tt.expected.Organization, result.Organization)
-				assert.Equal(t, tt.expected.ValidityDuration, result.ValidityDuration)
-				assert.Equal(t, tt.expected.AltNames.DNSNames, result.AltNames.DNSNames)
-				assert.Equal(t, tt.expected.AltNames.IPs, result.AltNames.IPs)
+				assert.Equal(t, tt.expected, result)
 			}
 		})
 	}
@@ -1042,17 +1033,14 @@ func TestCreateCMCertificateConfig(t *testing.T) {
 				},
 			},
 			expected: &certInterface.Config{
-				CommonName:       "cm.example.com",
-				Organization:     []string{"CM Org"},
-				ValidityDuration: 1440 * time.Hour, // 60 days
-				AltNames: certInterface.AltNames{
-					DNSNames: []string{"cm1.example.com", "cm2.example.com"},
-					IPs:      make([]net.IP, 2),
-				},
-				ExtraConfig: map[string]any{
-					"issuerName":  "test-issuer",
-					"issuerKind":  "ClusterIssuer",
-					"issuerGroup": "example.io",
+				CommonName:    "cm.example.com",
+				Organizations: []string{"CM Org"},
+				Duration:      1440 * time.Hour, // 60 days
+				DNSNames:      []string{"cm1.example.com", "cm2.example.com"},
+				IssuerRef: &cmmeta.IssuerReference{
+					Name:  "test-issuer",
+					Kind:  "ClusterIssuer",
+					Group: "example.io",
 				},
 			},
 			wantErr: false,
@@ -1086,12 +1074,7 @@ func TestCreateCMCertificateConfig(t *testing.T) {
 			} else {
 				require.NoError(t, err)
 				require.NotNil(t, result)
-				assert.Equal(t, tt.expected.CommonName, result.CommonName)
-				assert.Equal(t, tt.expected.Organization, result.Organization)
-				assert.Equal(t, tt.expected.ValidityDuration, result.ValidityDuration)
-				assert.Equal(t, tt.expected.AltNames.DNSNames, result.AltNames.DNSNames)
-				assert.Equal(t, tt.expected.AltNames.IPs, result.AltNames.IPs)
-				assert.Equal(t, tt.expected.ExtraConfig, result.ExtraConfig)
+				assert.Equal(t, tt.expected, result)
 			}
 		})
 	}
