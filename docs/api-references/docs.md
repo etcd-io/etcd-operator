@@ -283,5 +283,23 @@ _Appears in:_
 | `auto` _[TLSAutoProvider](#tlsautoprovider)_ | Auto configures the operator's built-in self-signed provider for THIS<br />surface. Only valid when provider is "auto". |  | Optional: \{\} <br /> |
 | `certManager` _[TLSCertManagerProvider](#tlscertmanagerprovider)_ | CertManager configures cert-manager issuance for THIS surface.<br />Required when provider is "cert-manager.io"; forbidden otherwise. |  | Optional: \{\} <br /> |
 | `clientCertAuth` _boolean_ | ClientCertAuth toggles mutual cert auth for THIS surface (etcd's<br />--client-cert-auth for the client surface, --peer-client-cert-auth for the<br />peer surface). Defaults to true (mTLS). Set false to serve server-only TLS<br />where clients authenticate by other means (password/token). When true with<br />the cert-manager provider a trusted CA (issuerRef.name) is REQUIRED,<br />enforced by the XValidation rule above. | true | Optional: \{\} <br /> |
+| `trustBundleConfigMapRef` _[TrustBundleConfigMapRef](#trustbundleconfigmapref)_ | TrustBundleConfigMapRef references a ConfigMap in the EtcdCluster's<br />namespace carrying one or more additional PEM CA certificates under the<br />fixed key "ca.crt". The bundle is APPENDED to (never replaces) this<br />surface's MEMBER-SIDE trusted CA set: the operator concatenates it with<br />the issued CA into the file behind --trusted-ca-file /<br />--peer-trusted-ca-file. It broadens which client/peer certificates etcd<br />members accept, NOT which servers the operator trusts when dialing etcd<br />(the operator pins the issuing CA only). etcd reads trusted-CA files at<br />process start only, so trust changes take effect per member on its next<br />restart. Intended for CA-rotation overlap windows. |  | Optional: \{\} <br /> |
+
+
+#### TrustBundleConfigMapRef
+
+
+
+TrustBundleConfigMapRef is a LocalObjectReference-style pointer to a
+ConfigMap holding extra trusted CAs under the key "ca.crt".
+
+
+
+_Appears in:_
+- [TLSSurface](#tlssurface)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `name` _string_ | Name of the ConfigMap. |  | MinLength: 1 <br /> |
 
 

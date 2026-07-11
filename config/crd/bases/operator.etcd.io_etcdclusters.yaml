@@ -1237,6 +1237,26 @@ spec:
                         - auto
                         - cert-manager.io
                         type: string
+                      trustBundleConfigMapRef:
+                        description: |-
+                          TrustBundleConfigMapRef references a ConfigMap in the EtcdCluster's
+                          namespace carrying one or more additional PEM CA certificates under the
+                          fixed key "ca.crt". The bundle is APPENDED to (never replaces) this
+                          surface's MEMBER-SIDE trusted CA set: the operator concatenates it with
+                          the issued CA into the file behind --trusted-ca-file /
+                          --peer-trusted-ca-file. It broadens which client/peer certificates etcd
+                          members accept, NOT which servers the operator trusts when dialing etcd
+                          (the operator pins the issuing CA only). etcd reads trusted-CA files at
+                          process start only, so trust changes take effect per member on its next
+                          restart. Intended for CA-rotation overlap windows.
+                        properties:
+                          name:
+                            description: Name of the ConfigMap.
+                            minLength: 1
+                            type: string
+                        required:
+                        - name
+                        type: object
                     type: object
                     x-kubernetes-validations:
                     - message: provider 'cert-manager.io' requires the certManager
@@ -1408,6 +1428,26 @@ spec:
                         - auto
                         - cert-manager.io
                         type: string
+                      trustBundleConfigMapRef:
+                        description: |-
+                          TrustBundleConfigMapRef references a ConfigMap in the EtcdCluster's
+                          namespace carrying one or more additional PEM CA certificates under the
+                          fixed key "ca.crt". The bundle is APPENDED to (never replaces) this
+                          surface's MEMBER-SIDE trusted CA set: the operator concatenates it with
+                          the issued CA into the file behind --trusted-ca-file /
+                          --peer-trusted-ca-file. It broadens which client/peer certificates etcd
+                          members accept, NOT which servers the operator trusts when dialing etcd
+                          (the operator pins the issuing CA only). etcd reads trusted-CA files at
+                          process start only, so trust changes take effect per member on its next
+                          restart. Intended for CA-rotation overlap windows.
+                        properties:
+                          name:
+                            description: Name of the ConfigMap.
+                            minLength: 1
+                            type: string
+                        required:
+                        - name
+                        type: object
                     type: object
                     x-kubernetes-validations:
                     - message: provider 'cert-manager.io' requires the certManager

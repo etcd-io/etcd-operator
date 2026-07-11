@@ -155,6 +155,22 @@ func TestTLSCELValidation(t *testing.T) {
 			},
 			wantApply: false,
 		},
+		{
+			name: "trust bundle ref accepted",
+			surface: ecv1alpha1.TLSSurface{
+				Provider:                ecv1alpha1.TLSProviderAuto,
+				TrustBundleConfigMapRef: &ecv1alpha1.TrustBundleConfigMapRef{Name: "extra-cas"},
+			},
+			wantApply: true,
+		},
+		{
+			name: "trust bundle ref with empty name rejected",
+			surface: ecv1alpha1.TLSSurface{
+				Provider:                ecv1alpha1.TLSProviderAuto,
+				TrustBundleConfigMapRef: &ecv1alpha1.TrustBundleConfigMapRef{Name: ""},
+			},
+			wantApply: false,
+		},
 	}
 
 	for i, tt := range tests {

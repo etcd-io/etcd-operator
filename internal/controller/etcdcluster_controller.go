@@ -354,6 +354,13 @@ func (r *EtcdClusterReconciler) reconcileClusterState(ctx context.Context, s *re
 	}
 
 	if targetReplica == int32(s.cluster.Spec.Size) {
+		// Steady state is the only path that skips reconcileStatefulSet, so
+		// re-apply the member certs and composed trust ConfigMaps here: a trust
+		// bundle edit (or issued-CA rotation) on a size-stable cluster must
+		// still recompose before the user's rollout restart picks it up.
+		if err := applyEtcdMemberCerts(ctx, s.cluster, r.Client); err != nil {
+			return ctrl.Result{}, err
+		}
 		logger.Info("EtcdCluster is already up-to-date")
 		return ctrl.Result{}, nil
 	}

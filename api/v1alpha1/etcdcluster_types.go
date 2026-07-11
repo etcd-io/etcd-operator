@@ -155,6 +155,27 @@ type TLSSurface struct {
 	// +kubebuilder:default=true
 	// +optional
 	ClientCertAuth *bool `json:"clientCertAuth,omitempty"`
+
+	// TrustBundleConfigMapRef references a ConfigMap in the EtcdCluster's
+	// namespace carrying one or more additional PEM CA certificates under the
+	// fixed key "ca.crt". The bundle is APPENDED to (never replaces) this
+	// surface's MEMBER-SIDE trusted CA set: the operator concatenates it with
+	// the issued CA into the file behind --trusted-ca-file /
+	// --peer-trusted-ca-file. It broadens which client/peer certificates etcd
+	// members accept, NOT which servers the operator trusts when dialing etcd
+	// (the operator pins the issuing CA only). etcd reads trusted-CA files at
+	// process start only, so trust changes take effect per member on its next
+	// restart. Intended for CA-rotation overlap windows.
+	// +optional
+	TrustBundleConfigMapRef *TrustBundleConfigMapRef `json:"trustBundleConfigMapRef,omitempty"`
+}
+
+// TrustBundleConfigMapRef is a LocalObjectReference-style pointer to a
+// ConfigMap holding extra trusted CAs under the key "ca.crt".
+type TrustBundleConfigMapRef struct {
+	// Name of the ConfigMap.
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
 }
 
 // EffectiveProvider resolves the surface's provider, defaulting to "auto" when

@@ -206,10 +206,12 @@ func reconcileStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1alpha
 // each --*client-cert-auth flag on its own *CertAuth toggle. The zero value
 // (everything false) yields byte-identical cleartext output to the pre-TLS args.
 type tlsArgs struct {
-	peerEnabled    bool
-	clientEnabled  bool
-	peerCertAuth   bool
-	clientCertAuth bool
+	peerEnabled       bool
+	clientEnabled     bool
+	peerCertAuth      bool
+	clientCertAuth    bool
+	peerTrustBundle   bool
+	clientTrustBundle bool
 }
 
 // tlsArgsFor derives tlsArgs from an EtcdCluster's two TLS surfaces.
@@ -220,6 +222,8 @@ func tlsArgsFor(ec *ecv1alpha1.EtcdCluster) tlsArgs {
 		a.clientEnabled = ec.Spec.TLS.Client != nil
 		a.peerCertAuth = clientCertAuthEnabled(ec.Spec.TLS.Peer)
 		a.clientCertAuth = clientCertAuthEnabled(ec.Spec.TLS.Client)
+		a.peerTrustBundle = trustBundleEnabled(ec.Spec.TLS.Peer)
+		a.clientTrustBundle = trustBundleEnabled(ec.Spec.TLS.Client)
 	}
 	return a
 }
@@ -242,12 +246,19 @@ func defaultArgs(name string, tls tlsArgs) []string {
 		fmt.Sprintf("--advertise-client-urls=%s://$(POD_NAME).%s.$(POD_NAMESPACE).svc.cluster.local:2379", clientScheme, name),
 	}
 
-	// Server (client-surface) TLS flag group: emitted iff the client surface is set.
+	// Server (client-surface) TLS flag group: emitted iff the client surface is
+	// set. With a trust bundle, --trusted-ca-file points at the composed trust
+	// ConfigMap mount instead of the secret's ca.crt; without one the output is
+	// byte-identical to the bundle-free path.
 	if tls.clientEnabled {
+		clientTrustPath := serverCertMountPath
+		if tls.clientTrustBundle {
+			clientTrustPath = serverTrustMountPath
+		}
 		args = append(args,
 			fmt.Sprintf("--cert-file=%s/%s", serverCertMountPath, tlsCertFile),
 			fmt.Sprintf("--key-file=%s/%s", serverCertMountPath, tlsKeyFile),
-			fmt.Sprintf("--trusted-ca-file=%s/%s", serverCertMountPath, tlsCAFile),
+			fmt.Sprintf("--trusted-ca-file=%s/%s", clientTrustPath, tlsCAFile),
 		)
 		if tls.clientCertAuth {
 			args = append(args, "--client-cert-auth")
@@ -256,10 +267,14 @@ func defaultArgs(name string, tls tlsArgs) []string {
 
 	// Peer TLS flag group: emitted iff the peer surface is set.
 	if tls.peerEnabled {
+		peerTrustPath := peerCertMountPath
+		if tls.peerTrustBundle {
+			peerTrustPath = peerTrustMountPath
+		}
 		args = append(args,
 			fmt.Sprintf("--peer-cert-file=%s/%s", peerCertMountPath, tlsCertFile),
 			fmt.Sprintf("--peer-key-file=%s/%s", peerCertMountPath, tlsKeyFile),
-			fmt.Sprintf("--peer-trusted-ca-file=%s/%s", peerCertMountPath, tlsCAFile),
+			fmt.Sprintf("--peer-trusted-ca-file=%s/%s", peerTrustPath, tlsCAFile),
 		)
 		if tls.peerCertAuth {
 			args = append(args, "--peer-client-cert-auth")
@@ -390,6 +405,21 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 			MountPath: serverCertMountPath,
 			ReadOnly:  true,
 		})
+		if trustBundleEnabled(ec.Spec.TLS.Client) {
+			certVolume = append(certVolume, corev1.Volume{
+				Name: serverTrustVolumeName,
+				VolumeSource: corev1.VolumeSource{
+					ConfigMap: &corev1.ConfigMapVolumeSource{
+						LocalObjectReference: corev1.LocalObjectReference{Name: getServerTrustName(ec.Name)},
+					},
+				},
+			})
+			certMounts = append(certMounts, corev1.VolumeMount{
+				Name:      serverTrustVolumeName,
+				MountPath: serverTrustMountPath,
+				ReadOnly:  true,
+			})
+		}
 	}
 	if peerTLSEnabled(ec) {
 		certVolume = append(certVolume, corev1.Volume{
@@ -403,6 +433,21 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 			MountPath: peerCertMountPath,
 			ReadOnly:  true,
 		})
+		if trustBundleEnabled(ec.Spec.TLS.Peer) {
+			certVolume = append(certVolume, corev1.Volume{
+				Name: peerTrustVolumeName,
+				VolumeSource: corev1.VolumeSource{
+					ConfigMap: &corev1.ConfigMapVolumeSource{
+						LocalObjectReference: corev1.LocalObjectReference{Name: getPeerTrustName(ec.Name)},
+					},
+				},
+			})
+			certMounts = append(certMounts, corev1.VolumeMount{
+				Name:      peerTrustVolumeName,
+				MountPath: peerTrustMountPath,
+				ReadOnly:  true,
+			})
+		}
 	}
 	if len(certVolume) != 0 {
 		podSpec.Volumes = certVolume
@@ -996,7 +1041,10 @@ func applyEtcdMemberCerts(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c cli
 			return err
 		}
 	}
-	return nil
+	// Compose the per-surface trust ConfigMaps after the certs exist (the
+	// composed output embeds each issued CA) and before the StatefulSet
+	// references them.
+	return applyTrustBundles(ctx, ec, c)
 }
 
 // buildClientTLSConfig builds the operator's etcd-client *tls.Config from the
