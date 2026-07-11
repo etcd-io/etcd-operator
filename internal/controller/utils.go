@@ -125,10 +125,10 @@ func clientCertAuthEnabled(s *ecv1alpha1.TLSSurface) bool {
 // construction -- the cheap form of the client/server CA-match rule is satisfied
 // without a runtime compare.
 func validateTLS(ec *ecv1alpha1.EtcdCluster) field.ErrorList {
-	var errs field.ErrorList
 	if ec.Spec.TLS == nil {
-		return errs
+		return nil
 	}
+	errs := make(field.ErrorList, 0, 2)
 	base := field.NewPath("spec", "tls")
 	errs = append(errs, validateTLSSurface(base.Child("peer"), ec.Spec.TLS.Peer)...)
 	errs = append(errs, validateTLSSurface(base.Child("client"), ec.Spec.TLS.Client)...)

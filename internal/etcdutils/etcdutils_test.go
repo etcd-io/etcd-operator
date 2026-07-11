@@ -88,7 +88,7 @@ func TestMemberList(t *testing.T) {
 	t.Run("NonNilTLSConfigIsApplied", func(t *testing.T) {
 		ln, err := tls.Listen("tcp", "127.0.0.1:0", selfSignedServerTLS(t))
 		assert.NoError(t, err)
-		defer ln.Close()
+		defer func() { _ = ln.Close() }()
 
 		handshakeSeen := make(chan struct{}, 1)
 		go func() {

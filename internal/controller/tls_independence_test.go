@@ -82,9 +82,9 @@ func cmSurface(clientCertAuth *bool) *ecv1alpha1.TLSSurface {
 	}
 }
 
-func clusterWithTLS(name string, tls *ecv1alpha1.EtcdClusterTLS) *ecv1alpha1.EtcdCluster {
+func clusterWithTLS(tls *ecv1alpha1.EtcdClusterTLS) *ecv1alpha1.EtcdCluster {
 	return &ecv1alpha1.EtcdCluster{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "ns"},
+		ObjectMeta: metav1.ObjectMeta{Name: "ec", Namespace: "ns"},
 		Spec:       ecv1alpha1.EtcdClusterSpec{Size: 3, Version: "v3.6.12", TLS: tls},
 	}
 }
@@ -198,7 +198,7 @@ func TestTLSIndependenceArgsMatrix(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ec := clusterWithTLS(name, tt.tls)
+			ec := clusterWithTLS(tt.tls)
 			got := createArgs(name, nil, tlsArgsFor(ec))
 			assert.Equal(t, tt.expected, got)
 		})
@@ -220,7 +220,7 @@ func TestTLSIndependenceSchemes(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ec := clusterWithTLS("ec", tt.tls)
+			ec := clusterWithTLS(tt.tls)
 			assert.Equal(t, tt.wantPeerScheme, peerScheme(ec), "peerScheme")
 			assert.Equal(t, tt.wantClientScheme, clientScheme(ec), "clientScheme")
 			// Endpoint generators must agree with the per-surface scheme.
@@ -275,7 +275,7 @@ func TestTLSIndependenceMounts(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ec := clusterWithTLS("ec", tt.tls)
+			ec := clusterWithTLS(tt.tls)
 			container, vols := stsContainer(t, ec)
 			vNames := volumeNames(vols)
 			mNames := mountNames(container.VolumeMounts)
@@ -291,7 +291,7 @@ func TestTLSIndependenceMounts(t *testing.T) {
 // TestTLSIndependenceMountsCoexistWithStorage asserts cert mounts and the storage
 // data-dir mount coexist (append-not-assign).
 func TestTLSIndependenceMountsCoexistWithStorage(t *testing.T) {
-	ec := clusterWithTLS("ec", &ecv1alpha1.EtcdClusterTLS{Peer: cmSurface(nil), Client: cmSurface(nil)})
+	ec := clusterWithTLS(&ecv1alpha1.EtcdClusterTLS{Peer: cmSurface(nil), Client: cmSurface(nil)})
 	ec.Spec.StorageSpec = &ecv1alpha1.StorageSpec{
 		VolumeSizeRequest: mustQuantity("1Gi"),
 	}
@@ -312,7 +312,7 @@ func TestBuildClientTLSConfigGatedOnClientSurface(t *testing.T) {
 		nil,
 		{Peer: cmSurface(nil)},
 	} {
-		ec := clusterWithTLS("ec", tls)
+		ec := clusterWithTLS(tls)
 		c := fake.NewClientBuilder().WithScheme(scheme).Build()
 		cfg, err := buildClientTLSConfig(t.Context(), ec, c)
 		require.NoError(t, err)
@@ -320,7 +320,7 @@ func TestBuildClientTLSConfigGatedOnClientSurface(t *testing.T) {
 	}
 
 	// client surface set but secret missing => explicit error (not silent nil).
-	ec := clusterWithTLS("ec", &ecv1alpha1.EtcdClusterTLS{Client: cmSurface(nil)})
+	ec := clusterWithTLS(&ecv1alpha1.EtcdClusterTLS{Client: cmSurface(nil)})
 	c := fake.NewClientBuilder().WithScheme(scheme).Build()
 	_, err := buildClientTLSConfig(t.Context(), ec, c)
 	require.Error(t, err, "missing client secret must be an error")
@@ -427,7 +427,7 @@ func TestValidateTLS(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			errs := validateTLS(clusterWithTLS("ec", tt.tls))
+			errs := validateTLS(clusterWithTLS(tt.tls))
 			if tt.wantErr {
 				assert.NotEmpty(t, errs, "expected a validation error")
 			} else {
