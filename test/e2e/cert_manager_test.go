@@ -179,8 +179,8 @@ func TestClusterCertCreation(t *testing.T) {
 			Size:    size,
 			Version: etcdVersion,
 			TLS: &ecv1alpha1.EtcdClusterTLS{
-				Peer:   certManagerSurface(cmIssuerType, cmIssuerName),
-				Client: certManagerSurface(cmIssuerType, cmIssuerName),
+				Peer:   certManagerSurface(cmIssuerName),
+				Client: certManagerSurface(cmIssuerName),
 			},
 		},
 	}

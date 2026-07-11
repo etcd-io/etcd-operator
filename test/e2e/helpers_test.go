@@ -344,14 +344,14 @@ func httpViaProxy(ctx context.Context, r *rest.Request, pod corev1.Pod, failpoin
 // or client). The peer/client split is configured independently in the new CRD
 // shape; the e2e helpers set both surfaces to the same issuer to mirror the
 // pre-split single-toggle behaviour.
-func certManagerSurface(issuerKind, issuerName string) *ecv1alpha1.TLSSurface {
+func certManagerSurface(issuerName string) *ecv1alpha1.TLSSurface {
 	return &ecv1alpha1.TLSSurface{
 		Provider: ecv1alpha1.TLSProviderCertManager,
 		CertManager: &ecv1alpha1.TLSCertManagerProvider{
 			CommonName: "etcd-operator-system",
 			Duration:   &metav1.Duration{Duration: 90 * time.Hour},
 			IssuerRef: cmmeta.IssuerReference{
-				Kind: issuerKind,
+				Kind: "ClusterIssuer",
 				Name: issuerName,
 			},
 		},

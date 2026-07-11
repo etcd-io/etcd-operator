@@ -210,15 +210,17 @@ func podFQDN(clusterName string, ordinal int) string {
 // tlsEtcdctl runs etcdctl inside the given pod with explicit mTLS flags pointed at
 // the server cert material mounted at serverCertMountPath, dialing the pod's own
 // advertised https endpoint.
-func tlsEtcdctl(t *testing.T, c *envconf.Config, podName, clusterName string, ordinal int, args ...string) (string, string, error) {
+func tlsEtcdctl(t *testing.T, c *envconf.Config, podName, clusterName string,
+	ordinal int, args ...string) (string, string, error) {
 	t.Helper()
-	base := []string{
+	base := make([]string, 0, 5+len(args))
+	base = append(base,
 		"etcdctl",
 		"--cacert=/etc/etcd/server-tls/ca.crt",
 		"--cert=/etc/etcd/server-tls/tls.crt",
 		"--key=/etc/etcd/server-tls/tls.key",
 		fmt.Sprintf("--endpoints=https://%s:2379", podFQDN(clusterName, ordinal)),
-	}
+	)
 	return execInPod(t, c, podName, namespace, append(base, args...))
 }
 
@@ -226,7 +228,8 @@ func tlsEtcdctl(t *testing.T, c *envconf.Config, podName, clusterName string, or
 // json`, run with mTLS flags. The shared getEtcdMemberListPB uses a bare etcdctl
 // (no certs, 127.0.0.1) which a client-cert-auth TLS server resets, so TLS clusters
 // need this variant.
-func getEtcdMemberListTLS(t *testing.T, c *envconf.Config, clusterName string, ordinal int) *etcdserverpb.MemberListResponse {
+func getEtcdMemberListTLS(t *testing.T, c *envconf.Config, clusterName string,
+	ordinal int) *etcdserverpb.MemberListResponse {
 	t.Helper()
 	podName := fmt.Sprintf("%s-%d", clusterName, ordinal)
 	stdout, stderr, err := tlsEtcdctl(t, c, podName, clusterName, ordinal, "member", "list", "-w", "json")
@@ -243,7 +246,8 @@ func getEtcdMemberListTLS(t *testing.T, c *envconf.Config, clusterName string, o
 // waitForNoLearnersTLS is the mTLS counterpart of waitForNoLearners: it waits until
 // the cluster reports exactly expectedMembers, all voting (no learners), querying
 // over mTLS.
-func waitForNoLearnersTLS(t *testing.T, c *envconf.Config, clusterName string, ordinal, expectedMembers int, waitFor time.Duration) {
+func waitForNoLearnersTLS(t *testing.T, c *envconf.Config, clusterName string,
+	ordinal, expectedMembers int, waitFor time.Duration) {
 	t.Helper()
 	err := wait.For(func(ctx context.Context) (bool, error) {
 		ml := getEtcdMemberListTLS(t, c, clusterName, ordinal)
@@ -311,8 +315,8 @@ func TestTLSMultiMemberQuorum(t *testing.T) {
 			Size:    size,
 			Version: etcdVersion,
 			TLS: &ecv1alpha1.EtcdClusterTLS{
-				Peer:   certManagerSurface(caIssuerType, caIssuerName),
-				Client: certManagerSurface(caIssuerType, caIssuerName),
+				Peer:   certManagerSurface(caIssuerName),
+				Client: certManagerSurface(caIssuerName),
 			},
 		},
 	}
@@ -362,6 +366,15 @@ func TestTLSMultiMemberQuorum(t *testing.T) {
 			if reason != "TLSReady" {
 				t.Errorf("expected TLSReady reason=TLSReady, got %q", reason)
 			}
+			return ctx
+		})
+
+	// Both surfaces deliberately share one CA issuer, so with client mTLS on the
+	// operator must announce the broadened admission boundary -- as a Warning
+	// EVENT only, while the condition above stays True.
+	feature.Assess("shared client/peer issuer emits a ClientCABroadTrust warning event",
+		func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+			waitForEventReason(t, c, clusterName, "ClientCABroadTrust", 2*time.Minute)
 			return ctx
 		})
 
@@ -483,9 +496,9 @@ func TestTLSPeerCANotShared(t *testing.T) {
 			Version: etcdVersion,
 			TLS: &ecv1alpha1.EtcdClusterTLS{
 				// Peer on a bare self-signed leaf issuer (the broken pattern).
-				Peer: certManagerSurface(cmIssuerType, cmIssuerName),
+				Peer: certManagerSurface(cmIssuerName),
 				// Client on the shared CA, so any failure is the peer surface's.
-				Client: certManagerSurface(caIssuerType, caIssuerName),
+				Client: certManagerSurface(caIssuerName),
 			},
 		},
 	}
@@ -545,4 +558,25 @@ func TestTLSPeerCANotShared(t *testing.T) {
 	})
 
 	_ = testEnv.Test(t, feature.Feature())
+}
+
+// waitForEventReason blocks until an Event with the given reason exists for the
+// named object in the test namespace.
+func waitForEventReason(t *testing.T, c *envconf.Config, name, reason string, waitFor time.Duration) {
+	t.Helper()
+	err := wait.For(func(ctx context.Context) (bool, error) {
+		var evs corev1.EventList
+		if err := c.Client().Resources(namespace).List(ctx, &evs); err != nil {
+			return false, nil
+		}
+		for i := range evs.Items {
+			if evs.Items[i].InvolvedObject.Name == name && evs.Items[i].Reason == reason {
+				return true, nil
+			}
+		}
+		return false, nil
+	}, wait.WithTimeout(waitFor), wait.WithInterval(5*time.Second))
+	if err != nil {
+		t.Fatalf("event with reason %q for %q never appeared: %v", reason, name, err)
+	}
 }
