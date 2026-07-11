@@ -637,10 +637,15 @@ func (r *EtcdClusterReconciler) recordTLSEvent(ec *ecv1alpha1.EtcdCluster, t tls
 		r.Recorder.Eventf(ec, nil, corev1.EventTypeWarning, t.reason, "TLSReady", "%s", t.message)
 		return
 	}
-	// Ready: only emit on transition (the prior TLSReady condition was not already True).
+	// Ready: only emit on transition into ready or on a spec change (observed
+	// generation moved), so a steady-state cluster stays quiet but a broadened
+	// trust setup is re-announced when the user (re)configures it.
 	prior := meta.FindStatusCondition(ec.Status.Conditions, tlsReadyConditionType)
-	if prior == nil || prior.Status != metav1.ConditionTrue {
+	if prior == nil || prior.Status != metav1.ConditionTrue || prior.ObservedGeneration != ec.Generation {
 		r.Recorder.Eventf(ec, nil, corev1.EventTypeNormal, reasonTLSReady, "TLSReady", "%s", t.message)
+		for _, w := range t.warnings {
+			r.Recorder.Eventf(ec, nil, corev1.EventTypeWarning, w.reason, "TLSReady", "%s", w.message)
+		}
 	}
 }
 

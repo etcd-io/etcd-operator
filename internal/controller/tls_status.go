@@ -76,7 +76,24 @@ const (
 	// reasonSurfaceNotReady indicates a configured surface's cert/secret has not
 	// yet materialized (a transient bring-up state, resolved by requeue).
 	reasonSurfaceNotReady = "SurfaceNotReady"
+	// reasonTrustBundleInvalid indicates a referenced trust bundle ConfigMap is
+	// missing, lacks the ca.crt key, or fails strict PEM validation. The composed
+	// trust ConfigMap is not updated while this is the reason (last good trust
+	// set is preserved).
+	reasonTrustBundleInvalid = "TrustBundleInvalid"
+	// reasonClientCABroadTrust is a WARNING (never a TLSReady failure): with mTLS
+	// on the client surface, the set of certificates etcd accepts is broader
+	// than a dedicated client CA -- either the client surface shares its issuer
+	// with the peer surface, or a trust bundle widens the admission boundary.
+	reasonClientCABroadTrust = "ClientCABroadTrust"
 )
+
+// tlsWarning is a non-fatal TLS finding: surfaced as a Warning Event but never
+// flips the TLSReady condition.
+type tlsWarning struct {
+	reason  string
+	message string
+}
 
 // tlsReadiness is the Recorder-free evaluation of a cluster's TLS surfaces. It is
 // the single source of truth that both updateConditions (the TLSReady condition)
@@ -92,6 +109,9 @@ type tlsReadiness struct {
 	reason string
 	// message is a human-readable detail for the condition/event.
 	message string
+	// warnings are non-fatal findings emitted as Warning Events alongside a
+	// ready verdict; they never affect the condition.
+	warnings []tlsWarning
 }
 
 // condition renders the tlsReadiness as a metav1.Condition for SetStatusCondition.
@@ -168,12 +188,112 @@ func evaluateTLSReadiness(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c cli
 		}
 	}
 
+	// Trust bundles: a referenced-but-unusable bundle is a hard failure (the
+	// composed trust ConfigMap cannot be built/updated).
+	if r, ok := checkTrustBundlesUsable(ctx, ec, c); !ok {
+		return r
+	}
+
 	return tlsReadiness{
 		configured: true,
 		ready:      true,
 		reason:     reasonTLSReady,
 		message:    tlsReadyMessage(ec),
+		warnings:   clientCABroadTrustWarnings(ec),
 	}
+}
+
+// checkTrustBundlesUsable validates every referenced trust bundle the way the
+// composer (applyTrustBundles) does, so a bad bundle reports TrustBundleInvalid
+// on the TLSReady condition instead of only a bare reconcile error.
+func checkTrustBundlesUsable(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client) (tlsReadiness, bool) {
+	for _, s := range []struct {
+		name    string
+		surface *ecv1alpha1.TLSSurface
+	}{
+		{"client", ec.Spec.TLS.Client},
+		{"peer", ec.Spec.TLS.Peer},
+	} {
+		if !trustBundleEnabled(s.surface) {
+			continue
+		}
+		verdict := func(msg string) tlsReadiness {
+			return tlsReadiness{
+				configured: true,
+				ready:      false,
+				reason:     reasonTrustBundleInvalid,
+				message:    fmt.Sprintf("%s surface: %s", s.name, msg),
+			}
+		}
+		cm := &corev1.ConfigMap{}
+		key := client.ObjectKey{Name: s.surface.TrustBundleConfigMapRef.Name, Namespace: ec.Namespace}
+		if err := c.Get(ctx, key, cm); err != nil {
+			return verdict(fmt.Sprintf("trust bundle ConfigMap %q: %v", key.Name, err)), false
+		}
+		bundle, ok := cm.Data[trustBundleKey]
+		if !ok || len(bundle) == 0 {
+			return verdict(fmt.Sprintf("trust bundle ConfigMap %q missing key %q", key.Name, trustBundleKey)), false
+		}
+		if err := validateTrustBundlePEM([]byte(bundle)); err != nil {
+			return verdict(err.Error()), false
+		}
+	}
+	return tlsReadiness{}, true
+}
+
+// clientCABroadTrustWarnings reports the ways the client surface's mTLS
+// admission boundary is broader than a dedicated client CA. Warnings only:
+// both setups are legitimate (a shared CA is the documented two-tier sample;
+// bundles exist for rotation overlap), but with clientCertAuth every
+// certificate chaining to the trusted set has full access to etcd, so the
+// operator says so out loud.
+func clientCABroadTrustWarnings(ec *ecv1alpha1.EtcdCluster) []tlsWarning {
+	clientSurface := ec.Spec.TLS.Client
+	if !clientCertAuthEnabled(clientSurface) {
+		return nil
+	}
+
+	var warnings []tlsWarning
+	if sharedIssuerRef(clientSurface, ec.Spec.TLS.Peer) {
+		warnings = append(warnings, tlsWarning{
+			reason: reasonClientCABroadTrust,
+			message: "client and peer surfaces share one issuer: any peer certificate also authenticates " +
+				"as a client. Use a dedicated client-surface CA to narrow etcd access",
+		})
+	}
+	if trustBundleEnabled(clientSurface) {
+		warnings = append(warnings, tlsWarning{
+			reason: reasonClientCABroadTrust,
+			message: fmt.Sprintf("client surface trusts extra CAs from ConfigMap %q: every CA in the bundle "+
+				"can mint credentials etcd accepts", clientSurface.TrustBundleConfigMapRef.Name),
+		})
+	}
+	return warnings
+}
+
+// sharedIssuerRef reports whether both surfaces are cert-manager surfaces
+// referencing the same issuer (name, effective kind, effective group).
+func sharedIssuerRef(a, b *ecv1alpha1.TLSSurface) bool {
+	if a == nil || b == nil || a.CertManager == nil || b.CertManager == nil {
+		return false
+	}
+	if a.EffectiveProvider() != ecv1alpha1.TLSProviderCertManager ||
+		b.EffectiveProvider() != ecv1alpha1.TLSProviderCertManager {
+		return false
+	}
+	ra, rb := a.CertManager.IssuerRef, b.CertManager.IssuerRef
+	return ra.Name == rb.Name &&
+		effectiveIssuerRefKind(ra.Kind) == effectiveIssuerRefKind(rb.Kind) &&
+		effectiveIssuerRefGroup(ra.Group) == effectiveIssuerRefGroup(rb.Group)
+}
+
+// effectiveIssuerRefGroup resolves an empty issuerRef.group to cert-manager's
+// documented default group.
+func effectiveIssuerRefGroup(group string) string {
+	if group == "" {
+		return "cert-manager.io"
+	}
+	return group
 }
 
 // tlsReadyMessage describes which surfaces are healthy.

@@ -66,6 +66,13 @@ cluster, not a broad shared intermediate: with a shared CA, every workload that
 can obtain a certificate from it can read and write all of etcd. The `auto`
 provider's per-surface self-signed CA is the safe zero-config default.
 
+The operator emits a `ClientCABroadTrust` **Warning event** (never a `TLSReady`
+failure — both setups are legitimate) when the client surface's mTLS admission
+boundary is broader than a dedicated CA: the client and peer surfaces share one
+issuer (any peer certificate then also authenticates as a client), or the
+client surface carries a trust bundle. The warning is emitted when the cluster
+becomes ready or when the TLS spec changes, not on every reconcile.
+
 ## Trust bundles (`trustBundleConfigMapRef`)
 
 Each surface optionally references a ConfigMap (same namespace, fixed key

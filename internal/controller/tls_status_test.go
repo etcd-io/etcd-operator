@@ -392,3 +392,133 @@ func TestFetchAndValidateStateEmitsTLSEvents(t *testing.T) {
 	assert.False(t, state.tls.ready)
 	assert.True(t, hasEventWith(drain(rec), corev1.EventTypeWarning, reasonPeerCANotShared))
 }
+
+// TestClientCABroadTrustWarnings drives the warning truth table: shared issuer
+// and client trust bundle each warn iff client mTLS is on; distinct issuers and
+// server-only TLS stay quiet.
+func TestClientCABroadTrustWarnings(t *testing.T) {
+	sharedBoth := func(clientCertAuth *bool) *ecv1alpha1.EtcdClusterTLS {
+		c := cmSurfaceFor("ca-issuer")
+		c.ClientCertAuth = clientCertAuth
+		return &ecv1alpha1.EtcdClusterTLS{Peer: cmSurfaceFor("ca-issuer"), Client: c}
+	}
+
+	t.Run("shared issuer with mTLS warns", func(t *testing.T) {
+		ws := clientCABroadTrustWarnings(clusterWithTLS(sharedBoth(nil)))
+		require.Len(t, ws, 1)
+		assert.Equal(t, reasonClientCABroadTrust, ws[0].reason)
+	})
+
+	t.Run("shared issuer without client mTLS stays quiet", func(t *testing.T) {
+		assert.Empty(t, clientCABroadTrustWarnings(clusterWithTLS(sharedBoth(boolPtr(false)))))
+	})
+
+	t.Run("distinct issuers stay quiet", func(t *testing.T) {
+		ec := clusterWithTLS(&ecv1alpha1.EtcdClusterTLS{
+			Peer: cmSurfaceFor("peer-ca"), Client: cmSurfaceFor("client-ca"),
+		})
+		assert.Empty(t, clientCABroadTrustWarnings(ec))
+	})
+
+	t.Run("shared issuer matches across kind/group defaulting", func(t *testing.T) {
+		clientSurface := cmSurfaceFor("ca-issuer")
+		clientSurface.CertManager.IssuerRef.Kind = "ClusterIssuer"
+		clientSurface.CertManager.IssuerRef.Group = "cert-manager.io"
+		peer := cmSurfaceFor("ca-issuer") // Group empty -> defaults to cert-manager.io
+		ec := clusterWithTLS(&ecv1alpha1.EtcdClusterTLS{Peer: peer, Client: clientSurface})
+		assert.Len(t, clientCABroadTrustWarnings(ec), 1)
+	})
+
+	t.Run("client trust bundle with mTLS warns", func(t *testing.T) {
+		ec := clusterWithTLS(&ecv1alpha1.EtcdClusterTLS{Client: bundledSurface()})
+		ws := clientCABroadTrustWarnings(ec)
+		require.Len(t, ws, 1)
+		assert.Equal(t, reasonClientCABroadTrust, ws[0].reason)
+	})
+
+	t.Run("bundle plus shared issuer warns twice", func(t *testing.T) {
+		clientSurface := bundledSurface() // cmSurface's issuer is etcd-ca-issuer
+		peer := cmSurface(nil)
+		ec := clusterWithTLS(&ecv1alpha1.EtcdClusterTLS{Peer: peer, Client: clientSurface})
+		assert.Len(t, clientCABroadTrustWarnings(ec), 2)
+	})
+}
+
+// TestEvaluateTLSReadinessTrustBundle covers the TrustBundleInvalid verdict and
+// the warning attachment on the ready path.
+func TestEvaluateTLSReadinessTrustBundle(t *testing.T) {
+	scheme := schemeWithCertManager(t)
+	_, _, bundleCA := genClientKeypair(t)
+
+	wiredCluster := func() *ecv1alpha1.EtcdCluster {
+		clientSurface := cmSurfaceFor("ca-issuer")
+		clientSurface.TrustBundleConfigMapRef = &ecv1alpha1.TrustBundleConfigMapRef{Name: "extra-cas"}
+		return clusterWithTLS(&ecv1alpha1.EtcdClusterTLS{Client: clientSurface})
+	}
+
+	t.Run("valid bundle => ready with ClientCABroadTrust warning", func(t *testing.T) {
+		ec := wiredCluster()
+		userCM := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: "extra-cas", Namespace: ec.Namespace},
+			Data:       map[string]string{trustBundleKey: string(bundleCA)},
+		}
+		c := fake.NewClientBuilder().WithScheme(scheme).
+			WithObjects(caClusterIssuer("ca-issuer"), clientSecretFor(t, ec), userCM).Build()
+		got := evaluateTLSReadiness(t.Context(), ec, c)
+		assert.True(t, got.ready, "message=%s", got.message)
+		require.Len(t, got.warnings, 1)
+		assert.Equal(t, reasonClientCABroadTrust, got.warnings[0].reason)
+	})
+
+	t.Run("corrupt bundle => TrustBundleInvalid", func(t *testing.T) {
+		ec := wiredCluster()
+		userCM := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: "extra-cas", Namespace: ec.Namespace},
+			Data:       map[string]string{trustBundleKey: "-----BEGIN CERTIFICATE-----\nbad!\n-----END CERTIFICATE-----\n"},
+		}
+		c := fake.NewClientBuilder().WithScheme(scheme).
+			WithObjects(caClusterIssuer("ca-issuer"), clientSecretFor(t, ec), userCM).Build()
+		got := evaluateTLSReadiness(t.Context(), ec, c)
+		assert.False(t, got.ready)
+		assert.Equal(t, reasonTrustBundleInvalid, got.reason)
+	})
+
+	t.Run("missing bundle ConfigMap => TrustBundleInvalid", func(t *testing.T) {
+		ec := wiredCluster()
+		c := fake.NewClientBuilder().WithScheme(scheme).
+			WithObjects(caClusterIssuer("ca-issuer"), clientSecretFor(t, ec)).Build()
+		got := evaluateTLSReadiness(t.Context(), ec, c)
+		assert.False(t, got.ready)
+		assert.Equal(t, reasonTrustBundleInvalid, got.reason)
+	})
+}
+
+// TestRecordTLSEventWarnings asserts warnings ride the ready transition: emitted
+// alongside the Normal event, suppressed at steady state.
+func TestRecordTLSEventWarnings(t *testing.T) {
+	verdict := tlsReadiness{
+		configured: true, ready: true, reason: reasonTLSReady, message: "m",
+		warnings: []tlsWarning{{reason: reasonClientCABroadTrust, message: "w"}},
+	}
+
+	t.Run("emitted on transition into ready", func(t *testing.T) {
+		rec := events.NewFakeRecorder(10)
+		r := &EtcdClusterReconciler{Recorder: rec}
+		fresh := &ecv1alpha1.EtcdCluster{ObjectMeta: metav1.ObjectMeta{Name: "ec", Namespace: "ns"}}
+		r.recordTLSEvent(fresh, verdict)
+		got := drain(rec)
+		assert.True(t, hasEventWith(got, corev1.EventTypeNormal, reasonTLSReady), "events=%v", got)
+		assert.True(t, hasEventWith(got, corev1.EventTypeWarning, reasonClientCABroadTrust), "events=%v", got)
+	})
+
+	t.Run("suppressed at steady state", func(t *testing.T) {
+		rec := events.NewFakeRecorder(10)
+		r := &EtcdClusterReconciler{Recorder: rec}
+		steady := &ecv1alpha1.EtcdCluster{ObjectMeta: metav1.ObjectMeta{Name: "ec", Namespace: "ns"}}
+		meta.SetStatusCondition(&steady.Status.Conditions, metav1.Condition{
+			Type: tlsReadyConditionType, Status: metav1.ConditionTrue, Reason: reasonTLSReady,
+		})
+		r.recordTLSEvent(steady, verdict)
+		assert.Empty(t, drain(rec))
+	})
+}
