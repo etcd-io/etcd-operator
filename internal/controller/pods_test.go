@@ -307,12 +307,19 @@ func TestCreateMemberPodWithAnnotations(t *testing.T) {
 	_ = corev1.AddToScheme(scheme)
 	_ = ecv1alpha1.AddToScheme(scheme)
 
+	cluster := &ecv1alpha1.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", UID: "1"},
+		Spec: ecv1alpha1.EtcdClusterSpec{
+			Size:    3,
+			Version: "3.5.17",
+		},
+	}
+
 	tests := []struct {
 		name                string
 		clusterName         string
 		podTemplate         *ecv1alpha1.PodTemplate
 		expectedAnnotations map[string]string
-		expectNil           bool
 	}{
 		{
 			name:        "creates pod with custom annotations",
@@ -329,13 +336,11 @@ func TestCreateMemberPodWithAnnotations(t *testing.T) {
 				"prometheus.io/scrape": "true",
 				"prometheus.io/port":   "2379",
 			},
-			expectNil: false,
 		},
 		{
 			name:        "creates pod without annotations when PodTemplate is nil",
 			clusterName: "test-etcd-no-podtemplate",
 			podTemplate: nil,
-			expectNil:   true,
 		},
 		{
 			name:        "creates pod without annotations when annotations map is empty",
@@ -345,20 +350,15 @@ func TestCreateMemberPodWithAnnotations(t *testing.T) {
 					Annotations: map[string]string{},
 				},
 			},
-			expectNil: true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ec := &ecv1alpha1.EtcdCluster{
-				ObjectMeta: metav1.ObjectMeta{Name: tt.clusterName, Namespace: "default", UID: "1"},
-				Spec: ecv1alpha1.EtcdClusterSpec{
-					Size:        3,
-					Version:     "3.5.17",
-					PodTemplate: tt.podTemplate,
-				},
-			}
+			ec := cluster.DeepCopy()
+			ec.Name = tt.clusterName
+			ec.Spec.PodTemplate = tt.podTemplate
+
 			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ec).Build()
 
 			err := createMemberPod(ctx, logger, fakeClient, ec, 0, scheme)
@@ -367,13 +367,15 @@ func TestCreateMemberPodWithAnnotations(t *testing.T) {
 			pod := &corev1.Pod{}
 			require.NoError(t, fakeClient.Get(ctx, client.ObjectKey{Name: tt.clusterName + "-0", Namespace: "default"}, pod))
 
-			if tt.expectNil {
-				assert.Nil(t, pod.Annotations)
-			} else {
-				assert.Equal(t, tt.expectedAnnotations, pod.Annotations)
-			}
 			require.Len(t, pod.OwnerReferences, 1)
 			assert.Equal(t, ec.Name, pod.OwnerReferences[0].Name)
+
+			// the operator can insert more annotations, but we can guarantee that the expected KVs would be there
+			for k, v := range tt.expectedAnnotations {
+				value, ok := pod.Annotations[k]
+				assert.True(t, ok, "the annotaion entry with key %s and value %s doesn't exist in the pod", k, v)
+				assert.Equal(t, v, value, "mismatch value for key %s: want %s, got %s", k, v, value)
+			}
 		})
 	}
 }
