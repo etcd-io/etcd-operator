@@ -178,7 +178,7 @@ func healthCheck(clusterName, namespace string, pods []*corev1.Pod, lg klog.Logg
 
 	memberlistResp, err := etcdutils.MemberList(endpoints)
 	if err != nil {
-		return nil, nil, nil
+		return nil, nil, err
 	}
 	memberCnt := len(memberlistResp.Members)
 
