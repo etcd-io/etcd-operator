@@ -27,6 +27,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/e2e-framework/klient/k8s/resources"
 	"sigs.k8s.io/e2e-framework/klient/wait"
@@ -35,6 +36,7 @@ import (
 	"sigs.k8s.io/e2e-framework/pkg/features"
 
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
+	"go.etcd.io/etcd-operator/internal/controller"
 )
 
 var etcdVersion = os.Getenv("ETCD_VERSION")
@@ -411,5 +413,77 @@ func TestEtcdClusterFunctionality(t *testing.T) {
 		return ctx
 	})
 
+	_ = testEnv.Test(t, feature.Feature())
+}
+
+func TestClusterHash(t *testing.T) {
+	feature := features.New("data-persistence")
+
+	const etcdClusterName = "etcd-hash"
+	const size = 3
+
+	etcdCluster := &ecv1alpha1.EtcdCluster{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "operator.etcd.io/v1alpha1",
+			Kind:       "EtcdCluster",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      etcdClusterName,
+			Namespace: namespace,
+		},
+		Spec: ecv1alpha1.EtcdClusterSpec{
+			Size:    size,
+			Version: "v3.5.18",
+			StorageSpec: &ecv1alpha1.StorageSpec{
+				AccessModes:       corev1.ReadWriteOnce,
+				StorageClassName:  "standard",
+				PVCName:           "test-pvc",
+				VolumeSizeRequest: resource.MustParse("64Mi"),
+				VolumeSizeLimit:   resource.MustParse("64Mi"),
+			},
+		},
+	}
+
+	clusterHash := controller.EtcdClusterHash(etcdCluster)
+
+	feature.Setup(func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+		client := cfg.Client()
+
+		// create the etcd cluster
+		if err := client.Resources().Create(ctx, etcdCluster); err != nil {
+			t.Fatalf("unable to create etcd cluster: %s", err)
+		}
+
+		// get the etcd cluster object
+		var ec ecv1alpha1.EtcdCluster
+		if err := client.Resources().Get(ctx, etcdClusterName, namespace, &ec); err != nil {
+			t.Fatalf("unable to fetch etcd cluster: %s", err)
+		}
+
+		return ctx
+	})
+
+	feature.Assess("verify all Pods have the etcd-cluster hash annotation",
+		func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+			var pods corev1.PodList
+			if err := c.Client().Resources().List(
+				ctx,
+				&pods,
+				resources.WithLabelSelector(fmt.Sprintf("app=%s", etcdClusterName))); err != nil {
+				t.Fatalf("unable to retrieve the member pods with labels %s and annotation %s", "fix", "me")
+			}
+
+			for _, pod := range pods.Items {
+				podAnnotation, ok := pod.Annotations[controller.HashMetadataKey]
+				if !ok {
+					t.Errorf("pod %s does not have its cluster hash: annotations: %v", pod.Name, pod.Annotations)
+				}
+				if podAnnotation != clusterHash {
+					t.Errorf("pod %s has a mismatched cluster hash: want %s, got %s: pod annotations: %v",
+						pod.Name, clusterHash, podAnnotation, pod.Annotations)
+				}
+			}
+			return ctx
+		})
 	_ = testEnv.Test(t, feature.Feature())
 }
