@@ -218,6 +218,10 @@ func defaultArgs(name string) []string {
 	}
 }
 
+const (
+	HashMetadataKey = "operator.etcd.io/spec-hash"
+)
+
 // buildMemberPod constructs the Pod object for a single etcd member.
 func buildMemberPod(ec *ecv1alpha1.EtcdCluster, podName string, initialClusterState etcdClusterState, initialCluster string) *corev1.Pod {
 	// Start with custom labels then overwrite with the mandatory defaults so
@@ -228,12 +232,13 @@ func buildMemberPod(ec *ecv1alpha1.EtcdCluster, podName string, initialClusterSt
 	}
 	maps.Copy(labels, etcdClusterLabels(ec))
 
-	// Annotations are purely from the PodTemplate; nil when not provided.
-	var annotations map[string]string
+	// Apply annotations from EtcdCluster and add additional annnotations required by etcd operator
+	annotations := make(map[string]string)
 	if ec.Spec.PodTemplate != nil && ec.Spec.PodTemplate.Metadata != nil &&
 		len(ec.Spec.PodTemplate.Metadata.Annotations) > 0 {
-		annotations = ec.Spec.PodTemplate.Metadata.Annotations
+		maps.Copy(annotations, ec.Spec.PodTemplate.Metadata.Annotations)
 	}
+	annotations[HashMetadataKey] = EtcdClusterHash(ec)
 
 	envVars := []corev1.EnvVar{
 		{
