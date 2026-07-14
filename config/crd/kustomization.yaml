@@ -3,6 +3,8 @@
 # It should be run by config/default
 resources:
 - bases/operator.etcd.io_etcdclusters.yaml
+- bases/operator.etcd.io_etcdbackups.yaml
+- bases/operator.etcd.io_etcdrestores.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 
 patches:

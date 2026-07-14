@@ -24,4 +24,8 @@ resources:
 # if you do not want those helpers be installed with your Project.
 - etcdcluster_editor_role.yaml
 - etcdcluster_viewer_role.yaml
+- etcdbackup_editor_role.yaml
+- etcdbackup_viewer_role.yaml
+- etcdrestore_editor_role.yaml
+- etcdrestore_viewer_role.yaml
 

@@ -29,6 +29,20 @@ rules:
   - patch
   - update
 - apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods/exec
+  verbs:
+  - create
+- apiGroups:
   - apps
   resources:
   - statefulsets
@@ -64,7 +78,9 @@ rules:
 - apiGroups:
   - operator.etcd.io
   resources:
+  - etcdbackups
   - etcdclusters
+  - etcdrestores
   verbs:
   - create
   - delete
@@ -76,13 +92,17 @@ rules:
 - apiGroups:
   - operator.etcd.io
   resources:
+  - etcdbackups/finalizers
   - etcdclusters/finalizers
+  - etcdrestores/finalizers
   verbs:
   - update
 - apiGroups:
   - operator.etcd.io
   resources:
+  - etcdbackups/status
   - etcdclusters/status
+  - etcdrestores/status
   verbs:
   - get
   - patch
