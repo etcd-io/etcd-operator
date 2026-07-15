@@ -17,6 +17,8 @@ func EtcdClusterHash(ec *v1alpha1.EtcdCluster) string {
 	clusterSpec := ec.DeepCopy().Spec
 	// size is not used for calculating the hash
 	clusterSpec.Size = 0
+	// version is handled separately
+	clusterSpec.Version = ""
 	clusterSpec.EtcdOptions = createArgs(ec.Name, ec.Spec.EtcdOptions)
 	// we don't want to roll etcd pods when metadata is changed.
 	// instead, we'd do in-place update for them.
