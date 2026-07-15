@@ -55,6 +55,11 @@ func TestEtcdClusterHash(t *testing.T) {
 		c.Spec.PodTemplate = nil
 		return c
 	}
+	withVersionChanged := func() *v1alpha1.EtcdCluster {
+		c := baseCluster.DeepCopy()
+		c.Spec.Version = "v8.8.8"
+		return c
+	}
 
 	// Define our table-driven test cases
 	tests := []struct {
@@ -90,6 +95,11 @@ func TestEtcdClusterHash(t *testing.T) {
 			cluster:     withNilTemplate(),
 			expectEqual: false,
 			checkLength: true,
+		},
+		{
+			name:        "Version check - Modifying etcd version must NOT change the hash",
+			cluster:     withVersionChanged(),
+			expectEqual: true,
 		},
 	}
 
