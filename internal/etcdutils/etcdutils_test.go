@@ -1,11 +1,13 @@
 package etcdutils
 
 import (
+	"crypto/tls"
 	"testing"
 	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -335,4 +337,28 @@ func TestHealthReportSwap(t *testing.T) {
 	// Check if the elements are swapped
 	assert.Equal(t, "http://localhost:2380", healthReports[0].Ep)
 	assert.Equal(t, "http://localhost:2379", healthReports[1].Ep)
+}
+
+// ---------------------------------------------------------------------------
+// Option / WithTLS — TLS config is applied to clientv3.Config
+// ---------------------------------------------------------------------------
+
+func TestApplyOptionsTLSConfig(t *testing.T) {
+	// applyOptions is the single point where every helper (MemberList,
+	// ClusterHealth, AddMember, PromoteLearner, RemoveMember) builds the
+	// clientv3.Config; asserting here covers all five call paths.
+	eps := []string{"https://127.0.0.1:2379"}
+
+	t.Run("no options leaves TLS nil", func(t *testing.T) {
+		cfg := applyOptions(eps)
+		assert.Nil(t, cfg.TLS)
+		assert.Equal(t, eps, cfg.Endpoints)
+	})
+
+	t.Run("WithTLS sets the tls.Config", func(t *testing.T) {
+		wantTLS := &tls.Config{MinVersion: tls.VersionTLS12}
+		cfg := applyOptions(eps, WithTLS(wantTLS))
+		require.NotNil(t, cfg.TLS)
+		assert.Equal(t, uint16(tls.VersionTLS12), cfg.TLS.MinVersion)
+	})
 }

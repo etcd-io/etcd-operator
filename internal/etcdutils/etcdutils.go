@@ -2,6 +2,7 @@ package etcdutils
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"sort"
@@ -17,13 +18,49 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
-func MemberList(eps []string) (*clientv3.MemberListResponse, error) {
-	cfg := clientv3.Config{
+// Option configures a clientv3.Config built by the helpers in this package.
+// It is the single, backward-compatible extension point that callers use to add
+// TLS (WithTLS) without changing positional signatures.
+type Option func(*clientConfig)
+
+type clientConfig struct {
+	tls *tls.Config
+}
+
+// WithTLS applies the given tls.Config to the etcd client so the operator can
+// reach a TLS-enabled cluster. Callers without TLS pass no option.
+func WithTLS(tlsCfg *tls.Config) Option {
+	return func(c *clientConfig) { c.tls = tlsCfg }
+}
+
+// applyOptions builds the base clientv3.Config shared by MemberList,
+// AddMember, PromoteLearner and RemoveMember, then applies the given options.
+func applyOptions(eps []string, opts ...Option) clientv3.Config {
+	cfg := clientConfig{}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	return clientv3.Config{
 		Endpoints:            eps,
 		DialTimeout:          2 * time.Second,
 		DialKeepAliveTime:    2 * time.Second,
 		DialKeepAliveTimeout: 6 * time.Second,
+		TLS:                  cfg.tls,
 	}
+}
+
+// closeAndCancel closes the client and, if Close errored, keeps the cancel
+// path non-fatal. Used by the single-call helpers below.
+func closeAndCancel(c *clientv3.Client, cancel context.CancelFunc) {
+	if err := c.Close(); err != nil {
+		cancel()
+		return
+	}
+	cancel()
+}
+
+func MemberList(eps []string, opts ...Option) (*clientv3.MemberListResponse, error) {
+	cfg := applyOptions(eps, opts...)
 
 	c, err := clientv3.New(cfg)
 	if err != nil {
@@ -31,14 +68,7 @@ func MemberList(eps []string) (*clientv3.MemberListResponse, error) {
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer func() {
-		err := c.Close()
-		if err != nil {
-			cancel()
-			return
-		}
-		cancel()
-	}()
+	defer func() { closeAndCancel(c, cancel) }()
 
 	return c.MemberList(ctx)
 }
@@ -120,7 +150,7 @@ func FindLearnerStatus(healthInfos []EpHealth, logger logr.Logger) (uint64, *cli
 	return learner, learnerStatus
 }
 
-func ClusterHealth(eps []string) ([]EpHealth, error) {
+func ClusterHealth(eps []string, opts ...Option) ([]EpHealth, error) {
 	lg, err := logutil.CreateDefaultZapLogger(zap.InfoLevel)
 	if err != nil {
 		return nil, err
@@ -128,14 +158,9 @@ func ClusterHealth(eps []string) ([]EpHealth, error) {
 
 	var cfgs = make([]*clientv3.Config, 0, len(eps))
 	for _, ep := range eps {
-		cfg := &clientv3.Config{
-			Endpoints:            []string{ep},
-			DialTimeout:          2 * time.Second,
-			DialKeepAliveTime:    2 * time.Second,
-			DialKeepAliveTimeout: 6 * time.Second,
-		}
+		cfg := applyOptions([]string{ep}, opts...)
 
-		cfgs = append(cfgs, cfg)
+		cfgs = append(cfgs, &cfg)
 	}
 
 	healthCh := make(chan EpHealth, len(eps))
@@ -200,13 +225,8 @@ func ClusterHealth(eps []string) ([]EpHealth, error) {
 	return healthList, nil
 }
 
-func AddMember(eps []string, peerURLs []string, learner bool) (*clientv3.MemberAddResponse, error) {
-	cfg := clientv3.Config{
-		Endpoints:            eps,
-		DialTimeout:          2 * time.Second,
-		DialKeepAliveTime:    2 * time.Second,
-		DialKeepAliveTimeout: 6 * time.Second,
-	}
+func AddMember(eps []string, peerURLs []string, learner bool, opts ...Option) (*clientv3.MemberAddResponse, error) {
+	cfg := applyOptions(eps, opts...)
 
 	c, err := clientv3.New(cfg)
 	if err != nil {
@@ -214,14 +234,7 @@ func AddMember(eps []string, peerURLs []string, learner bool) (*clientv3.MemberA
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer func() {
-		err := c.Close()
-		if err != nil {
-			cancel()
-			return
-		}
-		cancel()
-	}()
+	defer func() { closeAndCancel(c, cancel) }()
 
 	if learner {
 		return c.MemberAddAsLearner(ctx, peerURLs)
@@ -230,13 +243,8 @@ func AddMember(eps []string, peerURLs []string, learner bool) (*clientv3.MemberA
 	return c.MemberAdd(ctx, peerURLs)
 }
 
-func PromoteLearner(eps []string, learnerId uint64) error {
-	cfg := clientv3.Config{
-		Endpoints:            eps,
-		DialTimeout:          2 * time.Second,
-		DialKeepAliveTime:    2 * time.Second,
-		DialKeepAliveTimeout: 6 * time.Second,
-	}
+func PromoteLearner(eps []string, learnerId uint64, opts ...Option) error {
+	cfg := applyOptions(eps, opts...)
 
 	c, err := clientv3.New(cfg)
 	if err != nil {
@@ -244,26 +252,14 @@ func PromoteLearner(eps []string, learnerId uint64) error {
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer func() {
-		err := c.Close()
-		if err != nil {
-			cancel()
-			return
-		}
-		cancel()
-	}()
+	defer func() { closeAndCancel(c, cancel) }()
 
 	_, err = c.MemberPromote(ctx, learnerId)
 	return err
 }
 
-func RemoveMember(eps []string, memberID uint64) error {
-	cfg := clientv3.Config{
-		Endpoints:            eps,
-		DialTimeout:          2 * time.Second,
-		DialKeepAliveTime:    2 * time.Second,
-		DialKeepAliveTimeout: 6 * time.Second,
-	}
+func RemoveMember(eps []string, memberID uint64, opts ...Option) error {
+	cfg := applyOptions(eps, opts...)
 
 	c, err := clientv3.New(cfg)
 	if err != nil {
@@ -271,14 +267,7 @@ func RemoveMember(eps []string, memberID uint64) error {
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer func() {
-		err := c.Close()
-		if err != nil {
-			cancel()
-			return
-		}
-		cancel()
-	}()
+	defer func() { closeAndCancel(c, cancel) }()
 
 	_, err = c.MemberRemove(ctx, memberID)
 	return err

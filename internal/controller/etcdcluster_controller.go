@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"strings"
 	"time"
@@ -57,6 +58,8 @@ type reconcileState struct {
 	pods           []*corev1.Pod                // member pods owned by this cluster, sorted by ordinal
 	memberListResp *clientv3.MemberListResponse // member list fetched from the etcd cluster
 	memberHealth   []etcdutils.EpHealth         // health information for each etcd member
+	clientTLS      *tls.Config                  // operator's client TLS config (nil when cluster has no TLS)
+	clientOpts     []etcdutils.Option           // pre-built etcd client options for this loop (e.g. TLS config)
 }
 
 // +kubebuilder:rbac:groups=operator.etcd.io,resources=etcdclusters,verbs=get;list;watch;create;update;patch;delete
@@ -131,12 +134,28 @@ func (r *EtcdClusterReconciler) fetchAndValidateState(ctx context.Context, req c
 		))
 	}
 
+	// Build the operator's etcd-client TLS config (from the server cert Secret)
+	clientTLS, tlsErr := r.buildReconcileClientTLS(ctx, ec)
+	if tlsErr != nil && ec.Spec.TLS != nil {
+		logger.Error(tlsErr, "Failed to build client TLS config; will retry next reconcile")
+	}
+
 	logger.Info("Reconciling EtcdCluster", "spec", ec.Spec)
 
 	pods, err := listOwnedPods(ctx, r.Client, ec)
 	if err != nil {
 		logger.Error(err, "Failed to list pods. Requesting requeue")
 		return nil, ctrl.Result{RequeueAfter: requeueDuration}, nil
+	}
+
+	// Attach the per-reconcile TLS config to every returned state. When TLS is
+	// unused the options slice stays nil.
+	stateWithTLS := func(pods []*corev1.Pod) *reconcileState {
+		s := &reconcileState{cluster: ec, pods: pods, clientTLS: clientTLS}
+		if s.clientTLS != nil {
+			s.clientOpts = []etcdutils.Option{etcdutils.WithTLS(s.clientTLS)}
+		}
+		return s
 	}
 
 	// Validate the upgrade path using the image tag of the first pod.
@@ -149,7 +168,7 @@ func (r *EtcdClusterReconciler) fetchAndValidateState(ctx context.Context, req c
 			if idx == -1 {
 				logger.Info("could not extract image version from pod image",
 					"image", c.Image)
-				return &reconcileState{cluster: ec, pods: pods}, ctrl.Result{}, nil
+				return stateWithTLS(pods), ctrl.Result{}, nil
 			}
 			currentVersion := c.Image[idx+1:]
 			targetVersion := ec.Spec.Version
@@ -163,7 +182,7 @@ func (r *EtcdClusterReconciler) fetchAndValidateState(ctx context.Context, req c
 						"target", targetVersion,
 						"error", err,
 					)
-					return &reconcileState{cluster: ec, pods: pods}, ctrl.Result{}, nil
+					return stateWithTLS(pods), ctrl.Result{}, nil
 				}
 				if err != nil {
 					logger.Error(err, "unsupported upgrade path between current and target versions",
@@ -180,7 +199,17 @@ func (r *EtcdClusterReconciler) fetchAndValidateState(ctx context.Context, req c
 		}
 	}
 
-	return &reconcileState{cluster: ec, pods: pods}, ctrl.Result{}, nil
+	return stateWithTLS(pods), ctrl.Result{}, nil
+}
+
+// buildReconcileClientTLS builds the operator's etcd-client TLS Config for a
+// reconcile loop from the cluster's server certificate Secret. Returns a nil
+// config (and nil error) when the cluster has no TLS configured.
+func (r *EtcdClusterReconciler) buildReconcileClientTLS(ctx context.Context, ec *ecv1alpha1.EtcdCluster) (*tls.Config, error) {
+	if ec.Spec.TLS == nil {
+		return nil, nil
+	}
+	return buildClientTLSConfig(ctx, ec, r.Client)
 }
 
 // bootstrapCluster ensures the headless Service exists and, when no pods are
@@ -211,7 +240,7 @@ func (r *EtcdClusterReconciler) performHealthChecks(ctx context.Context, s *reco
 	logger := log.FromContext(ctx)
 	logger.Info("Now checking health of the cluster members")
 	var err error
-	s.memberListResp, s.memberHealth, err = healthCheck(s.cluster.Name, s.cluster.Namespace, s.pods, logger)
+	s.memberListResp, s.memberHealth, err = healthCheck(s.cluster.Name, s.cluster.Namespace, s.pods, clusterTLSEnabled(s.cluster), s.clientOpts, logger)
 	if err != nil {
 		return fmt.Errorf("health check failed: %w", err)
 	}
@@ -275,10 +304,10 @@ func (r *EtcdClusterReconciler) reconcileClusterState(ctx context.Context, s *re
 			logger.Info("Learner found", "learnerID", learner, "learnerStatus", learnerStatus)
 			if etcdutils.IsLearnerReady(leaderStatus, learnerStatus) {
 				logger.Info("Learner is ready to be promoted to voting member", "learnerID", learner)
-				eps := clientEndpointsFromPods(s.cluster.Name, s.cluster.Namespace, s.pods)
+				eps := clientEndpointsFromPods(s.cluster.Name, s.cluster.Namespace, s.pods, clusterTLSEnabled(s.cluster))
 				// Exclude the learner (last ordinal) from the endpoint list used for promotion.
 				eps = eps[:(len(eps) - 1)]
-				if err := etcdutils.PromoteLearner(eps, learner); err != nil {
+				if err := etcdutils.PromoteLearner(eps, learner, s.clientOpts...); err != nil {
 					return ctrl.Result{}, err
 				}
 			} else {
@@ -293,14 +322,14 @@ func (r *EtcdClusterReconciler) reconcileClusterState(ctx context.Context, s *re
 		return ctrl.Result{}, nil
 	}
 
-	eps := clientEndpointsFromPods(s.cluster.Name, s.cluster.Namespace, s.pods)
+	eps := clientEndpointsFromPods(s.cluster.Name, s.cluster.Namespace, s.pods, clusterTLSEnabled(s.cluster))
 
 	if currentPodCount < int32(s.cluster.Spec.Size) {
 		// Scale out: add a new learner member to etcd, then create its pod.
 		nextOrdinal := int(currentPodCount)
 		_, peerURL := peerEndpointForOrdinalIndex(s.cluster, nextOrdinal)
 		logger.Info("[Scale out] adding a new learner member to etcd cluster", "peerURL", peerURL)
-		if _, err := etcdutils.AddMember(eps, []string{peerURL}, true); err != nil {
+		if _, err := etcdutils.AddMember(eps, []string{peerURL}, true, s.clientOpts...); err != nil {
 			return ctrl.Result{}, err
 		}
 		logger.Info("Learner member added successfully", "peerURL", peerURL)
@@ -320,7 +349,7 @@ func (r *EtcdClusterReconciler) reconcileClusterState(ctx context.Context, s *re
 		logger.Info("[Scale in] removing one member", "memberID", memberID, "pod", podToRemove.Name)
 
 		epsForRemoval := eps[:len(eps)-1]
-		if err := etcdutils.RemoveMember(epsForRemoval, memberID); err != nil {
+		if err := etcdutils.RemoveMember(epsForRemoval, memberID, s.clientOpts...); err != nil {
 			return ctrl.Result{}, err
 		}
 
