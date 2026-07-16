@@ -176,7 +176,7 @@ func healthCheck(clusterName, namespace string, pods []*corev1.Pod, lg klog.Logg
 
 	endpoints := clientEndpointsFromPods(clusterName, namespace, pods)
 
-	memberlistResp, err := etcdutils.MemberList(endpoints)
+	memberlistResp, err := etcdutils.MemberList(etcdutils.ClientConfig{Endpoints: endpoints})
 	if err != nil {
 		return nil, nil, err
 	}
@@ -188,7 +188,7 @@ func healthCheck(clusterName, namespace string, pods []*corev1.Pod, lg klog.Logg
 	lg.Info("health checking", "podCount", len(pods), "len(members)", memberCnt)
 	endpoints = endpoints[:cnt]
 
-	healthInfos, err := etcdutils.ClusterHealth(endpoints)
+	healthInfos, err := etcdutils.ClusterHealth(etcdutils.ClientConfig{Endpoints: endpoints})
 	if err != nil {
 		return memberlistResp, nil, err
 	}
