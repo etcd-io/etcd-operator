@@ -2,6 +2,7 @@ package etcdutils
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"sort"
@@ -11,34 +12,46 @@ import (
 
 	"github.com/go-logr/logr"
 	"go.uber.org/zap"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	"go.etcd.io/etcd/client/pkg/v3/logutil"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
-func MemberList(eps []string) (*clientv3.MemberListResponse, error) {
-	cfg := clientv3.Config{
-		Endpoints:            eps,
+// ClientConfig is the subset of etcd client settings consumed by the helpers in this package.
+type ClientConfig struct {
+	Endpoints []string
+	TLS       *tls.Config
+}
+
+// buildConfig produces the clientv3.Config used by every helper.
+func (c ClientConfig) buildConfig() clientv3.Config {
+	return clientv3.Config{
+		Endpoints:            c.Endpoints,
 		DialTimeout:          2 * time.Second,
 		DialKeepAliveTime:    2 * time.Second,
 		DialKeepAliveTimeout: 6 * time.Second,
+		TLS:                  c.TLS,
 	}
+}
 
-	c, err := clientv3.New(cfg)
+// closeAndCancel closes etcd client and cancels context
+func closeAndCancel(c *clientv3.Client, cancel context.CancelFunc) {
+	if err := c.Close(); err != nil {
+		log.Log.Error(err, "failed to close client")
+	}
+	cancel()
+}
+
+func MemberList(cfg ClientConfig) (*clientv3.MemberListResponse, error) {
+	c, err := clientv3.New(cfg.buildConfig())
 	if err != nil {
 		return nil, err
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer func() {
-		err := c.Close()
-		if err != nil {
-			cancel()
-			return
-		}
-		cancel()
-	}()
+	defer func() { closeAndCancel(c, cancel) }()
 
 	return c.MemberList(ctx)
 }
@@ -120,25 +133,20 @@ func FindLearnerStatus(healthInfos []EpHealth, logger logr.Logger) (uint64, *cli
 	return learner, learnerStatus
 }
 
-func ClusterHealth(eps []string) ([]EpHealth, error) {
+func ClusterHealth(cfg ClientConfig) ([]EpHealth, error) {
 	lg, err := logutil.CreateDefaultZapLogger(zap.InfoLevel)
 	if err != nil {
 		return nil, err
 	}
 
-	var cfgs = make([]*clientv3.Config, 0, len(eps))
-	for _, ep := range eps {
-		cfg := &clientv3.Config{
-			Endpoints:            []string{ep},
-			DialTimeout:          2 * time.Second,
-			DialKeepAliveTime:    2 * time.Second,
-			DialKeepAliveTimeout: 6 * time.Second,
-		}
-
-		cfgs = append(cfgs, cfg)
+	var cfgs = make([]*clientv3.Config, 0, len(cfg.Endpoints))
+	for _, ep := range cfg.Endpoints {
+		epCfg := ClientConfig{Endpoints: []string{ep}, TLS: cfg.TLS}
+		built := epCfg.buildConfig()
+		cfgs = append(cfgs, &built)
 	}
 
-	healthCh := make(chan EpHealth, len(eps))
+	healthCh := make(chan EpHealth, len(cfg.Endpoints))
 
 	var wg sync.WaitGroup
 	for _, cfg := range cfgs {
@@ -200,28 +208,14 @@ func ClusterHealth(eps []string) ([]EpHealth, error) {
 	return healthList, nil
 }
 
-func AddMember(eps []string, peerURLs []string, learner bool) (*clientv3.MemberAddResponse, error) {
-	cfg := clientv3.Config{
-		Endpoints:            eps,
-		DialTimeout:          2 * time.Second,
-		DialKeepAliveTime:    2 * time.Second,
-		DialKeepAliveTimeout: 6 * time.Second,
-	}
-
-	c, err := clientv3.New(cfg)
+func AddMember(cfg ClientConfig, peerURLs []string, learner bool) (*clientv3.MemberAddResponse, error) {
+	c, err := clientv3.New(cfg.buildConfig())
 	if err != nil {
 		return nil, err
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer func() {
-		err := c.Close()
-		if err != nil {
-			cancel()
-			return
-		}
-		cancel()
-	}()
+	defer func() { closeAndCancel(c, cancel) }()
 
 	if learner {
 		return c.MemberAddAsLearner(ctx, peerURLs)
@@ -230,55 +224,27 @@ func AddMember(eps []string, peerURLs []string, learner bool) (*clientv3.MemberA
 	return c.MemberAdd(ctx, peerURLs)
 }
 
-func PromoteLearner(eps []string, learnerId uint64) error {
-	cfg := clientv3.Config{
-		Endpoints:            eps,
-		DialTimeout:          2 * time.Second,
-		DialKeepAliveTime:    2 * time.Second,
-		DialKeepAliveTimeout: 6 * time.Second,
-	}
-
-	c, err := clientv3.New(cfg)
+func PromoteLearner(cfg ClientConfig, learnerId uint64) error {
+	c, err := clientv3.New(cfg.buildConfig())
 	if err != nil {
 		return err
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer func() {
-		err := c.Close()
-		if err != nil {
-			cancel()
-			return
-		}
-		cancel()
-	}()
+	defer func() { closeAndCancel(c, cancel) }()
 
 	_, err = c.MemberPromote(ctx, learnerId)
 	return err
 }
 
-func RemoveMember(eps []string, memberID uint64) error {
-	cfg := clientv3.Config{
-		Endpoints:            eps,
-		DialTimeout:          2 * time.Second,
-		DialKeepAliveTime:    2 * time.Second,
-		DialKeepAliveTimeout: 6 * time.Second,
-	}
-
-	c, err := clientv3.New(cfg)
+func RemoveMember(cfg ClientConfig, memberID uint64) error {
+	c, err := clientv3.New(cfg.buildConfig())
 	if err != nil {
 		return err
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer func() {
-		err := c.Close()
-		if err != nil {
-			cancel()
-			return
-		}
-		cancel()
-	}()
+	defer func() { closeAndCancel(c, cancel) }()
 
 	_, err = c.MemberRemove(ctx, memberID)
 	return err

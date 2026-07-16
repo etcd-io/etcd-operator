@@ -278,7 +278,7 @@ func (r *EtcdClusterReconciler) reconcileClusterState(ctx context.Context, s *re
 				eps := clientEndpointsFromPods(s.cluster.Name, s.cluster.Namespace, s.pods)
 				// Exclude the learner (last ordinal) from the endpoint list used for promotion.
 				eps = eps[:(len(eps) - 1)]
-				if err := etcdutils.PromoteLearner(eps, learner); err != nil {
+				if err := etcdutils.PromoteLearner(etcdutils.ClientConfig{Endpoints: eps}, learner); err != nil {
 					return ctrl.Result{}, err
 				}
 			} else {
@@ -300,7 +300,7 @@ func (r *EtcdClusterReconciler) reconcileClusterState(ctx context.Context, s *re
 		nextOrdinal := int(currentPodCount)
 		_, peerURL := peerEndpointForOrdinalIndex(s.cluster, nextOrdinal)
 		logger.Info("[Scale out] adding a new learner member to etcd cluster", "peerURL", peerURL)
-		if _, err := etcdutils.AddMember(eps, []string{peerURL}, true); err != nil {
+		if _, err := etcdutils.AddMember(etcdutils.ClientConfig{Endpoints: eps}, []string{peerURL}, true); err != nil {
 			return ctrl.Result{}, err
 		}
 		logger.Info("Learner member added successfully", "peerURL", peerURL)
@@ -320,7 +320,7 @@ func (r *EtcdClusterReconciler) reconcileClusterState(ctx context.Context, s *re
 		logger.Info("[Scale in] removing one member", "memberID", memberID, "pod", podToRemove.Name)
 
 		epsForRemoval := eps[:len(eps)-1]
-		if err := etcdutils.RemoveMember(epsForRemoval, memberID); err != nil {
+		if err := etcdutils.RemoveMember(etcdutils.ClientConfig{Endpoints: epsForRemoval}, memberID); err != nil {
 			return ctrl.Result{}, err
 		}
 
