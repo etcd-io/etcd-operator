@@ -1,11 +1,13 @@
 package etcdutils
 
 import (
+	"crypto/tls"
 	"testing"
 	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -60,7 +62,7 @@ func TestMemberList(t *testing.T) {
 		assert.NoError(t, err)
 
 		eps := []string{"http://localhost:2379"}
-		resp, err := MemberList(eps)
+		resp, err := MemberList(ClientConfig{Endpoints: eps})
 		assert.NoError(t, err)
 		assert.NotNil(t, resp)
 		assert.Greater(t, len(resp.Members), 0)
@@ -68,7 +70,7 @@ func TestMemberList(t *testing.T) {
 
 	t.Run("ReturnsErrorForInvalidEndpoint", func(t *testing.T) {
 		eps := []string{"http://invalid:2379"}
-		resp, err := MemberList(eps)
+		resp, err := MemberList(ClientConfig{Endpoints: eps})
 		assert.Error(t, err)
 		assert.Nil(t, resp)
 	})
@@ -80,7 +82,7 @@ func TestClusterHealth(t *testing.T) {
 
 	t.Run("ReturnsHealthStatus", func(t *testing.T) {
 		eps := []string{"http://localhost:2379"}
-		health, err := ClusterHealth(eps)
+		health, err := ClusterHealth(ClientConfig{Endpoints: eps})
 		assert.NoError(t, err)
 		assert.NotNil(t, health)
 		assert.Greater(t, len(health), 0)
@@ -89,7 +91,7 @@ func TestClusterHealth(t *testing.T) {
 
 	t.Run("ReturnsErrorForInvalidEndpoint", func(t *testing.T) {
 		eps := []string{"http://invalid:2379"}
-		health, err := ClusterHealth(eps)
+		health, err := ClusterHealth(ClientConfig{Endpoints: eps})
 		assert.NoError(t, err)
 		assert.Equal(t, "http://invalid:2379", health[0].Ep)
 		assert.Equal(t, false, health[0].Health)
@@ -104,7 +106,7 @@ func TestAddMember(t *testing.T) {
 	t.Run("AddsNewMember", func(t *testing.T) {
 		eps := []string{"http://localhost:2379"}
 		peerURLs := []string{"http://127.0.0.1:2380"}
-		resp, err := AddMember(eps, peerURLs, false)
+		resp, err := AddMember(ClientConfig{Endpoints: eps}, peerURLs, false)
 		assert.NoError(t, err)
 		assert.NotNil(t, resp)
 		assert.Greater(t, len(resp.Members), 0)
@@ -113,7 +115,7 @@ func TestAddMember(t *testing.T) {
 	t.Run("ReturnsErrorForInvalidEndpoint", func(t *testing.T) {
 		eps := []string{"http://invalid:2379"}
 		peerURLs := []string{"http://127.0.0.1:2380"}
-		resp, err := AddMember(eps, peerURLs, false)
+		resp, err := AddMember(ClientConfig{Endpoints: eps}, peerURLs, false)
 		assert.Error(t, err)
 		assert.Nil(t, resp)
 	})
@@ -126,17 +128,17 @@ func TestPromoteLearner(t *testing.T) {
 	t.Run("PromotesMember", func(t *testing.T) {
 		eps := []string{"http://localhost:2379"}
 		peerURLs := []string{"http://test123:2380"}
-		addResp, err := AddMember(eps, peerURLs, true)
+		addResp, err := AddMember(ClientConfig{Endpoints: eps}, peerURLs, true)
 		assert.NoError(t, err)
 
-		err = PromoteLearner(eps, addResp.Member.ID)
+		err = PromoteLearner(ClientConfig{Endpoints: eps}, addResp.Member.ID)
 		assert.Error(t, err)
 		assert.Equal(t, err.Error(), "etcdserver: can only promote a learner member which is in sync with leader")
 	})
 
 	t.Run("ReturnsErrorForInvalidEndpoint", func(t *testing.T) {
 		eps := []string{"http://invalid:2379"}
-		err := PromoteLearner(eps, 12345)
+		err := PromoteLearner(ClientConfig{Endpoints: eps}, 12345)
 		assert.Error(t, err)
 	})
 }
@@ -147,7 +149,7 @@ func TestRemoveMember(t *testing.T) {
 
 	t.Run("ReturnsErrorForInvalidEndpoint", func(t *testing.T) {
 		eps := []string{"http://invalid:2379"}
-		err := RemoveMember(eps, 12345)
+		err := RemoveMember(ClientConfig{Endpoints: eps}, 12345)
 		assert.Error(t, err)
 	})
 }
@@ -335,4 +337,28 @@ func TestHealthReportSwap(t *testing.T) {
 	// Check if the elements are swapped
 	assert.Equal(t, "http://localhost:2380", healthReports[0].Ep)
 	assert.Equal(t, "http://localhost:2379", healthReports[1].Ep)
+}
+
+// ---------------------------------------------------------------------------
+// ClientConfig — buildConfig applies Endpoints and TLS to clientv3.Config
+// ---------------------------------------------------------------------------
+
+func TestClientConfigBuild(t *testing.T) {
+	// buildConfig is the single point where every helper (MemberList,
+	// ClusterHealth, AddMember, PromoteLearner, RemoveMember) builds the
+	// clientv3.Config; asserting here covers all five call paths.
+	eps := []string{"https://127.0.0.1:2379"}
+
+	t.Run("nil TLS leaves clientv3.Config.TLS nil", func(t *testing.T) {
+		cfg := ClientConfig{Endpoints: eps}.buildConfig()
+		assert.Nil(t, cfg.TLS)
+		assert.Equal(t, eps, cfg.Endpoints)
+	})
+
+	t.Run("TLS is propagated", func(t *testing.T) {
+		wantTLS := &tls.Config{MinVersion: tls.VersionTLS12}
+		cfg := ClientConfig{Endpoints: eps, TLS: wantTLS}.buildConfig()
+		require.NotNil(t, cfg.TLS)
+		assert.Equal(t, uint16(tls.VersionTLS12), cfg.TLS.MinVersion)
+	})
 }
