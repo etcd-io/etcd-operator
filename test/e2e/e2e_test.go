@@ -312,7 +312,7 @@ func TestPodRecovery(t *testing.T) {
 			}
 
 			// Verify cluster replication works across recovered pod
-			verifyDataOperations(t, c, etcdClusterName, "replication-test", "value")
+			verifyDataOperations(t, c, etcdClusterName, "replication-test", "value", false)
 
 			stdout, stderr, err := execInPod(t, c, targetPodName, namespace, []string{"etcdctl", "get", "replication-test"})
 			if err != nil {
@@ -380,7 +380,7 @@ func TestEtcdClusterFunctionality(t *testing.T) {
 	})
 
 	feature.Assess("test data operations", func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-		verifyDataOperations(t, c, etcdClusterName, "test-key", "test-value")
+		verifyDataOperations(t, c, etcdClusterName, "test-key", "test-value", false)
 		return ctx
 	})
 

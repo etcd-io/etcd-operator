@@ -109,18 +109,25 @@ func waitForPodReadiness(t *testing.T, c *envconf.Config, name string, expectedR
 	var pods corev1.PodList
 	return wait.For(func(ctx context.Context) (bool, error) {
 		if err := c.Client().Resources().List(ctx, &pods, resources.WithLabelSelector(label)); err != nil {
+			t.Logf("failed to list pods by label %s, %s", label, err)
 			return false, nil
 		}
 
-		if len(pods.Items) != expectedReplicas {
-			return false, nil
-		}
-
+		var readyCnt = 0
+		var unreadyPods []string
 		for _, pod := range pods.Items {
 			if !podReady(&pod) {
-				return false, nil
+				unreadyPods = append(unreadyPods, pod.Name)
+			} else {
+				readyCnt++
 			}
 		}
+		if readyCnt != expectedReplicas {
+			t.Logf("found pods(%d/%d/%d) by label(%s). unready pods: %s",
+				readyCnt, len(pods.Items), expectedReplicas, label, unreadyPods)
+			return false, nil
+		}
+
 		return true, nil
 	}, wait.WithTimeout(5*time.Minute), wait.WithInterval(10*time.Second))
 }
@@ -274,26 +281,50 @@ func getClusterEndpointHashKVs(t *testing.T, c *envconf.Config, podName string) 
 	return out
 }
 
-func verifyDataOperations(t *testing.T, c *envconf.Config, etcdClusterName, testKey, testValue string) {
+const (
+	etcdServerCertMountDir = "/etc/etcd-certs/server"
+
+	etcdServerCertFile = etcdServerCertMountDir + "/tls.crt"
+	etcdServerKeyFile  = etcdServerCertMountDir + "/tls.key"
+	etcdServerCAFile   = etcdServerCertMountDir + "/ca.crt"
+)
+
+func etcdctlCmd(podName, etcdClusterName, namespace string, tlsEnabled bool) []string {
+	args := []string{"etcdctl"}
+	if tlsEnabled {
+		endpoint := fmt.Sprintf("https://%s.%s.%s.svc.cluster.local:2379",
+			podName, etcdClusterName, namespace)
+		args = append(args,
+			"--cacert="+etcdServerCAFile,
+			"--cert="+etcdServerCertFile,
+			"--key="+etcdServerKeyFile,
+			"--endpoints="+endpoint,
+		)
+	}
+	return args
+}
+
+func verifyDataOperations(t *testing.T, c *envconf.Config, etcdClusterName, key, val string, tlsEnabled bool) {
 	podName := fmt.Sprintf("%s-0", etcdClusterName)
 
 	// Write key-value data
-	command := []string{"etcdctl", "put", testKey, testValue}
+	cmd := etcdctlCmd(podName, etcdClusterName, namespace, tlsEnabled)
+	command := append(cmd, "put", key, val)
 	_, stderr, err := execInPod(t, c, podName, namespace, command)
 	if err != nil {
 		t.Fatalf("Failed to write data: %v, stderr: %s", err, stderr)
 	}
 
 	// Read key-value data
-	command = []string{"etcdctl", "get", testKey}
+	command = append(cmd, "get", key)
 	stdout, stderr, err := execInPod(t, c, podName, namespace, command)
 	if err != nil {
 		t.Fatalf("Failed to read data: %v, stderr: %s", err, stderr)
 	}
 
 	lines := strings.Split(strings.TrimSpace(stdout), "\n")
-	if len(lines) < 2 || lines[0] != testKey || lines[1] != testValue {
-		t.Errorf("Expected key-value pair [%s=%s], but got output: %s", testKey, testValue, stdout)
+	if len(lines) < 2 || lines[0] != key || lines[1] != val {
+		t.Errorf("Expected key-value pair [%s=%s], but got output: %s", key, val, stdout)
 	}
 }
 
