@@ -13,4 +13,4 @@ spec:
     providerCfg:
       autoCfg:
         commonName: "etcd-operator-system"
-        validityDuration: 365d
+        validityDuration: 8760h

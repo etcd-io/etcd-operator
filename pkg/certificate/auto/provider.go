@@ -294,7 +294,11 @@ func (ac *Provider) createNewSecret(ctx context.Context, secretKey client.Object
 		return fmt.Errorf("validity duration converts to 0 years, must be at least 1 year")
 	}
 
-	tlsInfo, selfCertErr := transport.SelfCert(zap.NewNop(), tmpDir, hosts, validityYears)
+	// transport.SelfCert generates a self-signed cert whose ExtKeyUsage
+	// defaults to ServerAuth only. The operator reuses the server Secret
+	// as its own mTLS client identity talking with the etcd cluster.
+	// The cert must also carry ClientAuth.
+	tlsInfo, selfCertErr := transport.SelfCert(zap.NewNop(), tmpDir, hosts, validityYears, x509.ExtKeyUsageClientAuth)
 	if selfCertErr != nil {
 		return fmt.Errorf("certificate creation via transport.SelfCert failed: %w", selfCertErr)
 	}
