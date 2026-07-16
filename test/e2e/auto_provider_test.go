@@ -201,7 +201,7 @@ func TestClusterAutoCertCreation(t *testing.T) {
 	feature.Assess("Verify Data Operations",
 		func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
 			// verify etcdCluster is accessible via client certificate with put and get
-			verifyDataOperations(t, c, etcdClusterName, "test-key", "test-value")
+			verifyDataOperations(t, c, etcdClusterName, "test-key", "test-value", true)
 			return ctx
 		},
 	)
