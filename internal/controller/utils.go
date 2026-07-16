@@ -2,6 +2,8 @@ package controller
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"log"
 	"net"
@@ -127,8 +129,8 @@ func getArgName(s string) string {
 	return strings.TrimSpace(s)
 }
 
-func createArgs(name string, etcdOptions []string) []string {
-	defaultArgs := defaultArgs(name)
+func createArgs(name string, etcdOptions []string, tlsEnabled bool) []string {
+	defaultArgs := defaultArgs(name, tlsEnabled)
 	if len(etcdOptions) > 0 {
 		for i := range etcdOptions {
 			argName := getArgName(etcdOptions[i])
@@ -175,11 +177,13 @@ func createHeadlessServiceIfNotExist(ctx context.Context, logger logr.Logger, c 
 }
 
 // peerEndpointForOrdinalIndex returns the member name and peer URL for a given
-// ordinal, used both to build ETCD_INITIAL_CLUSTER and to call AddMember.
+// ordinal, used both to build ETCD_INITIAL_CLUSTER and to call AddMember. The
+// peer URL scheme reflects the cluster's TLS configuration (https when TLS is
+// configured, http otherwise).
 func peerEndpointForOrdinalIndex(ec *ecv1alpha1.EtcdCluster, index int) (string, string) {
 	name := fmt.Sprintf("%s-%d", ec.Name, index)
-	return name, fmt.Sprintf("http://%s-%d.%s.%s.svc.cluster.local:2380",
-		ec.Name, index, ec.Name, ec.Namespace)
+	return name, fmt.Sprintf("%s://%s-%d.%s.%s.svc.cluster.local:2380",
+		clusterScheme(clusterTLSEnabled(ec)), ec.Name, index, ec.Name, ec.Namespace)
 }
 
 // ---------------------------------------------------------------------------
@@ -377,6 +381,61 @@ func patchCertificateSecret(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c c
 		return fmt.Errorf("failed to update certificate secret with ownerReference: %w", err)
 	}
 	return nil
+}
+
+// verifySecretHasCA returns an error if the supplied certificate Secret lacks
+// a ca.crt data key. etcd requires --trusted-ca-file / --peer-trusted-ca-file,
+// so a Secret without the CA cannot drive a TLS-enabled cluster. The auto
+// provider always writes ca.crt; cert-manager only does so for CA-type Issuers
+// (SelfSigned/CA), so the missing-key case surfaces an actionable error rather
+// than mounting a non-existent file.
+func verifySecretHasCA(secret *corev1.Secret, provider string) error {
+	if _, ok := secret.Data[corev1.ServiceAccountRootCAKey]; !ok {
+		// corev1.ServiceAccountRootCAKey == "ca.crt".
+		return fmt.Errorf("certificate Secret %s (provider %s) is missing the ca.crt key; "+
+			"for cert-manager use a SelfSigned or CA Issuer (ACME does not emit ca.crt)",
+			secret.Name, provider)
+	}
+	return nil
+}
+
+// buildClientTLSConfig assembles the operator's TLS config from the cluster's
+// server certificate Secret. The operator reuses the server identity (tls.crt/tls.key)
+// and trusts the server CA (ca.crt), so the control plane can reach a TLS-enabled etcd client listener.
+func buildClientTLSConfig(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client) (*tls.Config, error) {
+	secret := &corev1.Secret{}
+	if err := c.Get(ctx, client.ObjectKey{Name: getServerCertName(ec.Name), Namespace: ec.Namespace}, secret); err != nil {
+		return nil, fmt.Errorf("failed to get server certificate secret for client TLS: %w", err)
+	}
+
+	if err := verifySecretHasCA(secret, ec.Spec.TLS.Provider); err != nil {
+		return nil, err
+	}
+
+	certData, ok := secret.Data[corev1.TLSCertKey]
+	if !ok || len(certData) == 0 {
+		return nil, fmt.Errorf("server certificate secret %s is missing tls.crt", secret.Name)
+	}
+	keyData, ok := secret.Data[corev1.TLSPrivateKeyKey]
+	if !ok || len(keyData) == 0 {
+		return nil, fmt.Errorf("server certificate secret %s is missing tls.key", secret.Name)
+	}
+
+	keyPair, err := tls.X509KeyPair(certData, keyData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load server keypair for client TLS: %w", err)
+	}
+
+	caPool := x509.NewCertPool()
+	if !caPool.AppendCertsFromPEM(secret.Data[corev1.ServiceAccountRootCAKey]) {
+		return nil, fmt.Errorf("failed to parse ca.crt from server certificate secret %s", secret.Name)
+	}
+
+	return &tls.Config{
+		Certificates: []tls.Certificate{keyPair},
+		RootCAs:      caPool,
+		MinVersion:   tls.VersionTLS12,
+	}, nil
 }
 
 // ---------------------------------------------------------------------------

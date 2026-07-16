@@ -286,3 +286,62 @@ func TestCreateCMCertificateConfig(t *testing.T) {
 		})
 	}
 }
+
+// ---------------------------------------------------------------------------
+// peerEndpointForOrdinalIndex — scheme reflects TLS configuration
+// ---------------------------------------------------------------------------
+
+func TestPeerEndpointForOrdinal(t *testing.T) {
+	mkCluster := func(name, namespace string, tls *ecv1alpha1.TLSCertificate) *ecv1alpha1.EtcdCluster {
+		return &ecv1alpha1.EtcdCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace, UID: "1"},
+			Spec:       ecv1alpha1.EtcdClusterSpec{TLS: tls},
+		}
+	}
+
+	httpCluster := mkCluster("test-cluster", "default", nil)
+	httpsCluster := mkCluster("test-cluster", "default", &ecv1alpha1.TLSCertificate{Provider: "auto"})
+
+	// Replace the trailing scheme expectations; the member name is scheme-agnostic.
+	const wantName = "test-cluster-0"
+	httpName, httpURL := peerEndpointForOrdinalIndex(httpCluster, 0)
+	httpsName, httpsURL := peerEndpointForOrdinalIndex(httpsCluster, 0)
+
+	assert.Equal(t, wantName, httpName)
+	assert.Equal(t, wantName, httpsName)
+
+	assert.Equal(t, "http://test-cluster-0.test-cluster.default.svc.cluster.local:2380", httpURL)
+	assert.Equal(t, "https://test-cluster-0.test-cluster.default.svc.cluster.local:2380", httpsURL)
+}
+
+// ---------------------------------------------------------------------------
+// verifySecretHasCA — error path when a cert Secret lacks ca.crt
+// ---------------------------------------------------------------------------
+
+func TestVerifySecretHasCA(t *testing.T) {
+	mkSecret := func(data map[string][]byte) *corev1.Secret {
+		return &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "x-tls", Namespace: "default"},
+			Data:       data,
+		}
+	}
+
+	t.Run("with ca.crt passes", func(t *testing.T) {
+		err := verifySecretHasCA(mkSecret(map[string][]byte{
+			"tls.crt": []byte("cert"),
+			"tls.key": []byte("key"),
+			"ca.crt":  []byte("ca"),
+		}), string(certificate.Auto))
+		assert.NoError(t, err)
+	})
+
+	t.Run("without ca.crt errors with provider hint", func(t *testing.T) {
+		err := verifySecretHasCA(mkSecret(map[string][]byte{
+			"tls.crt": []byte("cert"),
+			"tls.key": []byte("key"),
+		}), string(certificate.CertManager))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "ca.crt")
+		assert.Contains(t, err.Error(), "cert-manager")
+	})
+}
