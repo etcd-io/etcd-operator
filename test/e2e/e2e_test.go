@@ -81,7 +81,8 @@ func TestInvalidClusterSize(t *testing.T) {
 			return ctx
 		})
 
-		feature.Assess(fmt.Sprintf("etcdCluster %s should not be created when etcdCluster.Spec.Size is %d", name, size),
+		feature.Assess(
+			fmt.Sprintf("etcdCluster %s should not be created when etcdCluster.Spec.Size is %d", name, size),
 			func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
 				var etcdCluster ecv1alpha1.EtcdCluster
 				err := c.Client().Resources().Get(ctx, etcdClusterName, namespace, &etcdCluster)
@@ -245,7 +246,8 @@ func TestPodRecovery(t *testing.T) {
 				ctx,
 				&pods,
 				resources.WithLabelSelector(
-					fmt.Sprintf("app=%s", etcdClusterName)),
+					fmt.Sprintf("app=%s", etcdClusterName),
+				),
 			); err != nil {
 				t.Fatalf("Failed to get etcd PodList: %v", err)
 			}
@@ -444,7 +446,7 @@ func TestClusterHash(t *testing.T) {
 		},
 	}
 
-	clusterHash := controller.EtcdClusterHash(etcdCluster)
+	var clusterHash string
 
 	feature.Setup(func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
 		client := cfg.Client()
@@ -460,6 +462,7 @@ func TestClusterHash(t *testing.T) {
 			t.Fatalf("unable to fetch etcd cluster: %s", err)
 		}
 
+		clusterHash = controller.EtcdClusterHash(etcdCluster)
 		return ctx
 	})
 
@@ -469,7 +472,8 @@ func TestClusterHash(t *testing.T) {
 			if err := c.Client().Resources().List(
 				ctx,
 				&pods,
-				resources.WithLabelSelector(fmt.Sprintf("app=%s", etcdClusterName))); err != nil {
+				resources.WithLabelSelector(fmt.Sprintf("app=%s", etcdClusterName)),
+			); err != nil {
 				t.Fatalf("unable to retrieve the member pods with labels %s and annotation %s", "fix", "me")
 			}
 
