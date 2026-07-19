@@ -219,6 +219,7 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 
 	// Pod Scheduling specs
 	if ec.Spec.PodTemplate != nil && ec.Spec.PodTemplate.Spec != nil {
+		podSpec.SecurityContext = ec.Spec.PodTemplate.Spec.SecurityContext
 		podSpec.Affinity = ec.Spec.PodTemplate.Spec.Affinity
 		podSpec.NodeSelector = ec.Spec.PodTemplate.Spec.NodeSelector
 		podSpec.Tolerations = ec.Spec.PodTemplate.Spec.Tolerations
