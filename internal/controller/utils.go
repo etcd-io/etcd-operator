@@ -160,6 +160,19 @@ func createHeadlessServiceIfNotExist(ctx context.Context, logger logr.Logger, c 
 				Spec: corev1.ServiceSpec{
 					ClusterIP: "None",
 					Selector:  etcdClusterLabels(ec),
+					// PublishNotReadyAddresses keeps each member's Pod IP in the
+					// headless Service's DNS A record set even while the Pod is
+					// NotReady (e.g. a newly created member whose etcd process is
+					// still bootstrapping). etcd v3.6's peer-port TLS handler runs
+					// checkCertSAN, which forward-DNS-resolves the cert's DNSName
+					// and checks the connecting Pod IP against the returned A
+					// records. Without this flag CoreDNS returns only Ready Pod
+					// IPs, so a new member's own IP is absent from the lookup
+					// result, every peer handshake it initiates is rejected
+					// ("tls: \"<ip>\" does not match any of DNSNames"), its etcd
+					// bootstrap dies, and the Pod stays NotReady forever — a
+					// chicken-and-egg deadlock during cluster scale-out.
+					PublishNotReadyAddresses: true,
 				},
 			}
 			if err := controllerutil.SetControllerReference(ec, headlessSvc, scheme); err != nil {
