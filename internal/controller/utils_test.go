@@ -54,6 +54,16 @@ func TestCreateHeadlessServiceIfNotExist(t *testing.T) {
 			"app":        "test-etcd",
 			"controller": "test-etcd",
 		}, service.Spec.Selector)
+		// PublishNotReadyAddresses must be true so that during a cluster scale-out
+		// (e.g. 1->3 nodes), CoreDNS returns the NotReady new member's Pod IP in
+		// the headless Service's A record set. etcd v3.6's peer-port checkCertSAN
+		// does a forward-DNS lookup of the cert's DNSName against the connecting
+		// pod IP; without this flag, the new member's IP is missing from the
+		// lookup result, peer TLS handshake fails ("tls: \"<ip>\" does not match any
+		// of DNSNames"), etcd bootstrap dies, and the new pod never becomes Ready.
+		// See analysis in internal/controller/utils.go createHeadlessServiceIfNotExist.
+		assert.True(t, service.Spec.PublishNotReadyAddresses,
+			"headless Service for an etcd cluster MUST publish not-ready addresses; otherwise peer-bootstrap TLS hangs forever")
 		require.Len(t, service.OwnerReferences, 1)
 		assert.Equal(t, ec.Name, service.OwnerReferences[0].Name)
 	})
