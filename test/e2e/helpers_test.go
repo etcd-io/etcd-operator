@@ -21,6 +21,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"testing"
@@ -110,6 +111,9 @@ func waitForPodReadiness(t *testing.T, c *envconf.Config, name string, expectedR
 	return wait.For(func(ctx context.Context) (bool, error) {
 		if err := c.Client().Resources().List(ctx, &pods, resources.WithLabelSelector(label)); err != nil {
 			t.Logf("failed to list pods by label %s, %s", label, err)
+			for _, pod := range pods.Items {
+				dumpPodLogs(context.TODO(), t, c, &pod, 500)
+			}
 			return false, nil
 		}
 
@@ -366,4 +370,22 @@ func httpViaProxy(ctx context.Context, r *rest.Request, pod corev1.Pod, failpoin
 		Body(strings.NewReader(term)).
 		Do(ctx)
 	return result.Error()
+}
+
+// dumpPodLogs streams the last `tailLine` lines of `pod`'s log via the apiserver and pipes them into t.Logf
+func dumpPodLogs(ctx context.Context, t *testing.T, c *envconf.Config, pod *corev1.Pod, tailLine int64) {
+	t.Helper()
+	if pod == nil {
+		return
+	}
+	client := kubernetes.NewForConfigOrDie(c.Client().RESTConfig())
+	req := client.CoreV1().Pods(namespace).GetLogs(pod.Name, &corev1.PodLogOptions{TailLines: &tailLine})
+	stream, streamErr := req.Stream(ctx)
+	if streamErr != nil {
+		t.Logf("failed to stream log for pod %s/%s: %s", pod.Namespace, pod.Name, streamErr)
+		return
+	}
+	body, _ := io.ReadAll(stream)
+	_ = stream.Close()
+	t.Logf("pod %s/%s log tail:\n%s", pod.Namespace, pod.Name, string(body))
 }
