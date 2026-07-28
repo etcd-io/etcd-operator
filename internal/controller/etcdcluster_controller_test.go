@@ -34,7 +34,7 @@ import (
 
 // TestFetchAndValidateState verifies the fetchAndValidateState helper across
 // a range of conditions (missing cluster, no pods, pods owned by this cluster,
-// pods owned by a different cluster, and version-upgrade validation).
+// and pods owned by a different cluster).
 func TestFetchAndValidateState(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
@@ -129,91 +129,6 @@ func TestFetchAndValidateState(t *testing.T) {
 				assert.Equal(t, ctrl.Result{}, res)
 			},
 		},
-		{
-			name: "Valid upgrade path",
-			ec: &ecv1alpha1.EtcdCluster{
-				ObjectMeta: metav1.ObjectMeta{Name: "etcd", Namespace: "default", UID: "2"},
-				Spec:       ecv1alpha1.EtcdClusterSpec{Size: 1, Version: "3.6.17"},
-			},
-			pods: []*corev1.Pod{ownedPod("etcd", "default", "2", "3.5.17")},
-			req:  ctrl.Request{NamespacedName: types.NamespacedName{Name: "etcd", Namespace: "default"}},
-			assert: func(t *testing.T, state *reconcileState, res ctrl.Result, err error) {
-				require.NotNil(t, state)
-				assert.NoError(t, err)
-				assert.Equal(t, ctrl.Result{}, res)
-			},
-		},
-		{
-			name: "Cannot parse pod image tag",
-			ec: &ecv1alpha1.EtcdCluster{
-				ObjectMeta: metav1.ObjectMeta{Name: "etcd", Namespace: "default", UID: "2"},
-				Spec:       ecv1alpha1.EtcdClusterSpec{Size: 1, Version: "3.6.17"},
-			},
-			pods: []*corev1.Pod{ownedPod("etcd", "default", "2", "")},
-			req:  ctrl.Request{NamespacedName: types.NamespacedName{Name: "etcd", Namespace: "default"}},
-			assert: func(t *testing.T, state *reconcileState, res ctrl.Result, err error) {
-				// Image has no ":" so version can't be extracted; state is returned but no error.
-				require.NotNil(t, state)
-				assert.NoError(t, err)
-				assert.Equal(t, ctrl.Result{}, res)
-			},
-		},
-		{
-			name: "Invalid upgrade path",
-			ec: &ecv1alpha1.EtcdCluster{
-				ObjectMeta: metav1.ObjectMeta{Name: "etcd", Namespace: "default", UID: "2"},
-				Spec:       ecv1alpha1.EtcdClusterSpec{Size: 1, Version: "3.7.1"},
-			},
-			pods: []*corev1.Pod{ownedPod("etcd", "default", "2", "3.5.17")},
-			req:  ctrl.Request{NamespacedName: types.NamespacedName{Name: "etcd", Namespace: "default"}},
-			assert: func(t *testing.T, state *reconcileState, res ctrl.Result, err error) {
-				assert.Nil(t, state)
-				assert.Error(t, err)
-				assert.Equal(t, ctrl.Result{}, res)
-			},
-		},
-		{
-			name: "Downgrades are unsupported",
-			ec: &ecv1alpha1.EtcdCluster{
-				ObjectMeta: metav1.ObjectMeta{Name: "etcd", Namespace: "default", UID: "2"},
-				Spec:       ecv1alpha1.EtcdClusterSpec{Size: 1, Version: "3.5.1"},
-			},
-			pods: []*corev1.Pod{ownedPod("etcd", "default", "2", "3.6.10")},
-			req:  ctrl.Request{NamespacedName: types.NamespacedName{Name: "etcd", Namespace: "default"}},
-			assert: func(t *testing.T, state *reconcileState, res ctrl.Result, err error) {
-				assert.Nil(t, state)
-				assert.Error(t, err)
-				assert.Equal(t, ctrl.Result{}, res)
-			},
-		},
-		{
-			name: "Upgrade with non-semver versions",
-			ec: &ecv1alpha1.EtcdCluster{
-				ObjectMeta: metav1.ObjectMeta{Name: "etcd", Namespace: "default", UID: "2"},
-				Spec:       ecv1alpha1.EtcdClusterSpec{Size: 1, Version: "foo"},
-			},
-			pods: []*corev1.Pod{ownedPod("etcd", "default", "2", "bar")},
-			req:  ctrl.Request{NamespacedName: types.NamespacedName{Name: "etcd", Namespace: "default"}},
-			assert: func(t *testing.T, state *reconcileState, res ctrl.Result, err error) {
-				require.NotNil(t, state)
-				assert.NoError(t, err)
-				assert.Equal(t, ctrl.Result{}, res)
-			},
-		},
-		{
-			name: "Equal tags are a no-op even if they are not semver",
-			ec: &ecv1alpha1.EtcdCluster{
-				ObjectMeta: metav1.ObjectMeta{Name: "etcd", Namespace: "default", UID: "2"},
-				Spec:       ecv1alpha1.EtcdClusterSpec{Size: 1, Version: "bar"},
-			},
-			pods: []*corev1.Pod{ownedPod("etcd", "default", "2", "bar")},
-			req:  ctrl.Request{NamespacedName: types.NamespacedName{Name: "etcd", Namespace: "default"}},
-			assert: func(t *testing.T, state *reconcileState, res ctrl.Result, err error) {
-				require.NotNil(t, state)
-				assert.NoError(t, err)
-				assert.Equal(t, ctrl.Result{}, res)
-			},
-		},
 	}
 
 	for _, tc := range cases {
@@ -237,6 +152,103 @@ func TestFetchAndValidateState(t *testing.T) {
 
 			state, res, err := r.fetchAndValidateState(ctx, tc.req)
 			tc.assert(t, state, res, err)
+		})
+	}
+}
+
+// TestValidateSpec verifies the validateSpec helper's upgrade-path validation,
+// which checks the desired version in EtcdCluster.Spec against the version
+// currently running in the first pod's image tag.
+func TestValidateSpec(t *testing.T) {
+	// helper to build a minimal pod with a specific etcd image tag.
+	podWithImage := func(imageTag string) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "etcd-0", Namespace: "default"},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{Name: "etcd", Image: "gcr.io/etcd-development/etcd:" + imageTag},
+				},
+			},
+		}
+	}
+
+	cases := []struct {
+		name    string
+		version string
+		pods    []*corev1.Pod
+		assert  func(t *testing.T, err error)
+	}{
+		{
+			name:    "No pods yet is a no-op",
+			version: "3.5.17",
+			assert: func(t *testing.T, err error) {
+				assert.NoError(t, err)
+			},
+		},
+		{
+			name:    "Valid upgrade path",
+			version: "3.6.17",
+			pods:    []*corev1.Pod{podWithImage("3.5.17")},
+			assert: func(t *testing.T, err error) {
+				assert.NoError(t, err)
+			},
+		},
+		{
+			name:    "Cannot parse pod image tag",
+			version: "3.6.17",
+			pods:    []*corev1.Pod{podWithImage("")},
+			assert: func(t *testing.T, err error) {
+				// Image has no ":" so version can't be extracted; treated as a no-op.
+				assert.NoError(t, err)
+			},
+		},
+		{
+			name:    "Invalid upgrade path",
+			version: "3.7.1",
+			pods:    []*corev1.Pod{podWithImage("3.5.17")},
+			assert: func(t *testing.T, err error) {
+				assert.Error(t, err)
+			},
+		},
+		{
+			name:    "Downgrades are unsupported",
+			version: "3.5.1",
+			pods:    []*corev1.Pod{podWithImage("3.6.10")},
+			assert: func(t *testing.T, err error) {
+				assert.Error(t, err)
+			},
+		},
+		{
+			name:    "Upgrade with non-semver versions",
+			version: "foo",
+			pods:    []*corev1.Pod{podWithImage("bar")},
+			assert: func(t *testing.T, err error) {
+				assert.NoError(t, err)
+			},
+		},
+		{
+			name:    "Equal tags are a no-op even if they are not semver",
+			version: "bar",
+			pods:    []*corev1.Pod{podWithImage("bar")},
+			assert: func(t *testing.T, err error) {
+				assert.NoError(t, err)
+			},
+		},
+	}
+
+	r := &EtcdClusterReconciler{}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			state := &reconcileState{
+				cluster: &ecv1alpha1.EtcdCluster{
+					ObjectMeta: metav1.ObjectMeta{Name: "etcd", Namespace: "default"},
+					Spec:       ecv1alpha1.EtcdClusterSpec{Size: 1, Version: tc.version},
+				},
+				pods: tc.pods,
+			}
+			err := r.validateSpec(ctx, state)
+			tc.assert(t, err)
 		})
 	}
 }
