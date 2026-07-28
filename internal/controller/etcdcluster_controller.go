@@ -485,6 +485,14 @@ func (r *EtcdClusterReconciler) updateConditions(s *reconcileState) {
 	}
 
 	if s.sts != nil && s.memberListResp != nil && len(s.memberListResp.Members) > 0 {
+		healthyCount := 0
+		for _, health := range s.memberHealth {
+			if health.Health {
+				healthyCount++
+			}
+		}
+		totalMembers := len(s.memberListResp.Members)
+
 		// Issue a linearizable read against the cluster endpoints. A
 		// linearizable Get requires a Raft leader and quorum acknowledgement,
 		// so a successful response is sufficient proof that the cluster is
@@ -493,9 +501,9 @@ func (r *EtcdClusterReconciler) updateConditions(s *reconcileState) {
 		if etcdutils.IsClusterAvailable(eps) {
 			availableCondition.Status = metav1.ConditionTrue
 			availableCondition.Reason = "ClusterAvailable"
-			availableCondition.Message = fmt.Sprintf("Cluster is available: linearizable read succeeded (%d members)", len(s.memberListResp.Members))
+			availableCondition.Message = fmt.Sprintf("Etcd cluster is available: %d/%d members reachable, linearizable read succeeded", healthyCount, totalMembers)
 		} else {
-			availableCondition.Message = fmt.Sprintf("Cluster is unavailable: no member responded to a linearizable read (%d members)", len(s.memberListResp.Members))
+			availableCondition.Message = fmt.Sprintf("Etcd cluster is unavailable: %d/%d members reachable, no linearizable read succeeded", healthyCount, totalMembers)
 		}
 	}
 
