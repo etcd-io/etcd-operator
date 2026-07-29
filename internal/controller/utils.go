@@ -415,6 +415,12 @@ func verifySecretHasCA(secret *corev1.Secret, provider string) error {
 // buildClientTLSConfig assembles the operator's TLS config from the cluster's
 // server certificate Secret. The operator reuses the server identity (tls.crt/tls.key)
 // and trusts the server CA (ca.crt), so the control plane can reach a TLS-enabled etcd client listener.
+//
+// TODO: reusing the server certificate as the operator's client identity works
+// but conflates two distinct identities. Issue the operator its own dedicated
+// client certificate (e.g. an "operator" cert signed by the same CA, similar
+// to how createClientCertificate provisions one for external clients) instead
+// of reusing getServerCertName's Secret here.
 func buildClientTLSConfig(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client) (*tls.Config, error) {
 	secret := &corev1.Secret{}
 	if err := c.Get(ctx, client.ObjectKey{Name: getServerCertName(ec.Name), Namespace: ec.Namespace}, secret); err != nil {
