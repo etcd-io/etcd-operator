@@ -240,17 +240,24 @@ func (r *EtcdClusterReconciler) validateSpec(ctx context.Context, s *reconcileSt
 	return nil
 }
 
-// bootstrapCluster generates the client certificate (if needed) and builds the
-// operator's etcd-client TLS config from it, ensures the headless Service
-// exists, and, when no pods are present, creates the first member pod
-// (ordinal 0) to bootstrap a new cluster. A non-zero ctrl.Result requests a
-// requeue so the next loop observes the new pod.
+// bootstrapCluster generates the client/server/peer certificates (if needed),
+// builds the operator's etcd-client TLS config from the server certificate,
+// ensures the headless Service exists, and, when no pods are present,
+// creates the first member pod (ordinal 0) to bootstrap a new cluster. A
+// non-zero ctrl.Result requests a requeue so the next loop observes the new
+// pod.
 func (r *EtcdClusterReconciler) bootstrapCluster(ctx context.Context, s *reconcileState) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
 	if s.cluster.Spec.TLS != nil {
 		if err := createClientCertificate(ctx, s.cluster, r.Client); err != nil {
 			logger.Error(err, "Failed to create Client Certificate.")
+		}
+		// Server/peer certs must exist before buildReconcileClientTLS below reads
+		// the server cert Secret. createMemberPod also calls this (idempotently)
+		// once the first pod is created.
+		if err := applyEtcdMemberCerts(ctx, s.cluster, r.Client); err != nil {
+			logger.Error(err, "Failed to create server/peer certificates.")
 		}
 	} else {
 		logger.Error(nil, fmt.Sprintf(
