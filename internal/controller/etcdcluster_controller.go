@@ -50,6 +50,10 @@ type EtcdClusterReconciler struct {
 	Scheme        *runtime.Scheme
 	Recorder      events.EventRecorder
 	ImageRegistry string
+	// ServiceDNSDomain is the Kubernetes service DNS suffix used to build
+	// member FQDNs and default cert SANs. See the --service-dns-domain flag.
+	// Empty means the short form `<pod>.<svc>.<ns>.svc` is used.
+	ServiceDNSDomain string
 }
 
 // reconcileState holds all transient data for a single reconciliation loop.
@@ -165,10 +169,11 @@ func (r *EtcdClusterReconciler) fetchAndValidateState(ctx context.Context, req c
 		return nil, ctrl.Result{}, err
 	}
 
-	if ec.Spec.ImageRegistry == "" {
-		ec.Spec.ImageRegistry = r.ImageRegistry
-	}
-
+	// Apply operator-side defaults so downstream phases (hash, pod builder,
+	// cert wiring) all see consistent values regardless of which fields the
+	// user left empty. Defaults are in-memory only — the user-owned Spec is
+	// not persisted back, to avoid polluting the CR with operator policy.
+	FillEtcdClusterDefaultValues(ec, r.ImageRegistry)
 	pods, err := listOwnedPods(ctx, r.Client, ec)
 	if err != nil {
 		logger.Error(err, "Failed to list pods. Requesting requeue")
@@ -250,13 +255,13 @@ func (r *EtcdClusterReconciler) bootstrapCluster(ctx context.Context, s *reconci
 	logger := log.FromContext(ctx)
 
 	if s.cluster.Spec.TLS != nil {
-		if err := createClientCertificate(ctx, s.cluster, r.Client); err != nil {
+		if err := createClientCertificate(ctx, s.cluster, r.ServiceDNSDomain, r.Client); err != nil {
 			logger.Error(err, "Failed to create Client Certificate.")
 		}
 		// Server/peer certs must exist before buildReconcileClientTLS below reads
 		// the server cert Secret. createMemberPod also calls this (idempotently)
 		// once the first pod is created.
-		if err := applyEtcdMemberCerts(ctx, s.cluster, r.Client); err != nil {
+		if err := applyEtcdMemberCerts(ctx, s.cluster, r.ServiceDNSDomain, r.Client); err != nil {
 			logger.Error(err, "Failed to create server/peer certificates.")
 		}
 	} else {
@@ -285,7 +290,7 @@ func (r *EtcdClusterReconciler) bootstrapCluster(ctx context.Context, s *reconci
 	}
 
 	logger.Info("No member pods found, creating first member pod", "expectedSize", s.cluster.Spec.Size)
-	if err := createMemberPod(ctx, logger, r.Client, s.cluster, 0, r.Scheme); err != nil {
+	if err := createMemberPod(ctx, logger, r.Client, s.cluster, r.ServiceDNSDomain, 0, r.Scheme); err != nil {
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{RequeueAfter: requeueDuration}, nil
@@ -305,7 +310,7 @@ func (r *EtcdClusterReconciler) healthCheckAndFix(ctx context.Context, s *reconc
 	logger.Info("Now checking health of the cluster members")
 
 	var err error
-	s.memberListResp, s.memberHealth, err = healthCheck(s.cluster.Name, s.cluster.Namespace, s.pods, clusterTLSEnabled(s.cluster), s.tlsConfig, logger)
+	s.memberListResp, s.memberHealth, err = healthCheck(s.cluster.Name, s.cluster.Namespace, r.ServiceDNSDomain, s.pods, clusterTLSEnabled(s.cluster), s.tlsConfig, logger)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("health check failed: %w", err)
 	}
@@ -349,7 +354,7 @@ func (r *EtcdClusterReconciler) reconcileExceptions(ctx context.Context, s *reco
 		}
 		next := nextPodOrdinal(ordinals, s.cluster.Spec.Size)
 		logger.Info("Creating a new member pod", "cluster", s.cluster.Name, "ordinal", next)
-		if err := createMemberPod(ctx, logger, r.Client, s.cluster, next, r.Scheme); err != nil {
+		if err := createMemberPod(ctx, logger, r.Client, s.cluster, r.ServiceDNSDomain, next, r.Scheme); err != nil {
 			return ctrl.Result{}, err
 		}
 	} else {
@@ -392,7 +397,7 @@ func (r *EtcdClusterReconciler) promoteLearner(ctx context.Context, s *reconcile
 	}
 
 	logger.Info("Learner is ready to be promoted to voting member", "learnerID", learner)
-	eps := clientEndpointsFromPods(s.cluster.Name, s.cluster.Namespace, s.pods, clusterTLSEnabled(s.cluster))
+	eps := clientEndpointsFromPods(s.cluster.Name, s.cluster.Namespace, r.ServiceDNSDomain, s.pods, clusterTLSEnabled(s.cluster))
 	// Exclude the learner (last ordinal) from the endpoint list used for promotion.
 	eps = eps[:(len(eps) - 1)]
 	if err := etcdutils.PromoteLearner(etcdutils.ClientConfig{Endpoints: eps, TLS: s.tlsConfig}, learner); err != nil {
@@ -432,12 +437,12 @@ func (r *EtcdClusterReconciler) scaleCluster(ctx context.Context, s *reconcileSt
 		return ctrl.Result{}, nil
 	}
 
-	eps := clientEndpointsFromPods(s.cluster.Name, s.cluster.Namespace, s.pods, clusterTLSEnabled(s.cluster))
+	eps := clientEndpointsFromPods(s.cluster.Name, s.cluster.Namespace, r.ServiceDNSDomain, s.pods, clusterTLSEnabled(s.cluster))
 
 	if currentPodCount < desiredSize {
 		// Scale out: add a new learner member to etcd, then create its pod.
 		nextOrdinal := int(currentPodCount)
-		_, peerURL := peerEndpointForOrdinalIndex(s.cluster, nextOrdinal)
+		_, peerURL := peerEndpointForOrdinalIndex(s.cluster, r.ServiceDNSDomain, nextOrdinal)
 		logger.Info("[Scale out] adding a new learner member to etcd cluster", "peerURL", peerURL)
 		if _, err := etcdutils.AddMember(etcdutils.ClientConfig{Endpoints: eps, TLS: s.tlsConfig}, []string{peerURL}, true); err != nil {
 			return ctrl.Result{}, err
@@ -446,7 +451,7 @@ func (r *EtcdClusterReconciler) scaleCluster(ctx context.Context, s *reconcileSt
 
 		// gofail: var exceptionAfterMemberAdd struct{}
 
-		if err := createMemberPod(ctx, logger, r.Client, s.cluster, nextOrdinal, r.Scheme); err != nil {
+		if err := createMemberPod(ctx, logger, r.Client, s.cluster, r.ServiceDNSDomain, nextOrdinal, r.Scheme); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{RequeueAfter: requeueDuration}, nil

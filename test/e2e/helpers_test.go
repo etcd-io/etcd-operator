@@ -293,11 +293,23 @@ const (
 	etcdServerCAFile   = etcdServerCertMountDir + "/ca.crt"
 )
 
-func etcdctlCmd(podName, etcdClusterName, namespace string, tlsEnabled bool) []string {
+// memberDNSSuffix mirrors internal/controller.memberDNSSuffix: the trailing
+// segment appended to "<pod>.<sts>.<ns>." when building an etcd member FQDN.
+// Kept in sync by hand because the e2e package cannot import the unexported
+// helper. When dnsDomain is empty (the operator's default), the suffix is
+// "svc"; otherwise it is "svc.<dnsDomain>".
+func memberDNSSuffix(dnsDomain string) string {
+	if dnsDomain == "" {
+		return "svc"
+	}
+	return "svc." + dnsDomain
+}
+
+func etcdctlCmd(podName, etcdClusterName, namespace, dnsDomain string, tlsEnabled bool) []string {
 	args := []string{"etcdctl"}
 	if tlsEnabled {
-		endpoint := fmt.Sprintf("https://%s.%s.%s.svc.cluster.local:2379",
-			podName, etcdClusterName, namespace)
+		endpoint := fmt.Sprintf("https://%s.%s.%s.%s:2379",
+			podName, etcdClusterName, namespace, memberDNSSuffix(dnsDomain))
 		args = append(args,
 			"--cacert="+etcdServerCAFile,
 			"--cert="+etcdServerCertFile,
@@ -308,11 +320,12 @@ func etcdctlCmd(podName, etcdClusterName, namespace string, tlsEnabled bool) []s
 	return args
 }
 
-func verifyDataOperations(t *testing.T, c *envconf.Config, etcdClusterName, key, val string, tlsEnabled bool) {
+func verifyDataOperations(t *testing.T, c *envconf.Config,
+	etcdClusterName, key, val, dnsDomain string, tlsEnabled bool) {
 	podName := fmt.Sprintf("%s-0", etcdClusterName)
 
 	// Write key-value data
-	cmd := etcdctlCmd(podName, etcdClusterName, namespace, tlsEnabled)
+	cmd := etcdctlCmd(podName, etcdClusterName, namespace, dnsDomain, tlsEnabled)
 	command := append(cmd, "put", key, val)
 	_, stderr, err := execInPod(t, c, podName, namespace, command)
 	if err != nil {
@@ -330,6 +343,18 @@ func verifyDataOperations(t *testing.T, c *envconf.Config, etcdClusterName, key,
 	if len(lines) < 2 || lines[0] != key || lines[1] != val {
 		t.Errorf("Expected key-value pair [%s=%s], but got output: %s", key, val, stdout)
 	}
+}
+
+// operatorServiceDNSDomain returns the value of the --service-dns-domain
+// flag configured on the running etcd-operator-controller-manager Deployment.
+// The flag value is captured once in TestMain after `make deploy` and stashed
+// in ctx under serviceDNSDomainKey, so this helper is a pure ctx lookup with
+// no per-call API request. Returns "" when the flag is absent (the operator's
+// default), which the controller mirrors as the short `svc` FQDN suffix.
+func operatorServiceDNSDomain(t *testing.T, ctx context.Context) string {
+	t.Helper()
+	v, _ := ctx.Value(serviceDNSDomainKey).(string)
+	return v
 }
 
 const (

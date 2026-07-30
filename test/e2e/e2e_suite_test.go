@@ -22,6 +22,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"strings"
 	"testing"
 	"time"
 
@@ -37,6 +38,18 @@ import (
 
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 	test_utils "go.etcd.io/etcd-operator/test/utils"
+)
+
+// ctxKey is a private type for context.WithValue keys so they cannot collide
+// with keys defined in other packages.
+type ctxKey int
+
+const (
+	// serviceDNSDomainKey stores the value of the operator's --service-dns-domain
+	// flag, captured once from the running controller-manager Deployment after
+	// `make deploy` in TestMain. Tests read it via operatorServiceDNSDomain
+	// instead of repeatedly calling the API.
+	serviceDNSDomainKey ctxKey = iota
 )
 
 var (
@@ -144,6 +157,27 @@ func TestMain(m *testing.M) {
 			_ = corev1.AddToScheme(client.Resources().GetScheme())
 			_ = metav1.AddMetaToScheme(client.Resources().GetScheme())
 			_ = ecv1alpha1.AddToScheme(client.Resources().GetScheme())
+
+			// Capture the operator's --service-dns-domain flag value once and
+			// stash it in ctx so tests can read it without a per-call API Get.
+			// The operator's --image-registry is not captured here because its
+			// value is reflected in controller.DefaultImageRegistry; tests
+			// pass that constant directly to FillEtcdClusterDefaultValues.
+			var (
+				deployment appsv1.Deployment
+				dnsDomain  string
+			)
+			if err := client.Resources().Get(ctx, "etcd-operator-controller-manager", namespace, &deployment); err != nil {
+				log.Printf("Failed to get etcd-operator deployment for --service-dns-domain: %s", err)
+				return ctx, err
+			}
+			for _, arg := range deployment.Spec.Template.Spec.Containers[0].Args {
+				if value, ok := strings.CutPrefix(arg, "--service-dns-domain="); ok {
+					dnsDomain = value
+					break
+				}
+			}
+			ctx = context.WithValue(ctx, serviceDNSDomainKey, dnsDomain)
 
 			return ctx, nil
 		},

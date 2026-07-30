@@ -31,7 +31,7 @@ func TestEtcdClusterHash(t *testing.T) {
 	}
 
 	// Calculate base hash once to use as a benchmark in assertions
-	baseHash := EtcdClusterHash(baseCluster)
+	baseHash := EtcdClusterHash(baseCluster, "")
 
 	// Helper inline functions to generate mutated clusters cleanly
 	withSize := func(size int) *v1alpha1.EtcdCluster {
@@ -48,6 +48,15 @@ func TestEtcdClusterHash(t *testing.T) {
 	withOptionsChanged := func() *v1alpha1.EtcdCluster {
 		c := baseCluster.DeepCopy()
 		c.Spec.EtcdOptions = []string{"--auto-compaction-retention=1", "--max-txn-ops=10000"}
+		return c
+	}
+	withImageRegistryChanged := func() *v1alpha1.EtcdCluster {
+		// ImageRegistry is a user-declarable spec field, so changing it must
+		// trigger a pod roll via hash divergence. Operator-side defaults
+		// (FillEtcdClusterDefaultValues) are not exercised here on purpose —
+		// the unit test treats the input as already post-fill.
+		c := baseCluster.DeepCopy()
+		c.Spec.ImageRegistry = "registry.example.com/etcd"
 		return c
 	}
 	withNilTemplate := func() *v1alpha1.EtcdCluster {
@@ -101,12 +110,17 @@ func TestEtcdClusterHash(t *testing.T) {
 			cluster:     withVersionChanged(),
 			expectEqual: true,
 		},
+		{
+			name:        "Core Spec Change - Modifying ImageRegistry must force a brand new hash",
+			cluster:     withImageRegistryChanged(),
+			expectEqual: false,
+		},
 	}
 
 	// Loop through the table executing each row in isolation
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			currentHash := EtcdClusterHash(tt.cluster)
+			currentHash := EtcdClusterHash(tt.cluster, "")
 
 			if tt.checkLength {
 				assert.Len(t, currentHash, hashLength, "Hash must respect the %d-character limit constraint", hashLength)
