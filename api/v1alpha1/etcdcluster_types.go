@@ -61,6 +61,8 @@ type PodSpec struct {
 	Affinity     *corev1.Affinity    `json:"affinity,omitempty"`
 	NodeSelector map[string]string   `json:"nodeSelector,omitempty"`
 	Tolerations  []corev1.Toleration `json:"tolerations,omitempty"`
+	// Resources sets CPU/memory requests and limits on the etcd container.
+	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
 }
 
 type PodMetadata struct {
