@@ -381,6 +381,15 @@ func buildMemberPod(
 		podSpec.Affinity = ec.Spec.PodTemplate.Spec.Affinity
 		podSpec.NodeSelector = ec.Spec.PodTemplate.Spec.NodeSelector
 		podSpec.Tolerations = ec.Spec.PodTemplate.Spec.Tolerations
+
+		// Container-level customization: CPU/memory on the etcd container.
+		if ec.Spec.PodTemplate.Spec.Resources != nil {
+			requests := ec.Spec.PodTemplate.Spec.Resources.Requests
+			podSpec.Containers[0].Resources = corev1.ResourceRequirements{
+				Requests: requests.DeepCopy(),
+				Limits:   requests.DeepCopy(),
+			}
+		}
 	}
 
 	// Persistent storage volumes.
