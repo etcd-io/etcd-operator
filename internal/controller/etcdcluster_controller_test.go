@@ -373,3 +373,46 @@ func TestBootstrapCluster(t *testing.T) {
 		assert.Equal(t, "None", svc.Spec.ClusterIP)
 	})
 }
+
+// TestServiceDNSDomainPlumbsThroughBuildMemberPod verifies that the
+// value held in EtcdClusterReconciler.ServiceDNSDomain is what ends up in
+// the Pod's --advertise-* URLs. This is the controller-level wiring check
+// that guarantees the flag actually flows into the Pod template, separate
+// from the unit test on buildMemberPod alone.
+func TestServiceDNSDomainPlumbsThroughBuildMemberPod(t *testing.T) {
+	tests := []struct {
+		name       string
+		domain     string
+		wantPeer   string
+		wantClient string
+	}{
+		{
+			name:       "empty domain uses short form",
+			domain:     "",
+			wantPeer:   "http://$(POD_NAME).example.$(POD_NAMESPACE).svc:2380",
+			wantClient: "http://$(POD_NAME).example.$(POD_NAMESPACE).svc:2379",
+		},
+		{
+			name:       "custom domain uses full form",
+			domain:     "corp.local",
+			wantPeer:   "http://$(POD_NAME).example.$(POD_NAMESPACE).svc.corp.local:2380",
+			wantClient: "http://$(POD_NAME).example.$(POD_NAMESPACE).svc.corp.local:2379",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &EtcdClusterReconciler{ServiceDNSDomain: tt.domain}
+			ec := &ecv1alpha1.EtcdCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default", UID: "abc"},
+				Spec:       ecv1alpha1.EtcdClusterSpec{Size: 3, Version: "3.5.17"},
+			}
+			pod := buildMemberPod(ec, "example-0", r.ServiceDNSDomain, etcdClusterStateNew, "ignored")
+			args := ""
+			for _, a := range pod.Spec.Containers[0].Args {
+				args += a + "\n"
+			}
+			assert.Contains(t, args, "--initial-advertise-peer-urls="+tt.wantPeer)
+			assert.Contains(t, args, "--advertise-client-urls="+tt.wantClient)
+		})
+	}
+}

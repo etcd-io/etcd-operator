@@ -42,14 +42,6 @@ func TestEtcdOptions(t *testing.T) {
 
 	const etcdClusterName = "example"
 	const namespace = "etcd-test"
-	expectedArgs := []string{
-		"--name=$(POD_NAME)",
-		"--listen-peer-urls=http://0.0.0.0:2380",
-		"--listen-client-urls=http://0.0.0.0:2379",
-		"--initial-advertise-peer-urls=http://$(POD_NAME).example.$(POD_NAMESPACE).svc.cluster.local:2380",
-		"--advertise-client-urls=http://$(POD_NAME).example.$(POD_NAMESPACE).svc.cluster.local:2379",
-		"--experimental-peer-skip-client-san-verification",
-	}
 
 	etcdCluster := &ecv1alpha1.EtcdCluster{
 		TypeMeta: metav1.TypeMeta{
@@ -109,6 +101,21 @@ func TestEtcdOptions(t *testing.T) {
 
 	feature.Assess("Check etcd options are configured",
 		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+			// Mirror the controller's memberDNSSuffix behavior so we expect the
+			// exact FQDN form the operator produced: the short `<svc>` suffix
+			// when --service-dns-domain is empty, and `svc.<domain>` otherwise.
+			suffix := "svc"
+			if dnsDomain := operatorServiceDNSDomain(t, ctx); dnsDomain != "" {
+				suffix = "svc." + dnsDomain
+			}
+			expectedArgs := []string{
+				"--name=$(POD_NAME)",
+				"--listen-peer-urls=http://0.0.0.0:2380",
+				"--listen-client-urls=http://0.0.0.0:2379",
+				"--initial-advertise-peer-urls=http://$(POD_NAME)." + etcdClusterName + ".$(POD_NAMESPACE)." + suffix + ":2380",
+				"--advertise-client-urls=http://$(POD_NAME)." + etcdClusterName + ".$(POD_NAMESPACE)." + suffix + ":2379",
+				"--experimental-peer-skip-client-san-verification",
+			}
 			client := cfg.Client()
 			var pods corev1.PodList
 			if err := client.Resources().List(

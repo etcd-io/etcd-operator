@@ -30,7 +30,35 @@ import (
 const (
 	etcdDataDir = "/var/lib/etcd"
 	volumeName  = "etcd-data"
+
+	DefaultImageRegistry = "gcr.io/etcd-development/etcd"
 )
+
+// memberDNSSuffix returns the trailing DNS segment that should be appended
+// to a member FQDN, produced by the operator. The caller is responsible for
+// the "{pod}.{sts}.{ns}." prefix; this function returns only the suffix.
+//
+// When the operator's --service-dns-domain flag is empty (the default), the
+// suffix is "svc" and the full FQDN has the short, search-path-resolvable
+// form `<pod>.<svc>.<ns>.svc`. When set, the suffix is "svc.<dnsDomain>" and
+// the full FQDN is `<pod>.<svc>.<ns>.svc.<dnsDomain>`.
+//
+// The same helper is used for both URL construction and cert SAN
+// generation so that the two stay in sync by construction.
+func memberDNSSuffix(dnsDomain string) string {
+	if dnsDomain == "" {
+		return "svc"
+	}
+	return "svc." + dnsDomain
+}
+
+// FillEtcdClusterDefaultValues mutates `ec` in place to apply operator-side
+// defaults for any EtcdClusterSpec field that the user left empty.
+func FillEtcdClusterDefaultValues(ec *ecv1alpha1.EtcdCluster, defaultImageRegistry string) {
+	if ec.Spec.ImageRegistry == "" {
+		ec.Spec.ImageRegistry = defaultImageRegistry
+	}
+}
 
 type etcdClusterState string
 
@@ -129,8 +157,8 @@ func getArgName(s string) string {
 	return strings.TrimSpace(s)
 }
 
-func createArgs(name string, etcdOptions []string, tlsEnabled bool) []string {
-	defaultArgs := defaultArgs(name, tlsEnabled)
+func createArgs(name string, etcdOptions []string, dnsDomain string, tlsEnabled bool) []string {
+	defaultArgs := defaultArgs(name, dnsDomain, tlsEnabled)
 	if len(etcdOptions) > 0 {
 		for i := range etcdOptions {
 			argName := getArgName(etcdOptions[i])
@@ -192,11 +220,12 @@ func createHeadlessServiceIfNotExist(ctx context.Context, logger logr.Logger, c 
 // peerEndpointForOrdinalIndex returns the member name and peer URL for a given
 // ordinal, used both to build ETCD_INITIAL_CLUSTER and to call AddMember. The
 // peer URL scheme reflects the cluster's TLS configuration (https when TLS is
-// configured, http otherwise).
-func peerEndpointForOrdinalIndex(ec *ecv1alpha1.EtcdCluster, index int) (string, string) {
+// configured, http otherwise). The dnsDomain argument is the operator's
+// configured Kubernetes service DNS suffix (see --service-dns-domain).
+func peerEndpointForOrdinalIndex(ec *ecv1alpha1.EtcdCluster, dnsDomain string, index int) (string, string) {
 	name := fmt.Sprintf("%s-%d", ec.Name, index)
-	return name, fmt.Sprintf("%s://%s-%d.%s.%s.svc.cluster.local:2380",
-		clusterScheme(clusterTLSEnabled(ec)), ec.Name, index, ec.Name, ec.Namespace)
+	return name, fmt.Sprintf("%s://%s-%d.%s.%s.%s:2380",
+		clusterScheme(clusterTLSEnabled(ec)), ec.Name, index, ec.Name, ec.Namespace, memberDNSSuffix(dnsDomain))
 }
 
 // ---------------------------------------------------------------------------
@@ -226,7 +255,7 @@ func parseValidityDuration(customizedDuration string, defaultDuration time.Durat
 	return duration, nil
 }
 
-func createCMCertificateConfig(ec *ecv1alpha1.EtcdCluster) (*certInterface.Config, error) {
+func createCMCertificateConfig(ec *ecv1alpha1.EtcdCluster, dnsDomain string) (*certInterface.Config, error) {
 	cmConfig := ec.Spec.TLS.ProviderCfg.CertManagerCfg
 	if cmConfig == nil {
 		return nil, fmt.Errorf("cert-manager configuration is not present")
@@ -244,9 +273,10 @@ func createCMCertificateConfig(ec *ecv1alpha1.EtcdCluster) (*certInterface.Confi
 			IPs:      make([]net.IP, len(cmConfig.AltNames.DNSNames)),
 		}
 	} else {
+		suffix := memberDNSSuffix(dnsDomain)
 		defaultDNSNames := []string{
-			fmt.Sprintf("*.%s.%s.%s", ec.Name, ec.Namespace, certInterface.DefaultDomainName),
-			fmt.Sprintf("%s.%s.%s", ec.Name, ec.Namespace, certInterface.DefaultDomainName),
+			fmt.Sprintf("*.%s.%s.%s", ec.Name, ec.Namespace, suffix),
+			fmt.Sprintf("%s.%s.%s", ec.Name, ec.Namespace, suffix),
 		}
 		getAltNames = certInterface.AltNames{DNSNames: defaultDNSNames}
 	}
@@ -263,12 +293,13 @@ func createCMCertificateConfig(ec *ecv1alpha1.EtcdCluster) (*certInterface.Confi
 	}, nil
 }
 
-func createAutoCertificateConfig(ec *ecv1alpha1.EtcdCluster) (*certInterface.Config, error) {
+func createAutoCertificateConfig(ec *ecv1alpha1.EtcdCluster, dnsDomain string) (*certInterface.Config, error) {
 	autoConfig := ec.Spec.TLS.ProviderCfg.AutoCfg
 	if autoConfig == nil {
+		suffix := memberDNSSuffix(dnsDomain)
 		autoConfig = &ecv1alpha1.ProviderAutoConfig{
 			CommonConfig: ecv1alpha1.CommonConfig{
-				CommonName:       fmt.Sprintf("%s.%s.%s", ec.Name, ec.Namespace, certInterface.DefaultDomainName),
+				CommonName:       fmt.Sprintf("%s.%s.%s", ec.Name, ec.Namespace, suffix),
 				ValidityDuration: certInterface.DefaultAutoValidity.String(),
 			},
 		}
@@ -286,9 +317,10 @@ func createAutoCertificateConfig(ec *ecv1alpha1.EtcdCluster) (*certInterface.Con
 			IPs:      make([]net.IP, len(autoConfig.AltNames.DNSNames)),
 		}
 	} else {
+		suffix := memberDNSSuffix(dnsDomain)
 		defaultDNSNames := []string{
-			fmt.Sprintf("*.%s.%s.%s", ec.Name, ec.Namespace, certInterface.DefaultDomainName),
-			fmt.Sprintf("%s.%s.%s", ec.Name, ec.Namespace, certInterface.DefaultDomainName),
+			fmt.Sprintf("*.%s.%s.%s", ec.Name, ec.Namespace, suffix),
+			fmt.Sprintf("%s.%s.%s", ec.Name, ec.Namespace, suffix),
 		}
 		altNames = certInterface.AltNames{DNSNames: defaultDNSNames}
 	}
@@ -301,7 +333,7 @@ func createAutoCertificateConfig(ec *ecv1alpha1.EtcdCluster) (*certInterface.Con
 	}, nil
 }
 
-func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client.Client, certName string) error {
+func createCertificate(ec *ecv1alpha1.EtcdCluster, dnsDomain string, ctx context.Context, c client.Client, certName string) error {
 	providerName := ec.Spec.TLS.Provider
 	if providerName == "" {
 		providerName = string(certificate.Auto)
@@ -319,7 +351,7 @@ func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client
 
 			switch certificate.ProviderType(providerName) {
 			case certificate.Auto:
-				autoConfig, err := createAutoCertificateConfig(ec)
+				autoConfig, err := createAutoCertificateConfig(ec, dnsDomain)
 				if err != nil {
 					return fmt.Errorf("error creating auto certificate config: %w", err)
 				}
@@ -328,7 +360,7 @@ func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client
 				}
 				return nil
 			case certificate.CertManager:
-				cmConfig, err := createCMCertificateConfig(ec)
+				cmConfig, err := createCMCertificateConfig(ec, dnsDomain)
 				if err != nil {
 					return fmt.Errorf("error creating cert-manager certificate config: %w", err)
 				}
@@ -346,36 +378,36 @@ func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client
 	return nil
 }
 
-func createClientCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client) error {
+func createClientCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, dnsDomain string, c client.Client) error {
 	certName := getClientCertName(ec.Name)
-	if err := createCertificate(ec, ctx, c, certName); err != nil {
+	if err := createCertificate(ec, dnsDomain, ctx, c, certName); err != nil {
 		return err
 	}
 	return patchCertificateSecret(ctx, ec, c, certName)
 }
 
-func createServerCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client) error {
+func createServerCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, dnsDomain string, c client.Client) error {
 	serverCertName := getServerCertName(ec.Name)
-	if err := createCertificate(ec, ctx, c, serverCertName); err != nil {
+	if err := createCertificate(ec, dnsDomain, ctx, c, serverCertName); err != nil {
 		return err
 	}
 	return patchCertificateSecret(ctx, ec, c, serverCertName)
 }
 
-func createPeerCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client) error {
+func createPeerCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, dnsDomain string, c client.Client) error {
 	peerCertName := getPeerCertName(ec.Name)
-	if err := createCertificate(ec, ctx, c, peerCertName); err != nil {
+	if err := createCertificate(ec, dnsDomain, ctx, c, peerCertName); err != nil {
 		return err
 	}
 	return patchCertificateSecret(ctx, ec, c, peerCertName)
 }
 
-func applyEtcdMemberCerts(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client) error {
+func applyEtcdMemberCerts(ctx context.Context, ec *ecv1alpha1.EtcdCluster, dnsDomain string, c client.Client) error {
 	if ec.Spec.TLS != nil {
-		if err := createServerCertificate(ctx, ec, c); err != nil {
+		if err := createServerCertificate(ctx, ec, dnsDomain, c); err != nil {
 			return err
 		}
-		return createPeerCertificate(ctx, ec, c)
+		return createPeerCertificate(ctx, ec, dnsDomain, c)
 	}
 	return nil
 }

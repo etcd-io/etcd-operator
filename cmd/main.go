@@ -64,8 +64,9 @@ func main() {
 	var probeAddr string
 	var secureMetrics bool
 	var enableHTTP2 bool
+	var serviceDNSDomain string
 	var tlsOpts []func(*tls.Config)
-	flag.StringVar(&imageRegistry, "image-registry", "gcr.io/etcd-development/etcd",
+	flag.StringVar(&imageRegistry, "image-registry", controller.DefaultImageRegistry,
 		"The container registry to pull etcd images from. Defaults to gcr.io/etcd-development/etcd.")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -77,6 +78,11 @@ func main() {
 		"If set, the metrics endpoint is served securely via HTTPS. Use --metrics-secure=false to use HTTP instead.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
+	flag.StringVar(&serviceDNSDomain, "service-dns-domain", "",
+		"Kubernetes service DNS suffix used to build member FQDNs. "+
+			"Empty (the default) uses the short form <pod>.<svc>.<ns>.svc, "+
+			"resolvable via the pod's DNS search path. "+
+			"Set this to the kubelet's --cluster-domain value to use the full FQDN form <pod>.<svc>.<ns>.svc.<domain>.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -151,9 +157,10 @@ func main() {
 	}
 
 	if err = (&controller.EtcdClusterReconciler{
-		Client:        mgr.GetClient(),
-		Scheme:        mgr.GetScheme(),
-		ImageRegistry: imageRegistry,
+		Client:           mgr.GetClient(),
+		Scheme:           mgr.GetScheme(),
+		ImageRegistry:    imageRegistry,
+		ServiceDNSDomain: serviceDNSDomain,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "EtcdCluster")
 		os.Exit(1)
