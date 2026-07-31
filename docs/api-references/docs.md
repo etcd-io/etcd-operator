@@ -32,7 +32,7 @@ _Appears in:_
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `dnsNames` _string array_ | DNSNames is the expected array of DNS subject alternative names.<br />if empty defaults to $(POD_NAME).$(ETCD_CLUSTER_NAME).$(POD_NAMESPACE).svc.cluster.local |  | Optional: \{\} <br /> |
-| `ipAddresses` _IP array_ | IPs is the expected array of IP address subject alternative names. |  | Optional: \{\} <br /> |
+| `ipAddresses` _IP array_ | IPs is the expected array of IP address subject alternative names. |  | items:Type: string <br />Optional: \{\} <br /> |
 
 
 #### CommonConfig
@@ -286,6 +286,7 @@ _Appears in:_
 | `affinity` _[Affinity](https://kubernetes.io/docs/reference/generated/kubernetes-api/v/#affinity-v1-core)_ |  |  |  |
 | `nodeSelector` _object (keys:string, values:string)_ |  |  |  |
 | `tolerations` _[Toleration](https://kubernetes.io/docs/reference/generated/kubernetes-api/v/#toleration-v1-core) array_ |  |  |  |
+| `resources` _[ResourceRequirements](#resourcerequirements)_ | Resources sets equal CPU/memory requests and limits on the etcd container for Guaranteed QoS. |  | Optional: \{\} <br /> |
 
 
 #### PodTemplate
@@ -378,6 +379,22 @@ _Appears in:_
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `survivor` _integer_ | Survivor is the ordinal of the member that becomes the new<br />single-member cluster. For now it is only ever specified by a human<br />operator, through the operator.etcd.io/recover-cluster-from<br />annotation on the EtcdCluster; automatic recovery isn't supported.<br />This is a decision, not something re-derivable live once other<br />members are gone, and terminating every other member needs to know<br />exactly which one to spare. |  |  |
+
+
+#### ResourceRequirements
+
+
+
+ResourceRequirements configures the etcd container's Guaranteed resource allocation.
+
+
+
+_Appears in:_
+- [PodSpec](#podspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `requests` _[ResourceList](https://kubernetes.io/docs/reference/generated/kubernetes-api/v/#resourcelist-v1-core)_ | Requests specifies the CPU and memory quantities for the etcd container.<br />If resources is set, both cpu and memory must be provided and positive.<br />They are copied to the container's requests and limits; other resources<br />are not supported for now. |  | MaxProperties: 2 <br /> |
 
 
 #### StorageSpec

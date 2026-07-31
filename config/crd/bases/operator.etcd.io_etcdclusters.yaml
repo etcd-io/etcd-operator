@@ -3,7 +3,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.22.0
+    controller-gen.kubebuilder.io/version: v0.23.0
   name: etcdclusters.operator.etcd.io
 spec:
   group: operator.etcd.io
@@ -1016,6 +1016,34 @@ spec:
                       nodeSelector:
                         additionalProperties:
                           type: string
+                        type: object
+                      resources:
+                        description: Resources sets equal CPU/memory requests and
+                          limits on the etcd container for Guaranteed QoS.
+                        properties:
+                          requests:
+                            additionalProperties:
+                              anyOf:
+                              - type: integer
+                              - type: string
+                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                              x-kubernetes-int-or-string: true
+                            description: |-
+                              Requests specifies the CPU and memory quantities for the etcd container.
+                              If resources is set, both cpu and memory must be provided and positive.
+                              They are copied to the container's requests and limits; other resources
+                              are not supported for now.
+                            maxProperties: 2
+                            type: object
+                            x-kubernetes-validations:
+                            - message: requests must include both cpu and memory
+                              rule: '''cpu'' in self && ''memory'' in self'
+                            - message: only cpu and memory requests are supported
+                              rule: self.all(k, k in ['cpu', 'memory'])
+                            - message: requests must be positive resource quantities
+                              rule: self.all(k, isQuantity(string(self[k])) && quantity(string(self[k])).isGreaterThan(quantity('0')))
+                        required:
+                        - requests
                         type: object
                       tolerations:
                         items:

@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -1029,4 +1030,89 @@ func TestBuildMemberPodAdvertiseURLsHonorsServiceDNSDomain(t *testing.T) {
 			assert.Contains(t, args, "--advertise-client-urls="+tc.wantClient)
 		})
 	}
+}
+
+func TestBuildMemberPodResources(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+	require.NoError(t, ecv1alpha1.AddToScheme(scheme))
+
+	mkCluster := func(resources *ecv1alpha1.ResourceRequirements) *ecv1alpha1.EtcdCluster {
+		return &ecv1alpha1.EtcdCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: "rs-cluster", Namespace: "default", UID: "1"},
+			Spec: ecv1alpha1.EtcdClusterSpec{
+				Size:    3,
+				Version: "3.5.17",
+				PodTemplate: &ecv1alpha1.PodTemplate{
+					Spec: &ecv1alpha1.PodSpec{
+						Resources: resources,
+					},
+				},
+			},
+		}
+	}
+
+	buildPod := func(t *testing.T, ec *ecv1alpha1.EtcdCluster) *corev1.Pod {
+		t.Helper()
+		pod, err := buildMemberPod(ec, testMemberForCluster(ec, 0), "", etcdClusterStateNew, "ignored", scheme)
+		require.NoError(t, err)
+		return pod
+	}
+
+	t.Run("Resources unset → etcd container has zero-value Resources", func(t *testing.T) {
+		ec := mkCluster(nil)
+		pod := buildPod(t, ec)
+
+		assert.Equal(t, corev1.ResourceRequirements{}, pod.Spec.Containers[0].Resources,
+			"etcd container must have no Resources block when PodSpec.Resources is nil")
+	})
+
+	t.Run("Resources requests produce matching limits", func(t *testing.T) {
+		want := ecv1alpha1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("100m"),
+				corev1.ResourceMemory: resource.MustParse("256Mi"),
+			},
+		}
+		ec := mkCluster(&want)
+		pod := buildPod(t, ec)
+
+		assert.Equal(t, want.Requests, pod.Spec.Containers[0].Resources.Requests)
+		assert.Equal(t, want.Requests, pod.Spec.Containers[0].Resources.Limits)
+	})
+
+	t.Run("Resources maps are independent of the cluster and each other", func(t *testing.T) {
+		want := ecv1alpha1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("100m"),
+				corev1.ResourceMemory: resource.MustParse("256Mi"),
+			},
+		}
+		ec := mkCluster(&want)
+		pod := buildPod(t, ec)
+
+		got := pod.Spec.Containers[0].Resources
+		assert.Equal(t, want.Requests, got.Requests)
+		got.Requests[corev1.ResourceCPU] = resource.MustParse("2")
+		assert.Equal(t, resource.MustParse("100m"), ec.Spec.PodTemplate.Spec.Resources.Requests[corev1.ResourceCPU])
+		assert.Equal(t, resource.MustParse("100m"), got.Limits[corev1.ResourceCPU])
+		got.Limits[corev1.ResourceMemory] = resource.MustParse("1Gi")
+		assert.Equal(t, resource.MustParse("256Mi"), ec.Spec.PodTemplate.Spec.Resources.Requests[corev1.ResourceMemory])
+	})
+
+	t.Run("PodTemplate nil → no Resources written", func(t *testing.T) {
+		ec := mkCluster(nil)
+		ec.Spec.PodTemplate = nil
+		pod := buildPod(t, ec)
+
+		assert.Equal(t, corev1.ResourceRequirements{}, pod.Spec.Containers[0].Resources)
+	})
+
+	t.Run("PodTemplate.Spec nil → no Resources written", func(t *testing.T) {
+		ec := mkCluster(nil)
+		ec.Spec.PodTemplate.Spec = nil
+		pod := buildPod(t, ec)
+
+		assert.Equal(t, corev1.ResourceRequirements{}, pod.Spec.Containers[0].Resources)
+	})
 }
