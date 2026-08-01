@@ -50,6 +50,13 @@ func TestEtcdClusterHash(t *testing.T) {
 		c.Spec.EtcdOptions = []string{"--auto-compaction-retention=1", "--max-txn-ops=10000"}
 		return c
 	}
+	withImageRegistryChanged := func() *v1alpha1.EtcdCluster {
+		// ImageRegistry is a user-declarable spec field, so changing it must
+		// trigger a pod roll via hash divergence.
+		c := baseCluster.DeepCopy()
+		c.Spec.ImageRegistry = "registry.example.com/etcd"
+		return c
+	}
 	withNilTemplate := func() *v1alpha1.EtcdCluster {
 		c := baseCluster.DeepCopy()
 		c.Spec.PodTemplate = nil
@@ -100,6 +107,11 @@ func TestEtcdClusterHash(t *testing.T) {
 			name:        "Version check - Modifying etcd version must NOT change the hash",
 			cluster:     withVersionChanged(),
 			expectEqual: true,
+		},
+		{
+			name:        "Core Spec Change - Modifying ImageRegistry must force a brand new hash",
+			cluster:     withImageRegistryChanged(),
+			expectEqual: false,
 		},
 	}
 
