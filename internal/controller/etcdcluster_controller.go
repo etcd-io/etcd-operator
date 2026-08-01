@@ -165,9 +165,10 @@ func (r *EtcdClusterReconciler) fetchAndValidateState(ctx context.Context, req c
 		return nil, ctrl.Result{}, err
 	}
 
-	if ec.Spec.ImageRegistry == "" {
-		ec.Spec.ImageRegistry = r.ImageRegistry
-	}
+	// Apply operator-side defaults so downstream phases (hash, pod builder,
+	// cert wiring) all see consistent values regardless of which fields the
+	// user left empty.
+	r.PopulateDefaultValues(ec)
 
 	pods, err := listOwnedPods(ctx, r.Client, ec)
 	if err != nil {
@@ -176,6 +177,17 @@ func (r *EtcdClusterReconciler) fetchAndValidateState(ctx context.Context, req c
 	}
 
 	return &reconcileState{cluster: ec, pods: pods}, ctrl.Result{}, nil
+}
+
+// PopulateDefaultValues mutates `ec` in place to apply operator-side defaults
+// for any EtcdClusterSpec field that the user left empty. Defaults are sourced
+// from the reconciler instance (e.g. its ImageRegistry), keeping the reconcile
+// loop the single owner of how a partially-specified Spec becomes a fully
+// resolved one.
+func (r *EtcdClusterReconciler) PopulateDefaultValues(ec *ecv1alpha1.EtcdCluster) {
+	if ec.Spec.ImageRegistry == "" {
+		ec.Spec.ImageRegistry = r.ImageRegistry
+	}
 }
 
 // buildReconcileClientTLS builds the operator's etcd-client TLS Config for a
