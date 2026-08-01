@@ -278,9 +278,14 @@ func TestPodRecovery(t *testing.T) {
 			if err := wait.For(func(ctx context.Context) (done bool, err error) {
 				var newPod corev1.Pod
 				if err := c.Client().Resources().Get(ctx, targetPodName, namespace, &newPod); err != nil {
+					t.Logf("Failed to get pod(%s): %s", targetPodName, err)
 					return false, nil
 				}
-				return newPod.UID != deletedPodUID && newPod.Status.Phase == corev1.PodRunning, nil
+				done = newPod.UID != deletedPodUID && newPod.Status.Phase == corev1.PodRunning
+				if !done {
+					t.Logf("Pod(%s) UID=%s Phase=%s", newPod.Name, newPod.UID, newPod.Status.Phase)
+				}
+				return
 			}, wait.WithTimeout(3*time.Minute), wait.WithInterval(10*time.Second)); err != nil {
 				t.Fatalf("Pod failed to be recreated: %v", err)
 			}
@@ -312,7 +317,7 @@ func TestPodRecovery(t *testing.T) {
 			}
 
 			// Verify cluster replication works across recovered pod
-			verifyDataOperations(t, c, etcdClusterName, "replication-test", "value", false)
+			verifyDataOperations(t, c, etcdClusterName, "replication-test", "value", operatorServiceDNSDomain(t, ctx), false)
 
 			stdout, stderr, err := execInPod(t, c, targetPodName, namespace, []string{"etcdctl", "get", "replication-test"})
 			if err != nil {
@@ -380,7 +385,7 @@ func TestEtcdClusterFunctionality(t *testing.T) {
 	})
 
 	feature.Assess("test data operations", func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-		verifyDataOperations(t, c, etcdClusterName, "test-key", "test-value", false)
+		verifyDataOperations(t, c, etcdClusterName, "test-key", "test-value", operatorServiceDNSDomain(t, ctx), false)
 		return ctx
 	})
 
@@ -467,7 +472,7 @@ func TestClusterHash(t *testing.T) {
 		// apply the same logic (setting default values) before hashing.
 		reconciler := &controller.EtcdClusterReconciler{ImageRegistry: controller.DefaultImageRegistry}
 		reconciler.PopulateDefaultValues(etcdCluster)
-		clusterHash = controller.EtcdClusterHash(etcdCluster)
+		clusterHash = controller.EtcdClusterHash(etcdCluster, operatorServiceDNSDomain(t, ctx))
 		return ctx
 	})
 

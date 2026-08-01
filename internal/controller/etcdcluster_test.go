@@ -31,7 +31,7 @@ func TestEtcdClusterHash(t *testing.T) {
 	}
 
 	// Calculate base hash once to use as a benchmark in assertions
-	baseHash := EtcdClusterHash(baseCluster)
+	baseHash := EtcdClusterHash(baseCluster, "")
 
 	// Helper inline functions to generate mutated clusters cleanly
 	withSize := func(size int) *v1alpha1.EtcdCluster {
@@ -118,7 +118,7 @@ func TestEtcdClusterHash(t *testing.T) {
 	// Loop through the table executing each row in isolation
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			currentHash := EtcdClusterHash(tt.cluster)
+			currentHash := EtcdClusterHash(tt.cluster, "")
 
 			if tt.checkLength {
 				assert.Len(t, currentHash, hashLength, "Hash must respect the %d-character limit constraint", hashLength)

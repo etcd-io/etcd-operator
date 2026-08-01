@@ -134,28 +134,40 @@ func waitForPodReady(ctx context.Context, logger logr.Logger, c client.Client, p
 	return nil
 }
 
+// memberDNSSuffix returns the trailing segment appended to "<pod>.<sts>.<ns>."
+// when building an etcd member FQDN. When dnsDomain is empty (the operator's
+// default) the suffix is the short form "svc"; otherwise it is "svc.<dnsDomain>".
+// Kept in sync with test/e2e/helpers_test.go's mirror copy.
+func memberDNSSuffix(dnsDomain string) string {
+	if dnsDomain == "" {
+		return "svc"
+	}
+	return "svc." + dnsDomain
+}
+
 // clientEndpointsFromPods builds the client endpoint URL for every pod in the
 // slice, in the same order.  The DNS form is:
 //
-//	{scheme}://{podName}.{clusterName}.{namespace}.svc.cluster.local:2379
+//	{scheme}://{podName}.{clusterName}.{namespace}.{dnsSuffix}:2379
 //
-// where scheme reflects the cluster's TLS configuration.
-func clientEndpointsFromPods(clusterName, namespace string, pods []*corev1.Pod, tlsEnabled bool) []string {
+// where scheme reflects the cluster's TLS configuration and dnsSuffix is
+// produced by memberDNSSuffix from the operator's --service-dns-domain flag.
+func clientEndpointsFromPods(clusterName, namespace, dnsDomain string, pods []*corev1.Pod, tlsEnabled bool) []string {
 	if len(pods) == 0 {
 		return nil
 	}
 	eps := make([]string, 0, len(pods))
 	for _, pod := range pods {
-		eps = append(eps, clientEndpointForOrdinal(clusterName, namespace, podOrdinal(pod.Name, clusterName), tlsEnabled))
+		eps = append(eps, clientEndpointForOrdinal(clusterName, namespace, dnsDomain, podOrdinal(pod.Name, clusterName), tlsEnabled))
 	}
 	return eps
 }
 
 // clientEndpointForOrdinal returns the client endpoint URL for a member at the
 // given ordinal index. The URL scheme is https when tlsEnabled is true, otherwise http.
-func clientEndpointForOrdinal(clusterName, namespace string, ordinal int, tlsEnabled bool) string {
-	return fmt.Sprintf("%s://%s-%d.%s.%s.svc.cluster.local:2379",
-		clusterScheme(tlsEnabled), clusterName, ordinal, clusterName, namespace)
+func clientEndpointForOrdinal(clusterName, namespace, dnsDomain string, ordinal int, tlsEnabled bool) string {
+	return fmt.Sprintf("%s://%s-%d.%s.%s.%s:2379",
+		clusterScheme(tlsEnabled), clusterName, ordinal, clusterName, namespace, memberDNSSuffix(dnsDomain))
 }
 
 // clusterScheme returns the URL scheme to use for cluster endpoints: "https"
@@ -186,12 +198,12 @@ func areAllMembersHealthy(memberHealth []etcdutils.EpHealth) bool {
 
 // healthCheck returns a MemberListResponse and per-endpoint health information
 // for the etcd cluster reachable through the given pods.
-func healthCheck(clusterName, namespace string, pods []*corev1.Pod, tlsEnabled bool, tlsConfig *tls.Config, lg klog.Logger) (*clientv3.MemberListResponse, []etcdutils.EpHealth, error) {
+func healthCheck(clusterName, namespace, dnsDomain string, pods []*corev1.Pod, tlsEnabled bool, tlsConfig *tls.Config, lg klog.Logger) (*clientv3.MemberListResponse, []etcdutils.EpHealth, error) {
 	if len(pods) == 0 {
 		return nil, nil, nil
 	}
 
-	endpoints := clientEndpointsFromPods(clusterName, namespace, pods, tlsEnabled)
+	endpoints := clientEndpointsFromPods(clusterName, namespace, dnsDomain, pods, tlsEnabled)
 
 	memberlistResp, err := etcdutils.MemberList(etcdutils.ClientConfig{Endpoints: endpoints, TLS: tlsConfig})
 	if err != nil {
@@ -240,15 +252,16 @@ const (
 	peerTrustedCAFile = peerCertMountDir + "/ca.crt"
 )
 
-func defaultArgs(name string, tlsEnabled bool) []string {
+func defaultArgs(name, dnsDomain string, tlsEnabled bool) []string {
 	scheme := clusterScheme(tlsEnabled)
+	suffix := memberDNSSuffix(dnsDomain)
 	args := make([]string, 0, 13)
 	args = append(args,
 		"--name=$(POD_NAME)",
 		fmt.Sprintf("--listen-peer-urls=%s://0.0.0.0:2380", scheme),
 		fmt.Sprintf("--listen-client-urls=%s://0.0.0.0:2379", scheme),
-		fmt.Sprintf("--initial-advertise-peer-urls=%s://$(POD_NAME).%s.$(POD_NAMESPACE).svc.cluster.local:2380", scheme, name),
-		fmt.Sprintf("--advertise-client-urls=%s://$(POD_NAME).%s.$(POD_NAMESPACE).svc.cluster.local:2379", scheme, name),
+		fmt.Sprintf("--initial-advertise-peer-urls=%s://$(POD_NAME).%s.$(POD_NAMESPACE).%s:2380", scheme, name, suffix),
+		fmt.Sprintf("--advertise-client-urls=%s://$(POD_NAME).%s.$(POD_NAMESPACE).%s:2379", scheme, name, suffix),
 	)
 	if !tlsEnabled {
 		return args
@@ -270,7 +283,7 @@ const (
 )
 
 // buildMemberPod constructs the Pod object for a single etcd member.
-func buildMemberPod(ec *ecv1alpha1.EtcdCluster, podName string, initialClusterState etcdClusterState, initialCluster string) *corev1.Pod {
+func buildMemberPod(ec *ecv1alpha1.EtcdCluster, podName, dnsDomain string, initialClusterState etcdClusterState, initialCluster string) *corev1.Pod {
 	// Start with custom labels then overwrite with the mandatory defaults so
 	// that the headless-service selector is always satisfied.
 	labels := make(map[string]string)
@@ -285,7 +298,7 @@ func buildMemberPod(ec *ecv1alpha1.EtcdCluster, podName string, initialClusterSt
 		len(ec.Spec.PodTemplate.Metadata.Annotations) > 0 {
 		maps.Copy(annotations, ec.Spec.PodTemplate.Metadata.Annotations)
 	}
-	annotations[HashMetadataKey] = EtcdClusterHash(ec)
+	annotations[HashMetadataKey] = EtcdClusterHash(ec, dnsDomain)
 
 	envVars := []corev1.EnvVar{
 		{
@@ -309,7 +322,7 @@ func buildMemberPod(ec *ecv1alpha1.EtcdCluster, podName string, initialClusterSt
 		Name:    "etcd",
 		Image:   fmt.Sprintf("%s:%s", ec.Spec.ImageRegistry, ec.Spec.Version),
 		Command: []string{"/usr/local/bin/etcd"},
-		Args:    createArgs(ec.Name, ec.Spec.EtcdOptions, clusterTLSEnabled(ec)),
+		Args:    createArgs(ec.Name, ec.Spec.EtcdOptions, dnsDomain, clusterTLSEnabled(ec)),
 		Env:     envVars,
 		Ports: []corev1.ContainerPort{
 			{Name: "client", ContainerPort: 2379},
@@ -407,11 +420,11 @@ func buildMemberPod(ec *ecv1alpha1.EtcdCluster, podName string, initialClusterSt
 // createMemberPod creates a single etcd member Pod (and, if needed, its PVC)
 // for the given ordinal index.  It does not wait for the pod to become ready;
 // the caller is responsible for requeueing until the pod is healthy.
-func createMemberPod(ctx context.Context, logger logr.Logger, c client.Client, ec *ecv1alpha1.EtcdCluster, ordinal int, scheme *runtime.Scheme) error {
+func createMemberPod(ctx context.Context, logger logr.Logger, c client.Client, ec *ecv1alpha1.EtcdCluster, dnsDomain string, ordinal int, scheme *runtime.Scheme) error {
 	podName := memberPodName(ec.Name, ordinal)
 
 	// Ensure TLS certificates exist before the pod mounts them.
-	if err := applyEtcdMemberCerts(ctx, ec, c); err != nil {
+	if err := applyEtcdMemberCerts(ctx, ec, dnsDomain, c); err != nil {
 		return err
 	}
 
@@ -430,11 +443,11 @@ func createMemberPod(ctx context.Context, logger logr.Logger, c client.Client, e
 	// Build the initial-cluster value: all peers from ordinal 0 to this one.
 	var clusterParts []string
 	for i := range ordinal + 1 {
-		name, peerURL := peerEndpointForOrdinalIndex(ec, i)
+		name, peerURL := peerEndpointForOrdinalIndex(ec, dnsDomain, i)
 		clusterParts = append(clusterParts, fmt.Sprintf("%s=%s", name, peerURL))
 	}
 
-	pod := buildMemberPod(ec, podName, state, strings.Join(clusterParts, ","))
+	pod := buildMemberPod(ec, podName, dnsDomain, state, strings.Join(clusterParts, ","))
 	if err := controllerutil.SetControllerReference(ec, pod, scheme); err != nil {
 		return err
 	}
