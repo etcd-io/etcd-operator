@@ -462,6 +462,11 @@ func TestClusterHash(t *testing.T) {
 			t.Fatalf("unable to fetch etcd cluster: %s", err)
 		}
 
+		// The EtcdClusterHash spec.imageRegistry was mutated before
+		// computing EtcdClusterHash for the pod annotation. So we have to
+		// apply the same logic (setting default values) before hashing.
+		reconciler := &controller.EtcdClusterReconciler{ImageRegistry: controller.DefaultImageRegistry}
+		reconciler.PopulateDefaultValues(etcdCluster)
 		clusterHash = controller.EtcdClusterHash(etcdCluster)
 		return ctx
 	})

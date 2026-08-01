@@ -30,6 +30,10 @@ import (
 const (
 	etcdDataDir = "/var/lib/etcd"
 	volumeName  = "etcd-data"
+
+	// DefaultImageRegistry is the fallback container image registry used by
+	// the CLI flag default and by tests that wire an EtcdClusterReconciler.
+	DefaultImageRegistry = "gcr.io/etcd-development/etcd"
 )
 
 type etcdClusterState string
