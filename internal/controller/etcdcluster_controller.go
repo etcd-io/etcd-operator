@@ -20,6 +20,8 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"slices"
+	"sort"
 	"strings"
 	"time"
 
@@ -36,6 +38,7 @@ import (
 
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 	"go.etcd.io/etcd-operator/internal/etcdutils"
+	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	etcdversions "go.etcd.io/etcd/api/v3/version"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
@@ -411,6 +414,54 @@ func (r *EtcdClusterReconciler) promoteLearner(ctx context.Context, s *reconcile
 // the leader, move leadership to another member (the one with the lowest
 // ordinal) first.
 func (r *EtcdClusterReconciler) updateConfig(ctx context.Context, s *reconcileState) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+	hash := EtcdClusterHash(s.cluster)
+
+	sort.Slice(s.pods, func(i, j int) bool {
+		return strings.Compare(s.pods[i].Name, s.pods[j].Name) < 0
+	})
+	sort.Slice(s.memberListResp.Members, func(i, j int) bool {
+		return strings.Compare(s.memberListResp.Members[i].Name, s.memberListResp.Members[j].Name) < 0
+	})
+
+	var outdated *corev1.Pod
+	for _, p := range slices.Backward(s.pods) {
+		if p.Annotations != nil && p.Annotations[HashMetadataKey] != hash {
+			outdated = p
+			break
+		}
+	}
+	if outdated == nil {
+		logger.Info("no pods with outdated config found")
+		return ctrl.Result{}, nil
+	}
+	logger.Info("a pod with outdated config found", "pod name", outdated.Name)
+	leaderId, leaderStatus := etcdutils.FindLeaderStatus(s.memberHealth, logger)
+	if leaderStatus == nil {
+		return ctrl.Result{}, fmt.Errorf("couldn't find leader for cluster %s", s.cluster.Name)
+	}
+	var outdatedMember *etcdserverpb.Member
+	for _, m := range s.memberListResp.Members {
+		if m.Name == outdated.Name {
+			outdatedMember = m
+			break
+		}
+	}
+	if outdatedMember.ID == leaderId {
+		// move the leader
+		var moveTo uint64
+		for _, m := range s.memberListResp.Members {
+			if m.ID != leaderId {
+				moveTo = m.ID
+			}
+		}
+		eps := clientEndpointsFromPods(s.cluster.Name, s.cluster.Namespace, s.pods, clusterTLSEnabled(s.cluster))
+		etcdutils.MoveLeader(etcdutils.ClientConfig{Endpoints: eps, TLS: s.tlsConfig}, moveTo)
+	}
+	if err := r.Delete(ctx, outdated); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	return ctrl.Result{}, nil
 }
 

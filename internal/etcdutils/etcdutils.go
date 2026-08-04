@@ -115,7 +115,6 @@ func FindLeaderStatus(healthInfos []EpHealth, logger logr.Logger) (uint64, *clie
 		logger.Info("Leader found", "leaderID", leader)
 	}
 	return leader, leaderStatus
-
 }
 
 func FindLearnerStatus(healthInfos []EpHealth, logger logr.Logger) (uint64, *clientv3.StatusResponse) {
@@ -247,5 +246,18 @@ func RemoveMember(cfg ClientConfig, memberID uint64) error {
 	defer func() { closeAndCancel(c, cancel) }()
 
 	_, err = c.MemberRemove(ctx, memberID)
+	return err
+}
+
+func MoveLeader(cfg ClientConfig, memberId uint64) error {
+	c, err := clientv3.New(cfg.buildConfig())
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer func() { closeAndCancel(c, cancel) }()
+
+	_, err = c.MoveLeader(ctx, memberId)
 	return err
 }
