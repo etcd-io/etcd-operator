@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -697,6 +698,118 @@ func TestCreateOrPatchStatefulSetWithPodLabels(t *testing.T) {
 			// Verify statefulset is controlled by EtcdCluster
 			require.Len(t, sts.OwnerReferences, 1)
 			require.Equal(t, sts.OwnerReferences[0].Name, ec.Name)
+		})
+	}
+}
+
+func TestCreateOrPatchStatefulSetStorageAccessModes(t *testing.T) {
+	ctx := t.Context()
+	logger := log.FromContext(ctx)
+
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = ecv1alpha1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+
+	tests := []struct {
+		name            string
+		etcdClusterName string
+		storageSpec     *ecv1alpha1.StorageSpec
+		expectedErr     string
+		// expectedAccessModes is what the generated volume claim template must
+		// carry; empty means no volume claim template is expected at all.
+		expectedAccessModes []corev1.PersistentVolumeAccessMode
+		expectedClaimName   string
+	}{
+		{
+			name:            "defaults to ReadWriteOnce when accessModes is not provided",
+			etcdClusterName: "test-etcd-storage-default",
+			storageSpec: &ecv1alpha1.StorageSpec{
+				VolumeSizeRequest: resource.MustParse("100Mi"),
+			},
+			expectedAccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+		},
+		{
+			name:            "keeps ReadWriteOnce when it is set explicitly",
+			etcdClusterName: "test-etcd-storage-rwo",
+			storageSpec: &ecv1alpha1.StorageSpec{
+				AccessModes:       corev1.ReadWriteOnce,
+				VolumeSizeRequest: resource.MustParse("100Mi"),
+			},
+			expectedAccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+		},
+		{
+			name:            "ReadWriteMany mounts the provided PVC instead of a claim template",
+			etcdClusterName: "test-etcd-storage-rwx",
+			storageSpec: &ecv1alpha1.StorageSpec{
+				AccessModes:       corev1.ReadWriteMany,
+				PVCName:           "shared-etcd-data",
+				VolumeSizeRequest: resource.MustParse("100Mi"),
+			},
+			expectedClaimName: "shared-etcd-data",
+		},
+		{
+			name:            "ReadWriteMany without a PVC name is rejected",
+			etcdClusterName: "test-etcd-storage-rwx-no-pvc",
+			storageSpec: &ecv1alpha1.StorageSpec{
+				AccessModes:       corev1.ReadWriteMany,
+				VolumeSizeRequest: resource.MustParse("100Mi"),
+			},
+			expectedErr: "PVCName must be set when AccessModes is ReadWriteMany",
+		},
+		{
+			name:            "unsupported access mode is rejected",
+			etcdClusterName: "test-etcd-storage-rox",
+			storageSpec: &ecv1alpha1.StorageSpec{
+				AccessModes:       corev1.ReadOnlyMany,
+				VolumeSizeRequest: resource.MustParse("100Mi"),
+			},
+			expectedErr: "AccessMode ReadOnlyMany is not supported",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+			ec := &ecv1alpha1.EtcdCluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      tt.etcdClusterName,
+					Namespace: "default",
+				},
+				Spec: ecv1alpha1.EtcdClusterSpec{
+					Size:        1,
+					Version:     "3.5.17",
+					StorageSpec: tt.storageSpec,
+				},
+			}
+
+			err := createOrPatchStatefulSet(ctx, logger, ec, fakeClient, 1, scheme)
+			if tt.expectedErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.expectedErr)
+				return
+			}
+			require.NoError(t, err)
+
+			sts := &appsv1.StatefulSet{}
+			err = fakeClient.Get(ctx, client.ObjectKey{Name: tt.etcdClusterName, Namespace: "default"}, sts)
+			require.NoError(t, err)
+
+			if tt.expectedClaimName != "" {
+				assert.Empty(t, sts.Spec.VolumeClaimTemplates)
+				require.Len(t, sts.Spec.Template.Spec.Volumes, 1)
+				require.NotNil(t, sts.Spec.Template.Spec.Volumes[0].PersistentVolumeClaim)
+				assert.Equal(t, tt.expectedClaimName, sts.Spec.Template.Spec.Volumes[0].PersistentVolumeClaim.ClaimName)
+				return
+			}
+
+			require.Len(t, sts.Spec.VolumeClaimTemplates, 1)
+			assert.Equal(t, tt.expectedAccessModes, sts.Spec.VolumeClaimTemplates[0].Spec.AccessModes)
+			// An empty access mode reaches the API server as accessModes: [""],
+			// which the PVC schema rejects and which leaves every pod pending.
+			assert.NotContains(t, sts.Spec.VolumeClaimTemplates[0].Spec.AccessModes,
+				corev1.PersistentVolumeAccessMode(""))
 		})
 	}
 }
