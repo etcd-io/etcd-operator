@@ -26,6 +26,7 @@ import (
 	"testing"
 	"time"
 
+	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
@@ -337,4 +338,33 @@ func httpViaProxy(ctx context.Context, r *rest.Request, pod corev1.Pod, failpoin
 		Body(strings.NewReader(term)).
 		Do(ctx)
 	return result.Error()
+}
+
+// certManagerSurface returns a cert-manager TLSSurface for one TLS surface (peer
+// or client). The peer/client split is configured independently in the new CRD
+// shape; the e2e helpers set both surfaces to the same issuer to mirror the
+// pre-split single-toggle behaviour.
+func certManagerSurface(issuerKind, issuerName string) *ecv1alpha1.TLSSurface {
+	return &ecv1alpha1.TLSSurface{
+		Provider: ecv1alpha1.TLSProviderCertManager,
+		CertManager: &ecv1alpha1.TLSCertManagerProvider{
+			CommonName: "etcd-operator-system",
+			Duration:   &metav1.Duration{Duration: 90 * time.Hour},
+			IssuerRef: cmmeta.IssuerReference{
+				Kind: issuerKind,
+				Name: issuerName,
+			},
+		},
+	}
+}
+
+// autoSurface returns an auto-provider TLSSurface for one TLS surface.
+func autoSurface() *ecv1alpha1.TLSSurface {
+	return &ecv1alpha1.TLSSurface{
+		Provider: ecv1alpha1.TLSProviderAuto,
+		Auto: &ecv1alpha1.TLSAutoProvider{
+			CommonName: "etcd-operator-system",
+			Duration:   &metav1.Duration{Duration: 8760 * time.Hour},
+		},
+	}
 }

@@ -12,23 +12,15 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"net"
-	"strings"
 	"time"
 
 	certmanagerv1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
-	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	interfaces "go.etcd.io/etcd-operator/pkg/certificate/interfaces"
-)
-
-const (
-	IssuerNameKey = "issuerName"
-	IssuerKindKey = "issuerKind"
 )
 
 type CertManagerProvider struct {
@@ -218,25 +210,18 @@ func (cm *CertManagerProvider) GetCertificateConfig(ctx context.Context,
 		return nil, fmt.Errorf("failed to get certificate: %w", err)
 	}
 
-	var ipAddresses []net.IP
-	if len(cmCertificate.Spec.IPAddresses) != 0 {
-		ipAddresses = make([]net.IP, len(cmCertificate.Spec.IPAddresses))
-	} else {
-		ipAddresses = nil
-	}
-
 	cfg := &interfaces.Config{
-		CommonName:   cmCertificate.Spec.CommonName,
-		Organization: cmCertificate.Spec.Subject.Organizations,
-		AltNames: interfaces.AltNames{
-			DNSNames: cmCertificate.Spec.DNSNames,
-			IPs:      ipAddresses,
-		},
-		ValidityDuration: cmCertificate.Spec.Duration.Duration,
-		ExtraConfig: map[string]any{
-			IssuerNameKey: cmCertificate.Spec.IssuerRef.Name,
-			IssuerKindKey: cmCertificate.Spec.IssuerRef.Kind,
-		},
+		CommonName:  cmCertificate.Spec.CommonName,
+		DNSNames:    cmCertificate.Spec.DNSNames,
+		IPAddresses: cmCertificate.Spec.IPAddresses,
+		RenewBefore: cmCertificate.Spec.RenewBefore,
+		IssuerRef:   &cmCertificate.Spec.IssuerRef,
+	}
+	if cmCertificate.Spec.Subject != nil {
+		cfg.Organizations = cmCertificate.Spec.Subject.Organizations
+	}
+	if cmCertificate.Spec.Duration != nil {
+		cfg.Duration = cmCertificate.Spec.Duration.Duration
 	}
 
 	return cfg, nil
@@ -267,9 +252,18 @@ func (cm *CertManagerProvider) checkCertificateStatus(certificateName, namespace
 	return nil
 }
 
+// effectiveIssuerKind resolves an empty issuerRef.kind to cert-manager's
+// documented default, "Issuer".
+func effectiveIssuerKind(kind string) string {
+	if kind == "" {
+		return "Issuer"
+	}
+	return kind
+}
+
 // checkIssuerExists checks for if the provided issuer is present in the namespace/cluster
 func (cm *CertManagerProvider) checkIssuerExists(issuerName, issuerKind, namespace string, ctx context.Context) error {
-	switch issuerKind {
+	switch effectiveIssuerKind(issuerKind) {
 	case "Issuer":
 		issuer := &certmanagerv1.Issuer{}
 		err := cm.Get(ctx, client.ObjectKey{Name: issuerName, Namespace: namespace}, issuer)
@@ -291,19 +285,10 @@ func (cm *CertManagerProvider) checkIssuerExists(issuerName, issuerKind, namespa
 // validateCertificateConfig checks if the config passed is valid
 func (cm *CertManagerProvider) validateCertificateConfig(ctx context.Context, namespace string,
 	cfg *interfaces.Config) error {
-	issuerName, isValid := cfg.ExtraConfig[IssuerNameKey].(string)
-	if !isValid {
-		return fmt.Errorf("value for %s not correctly provided, try again", IssuerNameKey)
+	if cfg.IssuerRef == nil {
+		return errors.New("issuerRef not provided for cert-manager certificate")
 	}
-	issuerKind, isValid := cfg.ExtraConfig[IssuerKindKey].(string)
-	if !isValid {
-		return fmt.Errorf("value for %s not correctly provided, try again", IssuerKindKey)
-	}
-	checkIssuerExist := cm.checkIssuerExists(issuerName, issuerKind, namespace, ctx)
-	if checkIssuerExist != nil {
-		return checkIssuerExist
-	}
-	return nil
+	return cm.checkIssuerExists(cfg.IssuerRef.Name, cfg.IssuerRef.Kind, namespace, ctx)
 }
 
 // createCertificate creates a cert-manager Certificate resource in the specified namespace.
@@ -312,13 +297,8 @@ func (cm *CertManagerProvider) validateCertificateConfig(ctx context.Context, na
 // returns an error if the Certificate resource cannot be created.
 func (cm *CertManagerProvider) createCertificate(ctx context.Context, secretKey client.ObjectKey,
 	cfg *interfaces.Config) error {
-	issuerName, isValid := cfg.ExtraConfig[IssuerNameKey].(string)
-	if !isValid {
-		return fmt.Errorf("value for %s not correctly provided, try again", IssuerNameKey)
-	}
-	issuerKind, isValid := cfg.ExtraConfig[IssuerKindKey].(string)
-	if !isValid {
-		return fmt.Errorf("value for %s not correctly provided, try again", IssuerKindKey)
+	if cfg.IssuerRef == nil {
+		return errors.New("issuerRef not provided for cert-manager certificate")
 	}
 
 	certificateResource := &certmanagerv1.Certificate{
@@ -329,16 +309,14 @@ func (cm *CertManagerProvider) createCertificate(ctx context.Context, secretKey 
 		Spec: certmanagerv1.CertificateSpec{
 			CommonName: cfg.CommonName,
 			Subject: &certmanagerv1.X509Subject{
-				Organizations: cfg.Organization,
+				Organizations: cfg.Organizations,
 			},
 			SecretName:  secretKey.Name,
-			DNSNames:    cfg.AltNames.DNSNames,
-			IPAddresses: strings.Fields(strings.Trim(fmt.Sprint(cfg.AltNames.IPs), "[]")),
-			IssuerRef: cmmeta.IssuerReference{
-				Name: issuerName,
-				Kind: issuerKind,
-			},
-			Duration: &metav1.Duration{Duration: cfg.ValidityDuration},
+			DNSNames:    cfg.DNSNames,
+			IPAddresses: cfg.IPAddresses,
+			IssuerRef:   *cfg.IssuerRef,
+			Duration:    &metav1.Duration{Duration: cfg.Duration},
+			RenewBefore: cfg.RenewBefore,
 		},
 	}
 
