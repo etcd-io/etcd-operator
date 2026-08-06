@@ -1332,6 +1332,97 @@ spec:
                   This reflects the .status.readyReplicas of the underlying StatefulSet.
                 format: int32
                 type: integer
+              recovery:
+                description: |-
+                  Recovery captures the state of an in-progress (or last attempted) automatic
+                  disaster recovery from quorum loss. It is managed entirely by the operator's
+                  quorum-loss recovery state machine and is nil when no recovery has ever been
+                  attempted.
+                properties:
+                  attempts:
+                    description: |-
+                      Attempts is the number of times the operator has committed to a destructive
+                      rebuild for this cluster (i.e. entered the Rebuilding phase from Detecting).
+                      It is a monotonically increasing counter that survives across recoveries and
+                      is never reset, giving operators a durable signal of how often this cluster
+                      has needed disaster recovery — repeated recoveries usually point at an
+                      underlying infrastructure problem rather than a one-off event.
+                    format: int32
+                    type: integer
+                  dataLoss:
+                    description: |-
+                      DataLoss records the data-loss accounting for the most recent rebuild.
+
+                      Quorum-loss recovery via --force-new-cluster is NOT a lossless operation:
+                      the rebuilt cluster retains only the writes that were committed to the
+                      surviving member's local data directory. Any write that a now-destroyed
+                      majority had committed but had not yet replicated to the survivor is GONE.
+                      This field surfaces that fact explicitly (alongside a Warning Event, the
+                      DataLossPossible condition, and structured logs) so the loss is auditable
+                      and never silent. It is nil until a rebuild from a survivor completes.
+                    properties:
+                      message:
+                        description: |-
+                          Message is a human-readable, operator-facing summary of the data-loss
+                          situation, e.g. "recovered with possible data loss; rebuilt from member
+                          <id> at revision <r>".
+                        type: string
+                      raftIndex:
+                        description: |-
+                          RaftIndex is the survivor's raft committed index at rebuild time, recorded
+                          for forensic correlation with member logs.
+                        format: int64
+                        type: integer
+                      recoveredTime:
+                        description: |-
+                          RecoveredTime is when the rebuilt single-member cluster was confirmed
+                          healthy and this accounting was captured.
+                        format: date-time
+                        type: string
+                      survivorMemberID:
+                        description: |-
+                          SurvivorMemberID is the hex-encoded etcd member ID of the survivor whose
+                          data directory was used to rebuild the cluster.
+                        type: string
+                      survivorRevision:
+                        description: |-
+                          SurvivorRevision is the key-value store revision present on the survivor at
+                          the moment the single-member cluster came back healthy. It is the highest
+                          revision guaranteed to be retained; any revision the lost majority committed
+                          above this value did not survive the rebuild.
+                        format: int64
+                        type: integer
+                    type: object
+                  detectedTime:
+                    description: |-
+                      DetectedTime is the first time a sustained-quorum-loss candidate was
+                      observed. It anchors the grace window used to distinguish true quorum loss
+                      from transient single-member failures.
+                    format: date-time
+                    type: string
+                  lastTransitionTime:
+                    description: LastTransitionTime is the time the recovery phase
+                      last changed.
+                    format: date-time
+                    type: string
+                  message:
+                    description: Message is a human-readable description of the current
+                      recovery step.
+                    type: string
+                  phase:
+                    description: Phase is the current stage of the recovery state
+                      machine.
+                    type: string
+                  survivorOrdinal:
+                    description: |-
+                      SurvivorOrdinal is the StatefulSet pod ordinal whose data directory was
+                      chosen as the surviving source of truth for the rebuild. It is always 0
+                      today (the operator keeps ordinal-0's PVC) but is recorded explicitly so
+                      the choice is auditable and future survivor-selection policies remain
+                      backward compatible.
+                    format: int32
+                    type: integer
+                type: object
             type: object
         type: object
     served: true
