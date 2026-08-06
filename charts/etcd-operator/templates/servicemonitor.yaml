@@ -1,0 +1,27 @@
+{{- if and .Values.controller.enabled .Values.metrics.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "etcd-operator.fullname" . }}-metrics-monitor
+  labels:
+    {{- include "etcd-operator.labels" . | nindent 4 }}
+    {{- with .Values.metrics.serviceMonitor.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  endpoints:
+    - path: /metrics
+      {{- if .Values.metrics.secure }}
+      port: https
+      scheme: https
+      bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+      tlsConfig:
+        insecureSkipVerify: true
+      {{- else }}
+      port: http
+      scheme: http
+      {{- end }}
+  selector:
+    matchLabels:
+      {{- include "etcd-operator.selectorLabels" . | nindent 6 }}
+{{- end }}
