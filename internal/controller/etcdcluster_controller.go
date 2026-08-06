@@ -267,6 +267,22 @@ func (r *EtcdClusterReconciler) performHealthChecks(ctx context.Context, s *reco
 	return nil
 }
 
+func currentStsVersion(sts *appsv1.StatefulSet) string {
+	if len(sts.Spec.Template.Spec.Containers) == 0 {
+		return ""
+	}
+	image := sts.Spec.Template.Spec.Containers[0].Image
+	idx := strings.Index(image, ":")
+	if idx == -1 {
+		return ""
+	}
+	return image[idx+1:]
+}
+
+func stsImageMatchesCluster(sts *appsv1.StatefulSet, cluster *ecv1alpha1.EtcdCluster) bool {
+	return currentStsVersion(sts) == cluster.Spec.Version
+}
+
 // reconcileClusterState compares the desired cluster size with the observed
 // etcd member list and StatefulSet replica count. It performs scaling actions
 // and handles learner promotion when needed. A ctrl.Result with a requeue
@@ -337,6 +353,13 @@ func (r *EtcdClusterReconciler) reconcileClusterState(ctx context.Context, s *re
 	}
 
 	if targetReplica == int32(s.cluster.Spec.Size) {
+		if !stsImageMatchesCluster(s.sts, s.cluster) {
+			logger.Info("Image version changed, updating StatefulSet", "currentVersion", currentStsVersion(s.sts), "desiredVersion", s.cluster.Spec.Version)
+			if s.sts, err = reconcileStatefulSet(ctx, logger, s.cluster, r.Client, targetReplica, r.Scheme); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{RequeueAfter: requeueDuration}, nil
+		}
 		logger.Info("EtcdCluster is already up-to-date")
 		return ctrl.Result{}, nil
 	}
