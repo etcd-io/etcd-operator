@@ -49,6 +49,76 @@ type EtcdClusterSpec struct {
 	EtcdOptions []string `json:"etcdOptions,omitempty"`
 	// PodTemplate is the pod template to use for the etcd cluster.
 	PodTemplate *PodTemplate `json:"podTemplate,omitempty"`
+	// Metrics configures Prometheus observability for this cluster. When unset,
+	// the operator still exports its own per-cluster domain metrics on its
+	// /metrics endpoint, but does not create a PodMonitor for the etcd member
+	// pods. See MetricsSpec for the available knobs.
+	// +optional
+	Metrics *MetricsSpec `json:"metrics,omitempty"`
+}
+
+// MetricsSpec configures Prometheus observability for an EtcdCluster.
+type MetricsSpec struct {
+	// Enabled toggles emission of the operator's per-cluster domain metrics
+	// (member counts, quorum, leader changes, reconcile timings, etc.) for this
+	// cluster. When nil it defaults to true: metrics are exported unless
+	// explicitly disabled. Disabling drops the cluster's series from the
+	// operator's /metrics endpoint.
+	// +optional
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// PodMonitor, when set and enabled, instructs the operator to create and
+	// maintain a prometheus-operator PodMonitor selecting this cluster's etcd
+	// member pods so that Prometheus scrapes etcd's own /metrics endpoint.
+	// This requires the prometheus-operator PodMonitor CRD to be installed in
+	// the cluster; if it is absent the operator logs and skips PodMonitor
+	// reconciliation without failing the rest of the reconcile.
+	// +optional
+	PodMonitor *PodMonitorSpec `json:"podMonitor,omitempty"`
+}
+
+// PodMonitorSpec controls creation of a PodMonitor for the etcd member pods.
+type PodMonitorSpec struct {
+	// Enabled toggles creation of the PodMonitor. Defaults to false.
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+
+	// Interval at which Prometheus scrapes the etcd member pods, e.g. "30s".
+	// When empty the prometheus-operator default is used.
+	// +optional
+	Interval string `json:"interval,omitempty"`
+
+	// Port is the name of the pod port exposing etcd's /metrics endpoint.
+	// Defaults to "client" when empty.
+	// +optional
+	Port string `json:"port,omitempty"`
+
+	// Labels are additional metadata labels to set on the generated
+	// PodMonitor. They are merged on top of the operator-managed labels
+	// (app.kubernetes.io/name, /managed-by, /instance): user-provided keys
+	// take precedence on conflict. This is typically used to satisfy a
+	// namespaced Prometheus's podMonitorSelector, e.g. setting
+	// "release: kvs-prometheus" so a release-scoped Prometheus discovers and
+	// scrapes this PodMonitor. When empty, only the operator-managed labels
+	// are applied (today's behavior).
+	// +optional
+	Labels map[string]string `json:"labels,omitempty"`
+}
+
+// MetricsEnabled reports whether per-cluster domain metrics should be exported
+// for this cluster. Metrics are on by default and only disabled when
+// spec.metrics.enabled is explicitly set to false.
+func (s *EtcdClusterSpec) MetricsEnabled() bool {
+	if s.Metrics == nil || s.Metrics.Enabled == nil {
+		return true
+	}
+	return *s.Metrics.Enabled
+}
+
+// PodMonitorEnabled reports whether a PodMonitor should be reconciled for this
+// cluster's etcd member pods.
+func (s *EtcdClusterSpec) PodMonitorEnabled() bool {
+	return s.MetricsEnabled() && s.Metrics != nil && s.Metrics.PodMonitor != nil && s.Metrics.PodMonitor.Enabled
 }
 
 type PodTemplate struct {

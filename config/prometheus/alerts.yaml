@@ -1,0 +1,129 @@
+# PrometheusRule defining alerts over the etcd-operator's per-cluster domain
+# metrics (subsystem etcd_operator_cluster_*, exported on the operator's own
+# /metrics endpoint and labelled by namespace,name). These rules are opt-in:
+# they are only included when you uncomment the prometheus component in
+# config/default/kustomization.yaml and run against a cluster with the
+# prometheus-operator PrometheusRule CRD installed.
+#
+# See docs/metrics.md for the full metric reference. The series are produced by
+# the operator process, so a single rule covers every EtcdCluster it manages.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  labels:
+    control-plane: controller-manager
+    app.kubernetes.io/name: etcd-operator
+    app.kubernetes.io/managed-by: kustomize
+    # Allow operators to select these rules with a Prometheus ruleSelector.
+    role: alert-rules
+  name: etcd-operator-domain-rules
+  namespace: system
+spec:
+  groups:
+    - name: etcd-operator.cluster.rules
+      rules:
+        # Quorum lost: the operator no longer sees a strict majority of voting
+        # members healthy. This is the recovery feature's primary signal.
+        - alert: EtcdClusterQuorumLost
+          expr: etcd_operator_cluster_has_quorum == 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "EtcdCluster {{ $labels.namespace }}/{{ $labels.name }} has lost quorum"
+            description: >-
+              The etcd-operator reports has_quorum=0 for EtcdCluster
+              {{ $labels.namespace }}/{{ $labels.name }} for more than 1 minute.
+              The cluster cannot make progress until a majority of voting members
+              is healthy again.
+
+        # No leader: a known leader is absent. Brief leaderless windows during an
+        # election are normal, so this only fires after a sustained gap.
+        - alert: EtcdClusterNoLeader
+          expr: etcd_operator_cluster_has_leader == 0
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "EtcdCluster {{ $labels.namespace }}/{{ $labels.name }} has no leader"
+            description: >-
+              The etcd-operator reports has_leader=0 for EtcdCluster
+              {{ $labels.namespace }}/{{ $labels.name }} for more than 2 minutes.
+              A persistent leaderless state usually accompanies quorum loss or a
+              network partition.
+
+        # Members not ready: fewer pods are Ready than the cluster desires.
+        - alert: EtcdClusterMembersNotReady
+          expr: >-
+            etcd_operator_cluster_member_count_ready
+              < etcd_operator_cluster_member_count_desired
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "EtcdCluster {{ $labels.namespace }}/{{ $labels.name }} has members not ready"
+            description: >-
+              EtcdCluster {{ $labels.namespace }}/{{ $labels.name }} has fewer
+              ready members than desired (shortfall {{ $value }}) for more than
+              10 minutes. A single replica may roll briefly; a sustained shortfall
+              indicates a stuck or crash-looping member.
+
+        # TLS not ready: TLS is configured but the cluster is not Available. The
+        # tls_ready series only exists for TLS-configured clusters, so this never
+        # fires on plaintext clusters.
+        - alert: EtcdClusterTLSNotReady
+          expr: etcd_operator_cluster_tls_ready == 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "EtcdCluster {{ $labels.namespace }}/{{ $labels.name }} TLS-secured cluster not ready"
+            description: >-
+              EtcdCluster {{ $labels.namespace }}/{{ $labels.name }} is configured
+              for TLS but has not been Available for more than 5 minutes. Check the
+              cert-manager Certificate / TLS secrets and member readiness.
+
+        # Reconcile errors: the operator's reconcile loop for this cluster is
+        # returning errors. A few transient errors are tolerable; a sustained
+        # error rate means reconciliation is wedged.
+        - alert: EtcdOperatorReconcileErrors
+          expr: >-
+            increase(etcd_operator_cluster_reconcile_errors_total[10m]) > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "etcd-operator reconcile errors for {{ $labels.namespace }}/{{ $labels.name }}"
+            description: >-
+              The etcd-operator reconcile loop for EtcdCluster
+              {{ $labels.namespace }}/{{ $labels.name }} has returned errors
+              continuously for 15 minutes. Inspect the operator logs.
+
+        # Leader flapping: repeated leader changes indicate instability (flaky
+        # network, overloaded members) even while quorum is technically held.
+        - alert: EtcdClusterLeaderFlapping
+          expr: >-
+            increase(etcd_operator_cluster_leader_changes_total[15m]) > 3
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: "EtcdCluster {{ $labels.namespace }}/{{ $labels.name }} leader is flapping"
+            description: >-
+              EtcdCluster {{ $labels.namespace }}/{{ $labels.name }} observed
+              {{ $value }} leader changes in the last 15 minutes. Frequent
+              elections degrade write availability.
+
+        # Cluster not Available: the operator's Available condition has been false
+        # for a sustained period regardless of TLS.
+        - alert: EtcdClusterNotAvailable
+          expr: etcd_operator_cluster_available == 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "EtcdCluster {{ $labels.namespace }}/{{ $labels.name }} is not Available"
+            description: >-
+              The Available condition for EtcdCluster
+              {{ $labels.namespace }}/{{ $labels.name }} has been false for more
+              than 10 minutes.

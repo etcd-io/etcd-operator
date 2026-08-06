@@ -1,0 +1,23 @@
+# Ships the etcd-operator domain-metrics Grafana dashboard as a ConfigMap that
+# the Grafana dashboard sidecar (label grafana_dashboard: "1") auto-imports.
+#
+# This component is opt-in: it is not referenced by config/default. Apply it on
+# its own (kustomize build config/grafana | kubectl apply -f -) or add it to an
+# overlay in the namespace where your Grafana sidecar watches for dashboards.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+generatorOptions:
+  # Keep a stable ConfigMap name (no content hash suffix) so the sidecar and any
+  # GitOps tooling can reference it deterministically.
+  disableNameSuffixHash: true
+
+configMapGenerator:
+  - name: etcd-operator-grafana-dashboard
+    files:
+      - etcd-operator-dashboard.json
+    options:
+      labels:
+        grafana_dashboard: "1"
+        app.kubernetes.io/name: etcd-operator
+        app.kubernetes.io/managed-by: kustomize

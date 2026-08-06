@@ -1,0 +1,20 @@
+# Serve metrics over plain HTTP on :8080 for the e2e suite, which scrapes the
+# operator pod via the API server pod-proxy (see test/e2e/metrics_test.go). The
+# default overlay serves secure HTTPS metrics on :8443 behind authn/authz, which
+# the pod-proxy scrape cannot reach. This replaces the manager's args so the
+# metrics endpoint is reachable; it intentionally does not touch the env patched
+# in patch-env.yaml.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: etcd-operator
+spec:
+  template:
+    spec:
+      containers:
+        - name: manager
+          args:
+            - --metrics-bind-address=:8080
+            - --metrics-secure=false
+            - --leader-elect
+            - --health-probe-bind-address=:8081

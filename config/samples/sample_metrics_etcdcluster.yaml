@@ -1,0 +1,27 @@
+apiVersion: operator.etcd.io/v1alpha1
+kind: EtcdCluster
+metadata:
+  labels:
+    app.kubernetes.io/name: etcd-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: etcdcluster-metrics-sample
+spec:
+  version: v3.5.21
+  size: 3
+  # The operator always exports per-cluster domain metrics on its own /metrics
+  # endpoint (member counts, quorum, leader changes, reconcile timings, TLS-ready,
+  # learner count). The spec.metrics block lets you scope that behaviour per
+  # cluster and, optionally, emit a PodMonitor so Prometheus also scrapes etcd's
+  # own /metrics endpoint on the member pods.
+  metrics:
+    # Export the operator's per-cluster domain metrics for this cluster.
+    # Defaults to true when omitted; set to false to drop this cluster's series.
+    enabled: true
+    podMonitor:
+      # Create a prometheus-operator PodMonitor selecting this cluster's etcd
+      # member pods. Requires the PodMonitor CRD (prometheus-operator) to be
+      # installed; if absent the operator logs and skips it without failing.
+      enabled: true
+      interval: "30s"
+      # Name of the pod port exposing etcd's /metrics endpoint (default: client).
+      port: "client"
