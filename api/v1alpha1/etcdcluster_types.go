@@ -58,9 +58,10 @@ type PodTemplate struct {
 }
 
 type PodSpec struct {
-	Affinity     *corev1.Affinity    `json:"affinity,omitempty"`
-	NodeSelector map[string]string   `json:"nodeSelector,omitempty"`
-	Tolerations  []corev1.Toleration `json:"tolerations,omitempty"`
+	SecurityContext *corev1.PodSecurityContext `json:"securityContext,omitempty"`
+	Affinity        *corev1.Affinity           `json:"affinity,omitempty"`
+	NodeSelector    map[string]string          `json:"nodeSelector,omitempty"`
+	Tolerations     []corev1.Toleration        `json:"tolerations,omitempty"`
 }
 
 type PodMetadata struct {
