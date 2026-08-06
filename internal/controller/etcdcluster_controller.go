@@ -25,6 +25,7 @@ import (
 	certv1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -66,6 +67,7 @@ type reconcileState struct {
 // +kubebuilder:rbac:groups=operator.etcd.io,resources=etcdclusters/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=operator.etcd.io,resources=etcdclusters/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch;get;list;update
@@ -105,11 +107,32 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return res, err
 	}
 
-	if err = r.performHealthChecks(ctx, state); err != nil {
-		return ctrl.Result{}, err
+	// Reconcile the PDB even when the health check errors: healthCheck still
+	// returns the member list for unhealthy clusters, which is exactly when
+	// disruption protection matters most. A PDB write failure is logged but
+	// never blocks health handling or cluster reconciliation.
+	healthErr := r.performHealthChecks(ctx, state)
+	var stsReplicas int32
+	if state.sts != nil && state.sts.Spec.Replicas != nil {
+		stsReplicas = *state.sts.Spec.Replicas
+	}
+	pdbErr := reconcilePodDisruptionBudget(
+		ctx, log.FromContext(ctx), r.Client, state.cluster, state.memberListResp, stsReplicas, r.Scheme,
+	)
+	if pdbErr != nil {
+		log.FromContext(ctx).Error(pdbErr, "Failed to reconcile PodDisruptionBudget")
+	}
+	if healthErr != nil {
+		return ctrl.Result{}, healthErr
 	}
 
-	return r.reconcileClusterState(ctx, state)
+	res, err = r.reconcileClusterState(ctx, state)
+	if err == nil && res.IsZero() && pdbErr != nil {
+		// Nothing else requeues; surface the PDB failure for backoff. Assign
+		// to err so the deferred status/metrics closure observes it too.
+		err = pdbErr
+	}
+	return res, err
 }
 
 // fetchAndValidateState retrieves the EtcdCluster and its StatefulSet and ensures
@@ -586,7 +609,8 @@ func (r *EtcdClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&ecv1alpha1.EtcdCluster{}).
 		Owns(&appsv1.StatefulSet{}).
 		Owns(&corev1.Service{}).
-		Owns(&corev1.ConfigMap{})
+		Owns(&corev1.ConfigMap{}).
+		Owns(&policyv1.PodDisruptionBudget{})
 
 	// Conditionally watch cert-manager Certificate resources if CRDs are installed
 	// This allows the controller to react to Certificate status changes when using cert-manager provider
