@@ -47,7 +47,10 @@ const (
 // EtcdClusterReconciler reconciles a EtcdCluster object
 type EtcdClusterReconciler struct {
 	client.Client
-	Scheme        *runtime.Scheme
+	Scheme *runtime.Scheme
+	// PodReader reads pods straight from the API server. Reading pods through
+	// the cached client would lazily start a cluster-wide pod informer.
+	PodReader     client.Reader
 	Recorder      events.EventRecorder
 	ImageRegistry string
 }
@@ -69,6 +72,7 @@ type reconcileState struct {
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch;get;list;update
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;delete
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;patch;update;delete
 // +kubebuilder:rbac:groups="cert-manager.io",resources=certificates,verbs=get;list;watch;create;patch;update;delete
 // +kubebuilder:rbac:groups="cert-manager.io",resources=clusterissuers,verbs=get;list;watch
@@ -106,6 +110,12 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	if err = r.performHealthChecks(ctx, state); err != nil {
+		// A pod replaced during an upgrade may never come back healthy;
+		// without this the failed health check would keep template and pod
+		// convergence unreachable forever.
+		if res, handled := r.recoverDegradedUpgrade(ctx, state); handled {
+			return res, nil
+		}
 		return ctrl.Result{}, err
 	}
 
@@ -180,6 +190,12 @@ func (r *EtcdClusterReconciler) fetchAndValidateState(ctx context.Context, req c
 			return &reconcileState{cluster: ec, sts: sts}, ctrl.Result{}, nil
 		}
 		currentVersion := stsImage[idx+1:]
+		// Prefer the observed cluster version: the template tag may name an
+		// image that never ran (e.g. a nonexistent patch release), which would
+		// make every rollback look like a downgrade and wedge the cluster.
+		if ec.Status.CurrentVersion != "" {
+			currentVersion = ec.Status.CurrentVersion
+		}
 		targetVersion := ec.Spec.Version
 
 		// Only handle cases when there is a version change.
@@ -337,8 +353,7 @@ func (r *EtcdClusterReconciler) reconcileClusterState(ctx context.Context, s *re
 	}
 
 	if targetReplica == int32(s.cluster.Spec.Size) {
-		logger.Info("EtcdCluster is already up-to-date")
-		return ctrl.Result{}, nil
+		return r.reconcileVersionUpgrade(ctx, s)
 	}
 
 	eps := clientEndpointsFromStatefulsets(s.sts)
@@ -580,6 +595,9 @@ func isCertManagerCRDPresent(mgr ctrl.Manager) bool {
 // SetupWithManager sets up the controller with the Manager.
 func (r *EtcdClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.Recorder = mgr.GetEventRecorder("etcdcluster-controller")
+	if r.PodReader == nil {
+		r.PodReader = mgr.GetAPIReader()
+	}
 	setupLog := ctrl.Log.WithName("setup")
 
 	builder := ctrl.NewControllerManagedBy(mgr).

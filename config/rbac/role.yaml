@@ -29,6 +29,13 @@ rules:
   - patch
   - update
 - apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - delete
+  - get
+- apiGroups:
   - apps
   resources:
   - statefulsets

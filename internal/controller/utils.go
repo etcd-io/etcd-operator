@@ -47,6 +47,23 @@ const (
 )
 
 func reconcileStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1alpha1.EtcdCluster, c client.Client, replicas int32, scheme *runtime.Scheme) (*appsv1.StatefulSet, error) {
+	if _, err := syncStatefulSet(ctx, logger, ec, c, replicas, scheme); err != nil {
+		return nil, err
+	}
+
+	// Wait for statefulset to be ready
+	if err := waitForStatefulSetReady(ctx, logger, c, ec.Name, ec.Namespace); err != nil {
+		return nil, err
+	}
+
+	// Return latest Stateful set. (This is to ensure that we return the latest statefulset for next operation to act on)
+	return getStatefulSet(ctx, c, ec.Name, ec.Namespace)
+}
+
+// syncStatefulSet renders and applies the ConfigMap, member certs and
+// StatefulSet without waiting for readiness. Recovery paths use it while pods
+// are down, when waitForStatefulSetReady could never succeed.
+func syncStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1alpha1.EtcdCluster, c client.Client, replicas int32, scheme *runtime.Scheme) (*appsv1.StatefulSet, error) {
 
 	// prepare/update configmap for StatefulSet
 	err := applyEtcdClusterState(ctx, ec, int(replicas), c, scheme, logger)
@@ -66,13 +83,6 @@ func reconcileStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1alpha
 		return nil, err
 	}
 
-	// Wait for statefulset to be ready
-	err = waitForStatefulSetReady(ctx, logger, c, ec.Name, ec.Namespace)
-	if err != nil {
-		return nil, err
-	}
-
-	// Return latest Stateful set. (This is to ensure that we return the latest statefulset for next operation to act on)
 	return getStatefulSet(ctx, c, ec.Name, ec.Namespace)
 }
 
@@ -243,6 +253,9 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 	stsSpec := appsv1.StatefulSetSpec{
 		Replicas:    &replicas,
 		ServiceName: ec.Name,
+		// OnDelete: pods are only replaced when the upgrade gate deletes them,
+		// never rolled automatically on template changes.
+		UpdateStrategy: appsv1.StatefulSetUpdateStrategy{Type: appsv1.OnDeleteStatefulSetStrategyType},
 		Selector: &metav1.LabelSelector{
 			MatchLabels: labels,
 		},
