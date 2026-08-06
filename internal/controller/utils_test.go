@@ -931,6 +931,7 @@ func TestCreateAutoCertificateConfig(t *testing.T) {
 									ValidityDuration: "720h", // 30 days
 									AltNames: ecv1alpha1.AltNames{
 										DNSNames: []string{"custom1.example.com", "custom2.example.com"},
+										IPs:      []net.IP{net.ParseIP("10.96.99.99")},
 									},
 								},
 							},
@@ -944,10 +945,72 @@ func TestCreateAutoCertificateConfig(t *testing.T) {
 				ValidityDuration: 720 * time.Hour, // 30 days
 				AltNames: certInterface.AltNames{
 					DNSNames: []string{"custom1.example.com", "custom2.example.com"},
-					IPs:      make([]net.IP, 2),
+					IPs:      []net.IP{net.ParseIP("10.96.99.99")},
 				},
 			},
 			wantErr: false,
+		},
+		{
+			name: "auto config with only ipAddresses - IPs kept alongside default DNS names",
+			ec: &ecv1alpha1.EtcdCluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-cluster",
+					Namespace: "test-namespace",
+				},
+				Spec: ecv1alpha1.EtcdClusterSpec{
+					TLS: &ecv1alpha1.TLSCertificate{
+						Provider: string(certificate.Auto),
+						ProviderCfg: ecv1alpha1.ProviderConfig{
+							AutoCfg: &ecv1alpha1.ProviderAutoConfig{
+								CommonConfig: ecv1alpha1.CommonConfig{
+									CommonName: "custom.example.com",
+									AltNames: ecv1alpha1.AltNames{
+										IPs: []net.IP{net.ParseIP("10.96.99.99")},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: &certInterface.Config{
+				CommonName:       "custom.example.com",
+				ValidityDuration: certInterface.DefaultAutoValidity,
+				AltNames: certInterface.AltNames{
+					DNSNames: []string{
+						"*.test-cluster.test-namespace.svc.cluster.local",
+						"test-cluster.test-namespace.svc.cluster.local",
+					},
+					IPs: []net.IP{net.ParseIP("10.96.99.99")},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "auto config with invalid IP entry",
+			ec: &ecv1alpha1.EtcdCluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-cluster",
+					Namespace: "test-namespace",
+				},
+				Spec: ecv1alpha1.EtcdClusterSpec{
+					TLS: &ecv1alpha1.TLSCertificate{
+						Provider: string(certificate.Auto),
+						ProviderCfg: ecv1alpha1.ProviderConfig{
+							AutoCfg: &ecv1alpha1.ProviderAutoConfig{
+								CommonConfig: ecv1alpha1.CommonConfig{
+									CommonName: "custom.example.com",
+									AltNames: ecv1alpha1.AltNames{
+										IPs: []net.IP{nil},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: nil,
+			wantErr:  true,
 		},
 		{
 			name: "auto config with nil AutoCfg - should use defaults",
@@ -1025,6 +1088,7 @@ func TestCreateCMCertificateConfig(t *testing.T) {
 									ValidityDuration: "1440h", // 60 days
 									AltNames: ecv1alpha1.AltNames{
 										DNSNames: []string{"cm1.example.com", "cm2.example.com"},
+										IPs:      []net.IP{net.ParseIP("10.96.99.99")},
 									},
 								},
 								IssuerName: "test-issuer",
@@ -1040,7 +1104,49 @@ func TestCreateCMCertificateConfig(t *testing.T) {
 				ValidityDuration: 1440 * time.Hour, // 60 days
 				AltNames: certInterface.AltNames{
 					DNSNames: []string{"cm1.example.com", "cm2.example.com"},
-					IPs:      make([]net.IP, 2),
+					IPs:      []net.IP{net.ParseIP("10.96.99.99")},
+				},
+				ExtraConfig: map[string]any{
+					"issuerName": "test-issuer",
+					"issuerKind": "ClusterIssuer",
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "cert-manager config with only ipAddresses - IPs kept alongside default DNS names",
+			ec: &ecv1alpha1.EtcdCluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-cluster",
+					Namespace: "test-namespace",
+				},
+				Spec: ecv1alpha1.EtcdClusterSpec{
+					TLS: &ecv1alpha1.TLSCertificate{
+						Provider: string(certificate.CertManager),
+						ProviderCfg: ecv1alpha1.ProviderConfig{
+							CertManagerCfg: &ecv1alpha1.ProviderCertManagerConfig{
+								CommonConfig: ecv1alpha1.CommonConfig{
+									CommonName: "cm.example.com",
+									AltNames: ecv1alpha1.AltNames{
+										IPs: []net.IP{net.ParseIP("10.96.99.99")},
+									},
+								},
+								IssuerName: "test-issuer",
+								IssuerKind: "ClusterIssuer",
+							},
+						},
+					},
+				},
+			},
+			expected: &certInterface.Config{
+				CommonName:       "cm.example.com",
+				ValidityDuration: certInterface.DefaultCertManagerValidity,
+				AltNames: certInterface.AltNames{
+					DNSNames: []string{
+						"*.test-cluster.test-namespace.svc.cluster.local",
+						"test-cluster.test-namespace.svc.cluster.local",
+					},
+					IPs: []net.IP{net.ParseIP("10.96.99.99")},
 				},
 				ExtraConfig: map[string]any{
 					"issuerName": "test-issuer",
