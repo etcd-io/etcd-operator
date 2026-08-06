@@ -32,6 +32,7 @@ import (
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	controllerruntime "sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
@@ -50,6 +51,22 @@ type EtcdClusterReconciler struct {
 	Scheme        *runtime.Scheme
 	Recorder      events.EventRecorder
 	ImageRegistry string
+
+	// MaxConcurrentReconciles is the number of reconcile workers the controller
+	// runs in parallel. controller-runtime's default is 1.
+	//
+	// Each EtcdCluster is reconciled on its own workqueue key (the queue dedups
+	// by namespaced name), so a single cluster is NEVER reconciled by two workers
+	// at once; concurrency only ever parallelizes DISTINCT clusters. Because a
+	// reconcile here is relatively heavy and long-running (StatefulSet patches,
+	// member-list/health RPCs against managed etcd, certificate work), a small
+	// pool meaningfully improves throughput when many clusters need attention at
+	// the same time. The cost of a larger pool is more simultaneous apiserver and
+	// managed-etcd load, so wise operators should tune this for their fleet.
+	//
+	// A value <= 0 falls back to controller-runtime's default of 1, which stays
+	// behaviorally safe.
+	MaxConcurrentReconciles int
 }
 
 // reconcileState holds all transient data for a single reconciliation loop.
@@ -597,6 +614,16 @@ func (r *EtcdClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	} else {
 		// cert-manager CRDs not installed, skip Certificate watch
 		setupLog.Info("cert-manager CRDs not detected, only auto provider will be available. Restart the controller after cert-manager CRDs are installed")
+	}
+
+	// Widen the reconcile worker pool when configured. A value <= 0 leaves
+	// controller-runtime at its default of a single worker. See the doc comment
+	// on EtcdClusterReconciler.MaxConcurrentReconciles for why a small pool is a
+	// safe default for this operator.
+	if r.MaxConcurrentReconciles > 0 {
+		builder = builder.WithOptions(controllerruntime.Options{
+			MaxConcurrentReconciles: r.MaxConcurrentReconciles,
+		})
 	}
 
 	return builder.Complete(r)

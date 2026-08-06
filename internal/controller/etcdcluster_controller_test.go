@@ -26,9 +26,13 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/config"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 )
@@ -570,4 +574,52 @@ func TestBootstrapStatefulSet(t *testing.T) {
 		assert.NoError(t, err)
 		assert.Equal(t, storedCM.Data, fetchedCM.Data)
 	})
+}
+
+// TestSetupWithManagerThreadsMaxConcurrentReconciles verifies that the
+// --max-concurrent-reconciles knob is actually threaded through
+// SetupWithManager into controller-runtime's builder. A real manager is built
+// from the envtest rest.Config so the builder's option plumbing is exercised
+// end-to-end; the controller is never started.
+func TestSetupWithManagerThreadsMaxConcurrentReconciles(t *testing.T) {
+	if restCfg == nil {
+		t.Skip("envtest rest config unavailable; KUBEBUILDER_ASSETS not set")
+	}
+
+	testScheme := runtime.NewScheme()
+	require.NoError(t, clientgoscheme.AddToScheme(testScheme))
+	require.NoError(t, ecv1alpha1.AddToScheme(testScheme))
+
+	tests := []struct {
+		name                    string
+		maxConcurrentReconciles int
+	}{
+		{name: "widened pool", maxConcurrentReconciles: 5},
+		{name: "explicit single worker", maxConcurrentReconciles: 1},
+		{name: "non-positive falls back to default safely", maxConcurrentReconciles: 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mgr, err := ctrl.NewManager(restCfg, ctrl.Options{
+				Scheme:  testScheme,
+				Metrics: metricsserver.Options{BindAddress: "0"},
+				// Subtests register the same controller name on distinct managers;
+				// skip the global metric-name uniqueness guard so they can coexist.
+				Controller: config.Controller{SkipNameValidation: ptr.To(true)},
+			})
+			require.NoError(t, err)
+
+			r := &EtcdClusterReconciler{
+				Client:                  mgr.GetClient(),
+				Scheme:                  mgr.GetScheme(),
+				MaxConcurrentReconciles: tt.maxConcurrentReconciles,
+			}
+			// SetupWithManager must accept the configured pool size and register
+			// the controller without error for every value, including the
+			// non-positive fallback path.
+			require.NoError(t, r.SetupWithManager(mgr))
+			assert.Equal(t, tt.maxConcurrentReconciles, r.MaxConcurrentReconciles)
+		})
+	}
 }

@@ -25,6 +25,7 @@ import (
 	"testing"
 
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
@@ -37,6 +38,8 @@ import (
 
 var (
 	k8sClient client.Client
+	// restCfg is the envtest rest.Config, exposed so tests can build a manager.
+	restCfg *rest.Config
 )
 
 func TestMain(m *testing.M) {
@@ -67,6 +70,7 @@ func TestMain(m *testing.M) {
 	if cfg == nil {
 		logger.Fatalf("Test environment started with nil config")
 	}
+	restCfg = cfg
 
 	ctrl.SetLogger(zap.New())
 

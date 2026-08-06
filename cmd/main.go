@@ -64,6 +64,7 @@ func main() {
 	var probeAddr string
 	var secureMetrics bool
 	var enableHTTP2 bool
+	var maxConcurrentReconciles int
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&imageRegistry, "image-registry", "gcr.io/etcd-development/etcd",
 		"The container registry to pull etcd images from. Defaults to gcr.io/etcd-development/etcd.")
@@ -77,6 +78,13 @@ func main() {
 		"If set, the metrics endpoint is served securely via HTTPS. Use --metrics-secure=false to use HTTP instead.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
+	flag.IntVar(&maxConcurrentReconciles, "max-concurrent-reconciles", 5,
+		"Number of reconcile workers run in parallel. Each EtcdCluster is keyed on its own "+
+			"workqueue entry, so a single cluster is never reconciled by two workers at once; this "+
+			"only parallelizes distinct clusters. Reconciles are relatively heavy/long-running, so a "+
+			"small pool (default 5) improves multi-cluster throughput. Going higher increases "+
+			"simultaneous apiserver and managed-etcd load, so tune it for your fleet. A value <= 0 "+
+			"falls back to controller-runtime's default of 1.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -151,9 +159,10 @@ func main() {
 	}
 
 	if err = (&controller.EtcdClusterReconciler{
-		Client:        mgr.GetClient(),
-		Scheme:        mgr.GetScheme(),
-		ImageRegistry: imageRegistry,
+		Client:                  mgr.GetClient(),
+		Scheme:                  mgr.GetScheme(),
+		ImageRegistry:           imageRegistry,
+		MaxConcurrentReconciles: maxConcurrentReconciles,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "EtcdCluster")
 		os.Exit(1)
