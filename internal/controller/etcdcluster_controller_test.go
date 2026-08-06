@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -31,6 +32,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
+	"go.etcd.io/etcd-operator/internal/etcdutils"
+	"go.etcd.io/etcd/api/v3/etcdserverpb"
+	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 // TestFetchAndValidateState describes the scenarios for the fetchAndValidateState
@@ -570,4 +574,106 @@ func TestBootstrapStatefulSet(t *testing.T) {
 		assert.NoError(t, err)
 		assert.Equal(t, storedCM.Data, fetchedCM.Data)
 	})
+}
+
+// TestUpdateStatusMemberHealthCorrelation verifies that member statuses are
+// correlated with health reports by member ID. The member list from etcd is
+// ordered by member ID while the health report is ordered by endpoint, so the
+// two lists cannot be paired by index.
+func TestUpdateStatusMemberHealthCorrelation(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = ecv1alpha1.AddToScheme(scheme)
+
+	ec := &ecv1alpha1.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "etcd",
+			Namespace: "default",
+		},
+		Spec: ecv1alpha1.EtcdClusterSpec{Size: 3, Version: "3.5.17"},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(ec).
+		WithStatusSubresource(ec).
+		Build()
+	r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
+
+	// etcd-2 is the leader and has the lowest member ID, so it comes first in
+	// the ID-ordered member list while its health entry comes last in the
+	// endpoint-ordered health report.
+	const (
+		leaderID    uint64 = 0x100 // etcd-2
+		followerID0 uint64 = 0x200 // etcd-0
+		followerID1 uint64 = 0x300 // etcd-1
+	)
+
+	state := &reconcileState{
+		cluster: ec,
+		memberListResp: &clientv3.MemberListResponse{
+			Members: []*etcdserverpb.Member{
+				{ID: leaderID, Name: "etcd-2"},
+				{ID: followerID0, Name: "etcd-0"},
+				{ID: followerID1, Name: "etcd-1"},
+			},
+		},
+		memberHealth: []etcdutils.EpHealth{
+			{
+				Ep:     "http://etcd-0.etcd.default.svc.cluster.local:2379",
+				Health: true,
+				Status: &clientv3.StatusResponse{
+					Header:  &etcdserverpb.ResponseHeader{MemberId: followerID0},
+					Leader:  leaderID,
+					Version: "3.5.17",
+				},
+			},
+			{
+				Ep:     "http://etcd-1.etcd.default.svc.cluster.local:2379",
+				Health: true,
+				Status: &clientv3.StatusResponse{
+					Header:  &etcdserverpb.ResponseHeader{MemberId: followerID1},
+					Leader:  leaderID,
+					Version: "3.5.16",
+				},
+			},
+			{
+				Ep:     "http://etcd-2.etcd.default.svc.cluster.local:2379",
+				Health: true,
+				Status: &clientv3.StatusResponse{
+					Header:  &etcdserverpb.ResponseHeader{MemberId: leaderID},
+					Leader:  leaderID,
+					Version: "3.5.17",
+				},
+			},
+		},
+	}
+
+	require.NoError(t, r.updateStatus(t.Context(), state))
+
+	status := ec.Status
+	assert.Equal(t, fmt.Sprintf("%x", leaderID), status.LeaderID)
+	require.Len(t, status.Members, 3)
+
+	leaders := 0
+	for _, m := range status.Members {
+		if m.IsLeader {
+			leaders++
+			assert.Equal(t, status.LeaderID, m.ID, "isLeader member must match status.leaderID")
+		}
+	}
+	assert.Equal(t, 1, leaders, "exactly one member should be leader")
+
+	byName := map[string]ecv1alpha1.MemberStatus{}
+	for _, m := range status.Members {
+		byName[m.Name] = m
+	}
+	assert.True(t, byName["etcd-2"].IsLeader)
+	assert.False(t, byName["etcd-0"].IsLeader)
+	assert.False(t, byName["etcd-1"].IsLeader)
+	assert.Equal(t, "3.5.17", byName["etcd-0"].Version)
+	assert.Equal(t, "3.5.16", byName["etcd-1"].Version)
+	assert.Equal(t, "3.5.17", byName["etcd-2"].Version)
+	for _, m := range status.Members {
+		assert.True(t, m.IsHealthy, "member %s should be healthy", m.Name)
+	}
 }
