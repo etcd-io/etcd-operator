@@ -1090,3 +1090,33 @@ func TestCreateCMCertificateConfig(t *testing.T) {
 		})
 	}
 }
+
+func TestParseValidityDuration(t *testing.T) {
+	tests := []struct {
+		name        string
+		input       string
+		expected    time.Duration
+		expectedErr bool
+	}{
+		{name: "day suffix", input: "365d", expected: 365 * 24 * time.Hour},
+		{name: "days and hours", input: "100d12h", expected: 100*24*time.Hour + 12*time.Hour},
+		{name: "plain go duration", input: "24h", expected: 24 * time.Hour},
+		{name: "minutes", input: "90m", expected: 90 * time.Minute},
+		{name: "empty returns default", input: "", expected: certInterface.DefaultCertManagerValidity},
+		{name: "invalid string", input: "abc", expectedErr: true},
+		{name: "day unit without value", input: "d", expectedErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			duration, err := parseValidityDuration(tt.input, certInterface.DefaultCertManagerValidity)
+			if tt.expectedErr {
+				require.Error(t, err)
+				assert.ErrorContains(t, err, "failed to parse ValidityDuration")
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.expected, duration)
+		})
+	}
+}
