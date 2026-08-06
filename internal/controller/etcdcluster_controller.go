@@ -106,6 +106,13 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	if err = r.performHealthChecks(ctx, state); err != nil {
+		// While the StatefulSet is still converging (e.g. image pull after bootstrap)
+		// an unreachable member is expected; requeue instead of counting an error.
+		if !isStatefulSetSettled(state.sts) {
+			log.FromContext(ctx).Info("Health check failed while StatefulSet is converging, requeuing",
+				"reason", err.Error())
+			return ctrl.Result{RequeueAfter: requeueDuration}, nil
+		}
 		return ctrl.Result{}, err
 	}
 
@@ -277,6 +284,14 @@ func (r *EtcdClusterReconciler) reconcileClusterState(ctx context.Context, s *re
 	if s.memberListResp != nil {
 		memberCnt = len(s.memberListResp.Members)
 	}
+
+	// Don't act on a spec the StatefulSet controller hasn't observed yet (stale cache after our own write).
+	if !statefulSetSpecObserved(s.sts) {
+		logger.Info("StatefulSet spec not observed by its controller yet, requeuing",
+			"generation", s.sts.Generation, "observedGeneration", s.sts.Status.ObservedGeneration)
+		return ctrl.Result{RequeueAfter: requeueDuration}, nil
+	}
+
 	targetReplica := *s.sts.Spec.Replicas
 	var err error
 
@@ -298,6 +313,25 @@ func (r *EtcdClusterReconciler) reconcileClusterState(ctx context.Context, s *re
 				return ctrl.Result{}, err
 			}
 		}
+		return ctrl.Result{RequeueAfter: requeueDuration}, nil
+	}
+
+	// Membership mutations below must only run against a settled StatefulSet. This gate sits
+	// after mismatch recovery on purpose: an interrupted scale-in leaves an orphaned pod whose
+	// etcd has exited, so the StatefulSet can never settle until recovery shrinks it.
+	// Spec-driven scale-in is exempt: reaching here means every member passed health checks,
+	// so removal is quorum-safe, and the member removed first is the last ordinal — often the
+	// very pod whose unreadiness prevents settling. Gating it would wedge a shrink away from
+	// a broken pod.
+	scaleIn := targetReplica > int32(s.cluster.Spec.Size)
+	if !scaleIn && !isStatefulSetSettled(s.sts) {
+		logger.Info("StatefulSet replicas not ready yet, requeuing",
+			"readyReplicas", s.sts.Status.ReadyReplicas, "replicas", targetReplica)
+		// Health checks passed but pods lag: normal briefly after a scale-out, anomalous
+		// if persistent (e.g. NotReady kubelet with etcd still serving).
+		r.warnEvent(s.cluster, "StatefulSetNotSettled", "Requeue",
+			"waiting for %d/%d ready replicas before mutating etcd membership",
+			s.sts.Status.ReadyReplicas, targetReplica)
 		return ctrl.Result{RequeueAfter: requeueDuration}, nil
 	}
 
@@ -400,6 +434,13 @@ func (r *EtcdClusterReconciler) reconcileClusterState(ctx context.Context, s *re
 
 	logger.Info("EtcdCluster reconciled successfully")
 	return ctrl.Result{}, nil
+}
+
+// warnEvent emits a Warning event on the cluster; no-op when no Recorder is wired (unit tests).
+func (r *EtcdClusterReconciler) warnEvent(obj runtime.Object, reason, action, note string, args ...interface{}) {
+	if r.Recorder != nil {
+		r.Recorder.Eventf(obj, nil, corev1.EventTypeWarning, reason, action, note, args...)
+	}
 }
 
 // updateStatus updates the EtcdCluster status based on observed state.
