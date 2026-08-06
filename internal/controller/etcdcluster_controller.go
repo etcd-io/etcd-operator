@@ -182,8 +182,10 @@ func (r *EtcdClusterReconciler) fetchAndValidateState(ctx context.Context, req c
 		currentVersion := stsImage[idx+1:]
 		targetVersion := ec.Spec.Version
 
-		// Only handle cases when there is a version change.
-		if currentVersion != targetVersion {
+		// Only handle cases when there is a version change. Compare on the
+		// normalized (v-stripped) form so the v-prefixed live image tag and a bare
+		// spec.version describing the same release are not seen as a change.
+		if normalizeEtcdVersion(currentVersion) != normalizeEtcdVersion(targetVersion) {
 			// TODO: consider adding an option in the CRD called allowCustomImageUpgrade to make
 			// the behavior here optional:
 			//   https://github.com/etcd-io/etcd-operator/pull/278/changes#r2764717418

@@ -701,6 +701,62 @@ func TestCreateOrPatchStatefulSetWithPodLabels(t *testing.T) {
 	}
 }
 
+// TestEtcdImageTag guards the registry-convention normalization: the default
+// etcd-development registry only publishes v-prefixed tags, so a bare semver
+// spec.version must be rendered with a leading "v" (otherwise the image is
+// NotFound -> ImagePullBackOff), while an already-v-prefixed value and an
+// explicit non-semver custom tag must be passed through unchanged.
+func TestEtcdImageTag(t *testing.T) {
+	tests := []struct {
+		name    string
+		version string
+		want    string
+	}{
+		{name: "bare semver gets v prefix for the v-tagged registry", version: "3.6.1", want: "v3.6.1"},
+		{name: "v-prefixed semver passes through unchanged", version: "v3.6.1", want: "v3.6.1"},
+		{name: "default sample version (v-prefixed) is preserved", version: "v3.5.21", want: "v3.5.21"},
+		{name: "surrounding whitespace is trimmed", version: " 3.5.21 ", want: "v3.5.21"},
+		{name: "non-semver custom tag is left untouched", version: "latest", want: "latest"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, etcdImageTag(tt.version))
+		})
+	}
+}
+
+// TestRenderedImageRefIsVPrefixed asserts end-to-end that a bare spec.version
+// renders a v-prefixed image ref against the default registry, so the StatefulSet
+// pulls a tag the registry actually publishes.
+func TestRenderedImageRefIsVPrefixed(t *testing.T) {
+	ctx := t.Context()
+	logger := log.FromContext(ctx)
+
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = ecv1alpha1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	ec := &ecv1alpha1.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-etcd", Namespace: "default"},
+		Spec: ecv1alpha1.EtcdClusterSpec{
+			Size:          3,
+			Version:       "3.5.21", // bare semver, as a user might write it
+			ImageRegistry: "gcr.io/etcd-development/etcd",
+		},
+	}
+
+	require.NoError(t, createOrPatchStatefulSet(ctx, logger, ec, fakeClient, 3, scheme))
+
+	sts := &appsv1.StatefulSet{}
+	require.NoError(t, fakeClient.Get(ctx, client.ObjectKey{Name: "test-etcd", Namespace: "default"}, sts))
+	require.Len(t, sts.Spec.Template.Spec.Containers, 1)
+	assert.Equal(t, "gcr.io/etcd-development/etcd:v3.5.21",
+		sts.Spec.Template.Spec.Containers[0].Image,
+		"bare spec.version must render a v-prefixed tag against the v-only etcd-development registry")
+}
+
 func TestCreatingArgs(t *testing.T) {
 	tests := []struct {
 		testName       string

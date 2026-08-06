@@ -98,6 +98,28 @@ func TestMain(m *testing.M) {
 			return ctx, nil
 		},
 
+		// install cert-manager BEFORE deploy.
+		//
+		// The admission-webhook feature wires config/default to reference
+		// ../certmanager: a cert-manager Certificate/Issuer issues the
+		// webhook-server-cert secret, and manager_webhook_patch.yaml mounts that
+		// secret into the manager pod. If cert-manager is absent at deploy time the
+		// Certificate/Issuer manifests have no CRDs to apply against and the secret
+		// never materializes, so the manager pod hangs in ContainerCreating and the
+		// DeploymentAvailable wait below times out before a single webhook assertion
+		// can run. cert-manager must therefore be installed (and its own webhook
+		// Ready) here, not lazily inside an individual feature test that runs after
+		// TestMain. InstallCertManager blocks until cert-manager-webhook is Available.
+		func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
+			log.Println("Installing cert-manager...")
+			if err := test_utils.InstallCertManager(); err != nil {
+				log.Printf("Unable to install cert-manager: %s", err)
+				return ctx, err
+			}
+
+			return ctx, nil
+		},
+
 		// set up environment
 		func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
 			// create namespace
