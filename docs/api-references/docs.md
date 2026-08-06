@@ -110,6 +110,9 @@ _Appears in:_
 | `storageSpec` _[StorageSpec](#storagespec)_ | StorageSpec is the name of the StorageSpec to use for the etcd cluster. If not provided, then each POD just uses the temporary storage inside the container. |  |  |
 | `tls` _[TLSCertificate](#tlscertificate)_ | TLS is the TLS certificate configuration to use for the etcd cluster and etcd operator. |  |  |
 | `etcdOptions` _string array_ | etcd configuration options are passed as command line arguments to the etcd container, refer to etcd documentation for configuration options applicable for the version of etcd being used. |  |  |
+| `quotaBackendBytes` _[Quantity](https://kubernetes.io/docs/reference/generated/kubernetes-api/v/#quantity-resource-api)_ | QuotaBackendBytes is the etcd backend storage quota (--quota-backend-bytes).<br />When exceeded etcd raises a NOSPACE alarm and becomes read-only.<br />Unset means the etcd default (2GiB). etcd recommends at most 8GiB.<br />Must be at least 100Mi: etcd disables the quota for non-positive<br />values, and a byte-scale typo ("8" instead of "8Gi") would alarm the<br />whole cluster read-only on the first pod restart. Lowering the quota<br />below the current DB size has the same read-only effect. |  | Optional: \{\} <br /> |
+| `autoCompactionMode` _string_ | AutoCompactionMode selects the MVCC auto-compaction policy (--auto-compaction-mode). |  | Enum: [periodic revision] <br />Optional: \{\} <br /> |
+| `autoCompactionRetention` _string_ | AutoCompactionRetention is the retention window for auto compaction<br />(--auto-compaction-retention): a duration such as "5m"/"1h" in periodic<br />mode, or a revision count in revision mode. "0" disables auto compaction. |  | Pattern: `^([0-9]+[smh])+$\|^[0-9]+$` <br />Optional: \{\} <br /> |
 | `podTemplate` _[PodTemplate](#podtemplate)_ | PodTemplate is the pod template to use for the etcd cluster. |  |  |
 
 
@@ -153,6 +156,24 @@ _Appears in:_
 | `labels` _object (keys:string, values:string)_ |  |  |  |
 
 
+#### PodSpec
+
+
+
+
+
+
+
+_Appears in:_
+- [PodTemplate](#podtemplate)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `affinity` _[Affinity](https://kubernetes.io/docs/reference/generated/kubernetes-api/v/#affinity-v1-core)_ |  |  |  |
+| `nodeSelector` _object (keys:string, values:string)_ |  |  |  |
+| `tolerations` _[Toleration](https://kubernetes.io/docs/reference/generated/kubernetes-api/v/#toleration-v1-core) array_ |  |  |  |
+
+
 #### PodTemplate
 
 
@@ -167,6 +188,7 @@ _Appears in:_
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `metadata` _[PodMetadata](#podmetadata)_ | Refer to Kubernetes API documentation for fields of `metadata`. |  |  |
+| `spec` _[PodSpec](#podspec)_ |  |  |  |
 
 
 #### ProviderAutoConfig

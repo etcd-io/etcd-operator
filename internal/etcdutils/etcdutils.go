@@ -12,6 +12,7 @@ import (
 	"github.com/go-logr/logr"
 	"go.uber.org/zap"
 
+	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	"go.etcd.io/etcd/client/pkg/v3/logutil"
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -41,6 +42,51 @@ func MemberList(eps []string) (*clientv3.MemberListResponse, error) {
 	}()
 
 	return c.MemberList(ctx)
+}
+
+// MemberAlarm is an active alarm on one etcd member.
+type MemberAlarm struct {
+	MemberID uint64
+	Type     string // etcdserverpb.AlarmType name, e.g. "NOSPACE", "CORRUPT"
+}
+
+// AlarmList returns the active alarms across the cluster.
+func AlarmList(eps []string) ([]MemberAlarm, error) {
+	cfg := clientv3.Config{
+		Endpoints:            eps,
+		DialTimeout:          2 * time.Second,
+		DialKeepAliveTime:    2 * time.Second,
+		DialKeepAliveTimeout: 6 * time.Second,
+	}
+
+	c, err := clientv3.New(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer func() {
+		err := c.Close()
+		if err != nil {
+			cancel()
+			return
+		}
+		cancel()
+	}()
+
+	resp, err := c.AlarmList(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	alarms := make([]MemberAlarm, 0, len(resp.Alarms))
+	for _, a := range resp.Alarms {
+		if a.Alarm == etcdserverpb.AlarmType_NONE {
+			continue
+		}
+		alarms = append(alarms, MemberAlarm{MemberID: a.MemberID, Type: a.Alarm.String()})
+	}
+	return alarms, nil
 }
 
 type EpHealth struct {

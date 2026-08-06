@@ -23,7 +23,7 @@ package v1alpha1
 import (
 	"k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	runtime "k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime"
 	netx "net"
 )
 
@@ -155,6 +155,11 @@ func (in *EtcdClusterSpec) DeepCopyInto(out *EtcdClusterSpec) {
 		in, out := &in.EtcdOptions, &out.EtcdOptions
 		*out = make([]string, len(*in))
 		copy(*out, *in)
+	}
+	if in.QuotaBackendBytes != nil {
+		in, out := &in.QuotaBackendBytes, &out.QuotaBackendBytes
+		x := (*in).DeepCopy()
+		*out = &x
 	}
 	if in.PodTemplate != nil {
 		in, out := &in.PodTemplate, &out.PodTemplate

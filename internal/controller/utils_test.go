@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -702,11 +703,18 @@ func TestCreateOrPatchStatefulSetWithPodLabels(t *testing.T) {
 }
 
 func TestCreatingArgs(t *testing.T) {
+	quantityPtr := func(s string) *resource.Quantity {
+		q := resource.MustParse(s)
+		return &q
+	}
 	tests := []struct {
-		testName       string
-		etcdOptions    []string
-		clusterName    string
-		expectedResult []string
+		testName                string
+		etcdOptions             []string
+		clusterName             string
+		quotaBackendBytes       *resource.Quantity
+		autoCompactionMode      string
+		autoCompactionRetention string
+		expectedResult          []string
 	}{
 		{
 			testName:    "No etcdOptions provided",
@@ -785,10 +793,74 @@ func TestCreatingArgs(t *testing.T) {
 				"--experimental-peer-skip-client-san-verification",
 			},
 		},
+		{
+			testName:          "QuotaBackendBytes set",
+			clusterName:       "testCluster",
+			quotaBackendBytes: quantityPtr("8Gi"),
+			expectedResult: []string{
+				"--name=$(POD_NAME)",
+				"--listen-peer-urls=http://0.0.0.0:2380",
+				"--listen-client-urls=http://0.0.0.0:2379",
+				"--initial-advertise-peer-urls=http://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc.cluster.local:2380",
+				"--advertise-client-urls=http://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc.cluster.local:2379",
+				"--quota-backend-bytes=8589934592",
+			},
+		},
+		{
+			testName:                "Auto compaction mode and retention",
+			clusterName:             "testCluster",
+			autoCompactionMode:      "periodic",
+			autoCompactionRetention: "5m",
+			expectedResult: []string{
+				"--name=$(POD_NAME)",
+				"--listen-peer-urls=http://0.0.0.0:2380",
+				"--listen-client-urls=http://0.0.0.0:2379",
+				"--initial-advertise-peer-urls=http://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc.cluster.local:2380",
+				"--advertise-client-urls=http://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc.cluster.local:2379",
+				"--auto-compaction-mode=periodic",
+				"--auto-compaction-retention=5m",
+			},
+		},
+		{
+			testName:                "Auto compaction retention without mode",
+			clusterName:             "testCluster",
+			autoCompactionRetention: "1000",
+			expectedResult: []string{
+				"--name=$(POD_NAME)",
+				"--listen-peer-urls=http://0.0.0.0:2380",
+				"--listen-client-urls=http://0.0.0.0:2379",
+				"--initial-advertise-peer-urls=http://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc.cluster.local:2380",
+				"--advertise-client-urls=http://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc.cluster.local:2379",
+				"--auto-compaction-retention=1000",
+			},
+		},
+		{
+			testName:          "EtcdOptions override spec quotaBackendBytes",
+			clusterName:       "testCluster",
+			quotaBackendBytes: quantityPtr("8Gi"),
+			etcdOptions:       []string{"--quota-backend-bytes=123"},
+			expectedResult: []string{
+				"--name=$(POD_NAME)",
+				"--listen-peer-urls=http://0.0.0.0:2380",
+				"--listen-client-urls=http://0.0.0.0:2379",
+				"--initial-advertise-peer-urls=http://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc.cluster.local:2380",
+				"--advertise-client-urls=http://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc.cluster.local:2379",
+				"--quota-backend-bytes=123",
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.testName, func(t *testing.T) {
-			result := createArgs(tt.clusterName, tt.etcdOptions)
+			ec := &ecv1alpha1.EtcdCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: tt.clusterName},
+				Spec: ecv1alpha1.EtcdClusterSpec{
+					EtcdOptions:             tt.etcdOptions,
+					QuotaBackendBytes:       tt.quotaBackendBytes,
+					AutoCompactionMode:      tt.autoCompactionMode,
+					AutoCompactionRetention: tt.autoCompactionRetention,
+				},
+			}
+			result := createArgs(ec)
 			assert.Equal(t, tt.expectedResult, result)
 		})
 	}

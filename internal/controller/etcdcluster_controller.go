@@ -60,6 +60,7 @@ type reconcileState struct {
 	sts            *appsv1.StatefulSet          // associated StatefulSet for the cluster
 	memberListResp *clientv3.MemberListResponse // member list fetched from the etcd cluster
 	memberHealth   []etcdutils.EpHealth         // health information for each etcd member
+	alarms         []etcdutils.MemberAlarm      // active etcd alarms (e.g. NOSPACE)
 }
 
 // +kubebuilder:rbac:groups=operator.etcd.io,resources=etcdclusters,verbs=get;list;watch;create;update;patch;delete
@@ -69,6 +70,7 @@ type reconcileState struct {
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch;get;list;update
+// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;patch;update;delete
 // +kubebuilder:rbac:groups="cert-manager.io",resources=certificates,verbs=get;list;watch;create;patch;update;delete
 // +kubebuilder:rbac:groups="cert-manager.io",resources=clusterissuers,verbs=get;list;watch
@@ -261,10 +263,50 @@ func (r *EtcdClusterReconciler) performHealthChecks(ctx context.Context, s *reco
 	logger.Info("Now checking health of the cluster members")
 	var err error
 	s.memberListResp, s.memberHealth, err = healthCheck(s.sts, logger)
+
+	// Poll alarms even when the health check errored: a NOSPACE alarm makes
+	// members report unhealthy, and the deferred status update still runs.
+	if s.memberListResp != nil {
+		alarms, aerr := etcdutils.AlarmList(clientEndpointsFromStatefulsets(s.sts))
+		if aerr != nil {
+			logger.Error(aerr, "failed to list etcd alarms")
+		} else {
+			s.alarms = alarms
+		}
+		r.reportNospaceAlarms(s)
+	}
+
 	if err != nil {
 		return fmt.Errorf("health check failed: %w", err)
 	}
 	return nil
+}
+
+// memberNameForID resolves an etcd member ID to its name, falling back to the hex ID.
+func memberNameForID(resp *clientv3.MemberListResponse, id uint64) string {
+	if resp != nil {
+		for _, m := range resp.Members {
+			if m.ID == id && m.Name != "" {
+				return m.Name
+			}
+		}
+	}
+	return fmt.Sprintf("%x", id)
+}
+
+// reportNospaceAlarms emits a Warning event for each member with an active NOSPACE alarm.
+func (r *EtcdClusterReconciler) reportNospaceAlarms(s *reconcileState) {
+	if r.Recorder == nil {
+		return
+	}
+	for _, a := range s.alarms {
+		if a.Type != "NOSPACE" {
+			continue
+		}
+		name := memberNameForID(s.memberListResp, a.MemberID)
+		r.Recorder.Eventf(s.cluster, nil, corev1.EventTypeWarning, "DatabaseQuotaExceeded", "AlarmDetected",
+			"etcd member %s has an active NOSPACE alarm; cluster is read-only. Compact and defragment, then `etcdctl alarm disarm`. A raised spec.quotaBackendBytes rolls out automatically once members report healthy again.", name)
+	}
 }
 
 // reconcileClusterState compares the desired cluster size with the observed
@@ -562,6 +604,20 @@ func (r *EtcdClusterReconciler) updateConditions(s *reconcileState) {
 			degradedCondition.Reason = "UnhealthyMembers"
 			degradedCondition.Message = fmt.Sprintf("Unhealthy members: %s", strings.Join(unhealthyMembers, ", "))
 		}
+	}
+
+	// NOSPACE takes precedence over the generic UnhealthyMembers reason:
+	// alarmed members are also reported unhealthy by the health check.
+	var nospaceMembers []string
+	for _, a := range s.alarms {
+		if a.Type == "NOSPACE" {
+			nospaceMembers = append(nospaceMembers, memberNameForID(s.memberListResp, a.MemberID))
+		}
+	}
+	if len(nospaceMembers) > 0 {
+		degradedCondition.Status = metav1.ConditionTrue
+		degradedCondition.Reason = "DatabaseQuotaExceeded"
+		degradedCondition.Message = fmt.Sprintf("NOSPACE alarm active on member(s) %s: etcd is read-only until compaction/defragmentation and `etcdctl alarm disarm`", strings.Join(nospaceMembers, ", "))
 	}
 
 	// Update or append conditions

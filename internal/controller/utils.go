@@ -76,14 +76,24 @@ func reconcileStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1alpha
 	return getStatefulSet(ctx, c, ec.Name, ec.Namespace)
 }
 
-func defaultArgs(name string) []string {
-	return []string{
+func defaultArgs(ec *ecv1alpha1.EtcdCluster) []string {
+	args := []string{
 		"--name=$(POD_NAME)",
 		"--listen-peer-urls=http://0.0.0.0:2380",   // TODO: only listen on 127.0.0.1 and host IP
 		"--listen-client-urls=http://0.0.0.0:2379", // TODO: only listen on 127.0.0.1 and host IP
-		fmt.Sprintf("--initial-advertise-peer-urls=http://$(POD_NAME).%s.$(POD_NAMESPACE).svc.cluster.local:2380", name),
-		fmt.Sprintf("--advertise-client-urls=http://$(POD_NAME).%s.$(POD_NAMESPACE).svc.cluster.local:2379", name),
+		fmt.Sprintf("--initial-advertise-peer-urls=http://$(POD_NAME).%s.$(POD_NAMESPACE).svc.cluster.local:2380", ec.Name),
+		fmt.Sprintf("--advertise-client-urls=http://$(POD_NAME).%s.$(POD_NAMESPACE).svc.cluster.local:2379", ec.Name),
 	}
+	if q := ec.Spec.QuotaBackendBytes; q != nil && !q.IsZero() {
+		args = append(args, fmt.Sprintf("--quota-backend-bytes=%d", q.Value()))
+	}
+	if ec.Spec.AutoCompactionMode != "" {
+		args = append(args, "--auto-compaction-mode="+ec.Spec.AutoCompactionMode)
+	}
+	if ec.Spec.AutoCompactionRetention != "" {
+		args = append(args, "--auto-compaction-retention="+ec.Spec.AutoCompactionRetention)
+	}
+	return args
 }
 
 func RemoveStringFromSlice(s []string, str string) []string {
@@ -113,8 +123,9 @@ func getArgName(s string) string {
 	return strings.TrimSpace(s)
 }
 
-func createArgs(name string, etcdOptions []string) []string {
-	defaultArgs := defaultArgs(name)
+func createArgs(ec *ecv1alpha1.EtcdCluster) []string {
+	defaultArgs := defaultArgs(ec)
+	etcdOptions := ec.Spec.EtcdOptions
 	if len(etcdOptions) > 0 {
 		var argName string
 		// Remove default arguments if conflicts with user supplied
@@ -145,7 +156,7 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 			{
 				Name:    "etcd",
 				Command: []string{"/usr/local/bin/etcd"},
-				Args:    createArgs(ec.Name, ec.Spec.EtcdOptions),
+				Args:    createArgs(ec),
 				Image:   fmt.Sprintf("%s:%s", ec.Spec.ImageRegistry, ec.Spec.Version),
 				Env: []corev1.EnvVar{
 					{
