@@ -3,9 +3,10 @@ package certificate
 import (
 	"context"
 	"errors"
-	"net"
 	"time"
 
+	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -57,24 +58,22 @@ const (
 	DefaultDomainName = "svc.cluster.local"
 )
 
-// AltNames contains the domain names and IP addresses that will be added
-// to the x509 certificate SubAltNames fields. The values will be passed
-// directly to the x509.Certificate object.
-type AltNames struct {
-	DNSNames []string
-	IPs      []net.IP
-}
-
 // Config contains the basic fields required for creating a certificate
 type Config struct {
-	CommonName       string
-	Organization     []string
-	AltNames         AltNames
-	ValidityDuration time.Duration
-	CABundleSecret   string
-
-	// ExtraConfig contains provider specific configurations.
-	ExtraConfig map[string]any
+	CommonName    string
+	Organizations []string
+	DNSNames      []string
+	// IPAddresses are IP subject alternative names as literal IP strings.
+	IPAddresses []string
+	// Duration is the requested certificate lifetime, already resolved by the
+	// caller (providers do not apply their own default).
+	Duration time.Duration
+	// RenewBefore is passed through to providers that support renewal;
+	// nil means the provider default.
+	RenewBefore *metav1.Duration
+	// IssuerRef selects the cert-manager issuer signing the certificate.
+	// It is nil for providers that mint their own certificates.
+	IssuerRef *cmmeta.IssuerReference
 }
 
 type Provider interface {
