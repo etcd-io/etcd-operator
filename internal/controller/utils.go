@@ -222,6 +222,12 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 		podSpec.Affinity = ec.Spec.PodTemplate.Spec.Affinity
 		podSpec.NodeSelector = ec.Spec.PodTemplate.Spec.NodeSelector
 		podSpec.Tolerations = ec.Spec.PodTemplate.Spec.Tolerations
+		podSpec.TopologySpreadConstraints = ec.Spec.PodTemplate.Spec.TopologySpreadConstraints
+		podSpec.PriorityClassName = ec.Spec.PodTemplate.Spec.PriorityClassName
+		podSpec.SchedulerName = ec.Spec.PodTemplate.Spec.SchedulerName
+		if ec.Spec.PodTemplate.Spec.Resources != nil {
+			podSpec.Containers[0].Resources = *ec.Spec.PodTemplate.Spec.Resources
+		}
 	}
 
 	// Apply custom metadata from PodTemplate if provided

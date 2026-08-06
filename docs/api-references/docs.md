@@ -153,6 +153,28 @@ _Appears in:_
 | `labels` _object (keys:string, values:string)_ |  |  |  |
 
 
+#### PodSpec
+
+
+
+
+
+
+
+_Appears in:_
+- [PodTemplate](#podtemplate)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `affinity` _[Affinity](https://kubernetes.io/docs/reference/generated/kubernetes-api/v/#affinity-v1-core)_ |  |  |  |
+| `nodeSelector` _object (keys:string, values:string)_ |  |  |  |
+| `tolerations` _[Toleration](https://kubernetes.io/docs/reference/generated/kubernetes-api/v/#toleration-v1-core) array_ |  |  |  |
+| `topologySpreadConstraints` _[TopologySpreadConstraint](https://kubernetes.io/docs/reference/generated/kubernetes-api/v/#topologyspreadconstraint-v1-core) array_ | TopologySpreadConstraints describes how member pods should spread across topology<br />domains, typically zones or hosts. The labelSelector must match the member pod<br />labels, e.g. "app: <cluster-name>". |  | Optional: \{\} <br /> |
+| `resources` _[ResourceRequirements](https://kubernetes.io/docs/reference/generated/kubernetes-api/v/#resourcerequirements-v1-core)_ | Resources describes the compute resource requirements of the etcd container. |  | Optional: \{\} <br /> |
+| `priorityClassName` _string_ | PriorityClassName is the priority class of the member pods,<br />e.g. "system-cluster-critical". |  | Optional: \{\} <br /> |
+| `schedulerName` _string_ | SchedulerName dispatches the member pods to a specific scheduler instead of the<br />default one. |  | Optional: \{\} <br /> |
+
+
 #### PodTemplate
 
 
@@ -167,6 +189,7 @@ _Appears in:_
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `metadata` _[PodMetadata](#podmetadata)_ | Refer to Kubernetes API documentation for fields of `metadata`. |  |  |
+| `spec` _[PodSpec](#podspec)_ |  |  |  |
 
 
 #### ProviderAutoConfig
