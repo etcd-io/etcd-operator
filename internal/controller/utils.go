@@ -31,6 +31,7 @@ import (
 	"go.etcd.io/etcd-operator/internal/etcdutils"
 	"go.etcd.io/etcd-operator/pkg/certificate"
 	certInterface "go.etcd.io/etcd-operator/pkg/certificate/interfaces"
+	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
@@ -481,6 +482,69 @@ func applyEtcdClusterState(ctx context.Context, ec *ecv1alpha1.EtcdCluster, repl
 func clientEndpointForOrdinalIndex(sts *appsv1.StatefulSet, index int) string {
 	return fmt.Sprintf("http://%s-%d.%s.%s.svc.cluster.local:2379",
 		sts.Name, index, sts.Name, sts.Namespace)
+}
+
+// scaleInTargetID returns the ID of the highest-ordinal member — the pod the
+// StatefulSet scale-in deletes. Members run with --name=$(POD_NAME), so match
+// by name against the authoritative member list; the target need not be
+// reachable. memberHealth can't be used here: it is sorted lexically by
+// endpoint, so its last element is wrong once ordinals reach 10.
+func scaleInTargetID(sts *appsv1.StatefulSet, members []*etcdserverpb.Member) (uint64, error) {
+	if len(members) == 0 {
+		return 0, errors.New("no members eligible for scale-in")
+	}
+	name := fmt.Sprintf("%s-%d", sts.Name, len(members)-1)
+	for _, m := range members {
+		if m.Name == name {
+			return m.ID, nil
+		}
+	}
+	return 0, fmt.Errorf("scale-in target %s not found in member list", name)
+}
+
+// transfereeForScaleIn returns the lowest-ordinal healthy voting member other
+// than removeID; ok=false when none exists.
+func transfereeForScaleIn(sts *appsv1.StatefulSet, healthInfos []etcdutils.EpHealth, removeID uint64) (uint64, bool) {
+	byEp := make(map[string]etcdutils.EpHealth, len(healthInfos))
+	for _, h := range healthInfos {
+		byEp[h.Ep] = h
+	}
+	for i := range healthInfos {
+		h, ok := byEp[clientEndpointForOrdinalIndex(sts, i)]
+		if !ok || !h.Health || h.Status == nil || h.Status.Header == nil ||
+			h.Status.IsLearner || h.Status.Header.MemberId == removeID {
+			continue
+		}
+		return h.Status.Header.MemberId, true
+	}
+	return 0, false
+}
+
+// removeScaleInMember transfers leadership away from the removal target when
+// it is the leader (best-effort), then removes it from the etcd cluster.
+// moveLeader/removeMember are parameters so tests can stub the etcd calls;
+// production passes etcdutils.MoveLeader and etcdutils.RemoveMember.
+func removeScaleInMember(logger logr.Logger, s *reconcileState, leaderID uint64, eps []string,
+	moveLeader, removeMember func([]string, uint64) error) error {
+	members := s.memberListResp.Members
+	memberID, err := scaleInTargetID(s.sts, members)
+	if err != nil {
+		return err
+	}
+	if memberID == leaderID {
+		if transferee, ok := transfereeForScaleIn(s.sts, s.memberHealth, memberID); ok {
+			logger.Info("[Scale in] transferring leadership off removal target",
+				"leaderID", memberID, "transfereeID", transferee)
+			// MoveLeader must be served by the leader itself.
+			leaderEp := clientEndpointForOrdinalIndex(s.sts, len(members)-1)
+			if err := moveLeader([]string{leaderEp}, transferee); err != nil {
+				// Best-effort: removing a leader is legal; the transfer only avoids an election stall.
+				logger.Error(err, "leadership transfer failed, proceeding with removal")
+			}
+		}
+	}
+	logger.Info("[Scale in] removing one member", "memberID", memberID)
+	return removeMember(eps, memberID)
 }
 
 func getStatefulSet(ctx context.Context, c client.Client, name, namespace string) (*appsv1.StatefulSet, error) {
