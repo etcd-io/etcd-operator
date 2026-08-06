@@ -11,6 +11,8 @@ Package v1alpha1 contains API Schema definitions for the operator v1alpha1 API g
 ### Resource Types
 - [EtcdCluster](#etcdcluster)
 - [EtcdClusterList](#etcdclusterlist)
+- [EtcdMirror](#etcdmirror)
+- [EtcdMirrorList](#etcdmirrorlist)
 
 
 
@@ -115,6 +117,444 @@ _Appears in:_
 
 
 
+#### EtcdMirror
+
+
+
+EtcdMirror is the Schema for the etcdmirrors API. It describes a
+continuous, one-way key-range sync from a source etcd cluster to a target
+etcd cluster, run as a single supervised stateless pod (a size-1
+Deployment; progress lives in a fenced checkpoint key in the target etcd,
+not on a volume).
+
+It is a byte-copy of keys and values, not a replica: revisions, versions,
+and create/mod ordering are target-assigned, and leases are stripped. See
+Fidelity Caveats in docs/etcdmirror.md before depending on anything but
+key/value content.
+
+Two-way sync: never — etcd revisions are cluster-local and there is no
+per-key provenance channel, so bidirectional sync is structurally
+inexpressible. Reversal for cutover/failback: yes — delete the CR and
+create a new one with swapped endpoints, initialSync.mode
+OverwriteAndPrune, only after the forward mirror reported CutoverReady.
+See docs/etcdmirror.md.
+
+
+
+_Appears in:_
+- [EtcdMirrorList](#etcdmirrorlist)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `apiVersion` _string_ | `operator.etcd.io/v1alpha1` | | |
+| `kind` _string_ | `EtcdMirror` | | |
+| `metadata` _[ObjectMeta](https://kubernetes.io/docs/reference/generated/kubernetes-api/v/#objectmeta-v1-meta)_ | Refer to Kubernetes API documentation for fields of `metadata`. |  |  |
+| `spec` _[EtcdMirrorSpec](#etcdmirrorspec)_ |  |  |  |
+
+
+#### EtcdMirrorAuth
+
+
+
+EtcdMirrorAuth configures etcd RBAC username/password auth for one side.
+
+
+
+_Appears in:_
+- [EtcdMirrorEndpoint](#etcdmirrorendpoint)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `secretRef` _[LocalObjectReference](https://kubernetes.io/docs/reference/generated/kubernetes-api/v/#localobjectreference-v1-core)_ | SecretRef names a Secret holding "username" and "password" keys. If<br />this whole Auth block is nil, the agent does not call etcd's<br />Authenticate() at all; the pinned v3 client transparently re-auths on<br />token expiry. PRECEDENCE: when both a client certificate and Auth are<br />supplied, etcd uses the token identity, not the certificate CN — the<br />Auth user must hold the range-scoped role. |  |  |
+
+
+#### EtcdMirrorBackoffSpec
+
+
+
+
+
+
+
+_Appears in:_
+- [EtcdMirrorSyncSpec](#etcdmirrorsyncspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `initialDelay` _[Duration](https://kubernetes.io/docs/reference/generated/kubernetes-api/v/#duration-v1-meta)_ |  |  | Optional: \{\} <br /> |
+| `maxDelay` _[Duration](https://kubernetes.io/docs/reference/generated/kubernetes-api/v/#duration-v1-meta)_ |  |  | Optional: \{\} <br /> |
+
+
+#### EtcdMirrorCABundleRef
+
+
+
+EtcdMirrorCABundleRef points at one key of a Secret or ConfigMap holding a
+PEM CA bundle.
+
+
+
+_Appears in:_
+- [EtcdMirrorTLS](#etcdmirrortls)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `kind` _string_ | Kind is Secret or ConfigMap. Defaults to ConfigMap. | ConfigMap | Enum: [Secret ConfigMap] <br />Optional: \{\} <br /> |
+| `name` _string_ | Name of the Secret or ConfigMap, in the EtcdMirror's namespace. |  | MinLength: 1 <br /> |
+| `key` _string_ | Key within the object. Defaults to "ca.crt". |  | Optional: \{\} <br /> |
+
+
+#### EtcdMirrorCheckpointSpec
+
+
+
+EtcdMirrorCheckpointSpec configures the reserved checkpoint/fence key the
+agent maintains IN THE TARGET etcd. The checkpoint (the source-revision
+watermark plus {linkUID, epoch, role}) is written in the SAME Txn as every
+applied batch and fenced with a mod-revision compare on EVERY write path
+(applies, reconciliation repairs, prune deletes), so two agents can never
+interleave writes and a straggler apply after cutover fails loudly. The
+key is excluded by exact match from scans, counts, prune passes, and the
+RequireEmpty check; the target RBAC grant must cover it; CR deletion
+removes it via a delete-one-key finalizer.
+
+
+
+_Appears in:_
+- [EtcdMirrorSpec](#etcdmirrorspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `key` _string_ | Key overrides the reserved checkpoint key. Defaults to the effective<br />destination prefix + "\x00etcdmirror-checkpoint" — the \x00 byte after<br />the prefix cannot collide with any real key under it. MUST live under<br />the effective destination prefix (target.prefix + sync.destPrefix,<br />CEL-enforced): the range-scoped target credential covers it, and the<br />exact-match exclusion from scans/counts/prune only works inside the<br />mirrored range. Immutable after creation. |  | Optional: \{\} <br /> |
+
+
+#### EtcdMirrorCutoverStatus
+
+
+
+EtcdMirrorCutoverStatus tracks a Drain-mode cutover.
+
+
+
+_Appears in:_
+- [EtcdMirrorStatus](#etcdmirrorstatus)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `drainTargetRevision` _integer_ | DrainTargetRevision is the source revision observed when Drain was<br />requested — the revision the watermark must reach. |  | Optional: \{\} <br /> |
+| `drainedRevision` _integer_ | DrainedRevision is the watermark at which the drain completed. |  | Optional: \{\} <br /> |
+| `verifiedTime` _[Time](https://kubernetes.io/docs/reference/generated/kubernetes-api/v/#time-v1-meta)_ | VerifiedTime is when the post-drain verification pass succeeded. |  | Optional: \{\} <br /> |
+| `sourceKeyCount` _integer_ | SourceKeyCount and TargetKeyCount are the per-side key counts from the<br />verification pass (source read pinned at the drained revision;<br />reserved checkpoint key excluded). |  | Optional: \{\} <br /> |
+| `targetKeyCount` _integer_ |  |  | Optional: \{\} <br /> |
+| `leasedKeyCount` _integer_ | LeasedKeyCount is LeaseBackedKeyCount frozen at drain completion, for<br />the runbook's purge/re-lease step. |  | Optional: \{\} <br /> |
+
+
+#### EtcdMirrorDriftInfo
+
+
+
+
+
+
+
+_Appears in:_
+- [EtcdMirrorStatus](#etcdmirrorstatus)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `missingKeys` _integer_ | MissingKeys were present on the source but absent on the target. |  |  |
+| `divergentKeys` _integer_ | DivergentKeys were present on both sides with different values —<br />distinct from MissingKeys so "a resync dropped keys" is never<br />conflated with "a blind window went stale". |  |  |
+| `orphanKeys` _integer_ | OrphanKeys were present on the target with no source counterpart. |  |  |
+| `repaired` _boolean_ | Repaired is true when the pass wrote fixes rather than only reporting. |  |  |
+
+
+#### EtcdMirrorEndpoint
+
+
+
+EtcdMirrorEndpoint describes how to reach, authenticate to, and scope one
+side (source or target) of a mirror. Both sides need an identical shape
+(address resolution + prefix + TLS + auth), so one type serves both roles,
+the same way BackupDestination is reused verbatim between EtcdBackup and
+EtcdRestore rather than forked into near-duplicate per-role types.
+
+Exactly one of EndpointList or ServiceRef must be set. An empty
+endpointList ([]) is treated as unset, per Kubernetes list conventions —
+so `endpointList: []` alongside a serviceRef is accepted.
+
+Endpoint scheme and the TLS block must agree (CEL-enforced both ways):
+http:// endpoints with a tls block would silently drop TLS at dial time;
+https:// endpoints without one would dial with undeclared system-roots
+TLS. The agent derives the dial scheme from the presence of the tls block,
+so the declared contract is true by construction.
+
+
+
+_Appears in:_
+- [EtcdMirrorSpec](#etcdmirrorspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `endpointList` _string array_ | EndpointList is a raw set of etcd client-URL host:port (or<br />scheme://host:port) strings, e.g. "https://etcd-rke1.example.com:2379".<br />This is the ONLY supported mechanism for a cluster external to this<br />Kubernetes cluster (e.g. an RKE1/AWS source reached over a public NLB);<br />there is deliberately no tunnel/port-forward mode — terminate any<br />tunnel upstream and hand EtcdMirror the resulting stable endpoint(s).<br />Prefer listing per-member endpoints over a single load-balancer VIP: a<br />TCP-health-checked VIP cannot see etcd quorum, and the client's own<br />balancer handles per-member failover.<br />IP-LITERAL ENDPOINTS: Go's TLS stack requires an IP SAN (not a DNS SAN)<br />to verify a bare-IP endpoint. Either set EtcdMirrorTLS.ServerName to a<br />hostname present as a DNS SAN on the certificate, or ensure the<br />certificate carries a matching IP SAN. Fix the SAN/ServerName mismatch;<br />do not reach for InsecureSkipVerify. |  | Optional: \{\} <br /> |
+| `serviceRef` _[EtcdMirrorServiceRef](#etcdmirrorserviceref)_ | ServiceRef points at a Kubernetes Service in this cluster whose DNS<br />name resolves the etcd client endpoint(s), for the same-cluster case.<br />Namespace defaults to the EtcdMirror's own namespace when empty. |  | Optional: \{\} <br /> |
+| `prefix` _string_ | Prefix is the etcd key prefix on THIS side. On Source, only keys under<br />this prefix are synced; empty means the whole keyspace. On Target, this<br />is the prefix under which mirrored keys land (see EtcdMirrorSyncSpec's<br />rewrite formula). Immutable after creation. |  | Optional: \{\} <br /> |
+| `tls` _[EtcdMirrorTLS](#etcdmirrortls)_ | TLS configures the agent's client TLS for THIS side. Nil means the<br />agent dials this side in cleartext (and https:// endpoints are<br />CEL-rejected). An empty block means server-auth TLS verified against<br />the system trust roots. |  | Optional: \{\} <br /> |
+| `auth` _[EtcdMirrorAuth](#etcdmirrorauth)_ | Auth configures etcd username/password (RBAC) auth for THIS side. |  | Optional: \{\} <br /> |
+
+
+#### EtcdMirrorInitialSyncMode
+
+_Underlying type:_ _string_
+
+EtcdMirrorInitialSyncMode governs how the agent treats pre-existing keys
+under the effective destination prefix at genesis (first-ever sync, or a
+checkpoint invalidated by a cluster-identity mismatch).
+
+
+
+_Appears in:_
+- [EtcdMirrorInitialSyncSpec](#etcdmirrorinitialsyncspec)
+
+| Field | Description |
+| --- | --- |
+| `RequireEmpty` | EtcdMirrorInitialSyncRequireEmpty refuses to start if the destination<br />prefix already holds any key (Phase -> Failed, condition<br />EmptyTargetViolation). The reserved checkpoint key is excluded by exact<br />match.<br />RE-ARM CONTRACT: a source OR target cluster-ID mismatch invalidates<br />the checkpoint, forces genesis, and RE-ARMS this check. An ordinary<br />forced resync (Compacted) does NOT re-check RequireEmpty: the decoded,<br />ownership-validated fence proves the destination data is this link's<br />own.<br /> |
+| `Overwrite` | EtcdMirrorInitialSyncOverwrite scans and writes over whatever is there.<br />Keys present on the target but absent on the source are left alone.<br /> |
+| `OverwriteAndPrune` | EtcdMirrorInitialSyncOverwriteAndPrune is Overwrite plus one mandatory<br />orphan-prune pass after the scan: target keys under the destination<br />prefix with no source counterpart are deleted. This makes reversal onto<br />a previously-populated prefix (failback) a first-class correct<br />operation instead of silently resurrecting deleted keys.<br /> |
+
+
+#### EtcdMirrorInitialSyncSpec
+
+
+
+EtcdMirrorInitialSyncSpec governs the genesis scan.
+
+
+
+_Appears in:_
+- [EtcdMirrorSpec](#etcdmirrorspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `mode` _[EtcdMirrorInitialSyncMode](#etcdmirrorinitialsyncmode)_ | Mode governs pre-existing destination keys at genesis. Defaults to<br />RequireEmpty (refuse a non-empty destination prefix). | RequireEmpty | Enum: [RequireEmpty Overwrite OverwriteAndPrune] <br />Optional: \{\} <br /> |
+| `startRevision` _integer_ | StartRevision, when > 0, skips the genesis scan entirely and starts<br />watching from StartRevision+1. For fidelity-preserving seeds: restore<br />the target from a source snapshot (`etcdutl snapshot restore<br />--bump-revision --mark-compacted`), then mirror only the delta.<br />Requires Mode Overwrite or OverwriteAndPrune (CEL-enforced). |  | Minimum: 0 <br />Optional: \{\} <br /> |
+
+
+#### EtcdMirrorList
+
+
+
+EtcdMirrorList contains a list of EtcdMirror.
+
+
+
+
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `apiVersion` _string_ | `operator.etcd.io/v1alpha1` | | |
+| `kind` _string_ | `EtcdMirrorList` | | |
+| `metadata` _[ListMeta](https://kubernetes.io/docs/reference/generated/kubernetes-api/v/#listmeta-v1-meta)_ | Refer to Kubernetes API documentation for fields of `metadata`. |  |  |
+| `items` _[EtcdMirror](#etcdmirror) array_ |  |  |  |
+
+
+#### EtcdMirrorMode
+
+_Underlying type:_ _string_
+
+EtcdMirrorMode selects the mirror's operating mode.
+
+
+
+_Appears in:_
+- [EtcdMirrorSpec](#etcdmirrorspec)
+
+| Field | Description |
+| --- | --- |
+| `Sync` | EtcdMirrorModeSync is normal continuous replication.<br /> |
+| `Drain` | EtcdMirrorModeDrain prepares for cutover: the agent records the source<br />revision observed when Drain is requested (status.cutover.drainTargetRevision),<br />keeps replicating until the checkpoint watermark reaches it, runs a<br />verification pass (per-side key counts, lease-backed key count), then<br />sets the CutoverReady condition and flips the fence key's role to<br />Primary so any straggler apply fails its mod-revision compare loudly.<br />Runbook: quiesce source writers -> set mode=Drain -><br />`kubectl wait --for=condition=CutoverReady etcdmirror/<name>` -><br />purge/re-lease lease-backed keys -> repoint clients -> delete the CR.<br /> |
+
+
+#### EtcdMirrorPhase
+
+_Underlying type:_ _string_
+
+EtcdMirrorPhase is a high-level summary of an EtcdMirror's lifecycle.
+Unlike BackupPhase/RestorePhase, most phases here are NOT terminal — a
+healthy mirror spends its life in Syncing; there is no "Completed" state.
+
+
+
+_Appears in:_
+- [EtcdMirrorStatus](#etcdmirrorstatus)
+
+| Field | Description |
+| --- | --- |
+| `Pending` | EtcdMirrorPhasePending means the EtcdMirror has been accepted but the<br />agent workload has not been created yet.<br /> |
+| `Connecting` | EtcdMirrorPhaseConnecting means the agent pod is running, establishing<br />client connections to both sides and probing versions/cluster IDs.<br /> |
+| `InitialSync` | EtcdMirrorPhaseInitialSync means the agent is running the genesis scan:<br />an UNPINNED chunked scan with the watch already open from the revision<br />observed before the scan started, buffered events replayed over the<br />scanned base (reflector pattern). Because pages read at the current<br />revision, mid-scan compaction cannot fail the scan. Also entered during<br />a forced resync (then with condition Compacted=True/Reason=ForcedResync).<br /> |
+| `Syncing` | EtcdMirrorPhaseSyncing is the steady state: watching and applying live<br />changes, watermark advancing via progress notifications.<br /> |
+| `Degraded` | EtcdMirrorPhaseDegraded means the agent is in a retry/backoff loop<br />(connection or throttling class) and is expected to self-heal. Forced<br />resyncs are NOT Degraded; they report as InitialSync + Compacted=True.<br /> |
+| `Paused` | EtcdMirrorPhasePaused means spec.paused is true; the agent Deployment<br />is scaled to zero. The checkpoint is retained in the target.<br /> |
+| `Failed` | EtcdMirrorPhaseFailed means a terminal, non-recoverable error requiring<br />operator intervention: EmptyTargetViolation at genesis, source below<br />the 3.4 version floor (UnsupportedVersion), a permanent-class write<br />error (oversized revision vs target limits), malformed cert material,<br />or unresolvable spec misconfiguration.<br /> |
+
+
+#### EtcdMirrorReconciliationSpec
+
+
+
+EtcdMirrorReconciliationSpec configures the periodic full reconciliation
+pass. The same engine also runs unconditionally (regardless of Enabled or
+DeleteOrphans) as the post-forced-resync mark-and-sweep, the
+OverwriteAndPrune genesis pass, and the Drain verification pass.
+
+
+
+_Appears in:_
+- [EtcdMirrorSpec](#etcdmirrorspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `enabled` _boolean_ | Enabled toggles the PERIODIC pass. Defaults to false: it is a full<br />diff of the prefix contents on both sides (O(keyspace)), so it is<br />opt-in. |  | Optional: \{\} <br /> |
+| `interval` _[Duration](https://kubernetes.io/docs/reference/generated/kubernetes-api/v/#duration-v1-meta)_ | Interval between periodic passes. Defaults to 1h when Enabled. |  | Optional: \{\} <br /> |
+| `deleteOrphans` _boolean_ | DeleteOrphans, when true, allows the PERIODIC pass to delete target<br />keys under the destination prefix that have no corresponding source<br />key. Defaults to false. (Forced-resync sweeps and OverwriteAndPrune<br />always delete orphans; this knob only governs the periodic pass.) |  | Optional: \{\} <br /> |
+
+
+#### EtcdMirrorServiceRef
+
+
+
+EtcdMirrorServiceRef points at a Service and the client port on it to dial.
+
+
+
+_Appears in:_
+- [EtcdMirrorEndpoint](#etcdmirrorendpoint)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `name` _string_ | Name is the Service name. |  | MinLength: 1 <br /> |
+| `namespace` _string_ | Namespace defaults to the EtcdMirror's own namespace when empty. |  | Optional: \{\} <br /> |
+| `port` _string_ | Port is the Service port name or number exposing etcd's client API.<br />Defaults to "client" when empty, matching PodMonitorSpec.Port's<br />convention elsewhere in this API group. |  | Optional: \{\} <br /> |
+
+
+#### EtcdMirrorSpec
+
+
+
+EtcdMirrorSpec defines the desired state of an EtcdMirror.
+
+Range-defining and rewrite fields are immutable (CEL transition rules
+below): source.prefix, target.prefix, sync.destPrefix, sync.excludePrefixes
+and checkpoint.key. Changing what range is mirrored, or where it lands,
+mid-life silently diverges: a restarted agent resumes from its checkpoint
+without a scan, so removing an exclusion never backfills pre-existing keys
+and adding one strands already-mirrored keys as permanent orphans — all
+with every condition green. Endpoints stay mutable — rotating an NLB DNS
+name or adding a member to the same cluster is routine; pointing at a
+different cluster is caught at runtime by the checkpoint's dual-cluster-ID
+binding, not by spec validation.
+
+The transition rules compare VALUES, presence-normalized: for these
+fields the empty value and an absent field are semantically identical
+(prefix "" = whole keyspace, destPrefix "" = strip the source prefix), and
+Go typed clients drop explicit "" through omitempty — presence-based rules
+would reject every typed-client update of a CR created with an explicit
+empty string.
+
+
+
+_Appears in:_
+- [EtcdMirror](#etcdmirror)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `mode` _[EtcdMirrorMode](#etcdmirrormode)_ | Mode selects continuous replication (Sync, the default) or a cutover<br />drain (Drain). See EtcdMirrorModeDrain for the cutover contract. | Sync | Enum: [Sync Drain] <br />Optional: \{\} <br /> |
+| `source` _[EtcdMirrorEndpoint](#etcdmirrorendpoint)_ | Source is the etcd cluster keys are read from. EtcdMirror never writes<br />back to Source; the agent's source-side client is only ever used for<br />Get/Watch, never Put/Delete/Txn.<br />VERSION FLOOR: source etcd must be >= 3.4 (probed via maintenance<br />Status() at connect; below the floor the mirror goes Failed with reason<br />UnsupportedVersion). >= 3.4.25 / 3.5.8 is the recommended floor: below<br />it, watch progress notifications are unreliable and the agent cannot<br />trust the watermark machinery that drives lag, the checkpoint, and the<br />Drain gate. |  |  |
+| `target` _[EtcdMirrorEndpoint](#etcdmirrorendpoint)_ | Target is the etcd cluster keys are written into.<br />SECURITY PREREQUISITE: Target's credential (etcd RBAC user and/or the<br />client certificate's role) MUST be range-scoped to the effective<br />destination prefix — never a cluster-admin-equivalent credential. The<br />agent's client-side rewrite logic is defense against bugs in its own<br />code, NOT a security boundary. The grant must also cover the reserved<br />checkpoint key (see Checkpoint). Configure via `etcdctl role<br />grant-permission --prefix=true <role> readwrite <dest-prefix>` before<br />pointing an EtcdMirror at the cluster.<br />The target must run with auto-compaction enabled: forced-resync churn<br />and prune passes march an uncompacted target toward its storage quota<br />(2GiB by default), which surfaces as TargetQuotaExhausted. |  |  |
+| `initialSync` _[EtcdMirrorInitialSyncSpec](#etcdmirrorinitialsyncspec)_ | InitialSync governs genesis behavior: how pre-existing destination keys<br />are treated (Mode) and optionally where replication starts<br />(StartRevision). |  | Optional: \{\} <br /> |
+| `sync` _[EtcdMirrorSyncSpec](#etcdmirrorsyncspec)_ | Sync tunes runtime sync behavior (batching, paging, rate limiting,<br />prefix rewrite, timeouts, backoff). |  | Optional: \{\} <br /> |
+| `checkpoint` _[EtcdMirrorCheckpointSpec](#etcdmirrorcheckpointspec)_ | Checkpoint configures the reserved checkpoint/fence key on the target. |  | Optional: \{\} <br /> |
+| `reconciliation` _[EtcdMirrorReconciliationSpec](#etcdmirrorreconciliationspec)_ | Reconciliation optionally enables a periodic full diff-and-repair pass<br />layered on top of the continuous watch-based mirror. Independent of<br />this setting, one reconciliation-with-delete pass always runs after any<br />forced resync (mark-and-sweep), and as the OverwriteAndPrune genesis<br />pass and the Drain verification pass. |  | Optional: \{\} <br /> |
+| `podTemplate` _[PodTemplate](#podtemplate)_ | PodTemplate carries scheduling/affinity/labels/annotations for the<br />agent pod, reusing EtcdClusterSpec's PodTemplate shape verbatim. |  | Optional: \{\} <br /> |
+| `resources` _[ResourceRequirements](https://kubernetes.io/docs/reference/generated/kubernetes-api/v/#resourcerequirements-v1-core)_ | Resources are the agent container's compute resources. The agent's<br />memory model is bounded by Sync.PageBytes (single in-flight scan page,<br />no unbounded read-ahead); size limits accordingly. |  | Optional: \{\} <br /> |
+| `paused` _boolean_ | Paused, when true, scales the agent Deployment to zero without deleting<br />the CR or its checkpoint. The checkpoint lives in the target etcd, so<br />resume picks up from the last fenced watermark. NOTE: pausing longer<br />than the source's compaction retention guarantees a full forced resync<br />on resume — there is no free lunch past the retention window. |  | Optional: \{\} <br /> |
+
+
+
+
+#### EtcdMirrorSyncSpec
+
+
+
+EtcdMirrorSyncSpec tunes the mirror's runtime sync behavior.
+
+KEY REWRITE — one formula, no other composition:
+
+	key' = target.prefix + destPrefix + TrimPrefix(key, source.prefix)
+
+(anchored strip-and-reprefix; never a substring replace).
+
+BATCHING INVARIANT: target Txns flush ONLY at source-revision boundaries —
+a source revision's events are never split across Txns, whole revisions
+are coalesced up to the MaxTxnOps/TxnFlushBytes watermarks, and one op
+slot in MaxTxnOps is always reserved for the checkpoint write that rides
+in the same Txn. A single source revision larger than MaxTxnOps is applied
+as one oversized Txn (provision the target's --max-txn-ops accordingly)
+with the checkpoint held until it lands.
+
+RETENTION PREREQUISITE: the source's compaction retention window must
+exceed the worst-case initial scan + throttled drain time, approximately
+sourceKeyCount / min(effective scan rate, MaxOpsPerSecond). If it does
+not, genesis (and every forced resync) loses the race with compaction and
+the mirror livelocks (surfaced via the resync-loop detector).
+
+
+
+_Appears in:_
+- [EtcdMirrorSpec](#etcdmirrorspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `destPrefix` _string_ | DestPrefix is the middle term of the rewrite formula above. Default ""<br />means the source prefix is stripped and key remainders land directly<br />under target.prefix. Immutable after creation. |  | Optional: \{\} <br /> |
+| `excludePrefixes` _string array_ | ExcludePrefixes lists source key prefixes (full source-side keys, e.g.<br />"/registry/events/") skipped entirely: not scanned, not watched, not<br />counted, not pruned. Use to drop high-churn low-value ranges and cut<br />WAN cost, or to skip lease-backed ranges that don't survive mirroring.<br />Nested/duplicate entries are normalized by the agent (an entry covered<br />by another is dropped). Immutable after creation (it defines the<br />mirrored range): removing an exclusion would require a backfill scan<br />the checkpoint-resume path never runs, and adding one would strand<br />already-mirrored keys as permanent orphans — change it via<br />delete-and-recreate with an appropriate initialSync.mode instead. |  | MaxItems: 64 <br />Optional: \{\} <br /> |
+| `maxTxnOps` _integer_ | MaxTxnOps bounds how many operations the agent batches into a single<br />target Txn, including the reserved checkpoint-write slot. Must not<br />exceed the target's --max-txn-ops (etcd default 128). Defaults to 128. |  | Minimum: 2 <br />Optional: \{\} <br /> |
+| `txnFlushBytes` _[Quantity](https://kubernetes.io/docs/reference/generated/kubernetes-api/v/#quantity-resource-api)_ | TxnFlushBytes is the byte watermark at which a batch is flushed (at the<br />next source-revision boundary). Keep well under etcd's request size<br />limits: a Txn over ~1.5MiB is rejected by the server and one over 2MiB<br />by the client send cap — both classified permanent errors, not<br />throttling. Defaults to 1Mi. |  | Optional: \{\} <br /> |
+| `pageKeyLimit` _integer_ | PageKeyLimit bounds keys per source scan page during InitialSync and<br />reconciliation. The scan is pull-based, one page in flight — no<br />read-ahead — so this and PageBytes bound agent memory. Defaults to 512. |  | Minimum: 1 <br />Optional: \{\} <br /> |
+| `pageBytes` _[Quantity](https://kubernetes.io/docs/reference/generated/kubernetes-api/v/#quantity-resource-api)_ | PageBytes bounds bytes per source scan page. Defaults to 1Mi. |  | Optional: \{\} <br /> |
+| `watchBufferBytes` _[Quantity](https://kubernetes.io/docs/reference/generated/kubernetes-api/v/#quantity-resource-api)_ | WatchBufferBytes bounds the memory used to buffer watch events<br />observed from R0 while the genesis scan runs (the reflector replay<br />buffer). On overflow the agent cancels the source watch and restarts<br />the scan from a fresh R0 (see the InitialSyncCompactionRaced event) —<br />a bounded retry instead of unbounded growth when source churn outruns<br />scan+apply throughput. Defaults to 16Mi (must stay in lockstep with<br />pkg/mirroragent's DefaultWatchBufferBytes). |  | Optional: \{\} <br /> |
+| `maxOpsPerSecond` _integer_ | MaxOpsPerSecond rate-limits the agent's target write rate (a token<br />bucket over puts+deletes/sec), applied to both the genesis scan and<br />watch-driven applies. Zero (default) means unlimited. Mind the<br />retention prerequisite above when throttling. |  | Minimum: 0 <br />Optional: \{\} <br /> |
+| `requestTimeout` _[Duration](https://kubernetes.io/docs/reference/generated/kubernetes-api/v/#duration-v1-meta)_ | RequestTimeout is the per-RPC context deadline applied to every unary<br />call on both sides (watches excluded — they are long-lived by design<br />and covered by progress-notification liveness instead). Without it a<br />blackholed call through an NLB never errors and backoff never engages.<br />Defaults to 30s. |  | Optional: \{\} <br /> |
+| `dialTimeout` _[Duration](https://kubernetes.io/docs/reference/generated/kubernetes-api/v/#duration-v1-meta)_ | DialTimeout bounds establishing the initial client connection to each<br />side. Defaults to 10s. |  | Optional: \{\} <br /> |
+| `reconnectBackoff` _[EtcdMirrorBackoffSpec](#etcdmirrorbackoffspec)_ | ReconnectBackoff bounds the retry/backoff loop wrapping connection-class<br />errors. Throttling-class errors (target rate rejection) use a more<br />conservative curve derived from the same bounds; quota exhaustion<br />(TargetQuotaExhausted) and permanent errors are never retried through<br />this loop. Defaults to exponential backoff from 1s to 30s. |  | Optional: \{\} <br /> |
+
+
+#### EtcdMirrorTLS
+
+
+
+EtcdMirrorTLS configures the mirror agent's client TLS for one side of a
+mirror. Plain secretRef, not a reuse of EtcdClusterTLS/TLSSurface — the
+agent is always a client to clusters it does not own, so issuer-selection
+machinery doesn't apply.
+
+ROTATION CONTRACT: the agent re-reads TLS material from the mounted Secret
+on every handshake (transport.TLSInfo file paths, not a one-shot
+tls.Config); certificate rotation requires no pod restart.
+
+
+
+_Appears in:_
+- [EtcdMirrorEndpoint](#etcdmirrorendpoint)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `secretRef` _[LocalObjectReference](https://kubernetes.io/docs/reference/generated/kubernetes-api/v/#localobjectreference-v1-core)_ | SecretRef names a Secret (in the EtcdMirror's namespace) holding this<br />side's TLS material in the standard kubernetes.io/tls-compatible shape:<br />  - ca.crt:  PEM CA bundle used to verify the peer's server certificate<br />    (unless CABundleRef overrides it, or InsecureSkipVerify is true).<br />  - tls.crt / tls.key: PEM client certificate + key, for mTLS.<br />    Optional — omit both for server-auth-only TLS.<br />Nil means no client identity and verification against the system trust<br />roots (the etcdctl default). Note a source running with<br />--client-cert-auth (the RKE1 default) rejects certless clients at the<br />handshake regardless of etcd RBAC auth; server-auth-only + Auth is not<br />viable against such a source. |  | Optional: \{\} <br /> |
+| `caBundleRef` _[EtcdMirrorCABundleRef](#etcdmirrorcabundleref)_ | CABundleRef optionally sources the trust anchors from a separate<br />Secret or ConfigMap key, decoupling trust from the identity Secret<br />(Gateway API caCertificateRefs precedent). Takes precedence over<br />SecretRef's ca.crt. |  | Optional: \{\} <br /> |
+| `insecureSkipVerify` _boolean_ | InsecureSkipVerify disables server certificate verification. Strongly<br />discouraged, especially for a source reached over the public internet.<br />Requires InsecureSkipVerifyAcknowledgeRisk to also be set true<br />(CEL-enforced). The controller additionally emits a standing Warning<br />event whenever this is true. | false | Optional: \{\} <br /> |
+| `insecureSkipVerifyAcknowledgeRisk` _boolean_ | InsecureSkipVerifyAcknowledgeRisk must independently be set true<br />whenever InsecureSkipVerify is true (CEL-enforced companion field). Its<br />only purpose is to require a deliberate, separate, reviewable line in<br />the manifest diff before disabling TLS verification. | false | Optional: \{\} <br /> |
+| `serverName` _string_ | ServerName overrides the TLS ServerName (SNI) used for verification,<br />for cases where the dialed address doesn't match a SAN on the<br />certificate (e.g. dialing an NLB IP directly). Applies to EVERY<br />endpoint in the list, so mixing endpoints with different certificates<br />behind one ServerName will fail verification on the mismatched ones. |  | Optional: \{\} <br /> |
+
+
 #### MemberStatus
 
 
@@ -153,6 +593,24 @@ _Appears in:_
 | `labels` _object (keys:string, values:string)_ |  |  |  |
 
 
+#### PodSpec
+
+
+
+
+
+
+
+_Appears in:_
+- [PodTemplate](#podtemplate)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `affinity` _[Affinity](https://kubernetes.io/docs/reference/generated/kubernetes-api/v/#affinity-v1-core)_ |  |  |  |
+| `nodeSelector` _object (keys:string, values:string)_ |  |  |  |
+| `tolerations` _[Toleration](https://kubernetes.io/docs/reference/generated/kubernetes-api/v/#toleration-v1-core) array_ |  |  |  |
+
+
 #### PodTemplate
 
 
@@ -163,10 +621,12 @@ _Appears in:_
 
 _Appears in:_
 - [EtcdClusterSpec](#etcdclusterspec)
+- [EtcdMirrorSpec](#etcdmirrorspec)
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `metadata` _[PodMetadata](#podmetadata)_ | Refer to Kubernetes API documentation for fields of `metadata`. |  |  |
+| `spec` _[PodSpec](#podspec)_ |  |  |  |
 
 
 #### ProviderAutoConfig
