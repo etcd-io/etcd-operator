@@ -17,8 +17,7 @@ limitations under the License.
 package v1alpha1
 
 import (
-	"net"
-
+	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -43,8 +42,17 @@ type EtcdClusterSpec struct {
 	Version string `json:"version"`
 	// StorageSpec is the name of the StorageSpec to use for the etcd cluster. If not provided, then each POD just uses the temporary storage inside the container.
 	StorageSpec *StorageSpec `json:"storageSpec,omitempty"`
-	// TLS is the TLS certificate configuration to use for the etcd cluster and etcd operator.
-	TLS *TLSCertificate `json:"tls,omitempty"`
+	// TLS configures etcd's two independent TLS surfaces (peer and client/server).
+	// Each surface is optional and configured fully independently; a nil surface
+	// means that surface is served/dialed in cleartext. When TLS itself is nil, the
+	// entire cluster (peer + client + operator client) is cleartext, byte-identical
+	// to a TLS-free deployment.
+	//
+	// TLS is effectively create-time: it flows into the pod template and cert mounts.
+	// Toggling it on (or off) on a running cluster rolls the StatefulSet into a mixed
+	// http/https membership whose peers cannot connect, dropping quorum. The supported
+	// path is a NEW TLS cluster plus data migration, not an in-place flip.
+	TLS *EtcdClusterTLS `json:"tls,omitempty"`
 	// etcd configuration options are passed as command line arguments to the etcd container, refer to etcd documentation for configuration options applicable for the version of etcd being used.
 	EtcdOptions []string `json:"etcdOptions,omitempty"`
 	// PodTemplate is the pod template to use for the etcd cluster.
@@ -68,70 +76,196 @@ type PodMetadata struct {
 	Labels      map[string]string `json:"labels,omitempty"`
 }
 
-type TLSCertificate struct {
-	Provider    string         `json:"provider,omitempty"` // Defaults to Auto provider if not present
-	ProviderCfg ProviderConfig `json:"providerCfg,omitempty"`
-}
-
-type ProviderConfig struct {
-	AutoCfg        *ProviderAutoConfig        `json:"autoCfg,omitempty"`
-	CertManagerCfg *ProviderCertManagerConfig `json:"certManagerCfg,omitempty"`
-}
-
-type AltNames struct {
-	// DNSNames is the expected array of DNS subject alternative names.
-	// if empty defaults to $(POD_NAME).$(ETCD_CLUSTER_NAME).$(POD_NAMESPACE).svc.cluster.local
+// EtcdClusterTLS configures etcd's two independent TLS surfaces. Each surface is
+// optional; a nil surface means that surface is served/dialed in cleartext (http).
+// The two surfaces are configured fully independently -- different providers,
+// issuers, and client-cert-auth policy are allowed and expected. Both surfaces nil
+// is legal and means fully-cleartext (today's default); it is intentional, not an
+// error, so there is no "at least one surface" validation.
+type EtcdClusterTLS struct {
+	// Peer configures etcd<->etcd (peer) TLS. When nil, peer traffic is cleartext.
+	// A configured peer surface REQUIRES a CA-capable issuer shared by all members
+	// so members can mutually verify; a self-signed *leaf* issuer cannot form a
+	// multi-member cluster. (CA-capability lives on the cert-manager Issuer object,
+	// not on this spec, so that check is enforced at reconcile time, not via CEL.)
 	// +optional
-	DNSNames []string `json:"dnsNames,omitempty"`
+	Peer *TLSSurface `json:"peer,omitempty"`
 
-	// IPs is the expected array of IP address subject alternative names.
+	// Client configures client->etcd (server) TLS AND, transitively, the operator's
+	// own etcd client identity (the operator authenticates to etcd as a client).
+	// When nil, client traffic is cleartext and the operator dials cleartext.
 	// +optional
-	IPs []net.IP `json:"ipAddresses,omitempty"`
+	Client *TLSSurface `json:"client,omitempty"`
 }
 
-type CommonConfig struct {
-	// CommonName is the expected common name X509 certificate subject attribute.
-	// Should have a length of 64 characters or fewer to avoid generating invalid CSRs.
+// TLSProvider names the certificate provider for one TLS surface. It is the
+// discriminator of the flattened union on TLSSurface. Values are domain-style
+// identifiers (cf. StorageClass.provisioner): the operator's built-in
+// self-signed provider is "auto"; cert-manager is addressed by its API group.
+// +kubebuilder:validation:Enum=auto;cert-manager.io
+type TLSProvider string
+
+const (
+	// TLSProviderAuto selects the operator's built-in self-signed provider.
+	TLSProviderAuto TLSProvider = "auto"
+	// TLSProviderCertManager selects cert-manager issuance.
+	TLSProviderCertManager TLSProvider = "cert-manager.io"
+)
+
+// TLSSurface is the full, independent TLS configuration for ONE surface (peer or
+// client): a provider-discriminated union (provider selects which member block
+// below is honored), the surface's mutual client-cert-auth policy, and an
+// optional additional trust bundle.
+//
+// The XValidation rules below are the apply-time anti-misconfiguration
+// guardrails: they reject incoherent provider/member-block combinations and
+// mTLS-without-a-resolvable-CA at the API server, so a user "cannot
+// misconfigure" these from the spec alone. Rules that require reading cluster
+// objects (issuer existence, peer CA-capability, client/server CA match) cannot
+// be expressed in CEL and are enforced at reconcile time instead -- see
+// validateTLSSurface and the cert-manager provider's validateCertificateConfig.
+//
+// +kubebuilder:validation:XValidation:rule="self.provider != 'cert-manager.io' || has(self.certManager)",message="provider 'cert-manager.io' requires the certManager block"
+// +kubebuilder:validation:XValidation:rule="self.provider == 'cert-manager.io' || !has(self.certManager)",message="certManager may only be set when provider is 'cert-manager.io'"
+// +kubebuilder:validation:XValidation:rule="self.provider == 'auto' || !has(self.auto)",message="auto may only be set when provider is 'auto'"
+// +kubebuilder:validation:XValidation:rule="!self.clientCertAuth || self.provider != 'cert-manager.io' || (has(self.certManager) && size(self.certManager.issuerRef.name) > 0)",message="clientCertAuth requires a trusted CA: set certManager.issuerRef.name"
+type TLSSurface struct {
+	// Provider selects the certificate provider for THIS surface and names
+	// which member block below is honored. Defaults to "auto".
+	// +kubebuilder:default=auto
+	// +optional
+	Provider TLSProvider `json:"provider,omitempty"`
+
+	// Auto configures the operator's built-in self-signed provider for THIS
+	// surface. Only valid when provider is "auto".
+	// +optional
+	Auto *TLSAutoProvider `json:"auto,omitempty"`
+
+	// CertManager configures cert-manager issuance for THIS surface.
+	// Required when provider is "cert-manager.io"; forbidden otherwise.
+	// +optional
+	CertManager *TLSCertManagerProvider `json:"certManager,omitempty"`
+
+	// ClientCertAuth toggles mutual cert auth for THIS surface (etcd's
+	// --client-cert-auth for the client surface, --peer-client-cert-auth for the
+	// peer surface). Defaults to true (mTLS). Set false to serve server-only TLS
+	// where clients authenticate by other means (password/token). When true with
+	// the cert-manager provider a trusted CA (issuerRef.name) is REQUIRED,
+	// enforced by the XValidation rule above.
+	// +kubebuilder:default=true
+	// +optional
+	ClientCertAuth *bool `json:"clientCertAuth,omitempty"`
+
+	// TrustBundleConfigMapRef references a ConfigMap in the EtcdCluster's
+	// namespace carrying one or more additional PEM CA certificates under the
+	// fixed key "ca.crt". The bundle is APPENDED to (never replaces) this
+	// surface's MEMBER-SIDE trusted CA set: the operator concatenates it with
+	// the issued CA into the file behind --trusted-ca-file /
+	// --peer-trusted-ca-file. It broadens which client/peer certificates etcd
+	// members accept, NOT which servers the operator trusts when dialing etcd
+	// (the operator pins the issuing CA only). etcd reads trusted-CA files at
+	// process start only, so trust changes take effect per member on its next
+	// restart. Intended for CA-rotation overlap windows.
+	// +optional
+	TrustBundleConfigMapRef *TrustBundleConfigMapRef `json:"trustBundleConfigMapRef,omitempty"`
+}
+
+// TrustBundleConfigMapRef is a LocalObjectReference-style pointer to a
+// ConfigMap holding extra trusted CAs under the key "ca.crt".
+type TrustBundleConfigMapRef struct {
+	// Name of the ConfigMap.
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+}
+
+// EffectiveProvider resolves the surface's provider, defaulting to "auto" when
+// empty (objects written by an apiserver are already defaulted; this covers
+// fake-client / envtest-less code paths).
+func (s *TLSSurface) EffectiveProvider() TLSProvider {
+	if s == nil || s.Provider == "" {
+		return TLSProviderAuto
+	}
+	return s.Provider
+}
+
+// TLSAutoProvider tunes the built-in self-signed provider for one surface.
+// All fields are optional; empty values derive defaults from the cluster.
+type TLSAutoProvider struct {
+	// CommonName is the X509 subject CN. Keep to 64 characters or fewer to
+	// avoid generating invalid CSRs.
+	// +kubebuilder:validation:MaxLength=64
 	// +optional
 	CommonName string `json:"commonName,omitempty"`
 
-	// Organization is the expected array of Organization names to be used on the Certificate.
+	// Organizations are the X509 subject O values.
 	// +optional
-	Organization []string `json:"organizations,omitempty"`
+	Organizations []string `json:"organizations,omitempty"`
 
-	// AltNames contains the domain names and IP addresses that will be added
-	// to the x509 certificate SubAltNames fields. The values will be passed
-	// directly to the x509.Certificate object.
-	AltNames AltNames `json:"altNames,omitempty"`
-
-	// ValidityDuration is the expected duration until which the certificate will be valid,
-	// expects in human-readable duration: 100d12h, if empty defaults to 90d for cert-manager
-	// and 365d for auto as per: https://github.com/etcd-io/etcd/blob/b87bc1c3a275d7d4904f4d201b963a2de2264f0d/client/pkg/transport/listener.go#L275
+	// DNSNames are the DNS subject alternative names. Empty defaults to
+	// *.<cluster>.<ns>.svc.cluster.local and <cluster>.<ns>.svc.cluster.local
+	// (required for the operator's hostname verification of members).
 	// +optional
-	ValidityDuration string `json:"validityDuration,omitempty"`
+	DNSNames []string `json:"dnsNames,omitempty"`
 
-	// CABundleSecret is the expected secret name with CABundle present. It's used
-	// by each etcd POD to verify TLS communications with its peers or clients. If it isn't
-	// provided, the CA included in the secret generated by certificate provider will be
-	// used instead if present; otherwise, there is no way to verify TLS communications.
+	// IPAddresses are IP subject alternative names, as literal IP strings.
 	// +optional
-	CABundleSecret string `json:"caBundleSecret,omitempty"`
+	IPAddresses []string `json:"ipAddresses,omitempty"`
+
+	// Duration is the requested certificate lifetime. The auto provider
+	// requires at least 8760h (365 days); empty defaults to 8760h. Go duration
+	// units only (h/m/s); day suffixes like "365d" are not accepted.
+	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('8760h')",message="auto provider certificates must be valid for at least 8760h (365 days); use Go duration units h/m/s (day suffixes like '365d' are not accepted)"
+	// +optional
+	Duration *metav1.Duration `json:"duration,omitempty"`
+
+	// RenewBefore is reserved: the auto provider does not yet renew
+	// certificates. Accepted for parity with the certManager block.
+	// +kubebuilder:validation:XValidation:rule="duration(self) > duration('0s')",message="renewBefore must be a positive Go duration using h/m/s units (day suffixes are not accepted)"
+	// +optional
+	RenewBefore *metav1.Duration `json:"renewBefore,omitempty"`
 }
 
-type ProviderAutoConfig struct {
-	// CommonConfig is the struct of common fields required to create a certificate
-	CommonConfig `json:",inline"`
-}
+// TLSCertManagerProvider configures cert-manager issuance for one surface.
+type TLSCertManagerProvider struct {
+	// IssuerRef references the cert-manager Issuer or ClusterIssuer that signs
+	// this surface's certificates. kind defaults to "Issuer"; group defaults to
+	// "cert-manager.io". Point it at a CA Issuer to issue from a custom CA.
+	// +kubebuilder:validation:XValidation:rule="!has(self.kind) || self.kind in ['Issuer', 'ClusterIssuer']",message="issuerRef.kind must be 'Issuer' or 'ClusterIssuer'"
+	IssuerRef cmmeta.IssuerReference `json:"issuerRef"`
 
-type ProviderCertManagerConfig struct {
-	// CommonConfig is the struct of common fields required to create a certificate
-	CommonConfig `json:",inline"`
+	// CommonName is the X509 subject CN. Keep to 64 characters or fewer to
+	// avoid generating invalid CSRs.
+	// +kubebuilder:validation:MaxLength=64
+	// +optional
+	CommonName string `json:"commonName,omitempty"`
 
-	// IssuerKind is the expected kind of Issuer, either "ClusterIssuer" or "Issuer"
-	IssuerKind string `json:"issuerKind"`
+	// Organizations are the X509 subject O values.
+	// +optional
+	Organizations []string `json:"organizations,omitempty"`
 
-	// IssuerName is the expected name of Issuer required to issue a certificate
-	IssuerName string `json:"issuerName"`
+	// DNSNames are the DNS subject alternative names. Empty defaults to
+	// *.<cluster>.<ns>.svc.cluster.local and <cluster>.<ns>.svc.cluster.local
+	// (required for the operator's hostname verification of members).
+	// +optional
+	DNSNames []string `json:"dnsNames,omitempty"`
+
+	// IPAddresses are IP subject alternative names, as literal IP strings.
+	// +optional
+	IPAddresses []string `json:"ipAddresses,omitempty"`
+
+	// Duration is the requested certificate lifetime, passed through to
+	// Certificate.spec.duration. Empty defaults to 2160h (90 days). Go duration
+	// units only (h/m/s); day suffixes like "90d" are not accepted, and
+	// cert-manager's minimum is 1h.
+	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('1h')",message="duration must be at least 1h (cert-manager minimum) using Go duration units h/m/s (day suffixes like '90d' are not accepted)"
+	// +optional
+	Duration *metav1.Duration `json:"duration,omitempty"`
+
+	// RenewBefore is passed through to Certificate.spec.renewBefore; empty
+	// leaves cert-manager's default renewal policy in place.
+	// +kubebuilder:validation:XValidation:rule="duration(self) > duration('0s')",message="renewBefore must be a positive Go duration using h/m/s units (day suffixes are not accepted)"
+	// +optional
+	RenewBefore *metav1.Duration `json:"renewBefore,omitempty"`
 }
 
 // EtcdClusterStatus defines the observed state of EtcdCluster.

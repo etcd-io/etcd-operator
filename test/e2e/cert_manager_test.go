@@ -9,6 +9,7 @@ import (
 	"time"
 
 	certv1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
+	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsV1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
@@ -53,11 +54,13 @@ func TestCertManagerProvider(t *testing.T) {
 	feature := features.New("Cert-Manager Certificate").WithLabel("app", "cert-manager")
 
 	cmConfig := &interfaces.Config{
-		CommonName:       cmCertificateName,
-		ValidityDuration: cmCertificateValidity,
-		ExtraConfig: map[string]any{
-			"issuerName": cmIssuerName,
-			"issuerKind": cmIssuerType,
+		CommonName: cmCertificateName,
+		Duration:   cmCertificateValidity,
+		// Group is optional; cert-manager stores IssuerRef.Group == "" and
+		// GetCertificateConfig echoes that back, so the zero value DeepEqual-matches.
+		IssuerRef: &cmmeta.IssuerReference{
+			Name: cmIssuerName,
+			Kind: cmIssuerType,
 		},
 	}
 
@@ -175,18 +178,9 @@ func TestClusterCertCreation(t *testing.T) {
 		Spec: ecv1alpha1.EtcdClusterSpec{
 			Size:    size,
 			Version: etcdVersion,
-			TLS: &ecv1alpha1.TLSCertificate{
-				Provider: "cert-manager",
-				ProviderCfg: ecv1alpha1.ProviderConfig{
-					CertManagerCfg: &ecv1alpha1.ProviderCertManagerConfig{
-						CommonConfig: ecv1alpha1.CommonConfig{
-							CommonName:       "etcd-operator-system",
-							ValidityDuration: "90h",
-						},
-						IssuerKind: cmIssuerType,
-						IssuerName: cmIssuerName,
-					},
-				},
+			TLS: &ecv1alpha1.EtcdClusterTLS{
+				Peer:   certManagerSurface(cmIssuerName),
+				Client: certManagerSurface(cmIssuerName),
 			},
 		},
 	}

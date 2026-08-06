@@ -3,10 +3,10 @@ package controller
 import (
 	"errors"
 	"fmt"
-	"net"
 	"testing"
 	"time"
 
+	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	"github.com/coreos/go-semver/semver"
 	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/assert"
@@ -21,7 +21,6 @@ import (
 
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 	"go.etcd.io/etcd-operator/internal/etcdutils"
-	"go.etcd.io/etcd-operator/pkg/certificate"
 	certInterface "go.etcd.io/etcd-operator/pkg/certificate/interfaces"
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -170,6 +169,10 @@ func TestCreateHeadlessServiceIfNotExist(t *testing.T) {
 		err = fakeClient.Get(ctx, client.ObjectKey{Name: "test-etcd", Namespace: "default"}, service)
 		assert.NoError(t, err)
 		assert.Equal(t, "None", service.Spec.ClusterIP)
+		// Required for peer-TLS cluster formation: a joining (not-yet-Ready) member
+		// must be resolvable so etcd's peer cert SAN check (isHostInDNS) accepts it.
+		assert.True(t, service.Spec.PublishNotReadyAddresses,
+			"headless service must publish not-ready addresses so peer-TLS members can join")
 		assert.Equal(t, map[string]string{
 			"app":        "test-etcd",
 			"controller": "test-etcd",
@@ -205,7 +208,7 @@ func TestClientEndpointForOrdinalIndex(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(fmt.Sprintf("index %d", tt.index), func(t *testing.T) {
-			result := clientEndpointForOrdinalIndex(sts, tt.index)
+			result := clientEndpointForOrdinalIndex(sts, tt.index, "http")
 			assert.Equal(t, tt.expectedResult, result)
 		})
 	}
@@ -384,7 +387,7 @@ func TestClientEndpointsFromStatefulsets(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := clientEndpointsFromStatefulsets(tt.statefulSet)
+			result := clientEndpointsFromStatefulsets(tt.statefulSet, "http")
 			assert.Equal(t, tt.expectedResult, result)
 		})
 	}
@@ -423,7 +426,13 @@ func TestAreAllMembersHealthy(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			logger := logr.Discard() // Use a no-op logger for testing
 
-			result, err := areAllMembersHealthy(tt.statefulSet, logger)
+			// Cleartext cluster: buildClientTLSConfig returns nil and the dial
+			// times out, exactly as before the TLS-config threading.
+			ec := &ecv1alpha1.EtcdCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-sts", Namespace: "default"},
+			}
+			fakeClient := fake.NewClientBuilder().Build()
+			result, err := areAllMembersHealthy(t.Context(), ec, fakeClient, tt.statefulSet, logger)
 			assert.Equal(t, tt.expectedResult, result)
 			if tt.expectedError != nil {
 				assert.Error(t, err)
@@ -788,7 +797,7 @@ func TestCreatingArgs(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.testName, func(t *testing.T) {
-			result := createArgs(tt.clusterName, tt.etcdOptions)
+			result := createArgs(tt.clusterName, tt.etcdOptions, tlsArgs{})
 			assert.Equal(t, tt.expectedResult, result)
 		})
 	}
@@ -910,6 +919,7 @@ func TestCreateAutoCertificateConfig(t *testing.T) {
 	tests := []struct {
 		name     string
 		ec       *ecv1alpha1.EtcdCluster
+		surface  *ecv1alpha1.TLSSurface
 		expected *certInterface.Config
 		wantErr  bool
 	}{
@@ -920,34 +930,40 @@ func TestCreateAutoCertificateConfig(t *testing.T) {
 					Name:      "test-cluster",
 					Namespace: "test-namespace",
 				},
-				Spec: ecv1alpha1.EtcdClusterSpec{
-					TLS: &ecv1alpha1.TLSCertificate{
-						Provider: string(certificate.Auto),
-						ProviderCfg: ecv1alpha1.ProviderConfig{
-							AutoCfg: &ecv1alpha1.ProviderAutoConfig{
-								CommonConfig: ecv1alpha1.CommonConfig{
-									CommonName:       "custom.example.com",
-									Organization:     []string{"Test Org"},
-									ValidityDuration: "720h", // 30 days
-									AltNames: ecv1alpha1.AltNames{
-										DNSNames: []string{"custom1.example.com", "custom2.example.com"},
-									},
-								},
-							},
-						},
-					},
+			},
+			surface: &ecv1alpha1.TLSSurface{
+				Provider: ecv1alpha1.TLSProviderAuto,
+				Auto: &ecv1alpha1.TLSAutoProvider{
+					CommonName:    "custom.example.com",
+					Organizations: []string{"Test Org"},
+					Duration:      &metav1.Duration{Duration: 720 * time.Hour}, // 30 days
+					DNSNames:      []string{"custom1.example.com", "custom2.example.com"},
+					IPAddresses:   []string{"10.0.0.9"},
 				},
 			},
 			expected: &certInterface.Config{
-				CommonName:       "custom.example.com",
-				Organization:     []string{"Test Org"},
-				ValidityDuration: 720 * time.Hour, // 30 days
-				AltNames: certInterface.AltNames{
-					DNSNames: []string{"custom1.example.com", "custom2.example.com"},
-					IPs:      make([]net.IP, 2),
-				},
+				CommonName:    "custom.example.com",
+				Organizations: []string{"Test Org"},
+				Duration:      720 * time.Hour, // 30 days
+				DNSNames:      []string{"custom1.example.com", "custom2.example.com"},
+				IPAddresses:   []string{"10.0.0.9"},
 			},
 			wantErr: false,
+		},
+		{
+			name: "auto config with a malformed IP SAN is rejected",
+			ec: &ecv1alpha1.EtcdCluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-cluster",
+					Namespace: "test-namespace",
+				},
+			},
+			surface: &ecv1alpha1.TLSSurface{
+				Provider: ecv1alpha1.TLSProviderAuto,
+				Auto:     &ecv1alpha1.TLSAutoProvider{IPAddresses: []string{"not-an-ip"}},
+			},
+			expected: nil,
+			wantErr:  true,
 		},
 		{
 			name: "auto config with nil AutoCfg - should use defaults",
@@ -956,24 +972,17 @@ func TestCreateAutoCertificateConfig(t *testing.T) {
 					Name:      "test-cluster",
 					Namespace: "test-namespace",
 				},
-				Spec: ecv1alpha1.EtcdClusterSpec{
-					TLS: &ecv1alpha1.TLSCertificate{
-						Provider: string(certificate.Auto),
-						ProviderCfg: ecv1alpha1.ProviderConfig{
-							AutoCfg: nil,
-						},
-					},
-				},
+			},
+			surface: &ecv1alpha1.TLSSurface{
+				Provider: ecv1alpha1.TLSProviderAuto,
 			},
 			expected: &certInterface.Config{
-				CommonName:       "test-cluster.test-namespace.svc.cluster.local",
-				Organization:     nil,
-				ValidityDuration: certInterface.DefaultAutoValidity,
-				AltNames: certInterface.AltNames{
-					DNSNames: []string{
-						"*.test-cluster.test-namespace.svc.cluster.local",
-						"test-cluster.test-namespace.svc.cluster.local",
-					},
+				CommonName:    "test-cluster.test-namespace.svc.cluster.local",
+				Organizations: nil,
+				Duration:      certInterface.DefaultAutoValidity,
+				DNSNames: []string{
+					"*.test-cluster.test-namespace.svc.cluster.local",
+					"test-cluster.test-namespace.svc.cluster.local",
 				},
 			},
 			wantErr: false,
@@ -982,7 +991,7 @@ func TestCreateAutoCertificateConfig(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result, err := createAutoCertificateConfig(tt.ec)
+			result, err := createAutoCertificateConfig(tt.ec, tt.surface)
 
 			if tt.wantErr {
 				require.Error(t, err)
@@ -990,11 +999,7 @@ func TestCreateAutoCertificateConfig(t *testing.T) {
 			} else {
 				require.NoError(t, err)
 				require.NotNil(t, result)
-				assert.Equal(t, tt.expected.CommonName, result.CommonName)
-				assert.Equal(t, tt.expected.Organization, result.Organization)
-				assert.Equal(t, tt.expected.ValidityDuration, result.ValidityDuration)
-				assert.Equal(t, tt.expected.AltNames.DNSNames, result.AltNames.DNSNames)
-				assert.Equal(t, tt.expected.AltNames.IPs, result.AltNames.IPs)
+				assert.Equal(t, tt.expected, result)
 			}
 		})
 	}
@@ -1004,6 +1009,7 @@ func TestCreateCMCertificateConfig(t *testing.T) {
 	tests := []struct {
 		name     string
 		ec       *ecv1alpha1.EtcdCluster
+		surface  *ecv1alpha1.TLSSurface
 		expected *certInterface.Config
 		wantErr  bool
 	}{
@@ -1014,56 +1020,70 @@ func TestCreateCMCertificateConfig(t *testing.T) {
 					Name:      "test-cluster",
 					Namespace: "test-namespace",
 				},
-				Spec: ecv1alpha1.EtcdClusterSpec{
-					TLS: &ecv1alpha1.TLSCertificate{
-						Provider: string(certificate.CertManager),
-						ProviderCfg: ecv1alpha1.ProviderConfig{
-							CertManagerCfg: &ecv1alpha1.ProviderCertManagerConfig{
-								CommonConfig: ecv1alpha1.CommonConfig{
-									CommonName:       "cm.example.com",
-									Organization:     []string{"CM Org"},
-									ValidityDuration: "1440h", // 60 days
-									AltNames: ecv1alpha1.AltNames{
-										DNSNames: []string{"cm1.example.com", "cm2.example.com"},
-									},
-								},
-								IssuerName: "test-issuer",
-								IssuerKind: "ClusterIssuer",
-							},
-						},
+			},
+			surface: &ecv1alpha1.TLSSurface{
+				Provider: ecv1alpha1.TLSProviderCertManager,
+				CertManager: &ecv1alpha1.TLSCertManagerProvider{
+					CommonName:    "cm.example.com",
+					Organizations: []string{"CM Org"},
+					Duration:      &metav1.Duration{Duration: 1440 * time.Hour}, // 60 days
+					RenewBefore:   &metav1.Duration{Duration: 360 * time.Hour},
+					DNSNames:      []string{"cm1.example.com", "cm2.example.com"},
+					IssuerRef: cmmeta.IssuerReference{
+						Name:  "test-issuer",
+						Kind:  "ClusterIssuer",
+						Group: "example.io",
 					},
 				},
 			},
 			expected: &certInterface.Config{
-				CommonName:       "cm.example.com",
-				Organization:     []string{"CM Org"},
-				ValidityDuration: 1440 * time.Hour, // 60 days
-				AltNames: certInterface.AltNames{
-					DNSNames: []string{"cm1.example.com", "cm2.example.com"},
-					IPs:      make([]net.IP, 2),
-				},
-				ExtraConfig: map[string]any{
-					"issuerName": "test-issuer",
-					"issuerKind": "ClusterIssuer",
+				CommonName:    "cm.example.com",
+				Organizations: []string{"CM Org"},
+				Duration:      1440 * time.Hour, // 60 days
+				RenewBefore:   &metav1.Duration{Duration: 360 * time.Hour},
+				DNSNames:      []string{"cm1.example.com", "cm2.example.com"},
+				IssuerRef: &cmmeta.IssuerReference{
+					Name:  "test-issuer",
+					Kind:  "ClusterIssuer",
+					Group: "example.io",
 				},
 			},
 			wantErr: false,
 		},
 		{
-			name: "cert-manager config with nil CertManagerCfg",
+			name: "cert-manager config with defaulted duration",
 			ec: &ecv1alpha1.EtcdCluster{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "test-cluster",
 					Namespace: "test-namespace",
 				},
-				Spec: ecv1alpha1.EtcdClusterSpec{
-					TLS: &ecv1alpha1.TLSCertificate{
-						Provider: string(certificate.CertManager),
-						ProviderCfg: ecv1alpha1.ProviderConfig{
-							CertManagerCfg: nil,
-						},
-					},
+			},
+			surface: &ecv1alpha1.TLSSurface{
+				Provider: ecv1alpha1.TLSProviderCertManager,
+				CertManager: &ecv1alpha1.TLSCertManagerProvider{
+					IssuerRef: cmmeta.IssuerReference{Name: "test-issuer"},
 				},
+			},
+			expected: &certInterface.Config{
+				Duration: certInterface.DefaultCertManagerValidity,
+				DNSNames: []string{
+					"*.test-cluster.test-namespace.svc.cluster.local",
+					"test-cluster.test-namespace.svc.cluster.local",
+				},
+				IssuerRef: &cmmeta.IssuerReference{Name: "test-issuer"},
+			},
+			wantErr: false,
+		},
+		{
+			name: "cert-manager config with nil certManager block",
+			ec: &ecv1alpha1.EtcdCluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-cluster",
+					Namespace: "test-namespace",
+				},
+			},
+			surface: &ecv1alpha1.TLSSurface{
+				Provider: ecv1alpha1.TLSProviderCertManager,
 			},
 			expected: nil,
 			wantErr:  true,
@@ -1072,7 +1092,7 @@ func TestCreateCMCertificateConfig(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result, err := createCMCertificateConfig(tt.ec)
+			result, err := createCMCertificateConfig(tt.ec, tt.surface)
 
 			if tt.wantErr {
 				require.Error(t, err)
@@ -1080,12 +1100,7 @@ func TestCreateCMCertificateConfig(t *testing.T) {
 			} else {
 				require.NoError(t, err)
 				require.NotNil(t, result)
-				assert.Equal(t, tt.expected.CommonName, result.CommonName)
-				assert.Equal(t, tt.expected.Organization, result.Organization)
-				assert.Equal(t, tt.expected.ValidityDuration, result.ValidityDuration)
-				assert.Equal(t, tt.expected.AltNames.DNSNames, result.AltNames.DNSNames)
-				assert.Equal(t, tt.expected.AltNames.IPs, result.AltNames.IPs)
-				assert.Equal(t, tt.expected.ExtraConfig, result.ExtraConfig)
+				assert.Equal(t, tt.expected, result)
 			}
 		})
 	}

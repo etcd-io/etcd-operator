@@ -8,9 +8,16 @@ metadata:
 spec:
   version: v3.5.21
   size: 3
+  # Both surfaces use the built-in self-signed provider. The auto provider
+  # requires a duration of at least 8760h (365 days); Go duration units only.
   tls:
-    provider: "auto"
-    providerCfg:
-      autoCfg:
+    peer:
+      provider: "auto"
+      auto:
         commonName: "etcd-operator-system"
-        validityDuration: 365d
+        duration: "8760h"
+    client:
+      provider: "auto"
+      auto:
+        commonName: "etcd-operator-system"
+        duration: "8760h"

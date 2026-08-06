@@ -167,15 +167,26 @@ func (ac *Provider) GetCertificateConfig(ctx context.Context,
 
 	// Extract config from the certificate
 	config := &interfaces.Config{
-		CommonName:   cert.Subject.CommonName,
-		Organization: cert.Subject.Organization,
-		AltNames: interfaces.AltNames{
-			DNSNames: cert.DNSNames,
-			IPs:      cert.IPAddresses,
-		},
+		CommonName:    cert.Subject.CommonName,
+		Organizations: cert.Subject.Organization,
+		DNSNames:      cert.DNSNames,
+		IPAddresses:   ipStrings(cert.IPAddresses),
 	}
 
 	return config, nil
+}
+
+// ipStrings renders parsed IP SANs back to the literal-string form used by
+// interfaces.Config, preserving nil for certificates without IP SANs.
+func ipStrings(ips []net.IP) []string {
+	if len(ips) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(ips))
+	for _, ip := range ips {
+		out = append(out, ip.String())
+	}
+	return out
 }
 
 // parseCertificateFromSecret extracts and parses the x509 certificate from a Kubernetes secret.
@@ -248,8 +259,8 @@ func checkKeyPair(cert *x509.Certificate, privateKey crypto.PrivateKey) error {
 func (ac *Provider) createNewSecret(ctx context.Context, secretKey client.ObjectKey,
 	cfg *interfaces.Config) error {
 	validity := interfaces.DefaultAutoValidity
-	if cfg.ValidityDuration != 0 {
-		validity = cfg.ValidityDuration
+	if cfg.Duration != 0 {
+		validity = cfg.Duration
 	}
 
 	// Validate validity duration: minimum is 1 year as required by etcd
@@ -276,11 +287,15 @@ func (ac *Provider) createNewSecret(ctx context.Context, secretKey client.Object
 			hostPort := net.JoinHostPort(cfg.CommonName, "5500")
 			hosts = append(hosts, hostPort)
 		}
-		if len(cfg.AltNames.DNSNames) > 0 {
-			for _, dnsName := range cfg.AltNames.DNSNames {
-				hostPort := net.JoinHostPort(dnsName, "5500")
-				hosts = append(hosts, hostPort)
-			}
+		for _, dnsName := range cfg.DNSNames {
+			hostPort := net.JoinHostPort(dnsName, "5500")
+			hosts = append(hosts, hostPort)
+		}
+		// transport.SelfCert splits each host and sorts it into an IP or DNS
+		// SAN via net.ParseIP, so IP SANs ride the same hosts list.
+		for _, ip := range cfg.IPAddresses {
+			hostPort := net.JoinHostPort(ip, "5500")
+			hosts = append(hosts, hostPort)
 		}
 	}
 
