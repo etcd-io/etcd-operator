@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -861,5 +862,75 @@ func TestBuildMemberPodTLSVolumes(t *testing.T) {
 		args := strings.Join(pod.Spec.Containers[0].Args, "\n")
 		assert.NotContains(t, args, "--cert-file=")
 		assert.Contains(t, args, "--listen-client-urls=http://0.0.0.0:2379")
+	})
+}
+
+func TestBuildMemberPodResources(t *testing.T) {
+	mkCluster := func(resources *corev1.ResourceRequirements) *ecv1alpha1.EtcdCluster {
+		return &ecv1alpha1.EtcdCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: "rs-cluster", Namespace: "default", UID: "1"},
+			Spec: ecv1alpha1.EtcdClusterSpec{
+				Size:    3,
+				Version: "3.5.17",
+				PodTemplate: &ecv1alpha1.PodTemplate{
+					Spec: &ecv1alpha1.PodSpec{
+						Resources: resources,
+					},
+				},
+			},
+		}
+	}
+
+	t.Run("Resources unset → etcd container has zero-value Resources", func(t *testing.T) {
+		ec := mkCluster(nil)
+		pod := buildMemberPod(ec, "rs-cluster-0", etcdClusterStateNew, "ignored")
+
+		assert.Equal(t, corev1.ResourceRequirements{}, pod.Spec.Containers[0].Resources,
+			"etcd container must have no Resources block when PodSpec.Resources is nil")
+	})
+
+	t.Run("Resources fully populated → values copied verbatim", func(t *testing.T) {
+		want := corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("100m"),
+				corev1.ResourceMemory: resource.MustParse("256Mi"),
+			},
+			Limits: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("500m"),
+				corev1.ResourceMemory: resource.MustParse("512Mi"),
+			},
+		}
+		ec := mkCluster(&want)
+		pod := buildMemberPod(ec, "rs-cluster-0", etcdClusterStateNew, "ignored")
+
+		assert.Equal(t, want, pod.Spec.Containers[0].Resources)
+	})
+
+	t.Run("Resources requests only → limits left zero", func(t *testing.T) {
+		want := corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("100m"),
+				corev1.ResourceMemory: resource.MustParse("256Mi"),
+			},
+		}
+		ec := mkCluster(&want)
+		pod := buildMemberPod(ec, "rs-cluster-0", etcdClusterStateNew, "ignored")
+
+		got := pod.Spec.Containers[0].Resources
+		assert.Equal(t, want.Requests, got.Requests)
+		assert.Empty(t, got.Limits, "limits must remain unset when only requests are specified")
+	})
+
+	t.Run("Resources set but PodSpec nil → no Resources written", func(t *testing.T) {
+		// Resources field only counts when PodTemplate.Spec is itself non-nil.
+		// Here PodSpec is the zero value (nil Spec pointer) and we set nothing,
+		// so the guard chain must skip Resources.
+		ec := &ecv1alpha1.EtcdCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: "rs-cluster", Namespace: "default", UID: "1"},
+			Spec:       ecv1alpha1.EtcdClusterSpec{Size: 3, Version: "3.5.17"},
+		}
+		pod := buildMemberPod(ec, "rs-cluster-0", etcdClusterStateNew, "ignored")
+
+		assert.Equal(t, corev1.ResourceRequirements{}, pod.Spec.Containers[0].Resources)
 	})
 }

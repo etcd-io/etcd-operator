@@ -328,6 +328,11 @@ func buildMemberPod(ec *ecv1alpha1.EtcdCluster, podName string, initialClusterSt
 		podSpec.Affinity = ec.Spec.PodTemplate.Spec.Affinity
 		podSpec.NodeSelector = ec.Spec.PodTemplate.Spec.NodeSelector
 		podSpec.Tolerations = ec.Spec.PodTemplate.Spec.Tolerations
+
+		// Container-level customization: CPU/memory on the etcd container.
+		if ec.Spec.PodTemplate.Spec.Resources != nil {
+			podSpec.Containers[0].Resources = *ec.Spec.PodTemplate.Spec.Resources
+		}
 	}
 
 	// Persistent storage volumes.
