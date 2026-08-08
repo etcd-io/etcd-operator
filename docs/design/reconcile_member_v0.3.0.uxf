@@ -1,0 +1,1058 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<diagram program="umlet" version="15.1">
+  <zoom_level>10</zoom_level>
+  <element>
+    <id>Text</id>
+    <coordinates>
+      <x>420</x>
+      <y>70</y>
+      <w>590</w>
+      <h>40</h>
+    </coordinates>
+    <panel_attributes>Customized controller (v0.3.0): reconcile EtcdMember
+style=wordwrap
+fontsize=20
+halign=center</panel_attributes>
+    <additional_attributes/>
+  </element>
+  <element>
+    <id>UMLSpecialState</id>
+    <coordinates>
+      <x>50</x>
+      <y>180</y>
+      <w>120</w>
+      <h>60</h>
+    </coordinates>
+    <panel_attributes>type=decision
+in Pending
+phase?</panel_attributes>
+    <additional_attributes/>
+  </element>
+  <element>
+    <id>UMLState</id>
+    <coordinates>
+      <x>220</x>
+      <y>190</y>
+      <w>140</w>
+      <h>50</h>
+    </coordinates>
+    <panel_attributes>Change to 
+Provisioning phase</panel_attributes>
+    <additional_attributes/>
+  </element>
+  <element>
+    <id>Relation</id>
+    <coordinates>
+      <x>100</x>
+      <y>230</y>
+      <w>50</w>
+      <h>90</h>
+    </coordinates>
+    <panel_attributes>lt=&lt;-
+No
+</panel_attributes>
+    <additional_attributes>10.0;70.0;10.0;10.0</additional_attributes>
+  </element>
+  <element>
+    <id>UMLSpecialState</id>
+    <coordinates>
+      <x>130</x>
+      <y>630</y>
+      <w>120</w>
+      <h>60</h>
+    </coordinates>
+    <panel_attributes>type=decision
+the very first
+member?</panel_attributes>
+    <additional_attributes/>
+  </element>
+  <element>
+    <id>Relation</id>
+    <coordinates>
+      <x>160</x>
+      <y>190</y>
+      <w>80</w>
+      <h>40</h>
+    </coordinates>
+    <panel_attributes>lt=&lt;-
+Yes</panel_attributes>
+    <additional_attributes>60.0;20.0;10.0;20.0</additional_attributes>
+  </element>
+  <element>
+    <id>UMLState</id>
+    <coordinates>
+      <x>60</x>
+      <y>300</y>
+      <w>270</w>
+      <h>50</h>
+    </coordinates>
+    <panel_attributes>Create certificates if TLS
+is enabled and not exist yet</panel_attributes>
+    <additional_attributes/>
+  </element>
+  <element>
+    <id>Relation</id>
+    <coordinates>
+      <x>260</x>
+      <y>230</y>
+      <w>30</w>
+      <h>90</h>
+    </coordinates>
+    <panel_attributes>lt=&lt;-
+</panel_attributes>
+    <additional_attributes>10.0;70.0;10.0;10.0</additional_attributes>
+  </element>
+  <element>
+    <id>UMLState</id>
+    <coordinates>
+      <x>80</x>
+      <y>400</y>
+      <w>220</w>
+      <h>40</h>
+    </coordinates>
+    <panel_attributes>Create PVC/PV if not exist yet</panel_attributes>
+    <additional_attributes/>
+  </element>
+  <element>
+    <id>Relation</id>
+    <coordinates>
+      <x>180</x>
+      <y>340</y>
+      <w>30</w>
+      <h>80</h>
+    </coordinates>
+    <panel_attributes>lt=&lt;-
+</panel_attributes>
+    <additional_attributes>10.0;60.0;10.0;10.0</additional_attributes>
+  </element>
+  <element>
+    <id>Relation</id>
+    <coordinates>
+      <x>180</x>
+      <y>430</y>
+      <w>30</w>
+      <h>70</h>
+    </coordinates>
+    <panel_attributes>lt=&lt;-
+</panel_attributes>
+    <additional_attributes>10.0;50.0;10.0;10.0</additional_attributes>
+  </element>
+  <element>
+    <id>UMLState</id>
+    <coordinates>
+      <x>0</x>
+      <y>840</y>
+      <w>480</w>
+      <h>60</h>
+    </coordinates>
+    <panel_attributes>Start the POD if not exist yet. If it's the very first member,
+set --initial-cluster-state "new", otherwise "existing".</panel_attributes>
+    <additional_attributes/>
+  </element>
+  <element>
+    <id>UMLSpecialState</id>
+    <coordinates>
+      <x>70</x>
+      <y>480</y>
+      <w>240</w>
+      <h>100</h>
+    </coordinates>
+    <panel_attributes>type=decision
+is a member with the
+ordinal's deterministic peer URL
+already exist?</panel_attributes>
+    <additional_attributes/>
+  </element>
+  <element>
+    <id>Relation</id>
+    <coordinates>
+      <x>180</x>
+      <y>570</y>
+      <w>50</w>
+      <h>80</h>
+    </coordinates>
+    <panel_attributes>lt=&lt;-
+No</panel_attributes>
+    <additional_attributes>10.0;60.0;10.0;10.0</additional_attributes>
+  </element>
+  <element>
+    <id>UMLState</id>
+    <coordinates>
+      <x>100</x>
+      <y>740</y>
+      <w>180</w>
+      <h>50</h>
+    </coordinates>
+    <panel_attributes>add a new learner into
+the etcd cluster</panel_attributes>
+    <additional_attributes/>
+  </element>
+  <element>
+    <id>Relation</id>
+    <coordinates>
+      <x>180</x>
+      <y>680</y>
+      <w>50</w>
+      <h>80</h>
+    </coordinates>
+    <panel_attributes>lt=&lt;-
+No</panel_attributes>
+    <additional_attributes>10.0;60.0;10.0;10.0</additional_attributes>
+  </element>
+  <element>
+    <id>Relation</id>
+    <coordinates>
+      <x>300</x>
+      <y>520</y>
+      <w>110</w>
+      <h>340</h>
+    </coordinates>
+    <panel_attributes>lt=&lt;-
+Yes</panel_attributes>
+    <additional_attributes>70.0;320.0;70.0;10.0;10.0;10.0</additional_attributes>
+  </element>
+  <element>
+    <id>Relation</id>
+    <coordinates>
+      <x>180</x>
+      <y>780</y>
+      <w>30</w>
+      <h>80</h>
+    </coordinates>
+    <panel_attributes>lt=&lt;-</panel_attributes>
+    <additional_attributes>10.0;60.0;10.0;10.0</additional_attributes>
+  </element>
+  <element>
+    <id>Relation</id>
+    <coordinates>
+      <x>240</x>
+      <y>650</y>
+      <w>110</w>
+      <h>210</h>
+    </coordinates>
+    <panel_attributes>lt=&lt;-
+Yes</panel_attributes>
+    <additional_attributes>70.0;190.0;70.0;10.0;10.0;10.0</additional_attributes>
+  </element>
+  <element>
+    <id>UMLNote</id>
+    <coordinates>
+      <x>50</x>
+      <y>90</y>
+      <w>140</w>
+      <h>30</h>
+    </coordinates>
+    <panel_attributes>Provisioning case
+bg=blue</panel_attributes>
+    <additional_attributes/>
+  </element>
+  <element>
+    <id>Relation</id>
+    <coordinates>
+      <x>100</x>
+      <y>110</y>
+      <w>30</w>
+      <h>90</h>
+    </coordinates>
+    <panel_attributes>lt=&lt;-
+</panel_attributes>
+    <additional_attributes>10.0;70.0;10.0;10.0</additional_attributes>
+  </element>
+  <element>
+    <id>UMLNote</id>
+    <coordinates>
+      <x>810</x>
+      <y>200</y>
+      <w>140</w>
+      <h>30</h>
+    </coordinates>
+    <panel_attributes>Recreating case
+bg=blue</panel_attributes>
+    <additional_attributes/>
+  </element>
+  <element>
+    <id>UMLState</id>
+    <coordinates>
+      <x>820</x>
+      <y>950</y>
+      <w>130</w>
+      <h>40</h>
+    </coordinates>
+    <panel_attributes>Remove the POD</panel_attributes>
+    <additional_attributes/>
+  </element>
+  <element>
+    <id>Relation</id>
+    <coordinates>
+      <x>870</x>
+      <y>980</y>
+      <w>30</w>
+      <h>80</h>
+    </coordinates>
+    <panel_attributes>lt=&lt;-
+</panel_attributes>
+    <additional_attributes>10.0;60.0;10.0;10.0</additional_attributes>
+  </element>
+  <element>
+    <id>Relation</id>
+    <coordinates>
+      <x>870</x>
+      <y>220</y>
+      <w>30</w>
+      <h>80</h>
+    </coordinates>
+    <panel_attributes>lt=&lt;-
+</panel_attributes>
+    <additional_attributes>10.0;60.0;10.0;10.0</additional_attributes>
+  </element>
+  <element>
+    <id>UMLNote</id>
+    <coordinates>
+      <x>1230</x>
+      <y>200</y>
+      <w>140</w>
+      <h>30</h>
+    </coordinates>
+    <panel_attributes>Replacing case
+bg=blue</panel_attributes>
+    <additional_attributes/>
+  </element>
+  <element>
+    <id>UMLState</id>
+    <coordinates>
+      <x>1180</x>
+      <y>420</y>
+      <w>220</w>
+      <h>70</h>
+    </coordinates>
+    <panel_attributes>Remove the etcd member from
+the cluster if not yet</panel_attributes>
+    <additional_attributes/>
+  </element>
+  <element>
+    <id>UMLState</id>
+    <coordinates>
+      <x>1190</x>
+      <y>550</y>
+      <w>200</w>
+      <h>50</h>
+    </coordinates>
+    <panel_attributes>Delete its POD if not yet</panel_attributes>
+    <additional_attributes/>
+  </element>
+  <element>
+    <id>UMLState</id>
+    <coordinates>
+      <x>1190</x>
+      <y>660</y>
+      <w>200</w>
+      <h>50</h>
+    </coordinates>
+    <panel_attributes>Delete its PV/PVC if not yet</panel_attributes>
+    <additional_attributes/>
+  </element>
+  <element>
+    <id>UMLState</id>
+    <coordinates>
+      <x>1190</x>
+      <y>770</y>
+      <w>220</w>
+      <h>50</h>
+    </coordinates>
+    <panel_attributes>Delete its certificate if not yet</panel_attributes>
+    <additional_attributes/>
+  </element>
+  <element>
+    <id>UMLState</id>
+    <coordinates>
+      <x>1160</x>
+      <y>880</y>
+      <w>280</w>
+      <h>50</h>
+    </coordinates>
+    <panel_attributes>Change EtcdMember phase to Pending</panel_attributes>
+    <additional_attributes/>
+  </element>
+  <element>
+    <id>Relation</id>
+    <coordinates>
+      <x>1280</x>
+      <y>220</y>
+      <w>30</w>
+      <h>100</h>
+    </coordinates>
+    <panel_attributes>lt=&lt;-
+</panel_attributes>
+    <additional_attributes>10.0;80.0;10.0;10.0</additional_attributes>
+  </element>
+  <element>
+    <id>Relation</id>
+    <coordinates>
+      <x>1280</x>
+      <y>480</y>
+      <w>30</w>
+      <h>90</h>
+    </coordinates>
+    <panel_attributes>lt=&lt;-
+</panel_attributes>
+    <additional_attributes>10.0;70.0;10.0;10.0</additional_attributes>
+  </element>
+  <element>
+    <id>Relation</id>
+    <coordinates>
+      <x>1280</x>
+      <y>590</y>
+      <w>30</w>
+      <h>90</h>
+    </coordinates>
+    <panel_attributes>lt=&lt;-
+</panel_attributes>
+    <additional_attributes>10.0;70.0;10.0;10.0</additional_attributes>
+  </element>
+  <element>
+    <id>Relation</id>
+    <coordinates>
+      <x>1280</x>
+      <y>700</y>
+      <w>30</w>
+      <h>90</h>
+    </coordinates>
+    <panel_attributes>lt=&lt;-
+</panel_attributes>
+    <additional_attributes>10.0;70.0;10.0;10.0</additional_attributes>
+  </element>
+  <element>
+    <id>Relation</id>
+    <coordinates>
+      <x>1280</x>
+      <y>810</y>
+      <w>30</w>
+      <h>90</h>
+    </coordinates>
+    <panel_attributes>lt=&lt;-
+</panel_attributes>
+    <additional_attributes>10.0;70.0;10.0;10.0</additional_attributes>
+  </element>
+  <element>
+    <id>UMLNote</id>
+    <coordinates>
+      <x>1200</x>
+      <y>980</y>
+      <w>180</w>
+      <h>50</h>
+    </coordinates>
+    <panel_attributes>Follow the Provisioning
+case afterwards
+bg=blue</panel_attributes>
+    <additional_attributes/>
+  </element>
+  <element>
+    <id>Relation</id>
+    <coordinates>
+      <x>1280</x>
+      <y>920</y>
+      <w>30</w>
+      <h>80</h>
+    </coordinates>
+    <panel_attributes>lt=&lt;.</panel_attributes>
+    <additional_attributes>10.0;60.0;10.0;10.0</additional_attributes>
+  </element>
+  <element>
+    <id>UMLNote</id>
+    <coordinates>
+      <x>1560</x>
+      <y>200</y>
+      <w>140</w>
+      <h>30</h>
+    </coordinates>
+    <panel_attributes>Terminating case
+bg=blue</panel_attributes>
+    <additional_attributes/>
+  </element>
+  <element>
+    <id>UMLState</id>
+    <coordinates>
+      <x>1510</x>
+      <y>420</y>
+      <w>220</w>
+      <h>70</h>
+    </coordinates>
+    <panel_attributes>Remove the etcd member from
+the cluster if not yet</panel_attributes>
+    <additional_attributes/>
+  </element>
+  <element>
+    <id>UMLState</id>
+    <coordinates>
+      <x>1520</x>
+      <y>550</y>
+      <w>200</w>
+      <h>50</h>
+    </coordinates>
+    <panel_attributes>Delete its POD if not yet</panel_attributes>
+    <additional_attributes/>
+  </element>
+  <element>
+    <id>UMLState</id>
+    <coordinates>
+      <x>1520</x>
+      <y>660</y>
+      <w>200</w>
+      <h>50</h>
+    </coordinates>
+    <panel_attributes>Delete its PV/PVC if not yet</panel_attributes>
+    <additional_attributes/>
+  </element>
+  <element>
+    <id>UMLState</id>
+    <coordinates>
+      <x>1520</x>
+      <y>760</y>
+      <w>220</w>
+      <h>50</h>
+    </coordinates>
+    <panel_attributes>Delete its certificate if not yet</panel_attributes>
+    <additional_attributes/>
+  </element>
+  <element>
+    <id>UMLState</id>
+    <coordinates>
+      <x>1490</x>
+      <y>880</y>
+      <w>270</w>
+      <h>50</h>
+    </coordinates>
+    <panel_attributes>Delete the EtcdMember object</panel_attributes>
+    <additional_attributes/>
+  </element>
+  <element>
+    <id>Relation</id>
+    <coordinates>
+      <x>1610</x>
+      <y>220</y>
+      <w>30</w>
+      <h>100</h>
+    </coordinates>
+    <panel_attributes>lt=&lt;-
+</panel_attributes>
+    <additional_attributes>10.0;80.0;10.0;10.0</additional_attributes>
+  </element>
+  <element>
+    <id>Relation</id>
+    <coordinates>
+      <x>1610</x>
+      <y>480</y>
+      <w>30</w>
+      <h>90</h>
+    </coordinates>
+    <panel_attributes>lt=&lt;-
+</panel_attributes>
+    <additional_attributes>10.0;70.0;10.0;10.0</additional_attributes>
+  </element>
+  <element>
+    <id>Relation</id>
+    <coordinates>
+      <x>1610</x>
+      <y>590</y>
+      <w>30</w>
+      <h>90</h>
+    </coordinates>
+    <panel_attributes>lt=&lt;-
+</panel_attributes>
+    <additional_attributes>10.0;70.0;10.0;10.0</additional_attributes>
+  </element>
+  <element>
+    <id>Relation</id>
+    <coordinates>
+      <x>1610</x>
+      <y>700</y>
+      <w>30</w>
+      <h>80</h>
+    </coordinates>
+    <panel_attributes>lt=&lt;-
+</panel_attributes>
+    <additional_attributes>10.0;60.0;10.0;10.0</additional_attributes>
+  </element>
+  <element>
+    <id>Relation</id>
+    <coordinates>
+      <x>1610</x>
+      <y>800</y>
+      <w>30</w>
+      <h>100</h>
+    </coordinates>
+    <panel_attributes>lt=&lt;-
+</panel_attributes>
+    <additional_attributes>10.0;80.0;10.0;10.0</additional_attributes>
+  </element>
+  <element>
+    <id>UMLState</id>
+    <coordinates>
+      <x>1210</x>
+      <y>300</y>
+      <w>490</w>
+      <h>60</h>
+    </coordinates>
+    <panel_attributes>If it's a leader, transfer leader to the member with lowest ordinal,
+not including itself. This is a best-effort opeartion. </panel_attributes>
+    <additional_attributes/>
+  </element>
+  <element>
+    <id>Relation</id>
+    <coordinates>
+      <x>870</x>
+      <y>430</y>
+      <w>50</w>
+      <h>80</h>
+    </coordinates>
+    <panel_attributes>lt=&lt;-
+No</panel_attributes>
+    <additional_attributes>10.0;60.0;10.0;10.0</additional_attributes>
+  </element>
+  <element>
+    <id>Relation</id>
+    <coordinates>
+      <x>1280</x>
+      <y>350</y>
+      <w>30</w>
+      <h>90</h>
+    </coordinates>
+    <panel_attributes>lt=&lt;-
+</panel_attributes>
+    <additional_attributes>10.0;70.0;10.0;10.0</additional_attributes>
+  </element>
+  <element>
+    <id>Relation</id>
+    <coordinates>
+      <x>1610</x>
+      <y>350</y>
+      <w>30</w>
+      <h>90</h>
+    </coordinates>
+    <panel_attributes>lt=&lt;-
+</panel_attributes>
+    <additional_attributes>10.0;70.0;10.0;10.0</additional_attributes>
+  </element>
+  <element>
+    <id>UMLSpecialState</id>
+    <coordinates>
+      <x>820</x>
+      <y>380</y>
+      <w>120</w>
+      <h>60</h>
+    </coordinates>
+    <panel_attributes>type=decision
+is the member
+healthy?</panel_attributes>
+    <additional_attributes/>
+  </element>
+  <element>
+    <id>UMLState</id>
+    <coordinates>
+      <x>780</x>
+      <y>280</y>
+      <w>210</w>
+      <h>50</h>
+    </coordinates>
+    <panel_attributes>perform serializable health
+check for the etcd member</panel_attributes>
+    <additional_attributes/>
+  </element>
+  <element>
+    <id>Relation</id>
+    <coordinates>
+      <x>870</x>
+      <y>320</y>
+      <w>30</w>
+      <h>80</h>
+    </coordinates>
+    <panel_attributes>lt=&lt;-
+</panel_attributes>
+    <additional_attributes>10.0;60.0;10.0;10.0</additional_attributes>
+  </element>
+  <element>
+    <id>UMLState</id>
+    <coordinates>
+      <x>600</x>
+      <y>270</y>
+      <w>140</w>
+      <h>60</h>
+    </coordinates>
+    <panel_attributes>change its phase
+to Ready, reset
+RecreateCount.</panel_attributes>
+    <additional_attributes/>
+  </element>
+  <element>
+    <id>Relation</id>
+    <coordinates>
+      <x>750</x>
+      <y>390</y>
+      <w>90</w>
+      <h>40</h>
+    </coordinates>
+    <panel_attributes>lt=&lt;-
+Yes</panel_attributes>
+    <additional_attributes>10.0;20.0;70.0;20.0</additional_attributes>
+  </element>
+  <element>
+    <id>UMLSpecialState</id>
+    <coordinates>
+      <x>130</x>
+      <y>950</y>
+      <w>120</w>
+      <h>60</h>
+    </coordinates>
+    <panel_attributes>type=decision
+Is the member
+healthy?</panel_attributes>
+    <additional_attributes/>
+  </element>
+  <element>
+    <id>Relation</id>
+    <coordinates>
+      <x>180</x>
+      <y>890</y>
+      <w>30</w>
+      <h>80</h>
+    </coordinates>
+    <panel_attributes>lt=&lt;-</panel_attributes>
+    <additional_attributes>10.0;60.0;10.0;10.0</additional_attributes>
+  </element>
+  <element>
+    <id>UMLState</id>
+    <coordinates>
+      <x>110</x>
+      <y>1060</y>
+      <w>160</w>
+      <h>50</h>
+    </coordinates>
+    <panel_attributes>try to promote the
+learner if needed.</panel_attributes>
+    <additional_attributes/>
+  </element>
+  <element>
+    <id>UMLSpecialState</id>
+    <coordinates>
+      <x>820</x>
+      <y>630</y>
+      <w>120</w>
+      <h>60</h>
+    </coordinates>
+    <panel_attributes>type=decision
+Does the
+POD exist?</panel_attributes>
+    <additional_attributes/>
+  </element>
+  <element>
+    <id>UMLState</id>
+    <coordinates>
+      <x>820</x>
+      <y>1040</y>
+      <w>190</w>
+      <h>50</h>
+    </coordinates>
+    <panel_attributes>Create a new POD,
+updte RecreateCount</panel_attributes>
+    <additional_attributes/>
+  </element>
+  <element>
+    <id>Relation</id>
+    <coordinates>
+      <x>930</x>
+      <y>650</y>
+      <w>100</w>
+      <h>410</h>
+    </coordinates>
+    <panel_attributes>lt=&lt;-
+No</panel_attributes>
+    <additional_attributes>60.0;390.0;60.0;10.0;10.0;10.0</additional_attributes>
+  </element>
+  <element>
+    <id>UMLSpecialState</id>
+    <coordinates>
+      <x>820</x>
+      <y>740</y>
+      <w>120</w>
+      <h>60</h>
+    </coordinates>
+    <panel_attributes>type=decision
+Is the
+POD timedout?</panel_attributes>
+    <additional_attributes/>
+  </element>
+  <element>
+    <id>Relation</id>
+    <coordinates>
+      <x>870</x>
+      <y>680</y>
+      <w>50</w>
+      <h>80</h>
+    </coordinates>
+    <panel_attributes>lt=&lt;-
+Yes</panel_attributes>
+    <additional_attributes>10.0;60.0;10.0;10.0</additional_attributes>
+  </element>
+  <element>
+    <id>Relation</id>
+    <coordinates>
+      <x>770</x>
+      <y>760</y>
+      <w>70</w>
+      <h>70</h>
+    </coordinates>
+    <panel_attributes>lt=&lt;-
+No</panel_attributes>
+    <additional_attributes>10.0;50.0;10.0;10.0;50.0;10.0</additional_attributes>
+  </element>
+  <element>
+    <id>UMLState</id>
+    <coordinates>
+      <x>730</x>
+      <y>810</y>
+      <w>100</w>
+      <h>40</h>
+    </coordinates>
+    <panel_attributes>requeue</panel_attributes>
+    <additional_attributes/>
+  </element>
+  <element>
+    <id>Relation</id>
+    <coordinates>
+      <x>870</x>
+      <y>790</y>
+      <w>50</w>
+      <h>100</h>
+    </coordinates>
+    <panel_attributes>lt=&lt;-
+Yes</panel_attributes>
+    <additional_attributes>10.0;80.0;10.0;10.0</additional_attributes>
+  </element>
+  <element>
+    <id>UMLSpecialState</id>
+    <coordinates>
+      <x>810</x>
+      <y>490</y>
+      <w>140</w>
+      <h>60</h>
+    </coordinates>
+    <panel_attributes>type=decision
+RecreateCount
+&gt;=3</panel_attributes>
+    <additional_attributes/>
+  </element>
+  <element>
+    <id>Relation</id>
+    <coordinates>
+      <x>870</x>
+      <y>540</y>
+      <w>50</w>
+      <h>110</h>
+    </coordinates>
+    <panel_attributes>lt=&lt;-
+No</panel_attributes>
+    <additional_attributes>10.0;90.0;10.0;10.0</additional_attributes>
+  </element>
+  <element>
+    <id>UMLState</id>
+    <coordinates>
+      <x>990</x>
+      <y>490</y>
+      <w>150</w>
+      <h>60</h>
+    </coordinates>
+    <panel_attributes>change phase to
+Replacing, reset
+RecreateCount</panel_attributes>
+    <additional_attributes/>
+  </element>
+  <element>
+    <id>Relation</id>
+    <coordinates>
+      <x>940</x>
+      <y>500</y>
+      <w>70</w>
+      <h>40</h>
+    </coordinates>
+    <panel_attributes>lt=&lt;-
+Yes</panel_attributes>
+    <additional_attributes>50.0;20.0;10.0;20.0</additional_attributes>
+  </element>
+  <element>
+    <id>UMLNote</id>
+    <coordinates>
+      <x>980</x>
+      <y>580</y>
+      <w>180</w>
+      <h>50</h>
+    </coordinates>
+    <panel_attributes>Follow the Replacing
+case afterwards
+bg=blue</panel_attributes>
+    <additional_attributes/>
+  </element>
+  <element>
+    <id>Relation</id>
+    <coordinates>
+      <x>1050</x>
+      <y>540</y>
+      <w>30</w>
+      <h>60</h>
+    </coordinates>
+    <panel_attributes>lt=&lt;.</panel_attributes>
+    <additional_attributes>10.0;40.0;10.0;10.0</additional_attributes>
+  </element>
+  <element>
+    <id>UMLState</id>
+    <coordinates>
+      <x>790</x>
+      <y>870</y>
+      <w>170</w>
+      <h>40</h>
+    </coordinates>
+    <panel_attributes>move leader if needed</panel_attributes>
+    <additional_attributes/>
+  </element>
+  <element>
+    <id>Relation</id>
+    <coordinates>
+      <x>870</x>
+      <y>900</y>
+      <w>30</w>
+      <h>70</h>
+    </coordinates>
+    <panel_attributes>lt=&lt;-
+</panel_attributes>
+    <additional_attributes>10.0;50.0;10.0;10.0</additional_attributes>
+  </element>
+  <element>
+    <id>Relation</id>
+    <coordinates>
+      <x>180</x>
+      <y>1000</y>
+      <w>50</w>
+      <h>80</h>
+    </coordinates>
+    <panel_attributes>lt=&lt;-
+Yes</panel_attributes>
+    <additional_attributes>10.0;60.0;10.0;10.0</additional_attributes>
+  </element>
+  <element>
+    <id>Relation</id>
+    <coordinates>
+      <x>240</x>
+      <y>960</y>
+      <w>100</w>
+      <h>40</h>
+    </coordinates>
+    <panel_attributes>lt=&lt;-
+No</panel_attributes>
+    <additional_attributes>80.0;20.0;10.0;20.0</additional_attributes>
+  </element>
+  <element>
+    <id>UMLState</id>
+    <coordinates>
+      <x>60</x>
+      <y>1160</y>
+      <w>270</w>
+      <h>50</h>
+    </coordinates>
+    <panel_attributes>Change phase to Ready if Promotion
+is successful, reset RecreateCount</panel_attributes>
+    <additional_attributes/>
+  </element>
+  <element>
+    <id>Relation</id>
+    <coordinates>
+      <x>180</x>
+      <y>1100</y>
+      <w>30</w>
+      <h>80</h>
+    </coordinates>
+    <panel_attributes>lt=&lt;-</panel_attributes>
+    <additional_attributes>10.0;60.0;10.0;10.0</additional_attributes>
+  </element>
+  <element>
+    <id>UMLNote</id>
+    <coordinates>
+      <x>320</x>
+      <y>940</y>
+      <w>360</w>
+      <h>100</h>
+    </coordinates>
+    <panel_attributes>follow the same logic as "recreating case" to
+retry, and eventually replacing if needed.
+
+We do not change its phase to Recreating, but we
+may change it to Replacing eventually if needed.
+bg=blue</panel_attributes>
+    <additional_attributes/>
+  </element>
+  <element>
+    <id>UMLSpecialState</id>
+    <coordinates>
+      <x>580</x>
+      <y>380</y>
+      <w>180</w>
+      <h>60</h>
+    </coordinates>
+    <panel_attributes>type=decision
+does the config or
+Version changed?</panel_attributes>
+    <additional_attributes/>
+  </element>
+  <element>
+    <id>Relation</id>
+    <coordinates>
+      <x>660</x>
+      <y>320</y>
+      <w>50</w>
+      <h>80</h>
+    </coordinates>
+    <panel_attributes>lt=&lt;-
+No</panel_attributes>
+    <additional_attributes>10.0;10.0;10.0;60.0</additional_attributes>
+  </element>
+  <element>
+    <id>Relation</id>
+    <coordinates>
+      <x>660</x>
+      <y>430</y>
+      <w>150</w>
+      <h>550</h>
+    </coordinates>
+    <panel_attributes>lt=&lt;-
+Yes
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+</panel_attributes>
+    <additional_attributes>130.0;460.0;10.0;460.0;10.0;10.0</additional_attributes>
+  </element>
+</diagram>
