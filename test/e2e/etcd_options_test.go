@@ -105,7 +105,7 @@ func TestEtcdOptions(t *testing.T) {
 			// exact FQDN form the operator produced: the short `<svc>` suffix
 			// when --service-dns-domain is empty, and `svc.<domain>` otherwise.
 			suffix := "svc"
-			if dnsDomain := operatorServiceDNSDomain(t, ctx); dnsDomain != "" {
+			if dnsDomain := operatorServiceDNSDomain(t, ctx, cfg); dnsDomain != "" {
 				suffix = "svc." + dnsDomain
 			}
 			expectedArgs := []string{

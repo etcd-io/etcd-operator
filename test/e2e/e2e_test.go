@@ -317,7 +317,7 @@ func TestPodRecovery(t *testing.T) {
 			}
 
 			// Verify cluster replication works across recovered pod
-			verifyDataOperations(t, c, etcdClusterName, "replication-test", "value", operatorServiceDNSDomain(t, ctx), false)
+			verifyDataOperations(t, c, etcdClusterName, "replication-test", "value", operatorServiceDNSDomain(t, ctx, c), false)
 
 			stdout, stderr, err := execInPod(t, c, targetPodName, namespace, []string{"etcdctl", "get", "replication-test"})
 			if err != nil {
@@ -385,7 +385,7 @@ func TestEtcdClusterFunctionality(t *testing.T) {
 	})
 
 	feature.Assess("test data operations", func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-		verifyDataOperations(t, c, etcdClusterName, "test-key", "test-value", operatorServiceDNSDomain(t, ctx), false)
+		verifyDataOperations(t, c, etcdClusterName, "test-key", "test-value", operatorServiceDNSDomain(t, ctx, c), false)
 		return ctx
 	})
 
@@ -472,7 +472,7 @@ func TestClusterHash(t *testing.T) {
 		// apply the same logic (setting default values) before hashing.
 		reconciler := &controller.EtcdClusterReconciler{ImageRegistry: controller.DefaultImageRegistry}
 		reconciler.PopulateDefaultValues(etcdCluster)
-		clusterHash = controller.EtcdClusterHash(etcdCluster, operatorServiceDNSDomain(t, ctx))
+		clusterHash = controller.EtcdClusterHash(etcdCluster, operatorServiceDNSDomain(t, ctx, cfg))
 		return ctx
 	})
 
