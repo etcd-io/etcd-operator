@@ -39,12 +39,21 @@ func TestAutoProvider(t *testing.T) {
 		ValidityDuration: autoCertificateValidity,
 	}
 
+	// Captured in Setup, invoked in Teardown to restore the operator's
+	// original --service-dns-domain args (empty by default).
+	var restoreServiceDNSDomain func()
+
 	feature.Setup(
 		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
 			client := cfg.Client()
 			_ = appsv1.AddToScheme(client.Resources().GetScheme())
 			_ = corev1.AddToScheme(client.Resources().GetScheme())
 			_ = apiextensionsV1.AddToScheme(client.Resources().GetScheme())
+
+			// Override the operator's --service-dns-domain flag to cluster.local
+			// so the auto-provider runs against the realistic svc.cluster.local
+			// FQDN path; the teardown below restores the original args.
+			restoreServiceDNSDomain = setManagerServiceDNSDomain(t, ctx, cfg, "cluster.local")
 
 			return ctx
 		})
@@ -115,6 +124,15 @@ func TestAutoProvider(t *testing.T) {
 			}
 			return ctx
 		})
+
+	feature.Teardown(func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+		// Restore the operator's original --service-dns-domain flag (empty by
+		// default) so subsequent tests run against the operator's baseline.
+		if restoreServiceDNSDomain != nil {
+			restoreServiceDNSDomain()
+		}
+		return ctx
+	})
 
 	_ = testEnv.Test(t, feature.Feature())
 }
@@ -201,7 +219,7 @@ func TestClusterAutoCertCreation(t *testing.T) {
 	feature.Assess("Verify Data Operations",
 		func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
 			// verify etcdCluster is accessible via client certificate with put and get
-			verifyDataOperations(t, c, etcdClusterName, "test-key", "test-value", true)
+			verifyDataOperations(t, c, etcdClusterName, "test-key", "test-value", operatorServiceDNSDomain(t, ctx, c), true)
 			return ctx
 		},
 	)

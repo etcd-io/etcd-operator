@@ -131,7 +131,7 @@ func TestMain(m *testing.M) {
 
 			log.Println("Waiting for controller-manager deployment to be available...")
 			if err := wait.For(
-				conditions.New(client.Resources()).DeploymentAvailable("etcd-operator-controller-manager", "etcd-operator-system"),
+				conditions.New(client.Resources()).DeploymentAvailable(managerDeploymentName, "etcd-operator-system"),
 				wait.WithTimeout(3*time.Minute),
 				wait.WithInterval(10*time.Second),
 			); err != nil {

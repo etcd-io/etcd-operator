@@ -27,6 +27,7 @@ import (
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -36,6 +37,7 @@ import (
 	"sigs.k8s.io/e2e-framework/klient"
 	"sigs.k8s.io/e2e-framework/klient/k8s/resources"
 	"sigs.k8s.io/e2e-framework/klient/wait"
+	"sigs.k8s.io/e2e-framework/klient/wait/conditions"
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
 
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
@@ -293,11 +295,23 @@ const (
 	etcdServerCAFile   = etcdServerCertMountDir + "/ca.crt"
 )
 
-func etcdctlCmd(podName, etcdClusterName, namespace string, tlsEnabled bool) []string {
+// memberDNSSuffix mirrors internal/controller.memberDNSSuffix: the trailing
+// segment appended to "<pod>.<sts>.<ns>." when building an etcd member FQDN.
+// Kept in sync by hand because the e2e package cannot import the unexported
+// helper. When dnsDomain is empty (the operator's default), the suffix is
+// "svc"; otherwise it is "svc.<dnsDomain>".
+func memberDNSSuffix(dnsDomain string) string {
+	if dnsDomain == "" {
+		return "svc"
+	}
+	return "svc." + dnsDomain
+}
+
+func etcdctlCmd(podName, etcdClusterName, namespace, dnsDomain string, tlsEnabled bool) []string {
 	args := []string{"etcdctl"}
 	if tlsEnabled {
-		endpoint := fmt.Sprintf("https://%s.%s.%s.svc.cluster.local:2379",
-			podName, etcdClusterName, namespace)
+		endpoint := fmt.Sprintf("https://%s.%s.%s.%s:2379",
+			podName, etcdClusterName, namespace, memberDNSSuffix(dnsDomain))
 		args = append(args,
 			"--cacert="+etcdServerCAFile,
 			"--cert="+etcdServerCertFile,
@@ -308,11 +322,12 @@ func etcdctlCmd(podName, etcdClusterName, namespace string, tlsEnabled bool) []s
 	return args
 }
 
-func verifyDataOperations(t *testing.T, c *envconf.Config, etcdClusterName, key, val string, tlsEnabled bool) {
+func verifyDataOperations(t *testing.T, c *envconf.Config,
+	etcdClusterName, key, val, dnsDomain string, tlsEnabled bool) {
 	podName := fmt.Sprintf("%s-0", etcdClusterName)
 
 	// Write key-value data
-	cmd := etcdctlCmd(podName, etcdClusterName, namespace, tlsEnabled)
+	cmd := etcdctlCmd(podName, etcdClusterName, namespace, dnsDomain, tlsEnabled)
 	command := append(cmd, "put", key, val)
 	_, stderr, err := execInPod(t, c, podName, namespace, command)
 	if err != nil {
@@ -332,9 +347,104 @@ func verifyDataOperations(t *testing.T, c *envconf.Config, etcdClusterName, key,
 	}
 }
 
+// operatorServiceDNSDomain returns the current value of the --service-dns-domain
+// flag from the etcd-operator-controller-manager Deployment. Each call performs
+// a fresh API Get so the result reflects any in-flight override — for example
+// a test that toggles the flag in its Setup and restores it in TearDown.
+// Returns "" when the flag is absent (the operator's default), which the
+// controller mirrors as the short `svc` FQDN suffix.
+func operatorServiceDNSDomain(t *testing.T, ctx context.Context, cfg *envconf.Config) string {
+	t.Helper()
+	var deployment appsv1.Deployment
+	if err := cfg.Client().Resources().Get(ctx, managerDeploymentName, namespace, &deployment); err != nil {
+		t.Fatalf("failed to get %s/%s deployment: %v", namespace, managerDeploymentName, err)
+	}
+	for _, arg := range deployment.Spec.Template.Spec.Containers[0].Args {
+		if value, ok := strings.CutPrefix(arg, "--service-dns-domain="); ok {
+			return value
+		}
+	}
+	return ""
+}
+
+// setManagerServiceDNSDomain patches the manager Deployment to set
+// --service-dns-domain to dnsDomain for the rest of the test, and returns
+// a closure that restores manager Deployment.
+func setManagerServiceDNSDomain(t *testing.T, ctx context.Context, cfg *envconf.Config, dnsDomain string) func() {
+	t.Helper()
+	var deployment appsv1.Deployment
+	if err := cfg.Client().Resources().Get(ctx, managerDeploymentName, namespace, &deployment); err != nil {
+		t.Fatalf("failed to get %s/%s deployment: %v", namespace, managerDeploymentName, err)
+	}
+	container := &deployment.Spec.Template.Spec.Containers[0]
+	originalArgs := append([]string(nil), container.Args...)
+	container.Args = setFlagValue(originalArgs, "--service-dns-domain", dnsDomain)
+	if err := cfg.Client().Resources().Update(ctx, &deployment); err != nil {
+		t.Fatalf("failed to update %s/%s deployment: %v", namespace, managerDeploymentName, err)
+	}
+	// Args change triggers a Deployment rollout and pod restart. Wait for
+	// the new pod to be Ready before the caller runs assertions against it.
+	if err := wait.For(
+		conditions.New(cfg.Client().Resources()).DeploymentAvailable(managerDeploymentName, namespace),
+		wait.WithTimeout(3*time.Minute),
+		wait.WithInterval(5*time.Second),
+	); err != nil {
+		t.Fatalf("%s/%s deployment did not become available after flag change: %v",
+			namespace, managerDeploymentName, err)
+	}
+	return func() {
+		var d appsv1.Deployment
+		if err := cfg.Client().Resources().Get(ctx, managerDeploymentName, namespace, &d); err != nil {
+			t.Errorf("failed to get %s/%s deployment on teardown: %v",
+				namespace, managerDeploymentName, err)
+			return
+		}
+		d.Spec.Template.Spec.Containers[0].Args = originalArgs
+		if err := cfg.Client().Resources().Update(ctx, &d); err != nil {
+			t.Errorf("failed to restore %s/%s deployment args on teardown: %v",
+				namespace, managerDeploymentName, err)
+		}
+		// Wait for the restored pod so the next test starts against a stable
+		// operator (otherwise it may race the rollout in its own Setup).
+		if err := wait.For(
+			conditions.New(cfg.Client().Resources()).DeploymentAvailable(managerDeploymentName, namespace),
+			wait.WithTimeout(3*time.Minute),
+			wait.WithInterval(5*time.Second),
+		); err != nil {
+			t.Errorf("%s/%s deployment did not become available after restore: %v",
+				namespace, managerDeploymentName, err)
+		}
+	}
+}
+
+// setFlagValue returns a copy of args where the value for flag (matched as
+// "--flag=value") is replaced. If value is empty the matching arg is dropped,
+// and if the flag is absent it is appended when value is non-empty. The input
+// slice is not mutated.
+func setFlagValue(args []string, flag, value string) []string {
+	prefix := flag + "="
+	out := make([]string, 0, len(args))
+	found := false
+	for _, a := range args {
+		if strings.HasPrefix(a, prefix) {
+			found = true
+			if value != "" {
+				out = append(out, prefix+value)
+			}
+			continue
+		}
+		out = append(out, a)
+	}
+	if !found && value != "" {
+		out = append(out, prefix+value)
+	}
+	return out
+}
+
 const (
-	gofailPort    = "22381"                            // from config/e2e/patch-env.yaml
-	labelSelector = "control-plane=controller-manager" // from config/manager/manager.yaml,
+	gofailPort            = "22381"                            // from config/e2e/patch-env.yaml
+	labelSelector         = "control-plane=controller-manager" // from config/manager/manager.yaml,
+	managerDeploymentName = "etcd-operator-controller-manager"
 )
 
 // enableGoFailPoint enables the specified gofail failpoint on the specified pod via HTTP

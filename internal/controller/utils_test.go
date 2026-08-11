@@ -25,6 +25,29 @@ func pointerToBool(value bool) *bool {
 }
 
 // ---------------------------------------------------------------------------
+// memberDNSSuffix — short form when empty, full form when domain is set
+// ---------------------------------------------------------------------------
+
+func TestMemberDNSSuffix(t *testing.T) {
+	tests := []struct {
+		name      string
+		dnsDomain string
+		want      string
+	}{
+		{name: "empty uses short form", dnsDomain: "", want: "svc"},
+		{name: "single-label domain", dnsDomain: "corp.local", want: "svc.corp.local"},
+		{name: "multi-label domain", dnsDomain: "svc.staging.k8s.example.com", want: "svc.svc.staging.k8s.example.com"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := memberDNSSuffix(tt.dnsDomain); got != tt.want {
+				t.Errorf("memberDNSSuffix(%q) = %q, want %q", tt.dnsDomain, got, tt.want)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
 // createHeadlessServiceIfNotExist
 // ---------------------------------------------------------------------------
 
@@ -182,13 +205,13 @@ func TestCreateAutoCertificateConfig(t *testing.T) {
 				},
 			},
 			expected: &certInterface.Config{
-				CommonName:       "test-cluster.test-namespace.svc.cluster.local",
+				CommonName:       "test-cluster.test-namespace.svc",
 				Organization:     nil,
 				ValidityDuration: certInterface.DefaultAutoValidity,
 				AltNames: certInterface.AltNames{
 					DNSNames: []string{
-						"*.test-cluster.test-namespace.svc.cluster.local",
-						"test-cluster.test-namespace.svc.cluster.local",
+						"*.test-cluster.test-namespace.svc",
+						"test-cluster.test-namespace.svc",
 					},
 				},
 			},
@@ -198,7 +221,7 @@ func TestCreateAutoCertificateConfig(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result, err := createAutoCertificateConfig(tt.ec)
+			result, err := createAutoCertificateConfig(tt.ec, "")
 			if tt.wantErr {
 				require.Error(t, err)
 				assert.Nil(t, result)
@@ -279,7 +302,7 @@ func TestCreateCMCertificateConfig(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result, err := createCMCertificateConfig(tt.ec)
+			result, err := createCMCertificateConfig(tt.ec, "")
 			if tt.wantErr {
 				require.Error(t, err)
 				assert.Nil(t, result)
@@ -297,6 +320,111 @@ func TestCreateCMCertificateConfig(t *testing.T) {
 	}
 }
 
+// TestCreateCertificateConfigHonorsServiceDNSDomain verifies that both the
+// auto and cert-manager providers build default DNS SANs that follow the
+// memberDNSSuffix rule: an empty dnsDomain produces the short form
+// `*.<svc>.<ns>.svc` and a non-empty dnsDomain produces the full form
+// `*.<svc>.<ns>.svc.<domain>`.
+func TestCreateCertificateConfigHonorsServiceDNSDomain(t *testing.T) {
+	mkAutoEC := func() *ecv1alpha1.EtcdCluster {
+		return &ecv1alpha1.EtcdCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "test-namespace"},
+			Spec: ecv1alpha1.EtcdClusterSpec{
+				TLS: &ecv1alpha1.TLSCertificate{
+					Provider:    string(certificate.Auto),
+					ProviderCfg: ecv1alpha1.ProviderConfig{AutoCfg: nil},
+				},
+			},
+		}
+	}
+	mkCMEC := func() *ecv1alpha1.EtcdCluster {
+		return &ecv1alpha1.EtcdCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "test-namespace"},
+			Spec: ecv1alpha1.EtcdClusterSpec{
+				TLS: &ecv1alpha1.TLSCertificate{
+					Provider: string(certificate.CertManager),
+					ProviderCfg: ecv1alpha1.ProviderConfig{
+						CertManagerCfg: &ecv1alpha1.ProviderCertManagerConfig{
+							CommonConfig: ecv1alpha1.CommonConfig{},
+							IssuerName:   "test-issuer",
+							IssuerKind:   "ClusterIssuer",
+						},
+					},
+				},
+			},
+		}
+	}
+
+	tests := []struct {
+		name      string
+		ec        *ecv1alpha1.EtcdCluster
+		dnsDomain string
+		wantCN    string
+		wantSANs  []string
+	}{
+		{
+			name:      "auto provider short form",
+			ec:        mkAutoEC(),
+			dnsDomain: "",
+			wantCN:    "test-cluster.test-namespace.svc",
+			wantSANs: []string{
+				"*.test-cluster.test-namespace.svc",
+				"test-cluster.test-namespace.svc",
+			},
+		},
+		{
+			name:      "cert-manager provider short form",
+			ec:        mkCMEC(),
+			dnsDomain: "",
+			wantCN:    "",
+			wantSANs: []string{
+				"*.test-cluster.test-namespace.svc",
+				"test-cluster.test-namespace.svc",
+			},
+		},
+		{
+			name:      "auto provider full form",
+			ec:        mkAutoEC(),
+			dnsDomain: "corp.local",
+			wantCN:    "test-cluster.test-namespace.svc.corp.local",
+			wantSANs: []string{
+				"*.test-cluster.test-namespace.svc.corp.local",
+				"test-cluster.test-namespace.svc.corp.local",
+			},
+		},
+		{
+			name:      "cert-manager provider full form",
+			ec:        mkCMEC(),
+			dnsDomain: "corp.local",
+			wantCN:    "",
+			wantSANs: []string{
+				"*.test-cluster.test-namespace.svc.corp.local",
+				"test-cluster.test-namespace.svc.corp.local",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var (
+				got    *certInterface.Config
+				err    error
+				issuer = tt.ec.Spec.TLS.ProviderCfg.CertManagerCfg
+			)
+			if issuer != nil {
+				got, err = createCMCertificateConfig(tt.ec, tt.dnsDomain)
+			} else {
+				got, err = createAutoCertificateConfig(tt.ec, tt.dnsDomain)
+			}
+			require.NoError(t, err)
+			require.NotNil(t, got)
+			if tt.wantCN != "" {
+				assert.Equal(t, tt.wantCN, got.CommonName)
+			}
+			assert.Equal(t, tt.wantSANs, got.AltNames.DNSNames)
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // peerEndpointForOrdinalIndex — scheme reflects TLS configuration
 // ---------------------------------------------------------------------------
@@ -308,20 +436,63 @@ func TestPeerEndpointForOrdinal(t *testing.T) {
 			Spec:       ecv1alpha1.EtcdClusterSpec{TLS: tls},
 		}
 	}
-
-	httpCluster := mkCluster("test-cluster", "default", nil)
-	httpsCluster := mkCluster("test-cluster", "default", &ecv1alpha1.TLSCertificate{Provider: "auto"})
-
-	// Replace the trailing scheme expectations; the member name is scheme-agnostic.
-	const wantName = "test-cluster-0"
-	httpName, httpURL := peerEndpointForOrdinalIndex(httpCluster, 0)
-	httpsName, httpsURL := peerEndpointForOrdinalIndex(httpsCluster, 0)
-
-	assert.Equal(t, wantName, httpName)
-	assert.Equal(t, wantName, httpsName)
-
-	assert.Equal(t, "http://test-cluster-0.test-cluster.default.svc.cluster.local:2380", httpURL)
-	assert.Equal(t, "https://test-cluster-0.test-cluster.default.svc.cluster.local:2380", httpsURL)
+	tests := []struct {
+		name      string
+		cluster   *ecv1alpha1.EtcdCluster
+		dnsDomain string
+		wantName  string
+		wantURL   string
+	}{
+		{
+			name:      "http cluster empty domain",
+			cluster:   mkCluster("test-cluster", "default", nil),
+			dnsDomain: "",
+			wantName:  "test-cluster-0",
+			wantURL:   "http://test-cluster-0.test-cluster.default.svc:2380",
+		},
+		{
+			name:      "https cluster empty domain",
+			cluster:   mkCluster("test-cluster", "default", &ecv1alpha1.TLSCertificate{Provider: "auto"}),
+			dnsDomain: "",
+			wantName:  "test-cluster-0",
+			wantURL:   "https://test-cluster-0.test-cluster.default.svc:2380",
+		},
+		{
+			name:      "http cluster explicit cluster.local",
+			cluster:   mkCluster("test-cluster", "default", nil),
+			dnsDomain: "cluster.local",
+			wantName:  "test-cluster-0",
+			wantURL:   "http://test-cluster-0.test-cluster.default.svc.cluster.local:2380",
+		},
+		{
+			name:      "https cluster explicit cluster.local",
+			cluster:   mkCluster("test-cluster", "default", &ecv1alpha1.TLSCertificate{Provider: "auto"}),
+			dnsDomain: "cluster.local",
+			wantName:  "test-cluster-0",
+			wantURL:   "https://test-cluster-0.test-cluster.default.svc.cluster.local:2380",
+		},
+		{
+			name:      "http cluster custom domain",
+			cluster:   mkCluster("test-cluster", "default", nil),
+			dnsDomain: "corp.local",
+			wantName:  "test-cluster-0",
+			wantURL:   "http://test-cluster-0.test-cluster.default.svc.corp.local:2380",
+		},
+		{
+			name:      "https cluster custom domain",
+			cluster:   mkCluster("test-cluster", "default", &ecv1alpha1.TLSCertificate{Provider: "auto"}),
+			dnsDomain: "corp.local",
+			wantName:  "test-cluster-0",
+			wantURL:   "https://test-cluster-0.test-cluster.default.svc.corp.local:2380",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotName, gotURL := peerEndpointForOrdinalIndex(tt.cluster, tt.dnsDomain, 0)
+			assert.Equal(t, tt.wantName, gotName)
+			assert.Equal(t, tt.wantURL, gotURL)
+		})
+	}
 }
 
 // ---------------------------------------------------------------------------
