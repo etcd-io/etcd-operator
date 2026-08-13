@@ -60,16 +60,6 @@ func podOrdinal(podName, clusterName string) int {
 	return ordinal
 }
 
-func nextPodOrdinal(currentOrdinals []int, expectedReplica int) int {
-	sort.Ints(currentOrdinals)
-	for i := range expectedReplica {
-		if i >= len(currentOrdinals) || i != currentOrdinals[i] {
-			return i
-		}
-	}
-	return -1
-}
-
 // listOwnedPods returns all Pods that are owned (via OwnerReference) by ec,
 // sorted in ascending ordinal order.
 func listOwnedPods(ctx context.Context, c client.Client, ec *ecv1alpha1.EtcdCluster) ([]*corev1.Pod, error) {

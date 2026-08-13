@@ -31,8 +31,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	operatorv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
-	// nolint:gci
-	// +kubebuilder:scaffold:imports
 )
 
 var (
