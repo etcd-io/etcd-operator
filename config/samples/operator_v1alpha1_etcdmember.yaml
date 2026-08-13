@@ -1,0 +1,11 @@
+apiVersion: operator.etcd.io/v1alpha1
+kind: EtcdMember
+metadata:
+  labels:
+    app.kubernetes.io/name: etcd-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: etcdcluster-sample-0
+spec:
+  clusterName: etcdcluster-sample
+  ordinal: 0
+  version: v3.5.21
