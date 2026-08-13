@@ -184,7 +184,9 @@ func TestMain(m *testing.M) {
 			}
 			log.Println("Finishing tests, cleaning cluster ...")
 
-			// undeploy etcd operator
+			log.Println("Force-cleaning leftover EtcdCluster/EtcdMember resources...")
+			forceCleanupEtcdResources(ctx, cfg.Client().Resources())
+
 			log.Println("Undeploy etcd controller...")
 			cmd := exec.Command("make", "undeploy", "DEPLOY_MODE=e2e", "ignore-not-found=true")
 			if _, err := test_utils.Run(cmd); err != nil {

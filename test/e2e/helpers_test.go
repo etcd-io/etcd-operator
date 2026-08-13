@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"strings"
 	"testing"
@@ -32,7 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-	rest "k8s.io/client-go/rest"
+	"k8s.io/client-go/rest"
 	"sigs.k8s.io/e2e-framework/klient"
 	"sigs.k8s.io/e2e-framework/klient/k8s/resources"
 	"sigs.k8s.io/e2e-framework/klient/wait"
@@ -189,6 +190,43 @@ func cleanupEtcdCluster(ctx context.Context, t *testing.T, c *envconf.Config, na
 		if err := c.Client().Resources().Delete(ctx, &etcdCluster); err != nil {
 			t.Logf("Failed to delete EtcdCluster: %v", err)
 		}
+	}
+}
+
+// forceCleanupEtcdResources deletes any leftover EtcdCluster objects in
+// all namespaces and waits for the controller to fully drain them before
+// returning. This must happen while the controller-manager is still running:
+// EtcdClusterReconciler.finalizeCluster deletes each owned EtcdMember and
+// clears its memberCleanupFinalizer itself once the EtcdCluster starts
+// Terminating, but only the running controller does that. If the global
+// undeploy teardown killed the controller-manager first, a cluster left
+// over by a test would sit stuck Terminating forever and hang namespace
+// deletion.
+//
+// It retries for a while rather than doing a single pass: draining an
+// EtcdCluster's members takes the controller a few reconcile passes, not
+// one.
+func forceCleanupEtcdResources(ctx context.Context, res *resources.Resources) {
+	cleanupPass := func(ctx context.Context) (bool, error) {
+		var clusters ecv1alpha1.EtcdClusterList
+		if err := res.List(ctx, &clusters); err == nil {
+			log.Printf("Found %d etcd clusters", len(clusters.Items))
+			for i := range clusters.Items {
+				_ = res.Delete(ctx, &clusters.Items[i])
+			}
+		}
+
+		var remainingClusters ecv1alpha1.EtcdClusterList
+		var remainingMembers ecv1alpha1.EtcdMemberList
+		_ = res.List(ctx, &remainingClusters)
+		_ = res.List(ctx, &remainingMembers)
+		return len(remainingClusters.Items) == 0 && len(remainingMembers.Items) == 0, nil
+	}
+
+	err := wait.For(cleanupPass,
+		wait.WithContext(ctx), wait.WithTimeout(90*time.Second), wait.WithInterval(5*time.Second))
+	if err != nil {
+		log.Printf("forceCleanupEtcdResources: leftover EtcdCluster/EtcdMember objects may remain: %v", err)
 	}
 }
 
