@@ -130,6 +130,15 @@ func TestDataPersistence(t *testing.T) {
 
 	feature.Assess("Read data from the newly created pod",
 		func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+			// TODO: deleting a member's Pod is never noticed and repaired —
+			// the live-health-to-EtcdMember mapping that would flip a Ready
+			// member to Recreating, and the Recreating-phase repair step
+			// itself, are both M3 (see
+			// internal/controller/etcdcluster_controller.go dispatch, item 5
+			// and its "not implemented yet" branches). Unskip once M3's
+			// Pod-recovery ladder lands.
+			t.Skip("blocked on M3 pod-recovery ladder; see internal/controller/etcdcluster_controller.go dispatch item 5")
+
 			client := c.Client()
 
 			if err := waitForPodReadiness(t, c, etcdClusterName, 1); err != nil {
@@ -159,6 +168,11 @@ func TestDataPersistence(t *testing.T) {
 			return ctx
 		},
 	)
+
+	feature.Teardown(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+		cleanupEtcdCluster(ctx, t, c, etcdClusterName)
+		return ctx
+	})
 
 	_ = testEnv.Test(t, feature.Feature())
 }

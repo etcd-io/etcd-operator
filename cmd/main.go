@@ -35,8 +35,6 @@ import (
 
 	operatorv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 	"go.etcd.io/etcd-operator/internal/controller"
-	// nolint:gci
-	// +kubebuilder:scaffold:imports
 )
 
 var (

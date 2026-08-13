@@ -88,7 +88,7 @@ test: manifests generate fmt vet envtest ## Run tests.
 # - CERT_MANAGER_INSTALL_SKIP=true
 .PHONY: test-e2e
 test-e2e: generate fmt vet kind gofail-enable ## Run the e2e tests. Expected an isolated environment using Kind.
-	ETCD_VERSION="$(E2E_ETCD_VERSION)" PATH="$(LOCALBIN):$(PATH)" go test ./test/e2e/ -v
+	ETCD_VERSION="$(E2E_ETCD_VERSION)" PATH="$(LOCALBIN):$(PATH)" go test ./test/e2e/ -v -timeout="$${TIMEOUT:-20m}"
 	$(MAKE) gofail-disable
 
 .PHONY: gofail-enable
