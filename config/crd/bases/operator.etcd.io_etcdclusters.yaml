@@ -39,6 +39,17 @@ spec:
           spec:
             description: EtcdClusterSpec defines the desired state of EtcdCluster.
             properties:
+              allowVersionUpgradeOnRepair:
+                description: |-
+                  AllowVersionUpgradeOnRepair lets a human operator unblock a member that
+                  is stuck in a repair loop and can never become Ready, which would
+                  otherwise permanently block the upgrade phase (it only runs once every
+                  member is Ready). While set, every repair recreate of a member's Pod
+                  also brings that member to Version, instead of leaving it pinned at
+                  the member's current running version until the dedicated upgrade
+                  phase gets to it one member at a time. Off by default; the operator
+                  should turn it back off once the cluster is healthy again.
+                type: boolean
               etcdOptions:
                 description: etcd configuration options are passed as command line
                   arguments to the etcd container, refer to etcd documentation for
@@ -52,6 +63,15 @@ spec:
                   If unset, it defaults to the value provided via the controller's
                   --image-registry flag, which itself defaults to "gcr.io/etcd-development/etcd".
                 type: string
+              paused:
+                description: |-
+                  Paused lets a human operator pause EtcdClusterReconciler's reconciliation
+                  of this cluster, so they can debug or repair by hand without the
+                  controller fighting them over the same Pods, PVCs, or etcd membership.
+                  While paused, no mutating action runs — including CORRUPT/NOSPACE
+                  remediation and lost-quorum recovery — but the always-on, read-only
+                  status/health refresh keeps running so observability doesn't go stale.
+                type: boolean
               podTemplate:
                 description: PodTemplate is the pod template to use for the etcd cluster.
                 properties:
@@ -1265,6 +1285,25 @@ spec:
                   CurrentVersion is the observed etcd version of the cluster.
                   This is typically derived from the version of the healthy leader or a consensus among healthy members.
                 type: string
+              lastCompactTime:
+                description: |-
+                  LastCompactTime records when the cluster's keyspace was last compacted
+                  as part of NOSPACE alarm remediation (the Compacting step of
+                  NoSpaceRemediation).
+                format: date-time
+                type: string
+              lastRecoveredFrom:
+                description: |-
+                  LastRecoveredFrom is the ordinal of the member the most recent
+                  lost-quorum recovery recovered from. Observational only — never used
+                  to decide anything.
+                type: string
+              lastRecoveryTime:
+                description: |-
+                  LastRecoveryTime records when the most recent lost-quorum recovery
+                  completed. Observational only — never used to decide anything.
+                format: date-time
+                type: string
               leaderID:
                 description: LeaderID is the hex-encoded ID of the current etcd cluster
                   leader, if one exists and is known.
@@ -1320,14 +1359,65 @@ spec:
                 x-kubernetes-list-map-keys:
                 - id
                 x-kubernetes-list-type: map
+              noSpaceRemediation:
+                description: |-
+                  NoSpaceRemediation tracks an in-progress NOSPACE alarm remediation
+                  cycle (compact -> defragment -> disarm). Nil means no NOSPACE
+                  remediation is currently in progress.
+                properties:
+                  cycleStarted:
+                    description: |-
+                      CycleStarted marks when this remediation attempt began. Bumped to
+                      "now" any time the sequence (re-)starts from Compacting — including a
+                      restart after the post-Defragmenting db-size check finds the cycle
+                      didn't reclaim enough — which is what invalidates old
+                      LastCompactTime/LastDefragTime values and forces a real redo instead
+                      of trusting stale timestamps.
+                    format: date-time
+                    type: string
+                  phase:
+                    description: |-
+                      NoSpaceRemediationPhase is the current step of an in-progress NOSPACE
+                      alarm remediation cycle.
+                    type: string
+                required:
+                - cycleStarted
+                - phase
+                type: object
               observedGeneration:
                 description: ObservedGeneration is the most recent generation observed
                   for this EtcdCluster by the controller.
                 format: int64
                 type: integer
+              quorumRecovery:
+                description: |-
+                  QuorumRecovery tracks an in-progress lost-quorum recovery. Nil means
+                  no recovery is currently under way. Unlike the observational fields
+                  below, EtcdClusterReconciler does decide from this field — whether a
+                  lost-quorum recovery is already under way — because that's a question
+                  about decision history, not current topology.
+                properties:
+                  survivor:
+                    description: |-
+                      Survivor is the ordinal EtcdClusterReconciler selected (or a human
+                      operator specified) to become the new single-member cluster. This is
+                      a decision, not something re-derivable live once other members are
+                      gone — there may be nothing left to compare commit indices against —
+                      and terminating every other member needs to know exactly which one to
+                      spare.
+                    type: integer
+                required:
+                - survivor
+                type: object
               readyReplicas:
                 description: ReadyReplicas is the number of etcd member pods that
                   are currently Ready.
+                format: int32
+                type: integer
+              recoveryCount:
+                description: |-
+                  RecoveryCount is the number of lost-quorum recoveries this cluster has
+                  undergone. Observational only — never used to decide anything.
                 format: int32
                 type: integer
             type: object

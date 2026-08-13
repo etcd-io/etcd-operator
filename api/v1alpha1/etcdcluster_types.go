@@ -49,6 +49,24 @@ type EtcdClusterSpec struct {
 	EtcdOptions []string `json:"etcdOptions,omitempty"`
 	// PodTemplate is the pod template to use for the etcd cluster.
 	PodTemplate *PodTemplate `json:"podTemplate,omitempty"`
+	// Paused lets a human operator pause EtcdClusterReconciler's reconciliation
+	// of this cluster, so they can debug or repair by hand without the
+	// controller fighting them over the same Pods, PVCs, or etcd membership.
+	// While paused, no mutating action runs — including CORRUPT/NOSPACE
+	// remediation and lost-quorum recovery — but the always-on, read-only
+	// status/health refresh keeps running so observability doesn't go stale.
+	// +optional
+	Paused bool `json:"paused,omitempty"`
+	// AllowVersionUpgradeOnRepair lets a human operator unblock a member that
+	// is stuck in a repair loop and can never become Ready, which would
+	// otherwise permanently block the upgrade phase (it only runs once every
+	// member is Ready). While set, every repair recreate of a member's Pod
+	// also brings that member to Version, instead of leaving it pinned at
+	// the member's current running version until the dedicated upgrade
+	// phase gets to it one member at a time. Off by default; the operator
+	// should turn it back off once the cluster is healthy again.
+	// +optional
+	AllowVersionUpgradeOnRepair bool `json:"allowVersionUpgradeOnRepair,omitempty"`
 }
 
 type PodTemplate struct {
@@ -166,7 +184,41 @@ type EtcdClusterStatus struct {
 	// +optional
 	LeaderID string `json:"leaderID,omitempty"`
 
-	// TODO: expose LastDefragTime once the controller owns automated defragmentation.
+	// LastCompactTime records when the cluster's keyspace was last compacted
+	// as part of NOSPACE alarm remediation (the Compacting step of
+	// NoSpaceRemediation).
+	// +optional
+	LastCompactTime *metav1.Time `json:"lastCompactTime,omitempty"`
+
+	// NoSpaceRemediation tracks an in-progress NOSPACE alarm remediation
+	// cycle (compact -> defragment -> disarm). Nil means no NOSPACE
+	// remediation is currently in progress.
+	// +optional
+	NoSpaceRemediation *NoSpaceRemediationStatus `json:"noSpaceRemediation,omitempty"`
+
+	// QuorumRecovery tracks an in-progress lost-quorum recovery. Nil means
+	// no recovery is currently under way. Unlike the observational fields
+	// below, EtcdClusterReconciler does decide from this field — whether a
+	// lost-quorum recovery is already under way — because that's a question
+	// about decision history, not current topology.
+	// +optional
+	QuorumRecovery *QuorumRecoveryStatus `json:"quorumRecovery,omitempty"`
+
+	// LastRecoveryTime records when the most recent lost-quorum recovery
+	// completed. Observational only — never used to decide anything.
+	// +optional
+	LastRecoveryTime *metav1.Time `json:"lastRecoveryTime,omitempty"`
+
+	// RecoveryCount is the number of lost-quorum recoveries this cluster has
+	// undergone. Observational only — never used to decide anything.
+	// +optional
+	RecoveryCount int32 `json:"recoveryCount,omitempty"`
+
+	// LastRecoveredFrom is the ordinal of the member the most recent
+	// lost-quorum recovery recovered from. Observational only — never used
+	// to decide anything.
+	// +optional
+	LastRecoveredFrom string `json:"lastRecoveredFrom,omitempty"`
 
 	// Members provides the status of each individual etcd member.
 	// +optional
@@ -183,6 +235,41 @@ type EtcdClusterStatus struct {
 	// +listType=map
 	// +listMapKey=type
 	Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type"`
+}
+
+// NoSpaceRemediationPhase is the current step of an in-progress NOSPACE
+// alarm remediation cycle.
+type NoSpaceRemediationPhase string
+
+const (
+	// RemediationCompacting means the cluster's keyspace is being compacted to the current revision.
+	RemediationCompacting NoSpaceRemediationPhase = "Compacting"
+	// RemediationDefragmenting means members are being defragmented one at a time, leader last.
+	RemediationDefragmenting NoSpaceRemediationPhase = "Defragmenting"
+)
+
+// NoSpaceRemediationStatus tracks an in-progress NOSPACE alarm remediation cycle.
+type NoSpaceRemediationStatus struct {
+	Phase NoSpaceRemediationPhase `json:"phase"`
+
+	// CycleStarted marks when this remediation attempt began. Bumped to
+	// "now" any time the sequence (re-)starts from Compacting — including a
+	// restart after the post-Defragmenting db-size check finds the cycle
+	// didn't reclaim enough — which is what invalidates old
+	// LastCompactTime/LastDefragTime values and forces a real redo instead
+	// of trusting stale timestamps.
+	CycleStarted metav1.Time `json:"cycleStarted"`
+}
+
+// QuorumRecoveryStatus tracks an in-progress lost-quorum recovery.
+type QuorumRecoveryStatus struct {
+	// Survivor is the ordinal EtcdClusterReconciler selected (or a human
+	// operator specified) to become the new single-member cluster. This is
+	// a decision, not something re-derivable live once other members are
+	// gone — there may be nothing left to compare commit indices against —
+	// and terminating every other member needs to know exactly which one to
+	// spare.
+	Survivor int `json:"survivor"`
 }
 
 // MemberStatus defines the observed state of a single etcd member.
