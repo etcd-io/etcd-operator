@@ -32,6 +32,7 @@ import (
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
@@ -42,6 +43,16 @@ import (
 
 const (
 	requeueDuration = 10 * time.Second
+
+	// clusterCleanupFinalizer blocks an EtcdCluster's deletion until
+	// finalizeCluster has removed every EtcdMember it owns, mirroring
+	// memberCleanupFinalizer (design doc §4.3) one level up. Without it, the
+	// EtcdCluster (which the reconciler does not otherwise finalize) would
+	// disappear immediately on delete, and the controller would never see it
+	// again to clean up its members — Reconcile's first step is Get(cluster),
+	// which short-circuits on NotFound before ever inspecting owned
+	// EtcdMembers (see fetchAndValidateState).
+	clusterCleanupFinalizer = "operator.etcd.io/cluster-cleanup"
 )
 
 // EtcdClusterReconciler reconciles a EtcdCluster object
@@ -55,6 +66,7 @@ type EtcdClusterReconciler struct {
 // reconcileState holds all transient data for a single reconciliation loop.
 type reconcileState struct {
 	cluster        *ecv1alpha1.EtcdCluster      // cluster CR being reconciled
+	members        []ecv1alpha1.EtcdMember      // EtcdMembers owned by this cluster, sorted by ordinal
 	pods           []*corev1.Pod                // member pods owned by this cluster, sorted by ordinal
 	memberListResp *clientv3.MemberListResponse // member list fetched from the etcd cluster
 	memberHealth   []etcdutils.EpHealth         // health information for each etcd member
@@ -64,6 +76,9 @@ type reconcileState struct {
 // +kubebuilder:rbac:groups=operator.etcd.io,resources=etcdclusters,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=operator.etcd.io,resources=etcdclusters/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=operator.etcd.io,resources=etcdclusters/finalizers,verbs=update
+// +kubebuilder:rbac:groups=operator.etcd.io,resources=etcdmembers,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=operator.etcd.io,resources=etcdmembers/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=operator.etcd.io,resources=etcdmembers/finalizers,verbs=update
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
@@ -75,22 +90,24 @@ type reconcileState struct {
 
 // Reconcile orchestrates a single reconciliation cycle for an EtcdCluster.
 //
-// The loop is organized into the phases below (see reconcile_loop_v0.3.0.png
-// for the full workflow diagram this mirrors). Each phase returns a non-zero
-// ctrl.Result or a non-nil error to end the loop early (typically to requeue
-// after a single step, e.g. one Pod created/deleted/promoted); otherwise the
-// loop falls through to the next phase.
+// EtcdClusterReconciler reconciles both EtcdCluster and its owned EtcdMember
+// objects — there is no second controller (design doc §4.1). Each loop:
 //
-//  0. Fetch: get the EtcdCluster resource and its owned Pods.
+//  0. Fetch: get the EtcdCluster resource, its owned EtcdMembers and Pods.
 //  1. Validation: validate EtcdCluster.Spec.
-//  2. Bootstrap: ensure the headless Service and first member Pod exist.
-//  3. Health check & fix: check member/Pod health, fix unhealthy member/Pod.
-//  4. Exception handling: reconcile Pod-count vs etcd member-count drift left
-//     over from a previous loop that was interrupted mid-step.
-//  5. Promote learner: promote an in-sync learner to a voting member.
-//  6. Update config: recreate Pods whose running config no longer matches spec.
-//  7. Scale out & in: grow or shrink the cluster towards the desired size.
-//  8. Upgrade: roll one Pod to the desired etcd version.
+//  2. Cluster prerequisites: certs, TLS config, headless Service — always,
+//     independent of anything below.
+//  3. Always-on refresh (§4.2): live member list/health, never gated.
+//  4. Dispatch: §4.9's priority order picks at most one mutating action —
+//     pause, lost-quorum recovery, CORRUPT/NOSPACE remediation, per-member
+//     repair, Terminating cleanup, promote/advance-not-ready, and finally
+//     (only once every existing member is Ready) update-config/scale/upgrade.
+//
+// See docs/design/etcd-member-lifecycle-and-self-healing-v0.3.0.md and
+// reconcile_loop_v0.3.0.png for the full workflow this implements. Several
+// dispatch branches are intentionally TODO no-ops in this milestone (M2) —
+// per-member repair, CORRUPT/NOSPACE remediation, lost-quorum recovery, and
+// the EtcdMember/EtcdClusterStatus status roll-up — resolved by M3-M6.
 func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var (
 		state *reconcileState
@@ -99,60 +116,54 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	)
 
 	defer func() {
-		if state != nil {
+		// Skip once the cluster is being deleted: finalizeCluster may have
+		// just removed its last finalizer, in which case it's already gone
+		// and a status Update would only fail with NotFound.
+		if state != nil && state.cluster.DeletionTimestamp == nil {
 			if statusErr := r.updateStatus(ctx, state); statusErr != nil {
 				log.FromContext(ctx).Error(statusErr, "Failed to update status")
 			}
 		}
 	}()
 
-	// 0. Fetch: get the EtcdCluster resource and its owned Pods.
+	// 0. Fetch: get the EtcdCluster resource and its owned EtcdMembers/Pods.
 	state, res, err = r.fetchAndValidateState(ctx, req)
 	if state == nil || err != nil {
 		return res, err
 	}
 	log.FromContext(ctx).Info("Reconciling EtcdCluster", "spec", state.cluster.Spec)
 
+	// 0.5 Finalizer bookkeeping (§4.3-style, one level up from EtcdMember's):
+	// checked ahead of Paused/validation/prereqs so a paused or spec-invalid
+	// cluster can still be deleted.
+	if state.cluster.DeletionTimestamp != nil {
+		return r.finalizeCluster(ctx, state)
+	}
+	if err = r.ensureClusterFinalizer(ctx, state); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	// 1. Validation: validate EtcdCluster.Spec.
 	if err = r.validateSpec(ctx, state); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// 2. Bootstrap: ensure the headless Service and first member Pod exist.
-	if res, err = r.bootstrapCluster(ctx, state); err != nil || !res.IsZero() {
-		return res, err
+	// 2. Cluster prerequisites: certs, TLS config, headless Service.
+	if err = r.ensureClusterPrereqs(ctx, state); err != nil {
+		return ctrl.Result{}, err
 	}
 
-	// 3. Health check & fix: check member/Pod health, fix unhealthy member/Pod.
-	if res, err = r.healthCheckAndFix(ctx, state); err != nil || !res.IsZero() {
-		return res, err
+	// 3. Always-on refresh: live member list/health (§4.2) — never gated.
+	if err = r.refreshClusterState(ctx, state); err != nil {
+		return ctrl.Result{}, err
 	}
 
-	// 4. Exception handling: reconcile Pod-count vs etcd member-count drift.
-	if res, err = r.reconcileExceptions(ctx, state); err != nil || !res.IsZero() {
-		return res, err
-	}
-
-	// 5. Promote learner.
-	if res, err = r.promoteLearner(ctx, state); err != nil || !res.IsZero() {
-		return res, err
-	}
-
-	// 6. Update config: recreate Pods whose running config drifted from spec.
-	if res, err = r.updateConfig(ctx, state); err != nil || !res.IsZero() {
-		return res, err
-	}
-
-	// 7. Scale out & in.
-	if res, err = r.scaleCluster(ctx, state); err != nil || !res.IsZero() {
-		return res, err
-	}
-
-	// 8. Upgrade.
-	return r.upgradeCluster(ctx, state)
+	// 4. Dispatch: §4.9's priority order.
+	return r.dispatch(ctx, state)
 }
 
-// fetchAndValidateState retrieves the EtcdCluster and lists the Pods it owns.
+// fetchAndValidateState retrieves the EtcdCluster and lists the EtcdMembers
+// and Pods it owns.
 func (r *EtcdClusterReconciler) fetchAndValidateState(ctx context.Context, req ctrl.Request) (*reconcileState, ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
@@ -170,13 +181,19 @@ func (r *EtcdClusterReconciler) fetchAndValidateState(ctx context.Context, req c
 	// user left empty.
 	r.PopulateDefaultValues(ec)
 
+	members, err := listOwnedMembers(ctx, r.Client, ec)
+	if err != nil {
+		logger.Error(err, "Failed to list EtcdMembers. Requesting requeue")
+		return nil, ctrl.Result{RequeueAfter: requeueDuration}, nil
+	}
+
 	pods, err := listOwnedPods(ctx, r.Client, ec)
 	if err != nil {
 		logger.Error(err, "Failed to list pods. Requesting requeue")
 		return nil, ctrl.Result{RequeueAfter: requeueDuration}, nil
 	}
 
-	return &reconcileState{cluster: ec, pods: pods}, ctrl.Result{}, nil
+	return &reconcileState{cluster: ec, members: members, pods: pods}, ctrl.Result{}, nil
 }
 
 // PopulateDefaultValues mutates `ec` in place to apply operator-side defaults
@@ -252,13 +269,12 @@ func (r *EtcdClusterReconciler) validateSpec(ctx context.Context, s *reconcileSt
 	return nil
 }
 
-// bootstrapCluster generates the client/server/peer certificates (if needed),
-// builds the operator's etcd-client TLS config from the server certificate,
-// ensures the headless Service exists, and, when no pods are present,
-// creates the first member pod (ordinal 0) to bootstrap a new cluster. A
-// non-zero ctrl.Result requests a requeue so the next loop observes the new
-// pod.
-func (r *EtcdClusterReconciler) bootstrapCluster(ctx context.Context, s *reconcileState) (ctrl.Result, error) {
+// ensureClusterPrereqs generates the client/server/peer certificates (if
+// enabled), builds the operator's etcd-client TLS config from the server
+// certificate, and ensures the headless Service exists. Runs unconditionally
+// every reconcile, the same way the always-on health refresh does (§4.2) —
+// it isn't a "policy" phase and so is never gated by member readiness.
+func (r *EtcdClusterReconciler) ensureClusterPrereqs(ctx context.Context, s *reconcileState) error {
 	logger := log.FromContext(ctx)
 
 	if s.cluster.Spec.TLS != nil {
@@ -267,12 +283,18 @@ func (r *EtcdClusterReconciler) bootstrapCluster(ctx context.Context, s *reconci
 		}
 		// Server/peer certs must exist before buildReconcileClientTLS below reads
 		// the server cert Secret. createMemberPod also calls this (idempotently)
-		// once the first pod is created.
+		// once a member's pod is created.
+		// TODO: buildReconcileClientTLS reuses this member server
+		// certificate as the operator's own client identity (see its comment
+		// in utils.go) — that's the wrong cert for the operator to depend on;
+		// server/peer certs are a member concern. Issue the operator a
+		// dedicated client certificate instead, so this phase doesn't need to
+		// reach into member-owned certificate state at all.
 		if err := applyEtcdMemberCerts(ctx, s.cluster, r.Client); err != nil {
 			logger.Error(err, "Failed to create server/peer certificates.")
 		}
 	} else {
-		logger.Error(nil, fmt.Sprintf(
+		logger.Info(fmt.Sprintf(
 			"missing TLS config for %s,\n running etcd-cluster without TLS protection is NOT recommended for production.",
 			s.cluster.Name,
 		))
@@ -283,232 +305,275 @@ func (r *EtcdClusterReconciler) bootstrapCluster(ctx context.Context, s *reconci
 	clientTLS, tlsErr := r.buildReconcileClientTLS(ctx, s.cluster)
 	if tlsErr != nil {
 		logger.Error(tlsErr, "Failed to build client TLS config; will retry next reconcile")
-		return ctrl.Result{}, tlsErr
+		return tlsErr
 	}
 	s.tlsConfig = clientTLS
 
 	// Service must exist before pods start so that headless DNS resolves.
-	if err := createHeadlessServiceIfNotExist(ctx, logger, r.Client, s.cluster, r.Scheme); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	if len(s.pods) > 0 {
-		return ctrl.Result{}, nil
-	}
-
-	logger.Info("No member pods found, creating first member pod", "expectedSize", s.cluster.Spec.Size)
-	if err := createMemberPod(ctx, logger, r.Client, s.cluster, 0, r.Scheme); err != nil {
-		return ctrl.Result{}, err
-	}
-	return ctrl.Result{RequeueAfter: requeueDuration}, nil
+	return createHeadlessServiceIfNotExist(ctx, logger, r.Client, s.cluster, r.Scheme)
 }
 
-// healthCheckAndFix obtains the member list and health status from the etcd
-// cluster and stores them on reconcileState for later phases. When any
-// member/Pod is found unhealthy it should attempt a fix.
-//
-// ctrl.Result is always zero for now, but the fix TODO below will need to
-// return a non-zero Result (e.g. to requeue after restarting a Pod) once
-// implemented.
-//
-//nolint:unparam // see comment above
-func (r *EtcdClusterReconciler) healthCheckAndFix(ctx context.Context, s *reconcileState) (ctrl.Result, error) {
+// refreshClusterState fetches the live etcd member list and per-endpoint
+// health and stores them on reconcileState for the dispatcher below. Always
+// runs, never gated by member readiness (§4.2) — the health-driven "fix" is
+// the dispatcher's per-member-repair step (§4.9 item 5), not this phase.
+func (r *EtcdClusterReconciler) refreshClusterState(ctx context.Context, s *reconcileState) error {
 	logger := log.FromContext(ctx)
 	logger.Info("Now checking health of the cluster members")
 
 	var err error
 	s.memberListResp, s.memberHealth, err = healthCheck(s.cluster.Name, s.cluster.Namespace, s.pods, clusterTLSEnabled(s.cluster), s.tlsConfig, logger)
 	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("health check failed: %w", err)
+		return fmt.Errorf("health check failed: %w", err)
 	}
 
 	if !areAllMembersHealthy(s.memberHealth) {
 		logger.Info("Found one or more unhealthy members")
-		// TODO: not implemented yet. Try to fix one unhealthy member/Pod (e.g.
-		// restart it, or remove and re-add it to the etcd cluster). etcd only
-		// allows one learner at a time, so if the cluster already has a
-		// learner, promote or remove that learner first before adding a new
-		// one as part of the fix.
 	}
 
-	return ctrl.Result{}, nil
+	return nil
 }
 
-// reconcileExceptions reconciles any discrepancy between Pod count and etcd
-// member count. This can occur when a previous reconcile was interrupted
-// between the etcd member API call and the Pod create/delete.
-func (r *EtcdClusterReconciler) reconcileExceptions(ctx context.Context, s *reconcileState) (ctrl.Result, error) {
+// dispatch implements design doc §4.9's priority order: at most one mutating
+// action per reconcile. Each numbered step either claims the loop (returns a
+// non-zero Result or an error) or falls through to the next; only an item
+// that actually takes a mutating action ends the loop.
+//
+// Steps 2-8 are TODO no-ops in this milestone (M2) — the mechanics they'd
+// trigger (join/promote/repair/leave, CORRUPT/NOSPACE remediation,
+// lost-quorum recovery) land in M3-M5 — but the detection that decides
+// *whether* a step claims the loop is real, so the priority order itself is
+// reviewable now, ahead of any of that behavior landing.
+func (r *EtcdClusterReconciler) dispatch(ctx context.Context, s *reconcileState) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	memberCnt := 0
-	if s.memberListResp != nil {
-		memberCnt = len(s.memberListResp.Members)
+	// 1. Spec.Paused (requirement 15): do nothing else at all this loop,
+	// ahead of everything below, including an already-started lost-quorum
+	// recovery.
+	if s.cluster.Spec.Paused {
+		logger.Info("EtcdCluster is paused; skipping all mutating actions")
+		return ctrl.Result{RequeueAfter: requeueDuration}, nil
 	}
-	currentPodCount := int32(len(s.pods))
 
-	if int(currentPodCount) == memberCnt {
+	// 2. Continue an already-started lost-quorum recovery (§4.8).
+	if s.cluster.Status.QuorumRecovery != nil {
+		// TODO: §4.8/§4.9 item 2 — force-new-cluster the survivor,
+		// terminate the rest, let scale-out rebuild (M5).
+		logger.Info("Lost-quorum recovery in progress; continuation not implemented yet",
+			"survivor", s.cluster.Status.QuorumRecovery.Survivor)
+		return ctrl.Result{RequeueAfter: requeueDuration}, nil
+	}
+
+	// 3. CORRUPT alarm on some member (§4.6/§4.7).
+	// TODO: §4.9 item 3 — force the tagged member to Phase: Replacing
+	// (M4). Detection needs etcdutils.AlarmList, not fetched yet in this
+	// milestone, so this step can never fire until M4 lands.
+
+	// 4. NOSPACE alarm remediation (§4.7).
+	// TODO: §4.9 item 4 — compact/defragment/disarm cycle (M4). Same
+	// as above, needs AlarmList.
+
+	// 5. Per-member repair: continue a member already Recreating, or start
+	// fixing exactly one newly-unhealthy Ready member (requirement 6).
+	for _, m := range s.members {
+		if m.Status.Phase == ecv1alpha1.EtcdMemberRecreating {
+			// TODO: §4.9 item 5 — continue the shared Pod-recovery
+			// ladder (§4.6, M3).
+			logger.Info("Member is Recreating; per-member repair not implemented yet", "member", m.Name)
+			return ctrl.Result{RequeueAfter: requeueDuration}, nil
+		}
+	}
+	// TODO: §4.9 item 5 — picking a newly-unhealthy Ready member to
+	// start Recreating needs the live-health-to-EtcdMember mapping M3/M6
+	// add; not wired up yet, so this half of the step never fires either.
+
+	// 6. Decide whether to *start* lost-quorum recovery (§4.8/§4.9 item 6).
+	// TODO: opt-in, and only once steps 3-5 above find nothing to do
+	// and the cluster is still unhealthy (M5).
+
+	// 7. Clean up any EtcdMember with DeletionTimestamp set (§4.6's
+	// Terminating).
+	for i := range s.members {
+		m := &s.members[i]
+		if m.DeletionTimestamp != nil {
+			logger.Info("Member is Terminating; leave sequence not implemented yet, "+
+				"clearing finalizer as an interim workaround", "member", m.Name)
+			if err := r.clearMemberFinalizer(ctx, m); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{RequeueAfter: requeueDuration}, nil
+		}
+	}
+
+	// 8. Advance whatever's left not-Ready (Pending/Provisioning/Replacing).
+	// An existing learner always wins this slot (requirement 11).
+	if notReady := pickNotReadyMember(s.members); notReady != nil {
+		// TODO: §4.9 item 8 — promote if a caught-up learner,
+		// otherwise continue the member's join/replace progress (§4.6, M3).
+		logger.Info("Member not Ready; join/promotion not implemented yet",
+			"member", notReady.Name, "phase", notReady.Status.Phase)
+		return ctrl.Result{RequeueAfter: requeueDuration}, nil
+	}
+
+	// 9. Everything existing is Ready (§4.2's gate): steps 5, 7 and 8 above
+	// already return before reaching here whenever a member is Recreating,
+	// Terminating, or otherwise not-Ready, so update-config/scale/upgrade
+	// only ever run once every member is Ready.
+	if res, err := r.updateConfig(ctx, s); err != nil || !res.IsZero() {
+		return res, err
+	}
+
+	if res, err := r.scaleCluster(ctx, s); err != nil || !res.IsZero() {
+		return res, err
+	}
+
+	return r.upgradeCluster(ctx, s)
+}
+
+// ensureClusterFinalizer adds clusterCleanupFinalizer to s.cluster if it
+// isn't already present.
+func (r *EtcdClusterReconciler) ensureClusterFinalizer(ctx context.Context, s *reconcileState) error {
+	if !controllerutil.AddFinalizer(s.cluster, clusterCleanupFinalizer) {
+		return nil
+	}
+	return r.Update(ctx, s.cluster)
+}
+
+// finalizeCluster handles an EtcdCluster with DeletionTimestamp set: it
+// removes every EtcdMember it still owns — reusing the same interim
+// finalizer-clearing dispatch()'s step 7 uses for a single Terminating
+// member — and, once none remain, releases clusterCleanupFinalizer so
+// Kubernetes can finish deleting the EtcdCluster itself.
+//
+// TODO: like step 7, this skips the real six-step leave sequence (§4.6,
+// M3): members are removed without ever calling etcd's MemberRemove, so
+// deleting a cluster with live members can leave stale entries in etcd's
+// own membership list. Acceptable for now because the Pods backing those
+// members are torn down along with everything else, but M3 should replace
+// this loop with the real sequence rather than just deleting faster.
+func (r *EtcdClusterReconciler) finalizeCluster(ctx context.Context, s *reconcileState) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	if len(s.members) == 0 {
+		if controllerutil.RemoveFinalizer(s.cluster, clusterCleanupFinalizer) {
+			if err := r.Update(ctx, s.cluster); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
 		return ctrl.Result{}, nil
 	}
 
-	logger.Info("Pod count and etcd member count differ",
-		"podCount", currentPodCount, "memberCnt", memberCnt)
-	if int(currentPodCount) < memberCnt {
-		// A member was added to etcd but the pod was not yet created.
-		logger.Info("Creating pod for already-registered etcd member")
-		ordinals := make([]int, 0, len(s.pods))
-		for _, p := range s.pods {
-			ordinals = append(ordinals, podOrdinal(p.Name, s.cluster.Name))
+	logger.Info("EtcdCluster is Terminating; removing owned EtcdMembers", "remaining", len(s.members))
+	for i := range s.members {
+		m := &s.members[i]
+		if m.DeletionTimestamp == nil {
+			if err := r.Delete(ctx, m); err != nil && !errors.IsNotFound(err) {
+				return ctrl.Result{}, err
+			}
+			continue
 		}
-		next := nextPodOrdinal(ordinals, s.cluster.Spec.Size)
-		logger.Info("Creating a new member pod", "cluster", s.cluster.Name, "ordinal", next)
-		if err := createMemberPod(ctx, logger, r.Client, s.cluster, next, r.Scheme); err != nil {
-			return ctrl.Result{}, err
-		}
-	} else {
-		// A member was removed from etcd but the pod was not yet deleted.
-		logger.Info("Deleting pod for already-removed etcd member")
-		podToRemove := s.pods[len(s.pods)-1]
-		if err := r.Delete(ctx, podToRemove); err != nil {
+		if err := r.clearMemberFinalizer(ctx, m); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
 	return ctrl.Result{RequeueAfter: requeueDuration}, nil
 }
 
-// promoteLearner promotes an in-sync learner member to a voting member.
-func (r *EtcdClusterReconciler) promoteLearner(ctx context.Context, s *reconcileState) (ctrl.Result, error) {
-	logger := log.FromContext(ctx)
-
-	memberCnt := 0
-	if s.memberListResp != nil {
-		memberCnt = len(s.memberListResp.Members)
+// clearMemberFinalizer removes memberCleanupFinalizer from m, letting
+// Kubernetes finish deleting it. Shared by dispatch()'s step 7 (a single
+// Terminating member, cluster otherwise alive) and finalizeCluster (every
+// member, cluster itself being deleted).
+func (r *EtcdClusterReconciler) clearMemberFinalizer(ctx context.Context, m *ecv1alpha1.EtcdMember) error {
+	if !controllerutil.RemoveFinalizer(m, memberCleanupFinalizer) {
+		return nil
 	}
-	if memberCnt == 0 {
-		return ctrl.Result{}, nil
-	}
-
-	_, leaderStatus := etcdutils.FindLeaderStatus(s.memberHealth, logger)
-	if leaderStatus == nil {
-		return ctrl.Result{}, fmt.Errorf("couldn't find leader, memberCnt: %d", memberCnt)
-	}
-
-	learner, learnerStatus := etcdutils.FindLearnerStatus(s.memberHealth, logger)
-	if learner == 0 {
-		return ctrl.Result{}, nil
-	}
-
-	logger.Info("Learner found", "learnerID", learner, "learnerStatus", learnerStatus)
-	if !etcdutils.IsLearnerReady(leaderStatus, learnerStatus) {
-		logger.Info("The learner member isn't ready to be promoted yet", "learnerID", learner)
-		return ctrl.Result{RequeueAfter: requeueDuration}, nil
-	}
-
-	logger.Info("Learner is ready to be promoted to voting member", "learnerID", learner)
-	eps := clientEndpointsFromPods(s.cluster.Name, s.cluster.Namespace, s.pods, clusterTLSEnabled(s.cluster))
-	// Exclude the learner (last ordinal) from the endpoint list used for promotion.
-	eps = eps[:(len(eps) - 1)]
-	if err := etcdutils.PromoteLearner(etcdutils.ClientConfig{Endpoints: eps, TLS: s.tlsConfig}, learner); err != nil {
-		return ctrl.Result{}, err
-	}
-	return ctrl.Result{}, nil
+	return r.Update(ctx, m)
 }
 
-// updateConfig compares each Pod's running configuration against
+// updateConfig compares each member's running configuration against
 // EtcdCluster.Spec and recreates the first Pod whose config has drifted.
 //
-// TODO: not implemented yet. Per the workflow diagram's "Update config"
-// phase, this should hash EtcdCluster.Spec, compare it against each Pod's
-// recorded config hash, and recreate mismatched Pods one at a time, starting
-// with the highest ordinal and working down. If the Pod being replaced is
-// the leader, move leadership to another member (the one with the lowest
-// ordinal) first.
+// TODO: §4.6's Pod-recovery ladder (its config-drift branch) covers
+// this once M3 lands; recreating one member at a time, highest ordinal
+// first, transferring leadership first if needed (§4.5).
 func (r *EtcdClusterReconciler) updateConfig(ctx context.Context, s *reconcileState) (ctrl.Result, error) {
 	return ctrl.Result{}, nil
 }
 
-// scaleCluster compares the desired cluster size with the observed Pod count
-// and grows or shrinks the cluster by one member/Pod at a time towards it.
+// scaleCluster grows or shrinks the cluster by one member at a time towards
+// EtcdCluster.Spec.Size, picking the ordinal via §4.4's nextOrdinal (reuse
+// the lowest gap, else max+1) and always removing the highest ordinal first
+// on scale-in (requirement 2).
+//
+// Creating the EtcdMember object — and, for ordinal 0, its cert/PVC/Pod
+// directly (the bootstrap special case, §4.6 step 2) — is the only mechanic
+// this milestone (M2) implements. For every other ordinal, the general join
+// mechanics (MemberAdd + cert/PVC/Pod) are §4.6's TODO (M3), so a
+// newly-created EtcdMember simply sits at Phase: Pending until then. Scale-in
+// deletes the EtcdMember directly; the finalizer (§4.3) blocks its actual
+// removal until the Terminating leave sequence (§4.6, M3) runs.
 func (r *EtcdClusterReconciler) scaleCluster(ctx context.Context, s *reconcileState) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	currentPodCount := int32(len(s.pods))
-	desiredSize := int32(s.cluster.Spec.Size)
+	currentCount := len(s.members)
+	desiredSize := s.cluster.Spec.Size
 
-	if currentPodCount == desiredSize {
-		// Ensure every member is healthy before declaring success.
-		if !areAllMembersHealthy(s.memberHealth) {
-			logger.Info("EtcdCluster is at desired size but not all members are healthy yet")
-			return ctrl.Result{RequeueAfter: requeueDuration}, nil
-		}
-		logger.Info("EtcdCluster reconciled successfully")
+	if currentCount == desiredSize {
+		logger.Info("EtcdCluster is at desired size", "size", desiredSize)
 		return ctrl.Result{}, nil
 	}
 
-	eps := clientEndpointsFromPods(s.cluster.Name, s.cluster.Namespace, s.pods, clusterTLSEnabled(s.cluster))
-
-	if currentPodCount < desiredSize {
-		// Scale out: add a new learner member to etcd, then create its pod.
-		nextOrdinal := int(currentPodCount)
-		_, peerURL := peerEndpointForOrdinalIndex(s.cluster, nextOrdinal)
-		logger.Info("[Scale out] adding a new learner member to etcd cluster", "peerURL", peerURL)
-		if _, err := etcdutils.AddMember(etcdutils.ClientConfig{Endpoints: eps, TLS: s.tlsConfig}, []string{peerURL}, true); err != nil {
+	if currentCount < desiredSize {
+		ordinal := nextOrdinal(memberOrdinals(s.members))
+		logger.Info("[Scale out] creating a new EtcdMember", "ordinal", ordinal)
+		member, err := createEtcdMember(ctx, r.Client, s.cluster, ordinal, r.Scheme)
+		if err != nil {
 			return ctrl.Result{}, err
 		}
-		logger.Info("Learner member added successfully", "peerURL", peerURL)
 
-		// gofail: var exceptionAfterMemberAdd struct{}
-
-		if err := createMemberPod(ctx, logger, r.Client, s.cluster, nextOrdinal, r.Scheme); err != nil {
-			return ctrl.Result{}, err
+		if ordinal == 0 {
+			// Bootstrap special case: the first member starts as a full
+			// voting member with its Pod created directly — there's no
+			// cluster yet to MemberAdd(learner) into.
+			if err := createMemberPod(ctx, logger, r.Client, s.cluster, ordinal, r.Scheme); err != nil {
+				return ctrl.Result{}, err
+			}
+		} else {
+			logger.Info("Join mechanics not implemented yet; member stays Pending", "member", member.Name)
 		}
 		return ctrl.Result{RequeueAfter: requeueDuration}, nil
 	}
 
-	// Scale in: remove the last member from etcd, then delete its pod.
-	memberCnt := 0
-	if s.memberListResp != nil {
-		memberCnt = len(s.memberListResp.Members)
-	}
-	podToRemove := s.pods[len(s.pods)-1]
-	memberID := s.memberHealth[memberCnt-1].Status.Header.MemberId
-	logger.Info("[Scale in] removing one member", "memberID", memberID, "pod", podToRemove.Name)
-
-	// TODO: not implemented yet. If the member being removed is the leader,
-	// move leadership to another member (the one with the lowest ordinal)
-	// before removing it.
-
-	epsForRemoval := eps[:len(eps)-1]
-	if err := etcdutils.RemoveMember(etcdutils.ClientConfig{Endpoints: epsForRemoval, TLS: s.tlsConfig}, memberID); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	// gofail: var exceptionAfterMemberDelete struct{}
-
-	if err := r.Delete(ctx, podToRemove); err != nil {
+	// Scale in: always the highest ordinal (requirement 2).
+	highest := s.members[len(s.members)-1]
+	logger.Info("[Scale in] deleting the highest-ordinal EtcdMember", "member", highest.Name)
+	if err := r.Delete(ctx, &highest); err != nil {
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{RequeueAfter: requeueDuration}, nil
 }
 
-// upgradeCluster rolls one Pod to the etcd version requested in
-// EtcdCluster.Spec.Version, removing the Pod with the old version and the
-// highest ordinal (moving leadership first if it is the leader). The next
-// loop's reconcileExceptions phase recreates it with the new version.
+// upgradeCluster rolls one member to the etcd version requested in
+// EtcdCluster.Spec.Version, highest ordinal first.
 //
-// TODO: not implemented yet. validateSpec already checks, by comparing the
-// first Pod's image tag against EtcdCluster.Spec.Version, whether the
+// TODO: not implemented yet. validateSpec already checks, by comparing
+// the first Pod's image tag against EtcdCluster.Spec.Version, whether the
 // upgrade path is supported when the two differ — but it doesn't persist
 // that comparison anywhere on reconcileState. This phase needs to redo the
-// same current-vs-target version comparison to decide whether a Pod
-// replacement is needed, then perform the replacement described above. Per
-// the workflow diagram, consider recording the in-progress ordinal on
-// EtcdCluster.Status (e.g. status.currentUpgradeMember) so the correct Pod
-// is recreated if this loop is interrupted.
+// same current-vs-target version comparison, then bump one EtcdMember.Spec.Version
+// at a time (highest ordinal, non-leader first as a preference); the member
+// notices the drift and recreates via §4.6's ladder (M3).
 func (r *EtcdClusterReconciler) upgradeCluster(ctx context.Context, s *reconcileState) (ctrl.Result, error) {
 	return ctrl.Result{}, nil
 }
 
 // updateStatus reflects the current observed state onto EtcdCluster.Status.
+//
+// TODO: §4.11 (M6) rewrites this to write EtcdMember.Status and
+// EtcdClusterStatus.Members from the same live snapshot in one pass, and to
+// skip the write when nothing changed. For now this keeps computing
+// EtcdClusterStatus directly from live Pods/member-list, as it did before
+// EtcdMember existed.
 func (r *EtcdClusterReconciler) updateStatus(ctx context.Context, s *reconcileState) error {
 	logger := log.FromContext(ctx)
 
@@ -676,6 +741,7 @@ func (r *EtcdClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 	builder := ctrl.NewControllerManagedBy(mgr).
 		For(&ecv1alpha1.EtcdCluster{}).
+		Owns(&ecv1alpha1.EtcdMember{}).
 		Owns(&corev1.Pod{}).
 		Owns(&corev1.PersistentVolumeClaim{}).
 		Owns(&corev1.Service{})

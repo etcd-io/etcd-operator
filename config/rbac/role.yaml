@@ -54,6 +54,7 @@ rules:
   - operator.etcd.io
   resources:
   - etcdclusters
+  - etcdmembers
   verbs:
   - create
   - delete
@@ -66,12 +67,14 @@ rules:
   - operator.etcd.io
   resources:
   - etcdclusters/finalizers
+  - etcdmembers/finalizers
   verbs:
   - update
 - apiGroups:
   - operator.etcd.io
   resources:
   - etcdclusters/status
+  - etcdmembers/status
   verbs:
   - get
   - patch
