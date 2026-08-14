@@ -45,6 +45,13 @@ var (
 	namespace     = "etcd-operator-system"
 	containerTool = os.Getenv("CONTAINER_TOOL")
 	skipTeardown  = os.Getenv("ETCD_E2E_SKIP_TEARDOWN") == "true"
+	// skipSetup assumes a cluster/namespace/operator deployment already
+	// exists — either from a previous run (typically one made with
+	// ETCD_E2E_SKIP_TEARDOWN=true) or prepared manually by hand — and skips
+	// re-provisioning it. This lets you `go test -run TestXXX` against an
+	// already-prepared environment instead of paying for the full setup on
+	// every invocation.
+	skipSetup = os.Getenv("ETCD_E2E_SKIP_SETUP") == "true"
 )
 
 func TestMain(m *testing.M) {
@@ -56,8 +63,11 @@ func TestMain(m *testing.M) {
 	log.Println("Creating KinD cluster...")
 	testEnv.Setup(
 		// create KinD cluster
+		//
+		// Not gated by skipSetup: e2e-framework's kind.Cluster.Create already
+		// skips re-creating a cluster that exists, just re-fetching its
+		// kubeconfig into cfg — which every later step needs.
 		func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
-			// create KinD cluster
 			var err error
 			ctx, err = envfuncs.CreateClusterWithOpts(kindCluster, kindClusterName, clusterVersion)(ctx, cfg)
 			if err != nil {
@@ -70,6 +80,11 @@ func TestMain(m *testing.M) {
 
 		// prepare the resources
 		func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
+			if skipSetup {
+				log.Println("ETCD_E2E_SKIP_SETUP=true, skipping docker image build/load")
+				return ctx, nil
+			}
+
 			// Build docker image
 			log.Println("Building docker image...")
 			cmd := exec.Command("make", "docker-build", fmt.Sprintf("IMG=%s", imageName))
@@ -90,6 +105,11 @@ func TestMain(m *testing.M) {
 
 		// install prometheus
 		func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
+			if skipSetup {
+				log.Println("ETCD_E2E_SKIP_SETUP=true, skipping prometheus operator install")
+				return ctx, nil
+			}
+
 			log.Println("Installing prometheus operator...")
 			if err := test_utils.InstallPrometheusOperator(); err != nil {
 				log.Printf("Unable to install Prometheus operator: %s", err)
@@ -100,46 +120,51 @@ func TestMain(m *testing.M) {
 
 		// set up environment
 		func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
-			// create namespace
-			var err error
-			ctx, err = envfuncs.CreateNamespace(namespace)(ctx, cfg)
-			if err != nil {
-				log.Printf("failed to create namespace: %s", err)
-				return ctx, err
-			}
+			if skipSetup {
+				log.Println("ETCD_E2E_SKIP_SETUP=true, assuming namespace/crd/operator are already deployed")
+				cfg.WithNamespace(namespace)
+			} else {
+				// create namespace
+				var err error
+				ctx, err = envfuncs.CreateNamespace(namespace)(ctx, cfg)
+				if err != nil {
+					log.Printf("failed to create namespace: %s", err)
+					return ctx, err
+				}
 
-			// install crd
-			log.Println("Install crd...")
-			cmd := exec.Command("make", "install")
-			if _, err := test_utils.Run(cmd); err != nil {
-				log.Printf("Failed to install crd: %s", err)
-				return ctx, err
-			}
+				// install crd
+				log.Println("Install crd...")
+				cmd := exec.Command("make", "install")
+				if _, err := test_utils.Run(cmd); err != nil {
+					log.Printf("Failed to install crd: %s", err)
+					return ctx, err
+				}
 
-			// Deploy components
-			log.Println("Deploying components...")
+				// Deploy components
+				log.Println("Deploying components...")
 
-			log.Println("Deploying controller-manager resources...")
-			cmd = exec.Command("make", "deploy", "DEPLOY_MODE=e2e", fmt.Sprintf("IMG=%s", imageName))
-			if _, err := test_utils.Run(cmd); err != nil {
-				log.Printf("Failed to deploy resource configurations: %s", err)
-				return ctx, err
-			}
+				log.Println("Deploying controller-manager resources...")
+				cmd = exec.Command("make", "deploy", "DEPLOY_MODE=e2e", fmt.Sprintf("IMG=%s", imageName))
+				if _, err := test_utils.Run(cmd); err != nil {
+					log.Printf("Failed to deploy resource configurations: %s", err)
+					return ctx, err
+				}
 
-			// wait for controller to get ready
-			client := cfg.Client()
-
-			log.Println("Waiting for controller-manager deployment to be available...")
-			if err := wait.For(
-				conditions.New(client.Resources()).DeploymentAvailable("etcd-operator-controller-manager", "etcd-operator-system"),
-				wait.WithTimeout(3*time.Minute),
-				wait.WithInterval(10*time.Second),
-			); err != nil {
-				log.Printf("Timed out while waiting for etcd-operator-controller-manager deployment: %s", err)
-				return ctx, err
+				// wait for controller to get ready
+				log.Println("Waiting for controller-manager deployment to be available...")
+				resources := cfg.Client().Resources()
+				if err := wait.For(
+					conditions.New(resources).DeploymentAvailable("etcd-operator-controller-manager", "etcd-operator-system"),
+					wait.WithTimeout(3*time.Minute),
+					wait.WithInterval(10*time.Second),
+				); err != nil {
+					log.Printf("Timed out while waiting for etcd-operator-controller-manager deployment: %s", err)
+					return ctx, err
+				}
 			}
 
 			// Add schemes
+			client := cfg.Client()
 			_ = appsv1.AddToScheme(client.Resources().GetScheme())
 			_ = corev1.AddToScheme(client.Resources().GetScheme())
 			_ = metav1.AddMetaToScheme(client.Resources().GetScheme())
