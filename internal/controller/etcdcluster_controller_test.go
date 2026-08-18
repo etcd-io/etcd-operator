@@ -17,6 +17,9 @@ limitations under the License.
 package controller
 
 import (
+	"context"
+	"errors"
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -25,11 +28,16 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
+	"go.etcd.io/etcd-operator/internal/etcdutils"
+	"go.etcd.io/etcd/api/v3/etcdserverpb"
+	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 // TestFetchAndValidateState verifies the fetchAndValidateState helper across
@@ -372,4 +380,232 @@ func TestBootstrapCluster(t *testing.T) {
 		require.NoError(t, fakeClient.Get(ctx, client.ObjectKey{Name: ec.Name, Namespace: ec.Namespace}, svc))
 		assert.Equal(t, "None", svc.Spec.ClusterIP)
 	})
+}
+
+type moveLeaderActivity struct {
+	calls     int
+	endpoints []string
+	memberID  uint64
+}
+
+func NewFakeMoveLeader(t *testing.T, err error) *moveLeaderActivity {
+	t.Helper()
+
+	ml := &moveLeaderActivity{}
+	original := moveLeader
+	t.Cleanup(func() { moveLeader = original })
+
+	moveLeader = func(cfg etcdutils.ClientConfig, memberID uint64) error {
+		ml.calls++
+		ml.endpoints = cfg.Endpoints
+		ml.memberID = memberID
+		return err
+	}
+	return ml
+}
+
+const (
+	updateConfigCluster   = "etcd"
+	updateConfigNamespace = "default"
+
+	staleConfigHash = "000000000000"
+)
+
+func getMemberID(ordinal int) uint64 { return uint64(100 * (ordinal + 1)) }
+
+func clientEndpoint(ordinal int) string {
+	return clientEndpointForOrdinal(updateConfigCluster, updateConfigNamespace, ordinal, false)
+}
+
+func newCluster(t *testing.T, size int) *ecv1alpha1.EtcdCluster {
+	t.Helper()
+	ec := &ecv1alpha1.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: updateConfigCluster, Namespace: updateConfigNamespace},
+		Spec: ecv1alpha1.EtcdClusterSpec{
+			Size:          size,
+			Version:       "3.5.17",
+			ImageRegistry: DefaultImageRegistry,
+		},
+	}
+	require.NoError(t, k8sClient.Create(t.Context(), ec))
+	t.Cleanup(func() {
+		_ = k8sClient.Delete(context.Background(), ec)
+	})
+	return ec
+}
+
+func newMemberPods(t *testing.T, ec *ecv1alpha1.EtcdCluster, size int, staleOrdinals ...int) {
+	t.Helper()
+	desiredHash := EtcdClusterHash(ec)
+
+	for ordinal := range size {
+		pod := buildMemberPod(ec, memberPodName(ec.Name, ordinal), etcdClusterStateExisting, "ignored")
+		pod.Annotations[HashMetadataKey] = desiredHash
+		if slices.Contains(staleOrdinals, ordinal) {
+			pod.Annotations[HashMetadataKey] = staleConfigHash
+		}
+		require.NoError(t, controllerutil.SetControllerReference(ec, pod, scheme.Scheme))
+		require.NoError(t, k8sClient.Create(t.Context(), pod))
+		t.Cleanup(func() {
+			_ = k8sClient.Delete(context.Background(), pod, client.GracePeriodSeconds(0))
+		})
+	}
+}
+
+func setupReconcileState(t *testing.T, ec *ecv1alpha1.EtcdCluster, leaderOrdinal int) *reconcileState {
+	t.Helper()
+	pods, err := listOwnedPods(t.Context(), k8sClient, ec)
+	require.NoError(t, err)
+
+	state := &reconcileState{
+		cluster:        ec,
+		pods:           pods,
+		memberListResp: &clientv3.MemberListResponse{},
+	}
+	for _, pod := range pods {
+		ordinal := podOrdinal(pod.Name, ec.Name)
+		state.memberListResp.Members = append(state.memberListResp.Members,
+			&etcdserverpb.Member{ID: getMemberID(ordinal), Name: pod.Name})
+		state.memberHealth = append(state.memberHealth, etcdutils.EpHealth{
+			Ep:     clientEndpoint(ordinal),
+			Health: true,
+			Status: &clientv3.StatusResponse{
+				Header: &etcdserverpb.ResponseHeader{MemberId: getMemberID(ordinal)},
+				Leader: getMemberID(leaderOrdinal),
+			},
+		})
+	}
+	return state
+}
+
+func movedLeadership(from, to int) moveLeaderActivity {
+	return moveLeaderActivity{
+		calls:     1,
+		memberID:  getMemberID(to),
+		endpoints: []string{clientEndpoint(from)},
+	}
+}
+
+func remainingOrdinals(t *testing.T, ec *ecv1alpha1.EtcdCluster) []int {
+	t.Helper()
+	pods, err := listOwnedPods(t.Context(), k8sClient, ec)
+	require.NoError(t, err)
+
+	ordinals := make([]int, 0, len(pods))
+	for _, pod := range pods {
+		ordinals = append(ordinals, podOrdinal(pod.Name, ec.Name))
+	}
+	slices.Sort(ordinals)
+	return ordinals
+}
+
+func TestUpdateConfig(t *testing.T) {
+	tests := []struct {
+		name           string
+		size           int
+		leaderOrdinal  int
+		staleOrdinals  []int
+		moveLeaderErr  error
+		wantRemaining  []int
+		wantMoveLeader moveLeaderActivity
+	}{
+		{
+			name:          "no drift falls through to the next phase",
+			size:          3,
+			leaderOrdinal: 1,
+			wantRemaining: []int{0, 1, 2},
+		},
+		{
+			name:          "every pod drifted recreates the highest ordinal only",
+			size:          3,
+			leaderOrdinal: 0,
+			staleOrdinals: []int{0, 1, 2},
+			wantRemaining: []int{0, 1},
+		},
+		{
+			name:          "drifted pod that is not the leader keeps leadership in place",
+			size:          3,
+			leaderOrdinal: 0,
+			staleOrdinals: []int{2},
+			wantRemaining: []int{0, 1},
+		},
+		{
+			name:           "drifted leader hands leadership to the lowest ordinal",
+			size:           3,
+			leaderOrdinal:  2,
+			staleOrdinals:  []int{2},
+			wantRemaining:  []int{0, 1},
+			wantMoveLeader: movedLeadership(2, 0),
+		},
+		{
+			name:           "drifted leader on the lowest ordinal hands leadership to the next one",
+			size:           3,
+			leaderOrdinal:  0,
+			staleOrdinals:  []int{0},
+			wantRemaining:  []int{1, 2},
+			wantMoveLeader: movedLeadership(0, 1),
+		},
+		{
+			name:          "drifted lowest ordinal that is not the leader keeps leadership in place",
+			size:          3,
+			leaderOrdinal: 1,
+			staleOrdinals: []int{0},
+			wantRemaining: []int{1, 2},
+		},
+		{
+			name:           "a failed transfer still recreates the pod",
+			size:           3,
+			leaderOrdinal:  2,
+			staleOrdinals:  []int{2},
+			moveLeaderErr:  errors.New("etcdserver: request timed out"),
+			wantRemaining:  []int{0, 1},
+			wantMoveLeader: movedLeadership(2, 0),
+		},
+		{
+			name:          "single member cluster has nowhere to move leadership to",
+			size:          1,
+			leaderOrdinal: 0,
+			staleOrdinals: []int{0},
+			wantRemaining: []int{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ec := newCluster(t, tt.size)
+			newMemberPods(t, ec, tt.size, tt.staleOrdinals...)
+			state := setupReconcileState(t, ec, tt.leaderOrdinal)
+			require.Len(t, state.pods, tt.size)
+
+			r := &EtcdClusterReconciler{Client: k8sClient, Scheme: scheme.Scheme}
+			moveLeader := NewFakeMoveLeader(t, tt.moveLeaderErr)
+
+			res, err := r.updateConfig(t.Context(), state)
+			require.NoError(t, err)
+
+			wantResult := ctrl.Result{}
+			if len(tt.wantRemaining) != tt.size {
+				wantResult = ctrl.Result{RequeueAfter: requeueDuration}
+			}
+			assert.Equal(t, wantResult, res)
+			assert.Equal(t, tt.wantRemaining, remainingOrdinals(t, ec))
+			assert.Equal(t, tt.wantMoveLeader, *moveLeader)
+		})
+	}
+}
+
+func TestUpdateConfigOnAlreadyGonePods(t *testing.T) {
+	ec := newCluster(t, 3)
+	newMemberPods(t, ec, 3, 2)
+	state := setupReconcileState(t, ec, 0)
+
+	r := &EtcdClusterReconciler{Client: k8sClient, Scheme: scheme.Scheme}
+	NewFakeMoveLeader(t, nil)
+
+	require.NoError(t, k8sClient.Delete(t.Context(), state.pods[2], client.GracePeriodSeconds(0)))
+
+	res, err := r.updateConfig(t.Context(), state)
+	require.NoError(t, err)
+	assert.Equal(t, ctrl.Result{RequeueAfter: requeueDuration}, res)
+	assert.Equal(t, []int{0, 1}, remainingOrdinals(t, ec))
 }

@@ -226,8 +226,9 @@ func (r *EtcdClusterReconciler) validateSpec(ctx context.Context, s *reconcileSt
 			if currentVersion != targetVersion {
 				canParse, err := validateEtcdUpgradePath(etcdversions.AllVersions, currentVersion, targetVersion)
 				if !canParse {
-					logger.Info("error when parsing reconcile versions; it is your responsibility "+
-						"to validate if the upgrade path is supported",
+					logger.Info(
+						"error when parsing reconcile versions; it is your responsibility "+
+							"to validate if the upgrade path is supported",
 						"current", currentVersion,
 						"target", targetVersion,
 						"error", err,
@@ -235,7 +236,8 @@ func (r *EtcdClusterReconciler) validateSpec(ctx context.Context, s *reconcileSt
 					return nil
 				}
 				if err != nil {
-					logger.Error(err, "unsupported upgrade path between current and target versions",
+					logger.Error(
+						err, "unsupported upgrade path between current and target versions",
 						"current", currentVersion,
 						"target", targetVersion,
 					)
@@ -416,14 +418,63 @@ func (r *EtcdClusterReconciler) promoteLearner(ctx context.Context, s *reconcile
 // updateConfig compares each Pod's running configuration against
 // EtcdCluster.Spec and recreates the first Pod whose config has drifted.
 //
-// TODO: not implemented yet. Per the workflow diagram's "Update config"
-// phase, this should hash EtcdCluster.Spec, compare it against each Pod's
+// This hashes the current EtcdCluster.Spec, compare it against each Pod's
 // recorded config hash, and recreate mismatched Pods one at a time, starting
 // with the highest ordinal and working down. If the Pod being replaced is
 // the leader, move leadership to another member (the one with the lowest
 // ordinal) first.
 func (r *EtcdClusterReconciler) updateConfig(ctx context.Context, s *reconcileState) (ctrl.Result, error) {
-	return ctrl.Result{}, nil
+	logger := log.FromContext(ctx)
+
+	desiredHash := EtcdClusterHash(s.cluster)
+	configDrifted := findConfigDriftedPod(s.pods, s.cluster.Name, desiredHash)
+	if configDrifted == nil {
+		return ctrl.Result{}, nil
+	}
+
+	configDriftedOrdinal := podOrdinal(configDrifted.Name, s.cluster.Name)
+	logger.Info("pod config drifted from spec, recreating it",
+		"pod", configDrifted.Name,
+		"desiredHash", desiredHash,
+		"podHash", configDrifted.Annotations[HashMetadataKey])
+
+	leaderID, leaderOrdinal := findLeader(s.memberHealth, s.memberListResp, s.cluster.Name, logger)
+	if leaderOrdinal == configDriftedOrdinal {
+		r.moveLeadership(ctx, s, leaderID, leaderOrdinal)
+	}
+
+	if err := r.Delete(ctx, configDrifted); err != nil {
+		if !errors.IsNotFound(err) {
+			return ctrl.Result{}, err
+		}
+	}
+	return ctrl.Result{RequeueAfter: requeueDuration}, nil
+}
+
+// moveLeadership transfers etcd leadership away from the member at
+// leaderOrdinal, whose Pod is about to be deleted, to the member returned by
+// nextLeaderCandidate.
+func (r *EtcdClusterReconciler) moveLeadership(ctx context.Context, s *reconcileState, leaderID uint64, leaderOrdinal int) {
+	logger := log.FromContext(ctx)
+
+	candidateID, candidateOrdinal := nextLeaderCandidate(s.pods, s.memberListResp, s.cluster.Name, leaderID, leaderOrdinal)
+	if candidateID == leaderID {
+		logger.Info("No other member to take over leadership, proceeding without transferring it",
+			"leaderID", candidateID, "leaderOrdinal", candidateOrdinal)
+		return
+	}
+
+	leaderEndpoint := clientEndpointForOrdinal(s.cluster.Name, s.cluster.Namespace, leaderOrdinal, clusterTLSEnabled(s.cluster))
+	logger.Info("Transferring etcd leadership away from the member being acted on",
+		"leaderID", leaderID, "leaderOrdinal", leaderOrdinal,
+		"newLeaderID", candidateID, "newLeaderOrdinal", candidateOrdinal)
+
+	if err := moveLeader(etcdutils.ClientConfig{Endpoints: []string{leaderEndpoint}, TLS: s.tlsConfig}, candidateID); err != nil {
+		logger.Error(err, "Failed to transfer etcd leadership",
+			"leaderID", leaderID, "newLeaderID", candidateID)
+		return
+	}
+	logger.Info("Etcd leadership transferred", "newLeaderID", candidateID, "newLeaderOrdinal", candidateOrdinal)
 }
 
 // scaleCluster compares the desired cluster size with the observed Pod count
@@ -596,7 +647,8 @@ func (r *EtcdClusterReconciler) updateConditions(s *reconcileState) {
 		} else {
 			availableCondition.Message = fmt.Sprintf(
 				"Etcd cluster has %d/%d healthy members, quorum requires %d",
-				healthyCount, len(s.memberListResp.Members), quorum)
+				healthyCount, len(s.memberListResp.Members), quorum,
+			)
 		}
 	}
 

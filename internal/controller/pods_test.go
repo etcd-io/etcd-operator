@@ -863,3 +863,260 @@ func TestBuildMemberPodTLSVolumes(t *testing.T) {
 		assert.Contains(t, args, "--listen-client-urls=http://0.0.0.0:2379")
 	})
 }
+
+const testClusterName = "etcd"
+
+func podNames(pods []*corev1.Pod) []string {
+	names := make([]string, 0, len(pods))
+	for _, pod := range pods {
+		names = append(names, pod.Name)
+	}
+	return names
+}
+
+func createPods(ordinals ...int) []*corev1.Pod {
+	pods := make([]*corev1.Pod, 0, len(ordinals))
+	for _, ordinal := range ordinals {
+		pods = append(pods, &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      memberPodName(testClusterName, ordinal),
+				Namespace: "default",
+			},
+		})
+	}
+	return pods
+}
+
+func TestClonePods(t *testing.T) {
+	tests := []struct {
+		name     string
+		ordinals []int
+		want     []string
+	}{
+		{
+			name:     "sorts by ordinal, not by name",
+			ordinals: []int{2, 10, 0},
+			want:     []string{"etcd-0", "etcd-2", "etcd-10"},
+		},
+		{
+			name:     "no pods",
+			ordinals: nil,
+			want:     []string{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pods := createPods(tt.ordinals...)
+			asPassedIn := podNames(pods)
+
+			assert.Equal(t, tt.want, podNames(clonePods(pods, testClusterName)))
+			assert.Equal(t, asPassedIn, podNames(pods))
+		})
+	}
+}
+
+func TestFindConfigDriftedPod(t *testing.T) {
+	const (
+		clusterName = "etcd"
+		desiredHash = "abc123def456"
+		staleHash   = "000000000000"
+	)
+
+	withHash := func(pods []*corev1.Pod, hashes map[string]string) []*corev1.Pod {
+		for _, pod := range pods {
+			if hash, ok := hashes[pod.Name]; ok {
+				pod.Annotations = map[string]string{HashMetadataKey: hash}
+			}
+		}
+		return pods
+	}
+
+	tests := []struct {
+		name string
+		pods []*corev1.Pod
+		want string // expected pod name, "" for nil
+	}{
+		{
+			name: "no pods",
+			pods: nil,
+			want: "",
+		},
+		{
+			name: "every pod is up to date",
+			pods: withHash(createPods(0, 1, 2), map[string]string{
+				"etcd-0": desiredHash, "etcd-1": desiredHash, "etcd-2": desiredHash,
+			}),
+			want: "",
+		},
+		{
+			name: "single drifted pod",
+			pods: withHash(createPods(0, 1, 2), map[string]string{
+				"etcd-0": desiredHash, "etcd-1": staleHash, "etcd-2": desiredHash,
+			}),
+			want: "etcd-1",
+		},
+		{
+			name: "several drifted pods returns the highest ordinal",
+			pods: withHash(createPods(0, 1, 2), map[string]string{
+				"etcd-0": staleHash, "etcd-1": staleHash, "etcd-2": staleHash,
+			}),
+			want: "etcd-2",
+		},
+		{
+			name: "a pod with no hash annotation counts as drifted",
+			pods: withHash(createPods(0, 1), map[string]string{
+				"etcd-0": desiredHash,
+			}),
+			want: "etcd-1",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := findConfigDriftedPod(tt.pods, clusterName, desiredHash)
+			if tt.want == "" {
+				assert.Nil(t, got)
+				return
+			}
+			require.NotNil(t, got)
+			assert.Equal(t, tt.want, got.Name)
+		})
+	}
+}
+
+func TestFindLeader(t *testing.T) {
+	memberList := &clientv3.MemberListResponse{
+		Members: []*etcdserverpb.Member{
+			{ID: 100, Name: "etcd-0"},
+			{ID: 200, Name: "etcd-1"},
+			{ID: 300, Name: "etcd-2"},
+		},
+	}
+
+	health := func(leaderID uint64, memberIDs ...uint64) []etcdutils.EpHealth {
+		infos := make([]etcdutils.EpHealth, 0, len(memberIDs))
+		for _, id := range memberIDs {
+			infos = append(infos, etcdutils.EpHealth{
+				Health: true,
+				Status: &clientv3.StatusResponse{
+					Header: &etcdserverpb.ResponseHeader{MemberId: id},
+					Leader: leaderID,
+				},
+			})
+		}
+		return infos
+	}
+
+	tests := []struct {
+		name         string
+		memberHealth []etcdutils.EpHealth
+		wantLeaderID uint64
+		wantOrdinal  int
+	}{
+		{
+			name:         "leader on the lowest ordinal",
+			memberHealth: health(100, 100, 200, 300),
+			wantLeaderID: 100,
+			wantOrdinal:  0,
+		},
+		{
+			name:         "leader in the middle",
+			memberHealth: health(200, 100, 200, 300),
+			wantLeaderID: 200,
+			wantOrdinal:  1,
+		},
+		{
+			name:         "leader on the highest ordinal",
+			memberHealth: health(300, 100, 200, 300),
+			wantLeaderID: 300,
+			wantOrdinal:  2,
+		},
+		{
+			name:         "leader reported by a member that is not itself the leader",
+			memberHealth: health(300, 100, 200, 300)[:2],
+			wantLeaderID: 0,
+			wantOrdinal:  -1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			leaderID, leaderOrdinal := findLeader(tt.memberHealth, memberList, testClusterName, log.Log)
+
+			assert.Equal(t, tt.wantLeaderID, leaderID)
+			assert.Equal(t, tt.wantOrdinal, leaderOrdinal)
+		})
+	}
+}
+
+func TestNextLeaderCandidate(t *testing.T) {
+	const clusterName = "etcd"
+
+	memberList := func(members ...*etcdserverpb.Member) *clientv3.MemberListResponse {
+		return &clientv3.MemberListResponse{Members: members}
+	}
+	member := func(id uint64, name string) *etcdserverpb.Member {
+		return &etcdserverpb.Member{ID: id, Name: name}
+	}
+
+	threeMembers := memberList(
+		member(100, "etcd-0"),
+		member(200, "etcd-1"),
+		member(300, "etcd-2"),
+	)
+
+	tests := []struct {
+		name                 string
+		pods                 []*corev1.Pod
+		memberListResp       *clientv3.MemberListResponse
+		currentLeaderID      uint64
+		currentLeaderOrdinal int
+		wantID               uint64
+		wantOrdinal          int
+	}{
+		{
+			name:                 "picks the lowest ordinal member",
+			pods:                 createPods(0, 1, 2),
+			memberListResp:       threeMembers,
+			currentLeaderID:      300,
+			currentLeaderOrdinal: 2,
+			wantID:               100,
+			wantOrdinal:          0,
+		},
+		{
+			name:                 "skips the current leader even when it is the lowest",
+			pods:                 createPods(0, 1, 2),
+			memberListResp:       threeMembers,
+			currentLeaderID:      100,
+			currentLeaderOrdinal: 0,
+			wantID:               200,
+			wantOrdinal:          1,
+		},
+		{
+			name:                 "unsorted pods still yield the lowest ordinal",
+			pods:                 createPods(2, 0, 1),
+			memberListResp:       threeMembers,
+			currentLeaderID:      300,
+			currentLeaderOrdinal: 2,
+			wantID:               100,
+			wantOrdinal:          0,
+		},
+		{
+			name:                 "single member cluster keeps its leader",
+			pods:                 createPods(0),
+			memberListResp:       memberList(member(100, "etcd-0")),
+			currentLeaderID:      100,
+			currentLeaderOrdinal: 0,
+			wantID:               100,
+			wantOrdinal:          0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotID, gotOrdinal := nextLeaderCandidate(tt.pods, tt.memberListResp, clusterName, tt.currentLeaderID, tt.currentLeaderOrdinal)
+			assert.Equal(t, tt.wantID, gotID)
+			assert.Equal(t, tt.wantOrdinal, gotOrdinal)
+		})
+	}
+}
