@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -40,8 +41,13 @@ import (
 
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 	"go.etcd.io/etcd-operator/internal/etcdutils"
+	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
+
+// moveLeader performs the etcd MoveLeader RPC. It is a package-level variable
+// so unit tests can stub out the network call.
+var moveLeader = etcdutils.MoveLeader
 
 // memberPodName returns the deterministic name for an etcd member pod.
 // The naming convention mirrors StatefulSet so that headless-service DNS is identical.
@@ -74,7 +80,8 @@ func nextPodOrdinal(currentOrdinals []int, expectedReplica int) int {
 // sorted in ascending ordinal order.
 func listOwnedPods(ctx context.Context, c client.Client, ec *ecv1alpha1.EtcdCluster) ([]*corev1.Pod, error) {
 	podList := &corev1.PodList{}
-	if err := c.List(ctx, podList,
+	if err := c.List(
+		ctx, podList,
 		client.InNamespace(ec.Namespace),
 		client.MatchingLabels(etcdClusterLabels(ec)),
 	); err != nil {
@@ -102,6 +109,76 @@ func isPodReady(pod *corev1.Pod) bool {
 		}
 	}
 	return false
+}
+
+func clonePods(pods []*corev1.Pod, clusterName string) []*corev1.Pod {
+	sorted := slices.Clone(pods)
+	sort.Slice(sorted, func(i, j int) bool {
+		return podOrdinal(sorted[i].Name, clusterName) < podOrdinal(sorted[j].Name, clusterName)
+	})
+	return sorted
+}
+
+// findConfigDriftedPod returns the member Pod with the highest ordinal whose
+// recorded config hash no longer matches desiredHash, or nil when every Pod is
+// already running the desired config.
+func findConfigDriftedPod(pods []*corev1.Pod, clusterName, desiredHash string) *corev1.Pod {
+	podsCopy := clonePods(pods, clusterName)
+	slices.Reverse(podsCopy)
+
+	for _, pod := range podsCopy {
+		if podOrdinal(pod.Name, clusterName) < 0 {
+			continue // not a member Pod of this cluster, so never delete it
+		}
+		if pod.Annotations[HashMetadataKey] != desiredHash {
+			return pod
+		}
+	}
+	return nil
+}
+
+// getMember returns the etcd member served by the given Pod.
+func getMember(memberListResp *clientv3.MemberListResponse, podName string) (*etcdserverpb.Member, bool) {
+	for _, member := range memberListResp.Members {
+		if member.Name == podName {
+			return member, true
+		}
+	}
+	return nil, false
+}
+
+// findLeader returns the member ID of the current etcd leader and the ordinal
+// of the Pod serving it.
+func findLeader(memberHealth []etcdutils.EpHealth,
+	memberListResp *clientv3.MemberListResponse,
+	clusterName string,
+	logger logr.Logger,
+) (leaderID uint64, leaderOrdinal int) {
+	leaderID, _ = etcdutils.FindLeaderStatus(memberHealth, logger)
+	if leaderID == 0 {
+		return 0, -1
+	}
+	for _, member := range memberListResp.Members {
+		if member.ID == leaderID {
+			return leaderID, podOrdinal(member.Name, clusterName)
+		}
+	}
+	return leaderID, -1
+}
+
+// nextLeaderCandidate returns the member that etcd leadership should be moved
+// to before the current leader's Pod is removed or recreated, along with that
+// member's Pod ordinal: the existing member with the lowest ordinal, excluding
+// the current leader itself.
+func nextLeaderCandidate(pods []*corev1.Pod, memberListResp *clientv3.MemberListResponse, clusterName string, currentLeaderID uint64, currentLeaderOrdinal int) (memberID uint64, ordinal int) {
+	for _, pod := range clonePods(pods, clusterName) {
+		member, ok := getMember(memberListResp, pod.Name)
+		if !ok || member.ID == currentLeaderID {
+			continue
+		}
+		return member.ID, podOrdinal(pod.Name, clusterName)
+	}
+	return currentLeaderID, currentLeaderOrdinal
 }
 
 // waitForPodReady polls until the given Pod has its Ready condition set to True,
@@ -243,7 +320,8 @@ const (
 func defaultArgs(name string, tlsEnabled bool) []string {
 	scheme := clusterScheme(tlsEnabled)
 	args := make([]string, 0, 13)
-	args = append(args,
+	args = append(
+		args,
 		"--name=$(POD_NAME)",
 		fmt.Sprintf("--listen-peer-urls=%s://0.0.0.0:2380", scheme),
 		fmt.Sprintf("--listen-client-urls=%s://0.0.0.0:2379", scheme),
@@ -253,7 +331,8 @@ func defaultArgs(name string, tlsEnabled bool) []string {
 	if !tlsEnabled {
 		return args
 	}
-	return append(args,
+	return append(
+		args,
 		"--cert-file="+serverCertFile,
 		"--key-file="+serverKeyFile,
 		"--trusted-ca-file="+serverTrustedCAFile,
@@ -363,7 +442,8 @@ func buildMemberPod(ec *ecv1alpha1.EtcdCluster, podName string, initialClusterSt
 	// setup TLS certificate volumes. Both the pod Volume and VolumeMount are
 	// declared together so the etcd TLS args file paths resolve at runtime.
 	if ec.Spec.TLS != nil {
-		podSpec.Volumes = append(podSpec.Volumes,
+		podSpec.Volumes = append(
+			podSpec.Volumes,
 			corev1.Volume{
 				Name: "server-secret",
 				VolumeSource: corev1.VolumeSource{
@@ -379,7 +459,8 @@ func buildMemberPod(ec *ecv1alpha1.EtcdCluster, podName string, initialClusterSt
 		)
 
 		etcdContainer := &podSpec.Containers[0]
-		etcdContainer.VolumeMounts = append(etcdContainer.VolumeMounts,
+		etcdContainer.VolumeMounts = append(
+			etcdContainer.VolumeMounts,
 			corev1.VolumeMount{
 				Name:      "server-secret",
 				MountPath: serverCertMountDir,
