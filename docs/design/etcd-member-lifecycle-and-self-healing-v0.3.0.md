@@ -118,13 +118,15 @@ this alarm, don't redo it," etc.
    this same remedy, bypassing the heuristic whenever etcd's own
    consistency checking catches the corruption itself.
 6. When multiple members are broken, fix them **one at a time** — except
-   `NOSPACE`/`CORRUPT` alarm remediation, and a lost-quorum recovery already
-   under way (requirements 12–14), which are urgent enough to preempt a
-   repair already in flight on a different member. *Starting* a lost-quorum
-   recovery is different: it's tried only after `CORRUPT`/`NOSPACE`/an
-   ordinary repair attempt have all found nothing to do, since it discards
-   every other member's data and an ordinary repair might restore quorum on
-   its own. See §4.8/§4.9.
+   `NOSPACE`/`CORRUPT` alarm remediation, a lost-quorum recovery already
+   under way (requirements 12–14), and finishing the departure of a member
+   that's already `Terminating` (§4.6/§4.9), which are urgent enough to
+   preempt a repair already in flight on a different member, a member that's
+   already leaving is never a candidate for the repair ladder anyway.
+   *Starting* a lost-quorum recovery is different: it's tried only after
+   `CORRUPT`/`NOSPACE`/an ordinary repair attempt have all found nothing to
+   do, since it discards every other member's data and an ordinary repair
+   might restore quorum on its own. See §4.8/§4.9.
 7. Because fixing a member can span multiple reconcile loops, **per-member
    progress must be persisted** somewhere that survives across loops (not
    recomputed from scratch each time).
@@ -811,9 +813,10 @@ that's supposed to mean the remedy actually worked. Restarting from
 `Compacting` in that case, rather than calling `Disarm` anyway, keeps the
 cycle from ever disarming before it's actually justified.
 
-**Priority (§4.9): `CORRUPT` ranks just below a human-triggered pause and
-lost-quorum recovery, `NOSPACE` just below `CORRUPT` — both still above
-everything else.** A member failing health checks
+**Priority (§4.9): `CORRUPT` ranks just below a human-triggered pause, an
+already-started lost-quorum recovery, and cleaning up an already-`Terminating`
+member; `NOSPACE` just below `CORRUPT` — both still above everything else.**
+A member failing health checks
 because of either alarm isn't a Pod problem — the generic repair path
 (§4.6's table) would recreate the Pod, see it fail again, and waste
 `RecreateCount` strikes on a problem recreating a Pod can't solve.
@@ -923,18 +926,32 @@ the loop.
    member. Exempt from the gate (§4.2) and from waiting on anything else —
    with no quorum, nothing else can make
    progress regardless.
-3. **`CORRUPT` alarm detected on some member (§4.6).** Force that member
+3. **Clean up any `EtcdMember` with `DeletionTimestamp` set (§4.6's
+   `Terminating`).** Continue its leave sequence. Ranked here, right below
+   an already-started lost-quorum recovery and above everything else that
+   follows, because a member that's already leaving — whether from
+   scale-in or a human manually removing it — is a settled matter, not
+   something to weigh against other work: there's no reason to ever try to
+   recreate/replace it (the repair ladder never applies to a `Terminating`
+   member in the first place), it only ever touches its own Pod/PVC/cert/
+   membership state so it can't mechanically conflict with a repair in
+   flight on a different member, and leaving it parked behind CORRUPT/
+   NOSPACE/repair/scale/upgrade decisions for many loops would needlessly
+   keep a departing member's Pod and (if it's a voting member) its etcd
+   membership around, skewing health/quorum/leadership-transfer
+   calculations that the steps below rely on.
+4. **`CORRUPT` alarm detected on some member (§4.6).** Force that member
    directly to `Phase: Replacing`, regardless of what any *other* member's
    `Phase` currently is — data corruption is more urgent than letting an
    unrelated repair finish on its own schedule, and the two don't
    mechanically conflict.
-4. **`NOSPACE` alarm remediation (§4.7), if a cycle is active or new.**
+5. **`NOSPACE` alarm remediation (§4.7), if a cycle is active or new.**
    Exempt from the gate; ranked below `CORRUPT` but above everything else,
    and — for the same reason `CORRUPT` does — allowed to preempt a repair
    already in flight on a different member: a write-blocked cluster likely
    can't make progress on that repair either, and compact/defragment/disarm
    don't touch that other member's Pod or membership state.
-5. **If a member is already `Recreating`, continue it (§4.6).** There's
+6. **If a member is already `Recreating`, continue it (§4.6).** There's
    always at most one — this step itself is the only thing that ever
    starts one (requirement 6), so there's never more than one to pick
    among; just keep running its Pod-recovery ladder. Otherwise, if the
@@ -943,15 +960,13 @@ the loop.
    to reduce how often §4.5's transfer is needed) — *this* is the real
    selection, made once, at the moment a member is chosen to become
    `Recreating`.
-6. **Otherwise, decide whether to *start* lost-quorum recovery (§4.8).** If
-   the cluster still can't serve a linearizable request after steps 3–5
+7. **Otherwise, decide whether to *start* lost-quorum recovery (§4.8).** If
+   the cluster still can't serve a linearizable request after steps 3–6
    found nothing to do, and recovery isn't already under way (step 2),
    begin it — the next reconcile that finds it already running picks it up
    via step 2. Deliberately low priority: recovery discards every other
    member's data, so it's tried only once the cheaper remedies above have
    had a chance to restore quorum on their own.
-7. **Clean up any `EtcdMember` with `DeletionTimestamp` set (§4.6's
-   `Terminating`).** Continue its leave sequence.
 8. **Otherwise, advance whatever's left not-`Ready` (`Pending`/
    `Provisioning`/`Replacing`).** An existing learner always wins this slot
    — promoting it if it's caught up, otherwise simply waiting on it — over
@@ -965,26 +980,36 @@ the loop.
    gap on scale-out (§4.4), both happen.
 
 Two things about this order are easy to misread. First, per-member repair
-(step 5) outranks even *deciding* to start lost-quorum recovery (step 6) —
+(step 6) outranks even *deciding* to start lost-quorum recovery (step 7) —
 an unhealthy cluster isn't automatically a lost-quorum situation, and an
 ordinary repair might resolve it without ever resorting to a remedy that
 discards data. Second, promotion doesn't need its own early slot: an unpromoted learner is
-never `Ready`, so step 5 — which only ever touches `Ready` members — never
+never `Ready`, so step 6 — which only ever touches `Ready` members — never
 competes with it. Requirement 11 is instead enforced by step 8's
 learner-first tie-break, which never lets a *different* member's
 `Replacing` rejoin attempt a second `MemberAdd(learner)` while one is
 already pending.
 
-`CORRUPT`, `NOSPACE`, and a lost-quorum recovery already under way (steps
-2–4) still preempt a repair already in flight on a different member, per
-requirements 6/12/13; nothing from step 5 on down does — each of those
-either targets its own member deterministically (step 7) or waits its
-turn like everything else (steps 5, 8, 9).
+An already-started lost-quorum recovery, cleaning up a `Terminating`
+member, `CORRUPT`, and `NOSPACE` (steps 2–5) still preempt a repair already
+in flight on a different member, per requirements 6/12/13: recovery
+preempts because with quorum gone nothing else can reliably commit anyway;
+the other three each act on a specific, already-determined member (the
+`Terminating` one(s), the alarm's tagged member) rather than one chosen
+from among candidates the way repair (step 6) does.
 
-This priority order is a deliberate design decision: pause, lost-quorum recovery, and both
-alarm remedies are each dedicated steps with their own fixed rank, ahead of
-per-member repair, rather than being folded into it. §4.12 walks through
-today's reconcile loop phase by phase in these same terms.
+Nothing from step 6 on down preempts anything, but for two different
+reasons. Steps 6, 8, and 9 each just pick one thing to work on and
+otherwise wait their turn, the same as a repair running on some other
+member would. Step 7 (starting a lost-quorum recovery) isn't waiting its
+turn — it's deliberately held to last priority as a data-discarding
+remedy, tried only once steps 3–6 have found nothing else to do (§4.8).
+
+This priority order is a deliberate design decision: pause, lost-quorum
+recovery, cleaning up a `Terminating` member, and both alarm remedies are
+each dedicated steps with their own fixed rank, ahead of per-member repair,
+rather than being folded into it. §4.12 walks through today's reconcile
+loop phase by phase in these same terms.
 
 ### 4.10 PVC/PV and certificate ownership
 
@@ -1037,27 +1062,27 @@ one reconcile pass does, in order:
    gated, never skipped, regardless of anything below — as long as the
    cluster isn't being deleted (step 0).
 2. **§4.9's priority order** picks at most one mutating action: pause →
-   continue an already-started lost-quorum recovery → `CORRUPT` →
-   `NOSPACE` → per-member repair → decide whether to *start* lost-quorum
-   recovery → clean up any `Terminating` member → promote a learner or
+   continue an already-started lost-quorum recovery → clean up any
+   `Terminating` member → `CORRUPT` → `NOSPACE` → per-member repair →
+   decide whether to *start* lost-quorum recovery → promote a learner or
    advance whatever's left not-`Ready` → (only once every member is
    `Ready`) update-config / scale / upgrade. Each item falls through to the
    next if it finds nothing to mutate this loop (§4.9).
 
-| Phase                                 | What it does                                                                                                                                                                                                                                                                                                       |
-|---------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| Finalize cluster                      | Only runs if `EtcdCluster.DeletionTimestamp` is set; short-circuits everything else in this table for that loop (§4.13).                                                                                                                                                                                           |
-| Pause                                 | Nothing else runs this loop (§4.9 item 1, requirement 15).                                                                                                                                                                                                                                                         |
-| Continue lost-quorum recovery         | §4.8: force-new-cluster the most up-to-date member, terminate the rest, let scale-out rebuild. Off by default; only reachable once `Status.QuorumRecovery != nil` (§4.9 item 2).                                                                                                                                   |
-| `CORRUPT` alarm remediation           | Forces the tagged member directly to `Phase: Replacing` (§4.6) — reuses that state machine rather than a new one.                                                                                                                                                                                                  |
-| `NOSPACE` alarm remediation           | §4.7's compact → defragment (one member per loop, leader last) → disarm cycle.                                                                                                                                                                                                                                     |
-| Per-member repair                     | Continues the one member already `Recreating`, if any (there's never more than one); otherwise picks exactly one newly-unhealthy `Ready` member and starts `Recreating` it. Runs the shared Pod-recovery ladder (§4.6) — the same ladder a still-`Provisioning` member whose Pod never came up is already running. |
-| Start lost-quorum recovery            | Only once `CORRUPT`/`NOSPACE`/per-member repair found nothing to do and the cluster is still unhealthy (§4.9 item 6) — a last resort, since it discards every other member's data.                                                                                                                                 |
-| Clean up `Terminating` members        | Continues the leave sequence for any `EtcdMember` with `DeletionTimestamp` set (§4.6).                                                                                                                                                                                                                             |
-| Promote learner / advance not-`Ready` | An existing learner always wins this slot (requirement 11); otherwise the lowest-ordinal not-`Ready` member (`Pending`/`Provisioning`/`Replacing`, including bootstrapping ordinal 0) continues its progress.                                                                                                      |
-| Update config                         | Decides *which* member updates first (highest ordinal, one at a time), runs the §4.5 transfer first if needed, then recreates the Pod.                                                                                                                                                                             |
-| Scale out/in                          | Scale-out creates an `EtcdMember` at the lowest missing ordinal, or `max+1` if there's no gap to reuse (§4.4), and does the join mechanics (§4.6). Scale-in calls plain `client.Delete()` on the highest ordinal; the actual cleanup happens via the finalizer-driven `Terminating` flow.                          |
-| Upgrade                               | Bumps one `EtcdMember.Spec.Version` at a time (highest ordinal, non-leader first as a preference); the member notices the drift and recreates — a "planned" recreate, bumping `RecreateCount` like any other Pod creation but immediately reset to 0 once healthy again (§4.6).                                    |
+| Phase                                 | What it does                                                                                                                                                                                                                                                                                                              |
+|---------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Finalize cluster                      | Only runs if `EtcdCluster.DeletionTimestamp` is set; short-circuits everything else in this table for that loop (§4.13).                                                                                                                                                                                                  |
+| Pause                                 | Nothing else runs this loop (§4.9 item 1, requirement 15).                                                                                                                                                                                                                                                                |
+| Continue lost-quorum recovery         | §4.8: force-new-cluster the most up-to-date member, terminate the rest, let scale-out rebuild. Off by default; only reachable once `Status.QuorumRecovery != nil` (§4.9 item 2).                                                                                                                                          |
+| Clean up `Terminating` members        | Continues the leave sequence for any `EtcdMember` with `DeletionTimestamp` set (§4.6). Ranked above `CORRUPT`/`NOSPACE`/per-member repair (§4.9 item 3): a member that's already leaving is never worth trying to fix, only touches its own Pod/PVC/cert/membership state, and shouldn't linger behind other remediation. |
+| `CORRUPT` alarm remediation           | Forces the tagged member directly to `Phase: Replacing` (§4.6) — reuses that state machine rather than a new one.                                                                                                                                                                                                         |
+| `NOSPACE` alarm remediation           | §4.7's compact → defragment (one member per loop, leader last) → disarm cycle.                                                                                                                                                                                                                                            |
+| Per-member repair                     | Continues the one member already `Recreating`, if any (there's never more than one); otherwise picks exactly one newly-unhealthy `Ready` member and starts `Recreating` it. Runs the shared Pod-recovery ladder (§4.6) — the same ladder a still-`Provisioning` member whose Pod never came up is already running.        |
+| Start lost-quorum recovery            | Only once `CORRUPT`/`NOSPACE`/per-member repair found nothing to do and the cluster is still unhealthy (§4.9 item 7) — a last resort, since it discards every other member's data.                                                                                                                                        |
+| Promote learner / advance not-`Ready` | An existing learner always wins this slot (requirement 11); otherwise the lowest-ordinal not-`Ready` member (`Pending`/`Provisioning`/`Replacing`, including bootstrapping ordinal 0) continues its progress.                                                                                                             |
+| Update config                         | Decides *which* member updates first (highest ordinal, one at a time), runs the §4.5 transfer first if needed, then recreates the Pod.                                                                                                                                                                                    |
+| Scale out/in                          | Scale-out creates an `EtcdMember` at the lowest missing ordinal, or `max+1` if there's no gap to reuse (§4.4), and does the join mechanics (§4.6). Scale-in calls plain `client.Delete()` on the highest ordinal; the actual cleanup happens via the finalizer-driven `Terminating` flow.                                 |
+| Upgrade                               | Bumps one `EtcdMember.Spec.Version` at a time (highest ordinal, non-leader first as a preference); the member notices the drift and recreates — a "planned" recreate, bumping `RecreateCount` like any other Pod creation but immediately reset to 0 once healthy again (§4.6).                                           |
 
 The last three rows only run once every existing `EtcdMember` is `Ready`
 (§4.2's gate); everything above them runs regardless, per §4.9's ordering.
@@ -1259,7 +1284,9 @@ the CRD version.
   always wins the not-`Ready` catch-all over any other not-ready member,
   so a second `MemberAdd(learner)` never gets attempted), `NOSPACE`'s
   resumability and cycle-restart behavior, `CORRUPT` pre-empting an
-  in-flight repair on a different member, lost-quorum recovery end-to-end
+  in-flight repair on a different member, cleaning up a `Terminating`
+  member pre-empting `CORRUPT`/`NOSPACE`/an in-flight repair on a different
+  member, lost-quorum recovery end-to-end
   (continuation outranks `CORRUPT`/`NOSPACE`/per-member repair once
   started; starting it in the first place only happens after those find
   nothing to do), and `Spec.Paused`

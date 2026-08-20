@@ -461,21 +461,6 @@ func TestDispatch(t *testing.T) {
 		}
 	}
 
-	t.Run("Paused wins regardless of other state", func(t *testing.T) {
-		ctx := t.Context()
-		ec := baseCluster()
-		ec.Spec.Paused = true
-		ec.Status.QuorumRecovery = &ecv1alpha1.QuorumRecoveryStatus{Survivor: 0}
-
-		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ec).Build()
-		r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
-		state := &reconcileState{cluster: ec}
-
-		res, err := r.dispatch(ctx, state)
-		assert.NoError(t, err)
-		assert.Equal(t, ctrl.Result{RequeueAfter: requeueDuration}, res)
-	})
-
 	t.Run("Terminating member stops the loop before scale-out is attempted", func(t *testing.T) {
 		ctx := t.Context()
 		ec := baseCluster()
@@ -565,6 +550,43 @@ func TestDispatch(t *testing.T) {
 		require.NoError(t, fakeClient.Get(ctx, client.ObjectKey{Name: "etcd-1", Namespace: ec.Namespace}, member))
 		assert.Equal(t, 1, member.Spec.Ordinal)
 	})
+}
+
+// TestReconcilePaused verifies requirement 15's pause gate: Spec.Paused
+// skips dispatch (so no scale-out/EtcdMember mutation happens) but the
+// cluster-prereqs and always-on-refresh phases ahead of it in Reconcile
+// still run, since dispatch is no longer where Paused is checked (moved out
+// per reconcile_loop_v0.3.0.png's dedicated "Pause Reconciliation" box).
+func TestReconcilePaused(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = ecv1alpha1.AddToScheme(scheme)
+
+	ec := &ecv1alpha1.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "etcd", Namespace: "default", UID: "1"},
+		Spec:       ecv1alpha1.EtcdClusterSpec{Size: 3, Version: "3.5.17", Paused: true},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&ecv1alpha1.EtcdCluster{}).
+		WithObjects(ec).
+		Build()
+	r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
+
+	res, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: ec.Name, Namespace: ec.Namespace}})
+	assert.NoError(t, err)
+	assert.Equal(t, ctrl.Result{RequeueAfter: requeueDuration}, res)
+
+	// Dispatch (scale-out included) must not have run: no EtcdMember got
+	// created towards Spec.Size, even though there are zero today.
+	members := &ecv1alpha1.EtcdMemberList{}
+	require.NoError(t, fakeClient.List(t.Context(), members, client.InNamespace(ec.Namespace)))
+	assert.Empty(t, members.Items)
+
+	// Cluster prerequisites (ahead of the Pause check) must still have run.
+	svc := &corev1.Service{}
+	assert.NoError(t, fakeClient.Get(t.Context(), client.ObjectKey{Name: ec.Name, Namespace: ec.Namespace}, svc))
 }
 
 // TestEnsureClusterFinalizer verifies clusterCleanupFinalizer gets added

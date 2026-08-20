@@ -98,10 +98,19 @@ type reconcileState struct {
 //  2. Cluster prerequisites: certs, TLS config, headless Service — always,
 //     independent of anything below.
 //  3. Always-on refresh (§4.2): live member list/health, never gated.
-//  4. Dispatch: §4.9's priority order picks at most one mutating action —
-//     pause, lost-quorum recovery, CORRUPT/NOSPACE remediation, per-member
-//     repair, Terminating cleanup, promote/advance-not-ready, and finally
-//     (only once every existing member is Ready) update-config/scale/upgrade.
+//  4. Pause (§4.9 item 1, requirement 15): skip dispatch entirely for this
+//     loop. Checked here, right after the always-on refresh and ahead of
+//     dispatch, rather than literally ahead of Validation/Cluster
+//     prerequisites like reconcile_loop_v0.3.0.png's "Pause Reconciliation"
+//     box draws it — the refresh (and buildReconcileClientTLS's TLS config
+//     it depends on, built during Cluster prerequisites) must keep running
+//     while paused so status doesn't go stale (requirement 15), so pause
+//     can't gate those two phases without breaking that guarantee.
+//  5. Dispatch: §4.9's priority order (items 2-9) picks at most one
+//     mutating action — lost-quorum recovery, Terminating cleanup,
+//     CORRUPT/NOSPACE remediation, per-member repair, promote/advance-not-ready,
+//     and finally (only once every existing member is Ready)
+//     update-config/scale/upgrade.
 //
 // See docs/design/etcd-member-lifecycle-and-self-healing-v0.3.0.md and
 // reconcile_loop_v0.3.0.png for the full workflow this implements. Several
@@ -158,7 +167,14 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, err
 	}
 
-	// 4. Dispatch: §4.9's priority order.
+	// 4. Pause (requirement 15): do nothing else at all this loop, ahead of
+	// dispatch (including an already-started lost-quorum recovery).
+	if state.cluster.Spec.Paused {
+		log.FromContext(ctx).Info("EtcdCluster is paused; skipping all mutating actions")
+		return ctrl.Result{RequeueAfter: requeueDuration}, nil
+	}
+
+	// 5. Dispatch: §4.9's priority order (items 2-9).
 	return r.dispatch(ctx, state)
 }
 
@@ -315,8 +331,7 @@ func (r *EtcdClusterReconciler) ensureClusterPrereqs(ctx context.Context, s *rec
 
 // refreshClusterState fetches the live etcd member list and per-endpoint
 // health and stores them on reconcileState for the dispatcher below. Always
-// runs, never gated by member readiness (§4.2) — the health-driven "fix" is
-// the dispatcher's per-member-repair step (§4.9 item 5), not this phase.
+// runs, never gated by member readiness (§4.2).
 func (r *EtcdClusterReconciler) refreshClusterState(ctx context.Context, s *reconcileState) error {
 	logger := log.FromContext(ctx)
 	logger.Info("Now checking health of the cluster members")
@@ -334,26 +349,19 @@ func (r *EtcdClusterReconciler) refreshClusterState(ctx context.Context, s *reco
 	return nil
 }
 
-// dispatch implements design doc §4.9's priority order: at most one mutating
-// action per reconcile. Each numbered step either claims the loop (returns a
-// non-zero Result or an error) or falls through to the next; only an item
-// that actually takes a mutating action ends the loop.
+// dispatch implements design doc §4.9's priority order, items 2-9:
+// at most one mutating action per reconcile. Each numbered step either
+// claims the loop (returns a non-zero Result or an error) or falls through
+// to the next; only an item that actually takes a mutating action ends the
+// loop.
 //
-// Steps 2-8 are TODO no-ops in this milestone (M2) — the mechanics they'd
+// Steps 4-8 are TODO no-ops in this milestone (M2) — the mechanics they'd
 // trigger (join/promote/repair/leave, CORRUPT/NOSPACE remediation,
 // lost-quorum recovery) land in M3-M5 — but the detection that decides
 // *whether* a step claims the loop is real, so the priority order itself is
 // reviewable now, ahead of any of that behavior landing.
 func (r *EtcdClusterReconciler) dispatch(ctx context.Context, s *reconcileState) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
-
-	// 1. Spec.Paused (requirement 15): do nothing else at all this loop,
-	// ahead of everything below, including an already-started lost-quorum
-	// recovery.
-	if s.cluster.Spec.Paused {
-		logger.Info("EtcdCluster is paused; skipping all mutating actions")
-		return ctrl.Result{RequeueAfter: requeueDuration}, nil
-	}
 
 	// 2. Continue an already-started lost-quorum recovery (§4.8).
 	if s.cluster.Status.QuorumRecovery != nil {
@@ -364,38 +372,17 @@ func (r *EtcdClusterReconciler) dispatch(ctx context.Context, s *reconcileState)
 		return ctrl.Result{RequeueAfter: requeueDuration}, nil
 	}
 
-	// 3. CORRUPT alarm on some member (§4.6/§4.7).
-	// TODO: §4.9 item 3 — force the tagged member to Phase: Replacing
-	// (M4). Detection needs etcdutils.AlarmList, not fetched yet in this
-	// milestone, so this step can never fire until M4 lands.
-
-	// 4. NOSPACE alarm remediation (§4.7).
-	// TODO: §4.9 item 4 — compact/defragment/disarm cycle (M4). Same
-	// as above, needs AlarmList.
-
-	// 5. Per-member repair: continue a member already Recreating, or start
-	// fixing exactly one newly-unhealthy Ready member (requirement 6).
-	for _, m := range s.members {
-		if m.Status.Phase == ecv1alpha1.EtcdMemberRecreating {
-			// TODO: §4.9 item 5 — continue the shared Pod-recovery
-			// ladder (§4.6, M3).
-			logger.Info("Member is Recreating; per-member repair not implemented yet", "member", m.Name)
-			return ctrl.Result{RequeueAfter: requeueDuration}, nil
-		}
-	}
-	// TODO: §4.9 item 5 — picking a newly-unhealthy Ready member to
-	// start Recreating needs the live-health-to-EtcdMember mapping M3/M6
-	// add; not wired up yet, so this half of the step never fires either.
-
-	// 6. Decide whether to *start* lost-quorum recovery (§4.8/§4.9 item 6).
-	// TODO: opt-in, and only once steps 3-5 above find nothing to do
-	// and the cluster is still unhealthy (M5).
-
-	// 7. Clean up any EtcdMember with DeletionTimestamp set (§4.6's
-	// Terminating).
+	// 3. Clean up any EtcdMember already Terminating (§4.6/§4.9 item 3,
+	// reconcile_loop_v0.3.0.png). Ranked here — above CORRUPT/NOSPACE/
+	// per-member repair — because a member that's already leaving (from
+	// scale-in, or a user manually removing it) is a settled matter: it's
+	// never a repair candidate, only ever touches its own Pod/PVC/cert/
+	// membership state, and shouldn't linger behind other remediation.
 	for i := range s.members {
 		m := &s.members[i]
 		if m.DeletionTimestamp != nil {
+			// TODO: §4.6's real six-step leave sequence (M3); clearing the
+			// finalizer directly is an interim workaround.
 			logger.Info("Member is Terminating; leave sequence not implemented yet, "+
 				"clearing finalizer as an interim workaround", "member", m.Name)
 			if err := r.clearMemberFinalizer(ctx, m); err != nil {
@@ -404,6 +391,33 @@ func (r *EtcdClusterReconciler) dispatch(ctx context.Context, s *reconcileState)
 			return ctrl.Result{RequeueAfter: requeueDuration}, nil
 		}
 	}
+
+	// 4. CORRUPT alarm on some member (§4.6/§4.7).
+	// TODO: §4.9 item 4 — force the tagged member to Phase: Replacing
+	// (M4). Detection needs etcdutils.AlarmList, not fetched yet in this
+	// milestone, so this step can never fire until M4 lands.
+
+	// 5. NOSPACE alarm remediation (§4.7).
+	// TODO: §4.9 item 5 — compact/defragment/disarm cycle (M4). Same
+	// as above, needs AlarmList.
+
+	// 6. Per-member repair: continue a member already Recreating, or start
+	// fixing exactly one newly-unhealthy Ready member (requirement 6).
+	for _, m := range s.members {
+		if m.Status.Phase == ecv1alpha1.EtcdMemberRecreating {
+			// TODO: §4.9 item 6 — continue the shared Pod-recovery
+			// ladder (§4.6, M3).
+			logger.Info("Member is Recreating; per-member repair not implemented yet", "member", m.Name)
+			return ctrl.Result{RequeueAfter: requeueDuration}, nil
+		}
+	}
+	// TODO: §4.9 item 6 — picking a newly-unhealthy Ready member to
+	// start Recreating needs the live-health-to-EtcdMember mapping M3/M6
+	// add; not wired up yet, so this half of the step never fires either.
+
+	// 7. Decide whether to *start* lost-quorum recovery (§4.8/§4.9 item 7).
+	// TODO: opt-in, and only once steps 3-6 above find nothing to do
+	// and the cluster is still unhealthy (M5).
 
 	// 8. Advance whatever's left not-Ready (Pending/Provisioning/Replacing).
 	// An existing learner always wins this slot (requirement 11).
@@ -415,9 +429,7 @@ func (r *EtcdClusterReconciler) dispatch(ctx context.Context, s *reconcileState)
 		return ctrl.Result{RequeueAfter: requeueDuration}, nil
 	}
 
-	// 9. Everything existing is Ready (§4.2's gate): steps 5, 7 and 8 above
-	// already return before reaching here whenever a member is Recreating,
-	// Terminating, or otherwise not-Ready, so update-config/scale/upgrade
+	// 9. Everything existing is Ready (§4.2's gate), so update-config/scale/upgrade
 	// only ever run once every member is Ready.
 	if res, err := r.updateConfig(ctx, s); err != nil || !res.IsZero() {
 		return res, err
@@ -441,11 +453,12 @@ func (r *EtcdClusterReconciler) ensureClusterFinalizer(ctx context.Context, s *r
 
 // finalizeCluster handles an EtcdCluster with DeletionTimestamp set: it
 // removes every EtcdMember it still owns — reusing the same interim
-// finalizer-clearing dispatch()'s step 7 uses for a single Terminating
-// member — and, once none remain, releases clusterCleanupFinalizer so
-// Kubernetes can finish deleting the EtcdCluster itself.
+// finalizer-clearing dispatch()'s Terminating-cleanup step uses for a
+// single Terminating member — and, once none remain, releases
+// clusterCleanupFinalizer so Kubernetes can finish deleting the EtcdCluster
+// itself.
 //
-// TODO: like step 7, this skips the real six-step leave sequence (§4.6,
+// TODO: like that step, this skips the real six-step leave sequence (§4.6,
 // M3): members are removed without ever calling etcd's MemberRemove, so
 // deleting a cluster with live members can leave stale entries in etcd's
 // own membership list. Acceptable for now because the Pods backing those
@@ -480,9 +493,9 @@ func (r *EtcdClusterReconciler) finalizeCluster(ctx context.Context, s *reconcil
 }
 
 // clearMemberFinalizer removes memberCleanupFinalizer from m, letting
-// Kubernetes finish deleting it. Shared by dispatch()'s step 7 (a single
-// Terminating member, cluster otherwise alive) and finalizeCluster (every
-// member, cluster itself being deleted).
+// Kubernetes finish deleting it. Shared by dispatch()'s Terminating-cleanup
+// step (a single Terminating member, cluster otherwise alive) and
+// finalizeCluster (every member, cluster itself being deleted).
 func (r *EtcdClusterReconciler) clearMemberFinalizer(ctx context.Context, m *ecv1alpha1.EtcdMember) error {
 	if !controllerutil.RemoveFinalizer(m, memberCleanupFinalizer) {
 		return nil
