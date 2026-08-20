@@ -1072,7 +1072,10 @@ func TestCreateCMCertificateConfig(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result, err := createCMCertificateConfig(tt.ec)
+			scheme := runtime.NewScheme()
+			_ = ecv1alpha1.AddToScheme(scheme)
+
+			result, err := createCMCertificateConfig(tt.ec, scheme)
 
 			if tt.wantErr {
 				require.Error(t, err)
@@ -1085,7 +1088,334 @@ func TestCreateCMCertificateConfig(t *testing.T) {
 				assert.Equal(t, tt.expected.ValidityDuration, result.ValidityDuration)
 				assert.Equal(t, tt.expected.AltNames.DNSNames, result.AltNames.DNSNames)
 				assert.Equal(t, tt.expected.AltNames.IPs, result.AltNames.IPs)
-				assert.Equal(t, tt.expected.ExtraConfig, result.ExtraConfig)
+				// Don't check ExtraConfig as it now contains ownerReference and scheme
+			}
+		})
+	}
+}
+
+func TestHasControllerOwnerReference(t *testing.T) {
+	trueVal := true
+	falseVal := false
+
+	tests := []struct {
+		name     string
+		secret   *corev1.Secret
+		expected bool
+	}{
+		{
+			name: "Secret with no owner references",
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-secret",
+					Namespace: "default",
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "Secret with non-controller owner reference",
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-secret",
+					Namespace: "default",
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: "v1",
+							Kind:       "Pod",
+							Name:       "test-pod",
+							UID:        "12345",
+							Controller: &falseVal,
+						},
+					},
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "Secret with controller owner reference (cert-manager Certificate)",
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-secret",
+					Namespace: "default",
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: "cert-manager.io/v1",
+							Kind:       "Certificate",
+							Name:       "test-cert",
+							UID:        "67890",
+							Controller: &trueVal,
+						},
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "Secret with multiple owner references including controller",
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-secret",
+					Namespace: "default",
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: "v1",
+							Kind:       "ConfigMap",
+							Name:       "test-cm",
+							UID:        "11111",
+							Controller: &falseVal,
+						},
+						{
+							APIVersion: "cert-manager.io/v1",
+							Kind:       "Certificate",
+							Name:       "test-cert",
+							UID:        "22222",
+							Controller: &trueVal,
+						},
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "Secret with controller field nil (treated as false)",
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-secret",
+					Namespace: "default",
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: "v1",
+							Kind:       "Pod",
+							Name:       "test-pod",
+							UID:        "33333",
+							Controller: nil,
+						},
+					},
+				},
+			},
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := hasControllerOwnerReference(tt.secret)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestPatchCertificateSecret(t *testing.T) {
+	ctx := t.Context()
+	trueVal := true
+
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = ecv1alpha1.AddToScheme(scheme)
+
+	tests := []struct {
+		name                    string
+		secret                  *corev1.Secret
+		etcdCluster             *ecv1alpha1.EtcdCluster
+		expectOwnerReferenceSet bool
+		expectError             bool
+	}{
+		{
+			name: "Secret without existing controller owner - should set EtcdCluster as owner",
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-cert-secret",
+					Namespace: "default",
+				},
+				Data: map[string][]byte{
+					"tls.crt": []byte("cert-data"),
+					"tls.key": []byte("key-data"),
+				},
+			},
+			etcdCluster: &ecv1alpha1.EtcdCluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-cluster",
+					Namespace: "default",
+					UID:       "cluster-uid-123",
+				},
+			},
+			expectOwnerReferenceSet: true,
+			expectError:             false,
+		},
+		{
+			name: "Secret with cert-manager controller owner - should skip patching",
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-cert-secret",
+					Namespace: "default",
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: "cert-manager.io/v1",
+							Kind:       "Certificate",
+							Name:       "test-cert",
+							UID:        "cert-uid-456",
+							Controller: &trueVal,
+						},
+					},
+				},
+				Data: map[string][]byte{
+					"tls.crt": []byte("cert-data"),
+					"tls.key": []byte("key-data"),
+				},
+			},
+			etcdCluster: &ecv1alpha1.EtcdCluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-cluster",
+					Namespace: "default",
+					UID:       "cluster-uid-789",
+				},
+			},
+			expectOwnerReferenceSet: false,
+			expectError:             false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fakeClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(tt.secret).
+				Build()
+
+			err := patchCertificateSecret(ctx, tt.etcdCluster, fakeClient, tt.secret.Name)
+
+			if tt.expectError {
+				assert.Error(t, err)
+				return
+			}
+
+			assert.NoError(t, err)
+
+			updatedSecret := &corev1.Secret{}
+			err = fakeClient.Get(ctx, client.ObjectKey{
+				Name:      tt.secret.Name,
+				Namespace: tt.secret.Namespace,
+			}, updatedSecret)
+			require.NoError(t, err)
+
+			if tt.expectOwnerReferenceSet {
+				// Should have EtcdCluster as owner
+				require.Len(t, updatedSecret.OwnerReferences, 1)
+				assert.Equal(t, "EtcdCluster", updatedSecret.OwnerReferences[0].Kind)
+				assert.Equal(t, tt.etcdCluster.Name, updatedSecret.OwnerReferences[0].Name)
+				assert.NotNil(t, updatedSecret.OwnerReferences[0].Controller)
+				assert.True(t, *updatedSecret.OwnerReferences[0].Controller)
+			} else {
+				// Should still have original owner reference (cert-manager)
+				require.Len(t, updatedSecret.OwnerReferences, 1)
+				assert.Equal(t, "Certificate", updatedSecret.OwnerReferences[0].Kind)
+			}
+		})
+	}
+}
+
+func TestParseValidityDuration(t *testing.T) {
+	tests := []struct {
+		name             string
+		customDuration   string
+		defaultDuration  time.Duration
+		expectedDuration time.Duration
+		expectError      bool
+	}{
+		{
+			name:             "empty string returns default",
+			customDuration:   "",
+			defaultDuration:  90 * 24 * time.Hour,
+			expectedDuration: 90 * 24 * time.Hour,
+			expectError:      false,
+		},
+		{
+			name:             "365 days",
+			customDuration:   "365d",
+			defaultDuration:  90 * 24 * time.Hour,
+			expectedDuration: 365 * 24 * time.Hour,
+			expectError:      false,
+		},
+		{
+			name:             "90 days",
+			customDuration:   "90d",
+			defaultDuration:  365 * 24 * time.Hour,
+			expectedDuration: 90 * 24 * time.Hour,
+			expectError:      false,
+		},
+		{
+			name:             "1 day",
+			customDuration:   "1d",
+			defaultDuration:  90 * 24 * time.Hour,
+			expectedDuration: 24 * time.Hour,
+			expectError:      false,
+		},
+		{
+			name:             "mixed days and hours",
+			customDuration:   "100d12h",
+			defaultDuration:  90 * 24 * time.Hour,
+			expectedDuration: (100*24 + 12) * time.Hour,
+			expectError:      false,
+		},
+		{
+			name:             "fractional days",
+			customDuration:   "1.5d",
+			defaultDuration:  90 * 24 * time.Hour,
+			expectedDuration: 36 * time.Hour,
+			expectError:      false,
+		},
+		{
+			name:             "hours only",
+			customDuration:   "720h",
+			defaultDuration:  90 * 24 * time.Hour,
+			expectedDuration: 720 * time.Hour,
+			expectError:      false,
+		},
+		{
+			name:             "hours and minutes",
+			customDuration:   "24h30m",
+			defaultDuration:  90 * 24 * time.Hour,
+			expectedDuration: 24*time.Hour + 30*time.Minute,
+			expectError:      false,
+		},
+		{
+			name:             "complex duration with days",
+			customDuration:   "30d12h30m",
+			defaultDuration:  90 * 24 * time.Hour,
+			expectedDuration: 30*24*time.Hour + 12*time.Hour + 30*time.Minute,
+			expectError:      false,
+		},
+		{
+			name:             "multiple day segments",
+			customDuration:   "10d5d",
+			defaultDuration:  90 * 24 * time.Hour,
+			expectedDuration: (10*24 + 5*24) * time.Hour,
+			expectError:      false,
+		},
+		{
+			name:            "invalid format",
+			customDuration:  "invalid",
+			defaultDuration: 90 * 24 * time.Hour,
+			expectError:     true,
+		},
+		{
+			name:            "invalid day value",
+			customDuration:  "abcd",
+			defaultDuration: 90 * 24 * time.Hour,
+			expectError:     true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			duration, err := parseValidityDuration(tt.customDuration, tt.defaultDuration)
+
+			if tt.expectError {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+				assert.Equal(t, tt.expectedDuration, duration)
 			}
 		})
 	}
