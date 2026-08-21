@@ -93,12 +93,17 @@ type reconcileState struct {
 // EtcdClusterReconciler reconciles both EtcdCluster and its owned EtcdMember
 // objects — there is no second controller (design doc §4.1). Each loop:
 //
-//  0. Fetch: get the EtcdCluster resource, its owned EtcdMembers and Pods.
-//  1. Validation: validate EtcdCluster.Spec.
-//  2. Cluster prerequisites: certs, TLS config, headless Service — always,
+//  1. Fetch: get the EtcdCluster resource, its owned EtcdMembers and Pods.
+//  2. Finalizer EtcdCluster:
+//     finalize a cluster with DeletionTimestamp set, or else ensure
+//     clusterCleanupFinalizer is present. Checked ahead of
+//     Validation/Cluster prerequisites so a paused or spec-invalid cluster
+//     can still be deleted.
+//  3. Validation: validate EtcdCluster.Spec.
+//  4. Cluster prerequisites: certs, TLS config, headless Service — always,
 //     independent of anything below.
-//  3. Always-on refresh (§4.2): live member list/health, never gated.
-//  4. Pause (§4.9 item 1, requirement 15): skip dispatch entirely for this
+//  5. Always-on refresh (§4.2): live member list/health, never gated.
+//  6. Pause (§4.9 item 1, requirement 15): skip dispatch entirely for this
 //     loop. Checked here, right after the always-on refresh and ahead of
 //     dispatch, rather than literally ahead of Validation/Cluster
 //     prerequisites like reconcile_loop_v0.3.0.png's "Pause Reconciliation"
@@ -106,7 +111,7 @@ type reconcileState struct {
 //     it depends on, built during Cluster prerequisites) must keep running
 //     while paused so status doesn't go stale (requirement 15), so pause
 //     can't gate those two phases without breaking that guarantee.
-//  5. Dispatch: §4.9's priority order (items 2-9) picks at most one
+//  7. Dispatch: §4.9's priority order (items 2-9) picks at most one
 //     mutating action — lost-quorum recovery, Terminating cleanup,
 //     CORRUPT/NOSPACE remediation, per-member repair, promote/advance-not-ready,
 //     and finally (only once every existing member is Ready)
@@ -135,14 +140,14 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		}
 	}()
 
-	// 0. Fetch: get the EtcdCluster resource and its owned EtcdMembers/Pods.
+	// 1. Fetch: get the EtcdCluster resource and its owned EtcdMembers/Pods.
 	state, res, err = r.fetchAndValidateState(ctx, req)
 	if state == nil || err != nil {
 		return res, err
 	}
 	log.FromContext(ctx).Info("Reconciling EtcdCluster", "spec", state.cluster.Spec)
 
-	// 0.5 Finalizer bookkeeping (§4.3-style, one level up from EtcdMember's):
+	// 2. Finalizer EtcdCluster:
 	// checked ahead of Paused/validation/prereqs so a paused or spec-invalid
 	// cluster can still be deleted.
 	if state.cluster.DeletionTimestamp != nil {
@@ -152,29 +157,29 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, err
 	}
 
-	// 1. Validation: validate EtcdCluster.Spec.
+	// 3. Validation: validate EtcdCluster.Spec.
 	if err = r.validateSpec(ctx, state); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// 2. Cluster prerequisites: certs, TLS config, headless Service.
+	// 4. Cluster prerequisites: certs, TLS config, headless Service.
 	if err = r.ensureClusterPrereqs(ctx, state); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// 3. Always-on refresh: live member list/health (§4.2) — never gated.
+	// 5. Always-on refresh: live member list/health (§4.2) — never gated.
 	if err = r.refreshClusterState(ctx, state); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// 4. Pause (requirement 15): do nothing else at all this loop, ahead of
+	// 6. Pause (requirement 15): do nothing else at all this loop, ahead of
 	// dispatch (including an already-started lost-quorum recovery).
 	if state.cluster.Spec.Paused {
 		log.FromContext(ctx).Info("EtcdCluster is paused; skipping all mutating actions")
 		return ctrl.Result{RequeueAfter: requeueDuration}, nil
 	}
 
-	// 5. Dispatch: §4.9's priority order (items 2-9).
+	// 7. Dispatch: §4.9's priority order (items 2-9).
 	return r.dispatch(ctx, state)
 }
 
@@ -364,6 +369,10 @@ func (r *EtcdClusterReconciler) dispatch(ctx context.Context, s *reconcileState)
 	logger := log.FromContext(ctx)
 
 	// 2. Continue an already-started lost-quorum recovery (§4.8).
+	// We should check whether the cluster is healthy first. If yes,
+	// cleanup the Status.QuorumRecovery; if no, then check whether
+	// it's an already-started lost-quorum recovery, and continue to
+	// do it if present.
 	if s.cluster.Status.QuorumRecovery != nil {
 		// TODO: §4.8/§4.9 item 2 — force-new-cluster the survivor,
 		// terminate the rest, let scale-out rebuild (M5).
