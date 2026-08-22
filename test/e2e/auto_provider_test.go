@@ -197,7 +197,7 @@ func TestClusterAutoCertCreation(t *testing.T) {
 
 	feature.Assess("Wait for etcd pods readiness",
 		func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-			if err := waitForPodReadiness(t, c, etcdClusterName, size); err != nil {
+			if err := waitForAllEtcdMemberReady(t, c, etcdCluster); err != nil {
 				t.Fatalf("etcd pods of cluster %s failed to reach readiness for %d replicas: %v", etcdClusterName, size, err)
 			}
 			return ctx

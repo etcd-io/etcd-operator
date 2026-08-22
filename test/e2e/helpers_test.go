@@ -105,36 +105,105 @@ func createEtcdClusterWithPVC(ctx context.Context, t *testing.T, c *envconf.Conf
 	}
 }
 
-func waitForPodReadiness(t *testing.T, c *envconf.Config, name string, expectedReplicas int) error {
+// etcdClusterRef builds a minimal EtcdCluster reference in the e2e test
+// namespace, for wait helpers that only need the cluster's name and size.
+func etcdClusterRef(name string, size int) *ecv1alpha1.EtcdCluster {
+	return &ecv1alpha1.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		Spec:       ecv1alpha1.EtcdClusterSpec{Size: size},
+	}
+}
+
+// waitForAllEtcdMemberReady waits until the cluster converges to the size
+// recorded in ec.Spec.Size, checking every layer of readiness:
+//   - EtcdMember objects: exactly that many, all Phase Ready, provisioned
+//     strictly in ascending ordinal order (a higher ordinal appearing before
+//     every lower one is Ready fails immediately).
+//   - Pods: the same number of them, all Ready.
+//   - etcd membership itself, via the etcd client: that many members with no
+//     learner left unpromoted.
+func waitForAllEtcdMemberReady(t *testing.T, c *envconf.Config, ec *ecv1alpha1.EtcdCluster) error {
 	t.Helper()
-	label := fmt.Sprintf("app=%s", name)
+	expectedMembers := ec.Spec.Size
+	// Declared outside the polling closure so a failed Pod listing can still
+	// dump logs of the Pods observed on the previous pass.
 	var pods corev1.PodList
 	return wait.For(func(ctx context.Context) (bool, error) {
-		if err := c.Client().Resources().List(ctx, &pods, resources.WithLabelSelector(label)); err != nil {
-			t.Logf("failed to list pods by label %s, %s", label, err)
-			for _, pod := range pods.Items {
-				dumpPodLogs(context.TODO(), t, c, &pod, 500)
-			}
+		var memberList ecv1alpha1.EtcdMemberList
+		if err := c.Client().Resources().List(ctx, &memberList); err != nil {
+			t.Logf("failed to list EtcdMembers for %s: %v", ec.Name, err)
 			return false, nil
 		}
 
-		var readyCnt = 0
-		var unreadyPods []string
-		for _, pod := range pods.Items {
-			if !podReady(&pod) {
-				unreadyPods = append(unreadyPods, pod.Name)
-			} else {
-				readyCnt++
+		members := map[int]ecv1alpha1.EtcdMember{}
+		for i := range memberList.Items {
+			member := memberList.Items[i]
+			if member.Namespace == ec.Namespace && member.Spec.ClusterName == ec.Name {
+				members[member.Spec.Ordinal] = member
 			}
 		}
-		if readyCnt != expectedReplicas {
-			t.Logf("found pods(%d/%d/%d) by label(%s). unready pods: %s",
-				readyCnt, len(pods.Items), expectedReplicas, label, unreadyPods)
+
+		for ordinal := range members {
+			if ordinal >= expectedMembers {
+				return false, fmt.Errorf("unexpected EtcdMember ordinal %d for size %d", ordinal, expectedMembers)
+			}
+			for previousOrdinal := range ordinal {
+				previous, exists := members[previousOrdinal]
+				if !exists || previous.Status.Phase != ecv1alpha1.EtcdMemberReady {
+					return false, fmt.Errorf(
+						"EtcdMember %d appeared before ordinal %d was Ready",
+						ordinal,
+						previousOrdinal,
+					)
+				}
+			}
+		}
+
+		if len(members) != expectedMembers {
+			return false, nil
+		}
+		for ordinal := range expectedMembers {
+			member, exists := members[ordinal]
+			if !exists || member.Status.Phase != ecv1alpha1.EtcdMemberReady {
+				return false, nil
+			}
+		}
+
+		if err := c.Client().Resources().List(ctx, &pods, resources.WithLabelSelector("app="+ec.Name)); err != nil {
+			t.Logf("failed to list Pods for %s: %v", ec.Name, err)
+			for i := range pods.Items {
+				dumpPodLogs(ctx, t, c, &pods.Items[i], 500)
+			}
+			return false, nil
+		}
+		readyPods := 0
+		for i := range pods.Items {
+			if podReady(&pods.Items[i]) {
+				readyPods++
+			}
+		}
+		if readyPods != expectedMembers {
+			t.Logf("pods ready %d/%d for cluster %s", readyPods, expectedMembers, ec.Name)
 			return false, nil
 		}
 
+		// Pods are Ready, so the etcd client endpoint exists: the live
+		// membership must match the expected size with no learner left.
+		live, err := getEtcdMemberList(t, c, ec.Namespace, ec.Name+"-0", ec.Name, ec.Spec.TLS != nil)
+		if err != nil {
+			t.Logf("failed to get etcd member list for %s: %v", ec.Name, err)
+			return false, nil
+		}
+		if len(live.Members) != expectedMembers {
+			return false, nil
+		}
+		for _, member := range live.Members {
+			if member.IsLearner {
+				return false, nil
+			}
+		}
 		return true, nil
-	}, wait.WithTimeout(5*time.Minute), wait.WithInterval(10*time.Second))
+	}, wait.WithTimeout(5*time.Minute), wait.WithInterval(2*time.Second))
 }
 
 func podReady(pod *corev1.Pod) bool {
@@ -243,18 +312,37 @@ func getEtcdMembersName2IDMapping(t *testing.T, c *envconf.Config, podName strin
 	return memberMap
 }
 
-// getEtcdMemberListPB returns the etcdserverpb.MemberListResponse by calling etcdctl -w json.
-func getEtcdMemberListPB(t *testing.T, c *envconf.Config, podName string) *etcdserverpb.MemberListResponse {
+// getEtcdMemberList returns the etcdserverpb.MemberListResponse by calling
+// etcdctl -w json inside the given Pod, using the cluster's client
+// certificates when tlsEnabled.
+func getEtcdMemberList(
+	t *testing.T,
+	c *envconf.Config,
+	podNamespace, podName, clusterName string,
+	tlsEnabled bool,
+) (*etcdserverpb.MemberListResponse, error) {
 	t.Helper()
-	stdout, stderr, err := execInPod(t, c, podName, namespace, []string{"etcdctl", "member", "list", "-w", "json"})
+	cmd := append(etcdctlCmd(podName, clusterName, podNamespace, tlsEnabled), "member", "list", "-w", "json")
+	stdout, stderr, err := execInPod(t, c, podName, podNamespace, cmd)
 	if err != nil {
-		t.Fatalf("Failed to get etcd member list: %v, stderr: %s", err, stderr)
+		return nil, fmt.Errorf("etcd member list via %s: %w, stderr: %s", podName, err, stderr)
 	}
 	var memberList etcdserverpb.MemberListResponse
 	if err := json.Unmarshal([]byte(stdout), &memberList); err != nil {
-		t.Fatalf("Failed to parse etcd member list JSON: %v", err)
+		return nil, fmt.Errorf("parsing etcd member list JSON: %w", err)
 	}
-	return &memberList
+	return &memberList, nil
+}
+
+// getEtcdMemberListPB is the fatal-on-error wrapper around getEtcdMemberList
+// for non-TLS assertions that run after the target Pod is already Ready.
+func getEtcdMemberListPB(t *testing.T, c *envconf.Config, podName string) *etcdserverpb.MemberListResponse {
+	t.Helper()
+	memberList, err := getEtcdMemberList(t, c, namespace, podName, "", false)
+	if err != nil {
+		t.Fatalf("Failed to get etcd member list: %v", err)
+	}
+	return memberList
 }
 
 // waitForNoLearners waits until the member list has the expected number of members
@@ -417,7 +505,7 @@ func dumpPodLogs(ctx context.Context, t *testing.T, c *envconf.Config, pod *core
 		return
 	}
 	client := kubernetes.NewForConfigOrDie(c.Client().RESTConfig())
-	req := client.CoreV1().Pods(namespace).GetLogs(pod.Name, &corev1.PodLogOptions{TailLines: &tailLine})
+	req := client.CoreV1().Pods(pod.Namespace).GetLogs(pod.Name, &corev1.PodLogOptions{TailLines: &tailLine})
 	stream, streamErr := req.Stream(ctx)
 	if streamErr != nil {
 		t.Logf("failed to stream log for pod %s/%s: %s", pod.Namespace, pod.Name, streamErr)

@@ -60,9 +60,12 @@ func podOrdinal(podName, clusterName string) int {
 	return ordinal
 }
 
-// listOwnedPods returns all Pods that are owned (via OwnerReference) by ec,
-// sorted in ascending ordinal order.
-func listOwnedPods(ctx context.Context, c client.Client, ec *ecv1alpha1.EtcdCluster) ([]*corev1.Pod, error) {
+// listOwnedPods returns all Pods controlled by one of the given EtcdMembers,
+// sorted by name. EtcdCluster never owns Pods directly; a Pod belongs to the
+// cluster when its controlling EtcdMember is in members. Checking against
+// this already-fetched slice avoids re-reading each Pod's controlling
+// EtcdMember from the API server.
+func listOwnedPods(ctx context.Context, c client.Client, ec *ecv1alpha1.EtcdCluster, members []ecv1alpha1.EtcdMember) ([]*corev1.Pod, error) {
 	podList := &corev1.PodList{}
 	if err := c.List(ctx, podList,
 		client.InNamespace(ec.Namespace),
@@ -71,17 +74,32 @@ func listOwnedPods(ctx context.Context, c client.Client, ec *ecv1alpha1.EtcdClus
 		return nil, fmt.Errorf("failed to list pods for cluster %s: %w", ec.Name, err)
 	}
 
-	var owned []*corev1.Pod
+	owned := []*corev1.Pod{}
 	for i := range podList.Items {
-		if metav1.IsControlledBy(&podList.Items[i], ec) {
-			owned = append(owned, &podList.Items[i])
+		pod := &podList.Items[i]
+		if podIsControlledByClusterMember(pod, members) {
+			owned = append(owned, pod)
 		}
 	}
 
 	sort.Slice(owned, func(i, j int) bool {
-		return podOrdinal(owned[i].Name, ec.Name) < podOrdinal(owned[j].Name, ec.Name)
+		return owned[i].Name < owned[j].Name
 	})
 	return owned, nil
+}
+
+func podIsControlledByClusterMember(pod *corev1.Pod, members []ecv1alpha1.EtcdMember) bool {
+	owner := metav1.GetControllerOf(pod)
+	if owner == nil || owner.APIVersion != ecv1alpha1.GroupVersion.String() || owner.Kind != "EtcdMember" {
+		return false
+	}
+
+	for i := range members {
+		if members[i].Name == owner.Name {
+			return true
+		}
+	}
+	return false
 }
 
 // isPodReady returns true when the Pod's Ready condition is True.
@@ -276,8 +294,16 @@ const (
 	HashMetadataKey = "operator.etcd.io/spec-hash"
 )
 
-// buildMemberPod constructs the Pod object for a single etcd member.
-func buildMemberPod(ec *ecv1alpha1.EtcdCluster, podName string, initialClusterState etcdClusterState, initialCluster string) *corev1.Pod {
+// buildMemberPod constructs the Pod object for a single EtcdMember using the
+// authoritative topology selected by its lifecycle reconciliation.
+func buildMemberPod(
+	ec *ecv1alpha1.EtcdCluster,
+	member *ecv1alpha1.EtcdMember,
+	initialClusterState etcdClusterState,
+	initialCluster string,
+	scheme *runtime.Scheme,
+) (*corev1.Pod, error) {
+	podName := memberPodName(ec.Name, member.Spec.Ordinal)
 	// Start with custom labels then overwrite with the mandatory defaults so
 	// that the headless-service selector is always satisfied.
 	labels := make(map[string]string)
@@ -314,7 +340,7 @@ func buildMemberPod(ec *ecv1alpha1.EtcdCluster, podName string, initialClusterSt
 
 	container := corev1.Container{
 		Name:    "etcd",
-		Image:   fmt.Sprintf("%s:%s", ec.Spec.ImageRegistry, ec.Spec.Version),
+		Image:   fmt.Sprintf("%s:%s", ec.Spec.ImageRegistry, member.Spec.Version),
 		Command: []string{"/usr/local/bin/etcd"},
 		Args:    createArgs(ec.Name, ec.Spec.EtcdOptions, clusterTLSEnabled(ec)),
 		Env:     envVars,
@@ -400,7 +426,7 @@ func buildMemberPod(ec *ecv1alpha1.EtcdCluster, podName string, initialClusterSt
 		)
 	}
 
-	return &corev1.Pod{
+	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        podName,
 			Namespace:   ec.Namespace,
@@ -409,43 +435,39 @@ func buildMemberPod(ec *ecv1alpha1.EtcdCluster, podName string, initialClusterSt
 		},
 		Spec: podSpec,
 	}
+	if err := controllerutil.SetControllerReference(member, pod, scheme); err != nil {
+		return nil, fmt.Errorf("setting EtcdMember owner on Pod %q: %w", podName, err)
+	}
+	return pod, nil
 }
 
-// createMemberPod creates a single etcd member Pod (and, if needed, its PVC)
-// for the given ordinal index.  It does not wait for the pod to become ready;
-// the caller is responsible for requeueing until the pod is healthy.
-func createMemberPod(ctx context.Context, logger logr.Logger, c client.Client, ec *ecv1alpha1.EtcdCluster, ordinal int, scheme *runtime.Scheme) error {
-	podName := memberPodName(ec.Name, ordinal)
+// createMemberPod creates a single etcd member Pod for the given EtcdMember
+// and authoritative topology. Certificates and the member's PVC are
+// idempotent prerequisites provisioned earlier by reconcileProvisioning. It
+// does not wait for the Pod to become ready; the caller requeues until live
+// etcd health converges.
+func createMemberPod(
+	ctx context.Context,
+	logger logr.Logger,
+	c client.Client,
+	ec *ecv1alpha1.EtcdCluster,
+	member *ecv1alpha1.EtcdMember,
+	initialClusterState etcdClusterState,
+	initialCluster string,
+	scheme *runtime.Scheme,
+) error {
+	podName := memberPodName(ec.Name, member.Spec.Ordinal)
 
-	// Ensure TLS certificates exist before the pod mounts them.
-	if err := applyEtcdMemberCerts(ctx, ec, c); err != nil {
+	pod, err := buildMemberPod(ec, member, initialClusterState, initialCluster, scheme)
+	if err != nil {
 		return err
 	}
 
-	// Create per-member PVC for ReadWriteOnce storage.
-	if ec.Spec.StorageSpec != nil && ec.Spec.StorageSpec.AccessModes != corev1.ReadWriteMany {
-		if err := createPVCForMember(ctx, c, ec, podName, scheme); err != nil {
-			return err
-		}
-	}
-
-	state := etcdClusterStateExisting
-	if ordinal == 0 {
-		state = etcdClusterStateNew
-	}
-
-	// Build the initial-cluster value: all peers from ordinal 0 to this one.
-	var clusterParts []string
-	for i := range ordinal + 1 {
-		name, peerURL := peerEndpointForOrdinalIndex(ec, i)
-		clusterParts = append(clusterParts, fmt.Sprintf("%s=%s", name, peerURL))
-	}
-
-	pod := buildMemberPod(ec, podName, state, strings.Join(clusterParts, ","))
-	if err := controllerutil.SetControllerReference(ec, pod, scheme); err != nil {
-		return err
-	}
-
-	logger.Info("Creating member pod", "name", podName, "ordinal", ordinal, "state", state)
+	logger.Info(
+		"Creating member pod",
+		"name", podName,
+		"ordinal", member.Spec.Ordinal,
+		"state", initialClusterState,
+	)
 	return c.Create(ctx, pod)
 }

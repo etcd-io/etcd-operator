@@ -18,6 +18,10 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 )
@@ -75,4 +79,49 @@ func TestAllReady(t *testing.T) {
 	assert.True(t, allReady(nil), "zero members should be vacuously ready")
 	assert.True(t, allReady([]ecv1alpha1.EtcdMember{ready, ready}))
 	assert.False(t, allReady([]ecv1alpha1.EtcdMember{ready, pending}))
+}
+
+func TestListOwnedMembers(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, ecv1alpha1.AddToScheme(scheme))
+
+	ec := &ecv1alpha1.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-cluster", Namespace: "default", UID: "cluster-uid"},
+	}
+	foreign := &ecv1alpha1.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "other-cluster", Namespace: ec.Namespace, UID: "foreign-uid"},
+	}
+	makeMember := func(cluster *ecv1alpha1.EtcdCluster, ordinal int, labelCluster string) ecv1alpha1.EtcdMember {
+		return ecv1alpha1.EtcdMember{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      etcdMemberName(labelCluster, ordinal),
+				Namespace: cluster.Namespace,
+				Labels:    map[string]string{clusterNameLabel: labelCluster},
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: ecv1alpha1.GroupVersion.String(),
+					Kind:       "EtcdCluster",
+					Name:       cluster.Name,
+					UID:        cluster.UID,
+					Controller: new(true),
+				}},
+			},
+			Spec: ecv1alpha1.EtcdMemberSpec{ClusterName: cluster.Name, Ordinal: ordinal},
+		}
+	}
+	member0 := makeMember(ec, 0, ec.Name)
+	member2 := makeMember(ec, 2, ec.Name)
+	otherMember := makeMember(foreign, 0, foreign.Name)
+	// Carries this cluster's selected label but is controlled by a foreign
+	// cluster: the selector lets it through, the ownership check must not.
+	spoofed := makeMember(foreign, 1, ec.Name)
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(ec, foreign, &member0, &member2, &otherMember, &spoofed).
+		Build()
+
+	members, err := listOwnedMembers(t.Context(), fakeClient, ec)
+	require.NoError(t, err)
+	require.Len(t, members, 2)
+	assert.Equal(t, "my-cluster-0", members[0].Name)
+	assert.Equal(t, "my-cluster-2", members[1].Name)
 }

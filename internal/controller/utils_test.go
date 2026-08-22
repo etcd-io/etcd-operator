@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -19,10 +20,6 @@ import (
 	"go.etcd.io/etcd-operator/pkg/certificate"
 	certInterface "go.etcd.io/etcd-operator/pkg/certificate/interfaces"
 )
-
-func pointerToBool(value bool) *bool {
-	return &value
-}
 
 // ---------------------------------------------------------------------------
 // createHeadlessServiceIfNotExist
@@ -71,6 +68,75 @@ func TestCreateHeadlessServiceIfNotExist(t *testing.T) {
 	t.Run("does not create service if it already exists", func(t *testing.T) {
 		err := createHeadlessServiceIfNotExist(ctx, logger, fakeClient, ec, scheme)
 		assert.NoError(t, err)
+	})
+}
+
+// ---------------------------------------------------------------------------
+// createPVCForMember
+// ---------------------------------------------------------------------------
+
+func TestCreatePVCForMember(t *testing.T) {
+	ctx := t.Context()
+
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = ecv1alpha1.AddToScheme(scheme)
+
+	newCluster := func() *ecv1alpha1.EtcdCluster {
+		return &ecv1alpha1.EtcdCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-etcd", Namespace: "default", UID: "1"},
+			Spec: ecv1alpha1.EtcdClusterSpec{
+				Size:    3,
+				Version: "3.5.17",
+				StorageSpec: &ecv1alpha1.StorageSpec{
+					VolumeSizeRequest: resource.MustParse("2Gi"),
+				},
+			},
+		}
+	}
+
+	t.Run("creates PVC owned by the EtcdMember with the cluster name label", func(t *testing.T) {
+		ec := newCluster()
+		member := testMemberForCluster(ec, 0)
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+		err := createPVCForMember(ctx, fakeClient, ec, member, memberPodName(ec.Name, 0), scheme)
+		require.NoError(t, err)
+
+		pvc := &corev1.PersistentVolumeClaim{}
+		require.NoError(t, fakeClient.Get(ctx, client.ObjectKey{Name: "etcd-data-test-etcd-0", Namespace: "default"}, pvc))
+
+		require.Len(t, pvc.OwnerReferences, 1)
+		assert.Equal(t, member.Name, pvc.OwnerReferences[0].Name)
+		assert.Equal(t, "EtcdMember", pvc.OwnerReferences[0].Kind)
+		assert.True(t, *pvc.OwnerReferences[0].Controller)
+		assert.Equal(t, ec.Name, pvc.Labels[clusterNameLabel])
+		assert.Equal(t, resource.MustParse("2Gi"), *pvc.Spec.Resources.Requests.Storage())
+	})
+
+	t.Run("does not modify an existing PVC", func(t *testing.T) {
+		ec := newCluster()
+		member := testMemberForCluster(ec, 0)
+		existing := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{Name: "etcd-data-test-etcd-0", Namespace: "default"},
+		}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(existing).Build()
+
+		require.NoError(t, createPVCForMember(ctx, fakeClient, ec, member, memberPodName(ec.Name, 0), scheme))
+
+		pvc := &corev1.PersistentVolumeClaim{}
+		require.NoError(t, fakeClient.Get(ctx, client.ObjectKey{Name: "etcd-data-test-etcd-0", Namespace: "default"}, pvc))
+		assert.Empty(t, pvc.OwnerReferences)
+	})
+
+	t.Run("rejects VolumeSizeRequest below 1Mi", func(t *testing.T) {
+		ec := newCluster()
+		ec.Spec.StorageSpec.VolumeSizeRequest = resource.MustParse("1Ki")
+		member := testMemberForCluster(ec, 0)
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+		err := createPVCForMember(ctx, fakeClient, ec, member, memberPodName(ec.Name, 0), scheme)
+		assert.ErrorContains(t, err, "VolumeSizeRequest must be at least 1Mi")
 	})
 }
 
@@ -322,6 +388,72 @@ func TestPeerEndpointForOrdinal(t *testing.T) {
 
 	assert.Equal(t, "http://test-cluster-0.test-cluster.default.svc.cluster.local:2380", httpURL)
 	assert.Equal(t, "https://test-cluster-0.test-cluster.default.svc.cluster.local:2380", httpsURL)
+}
+
+// ---------------------------------------------------------------------------
+// getMemberNameFromPeerURL — member name encoded in a peer URL
+// ---------------------------------------------------------------------------
+
+func TestGetMemberNameFromPeerURL(t *testing.T) {
+	tests := []struct {
+		name     string
+		peerURL  string
+		wantName string
+	}{
+		{
+			name:     "http peer URL",
+			peerURL:  "http://etcd-0.etcd.default.svc.cluster.local:2380",
+			wantName: "etcd-0",
+		},
+		{
+			name:     "https peer URL",
+			peerURL:  "https://etcd-12.etcd.kube-system.svc.cluster.local:2380",
+			wantName: "etcd-12",
+		},
+		{
+			name:     "cluster name containing dashes and digits",
+			peerURL:  "http://my-cluster-2-1.my-cluster-2.default.svc.cluster.local:2380",
+			wantName: "my-cluster-2-1",
+		},
+		{
+			name:     "non-default DNS domain",
+			peerURL:  "http://etcd-1.etcd.prod.svc.my.custom.domain:2380",
+			wantName: "etcd-1",
+		},
+		{
+			name:     "hostname without dots",
+			peerURL:  "http://etcd-0:2380",
+			wantName: "etcd-0",
+		},
+		{
+			name:     "missing scheme has no host",
+			peerURL:  "etcd-0.etcd.default.svc.cluster.local:2380",
+			wantName: "",
+		},
+		{
+			name:     "empty input",
+			peerURL:  "",
+			wantName: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.wantName, getMemberNameFromPeerURL(tt.peerURL))
+		})
+	}
+}
+
+func TestGetMemberNameFromPeerURLRoundtrip(t *testing.T) {
+	cluster := &ecv1alpha1.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-cluster", Namespace: "prod"},
+		Spec:       ecv1alpha1.EtcdClusterSpec{TLS: &ecv1alpha1.TLSCertificate{Provider: "auto"}},
+	}
+	for _, ordinal := range []int{0, 1, 42} {
+		wantName, peerURL := peerEndpointForOrdinalIndex(cluster, ordinal)
+		assert.Equal(t, wantName, getMemberNameFromPeerURL(peerURL),
+			"peer URL %q should round-trip", peerURL)
+	}
 }
 
 // ---------------------------------------------------------------------------
