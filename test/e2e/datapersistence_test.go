@@ -83,7 +83,7 @@ func TestDataPersistence(t *testing.T) {
 
 	feature.Assess("Check if there exists one replica of the etcd pod",
 		func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-			if err := waitForPodReadiness(t, c, etcdClusterName, 1); err != nil {
+			if err := waitForAllEtcdMemberReady(t, c, etcdCluster); err != nil {
 				t.Fatalf("unable to find the replica of the etcd pod: %s", err)
 			}
 			return ctx
@@ -141,7 +141,7 @@ func TestDataPersistence(t *testing.T) {
 
 			client := c.Client()
 
-			if err := waitForPodReadiness(t, c, etcdClusterName, 1); err != nil {
+			if err := waitForAllEtcdMemberReady(t, c, etcdCluster); err != nil {
 				t.Fatalf("unable to scale the etcd pod back post pod deletion: %s", err)
 			}
 

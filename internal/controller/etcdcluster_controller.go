@@ -206,7 +206,7 @@ func (r *EtcdClusterReconciler) fetchAndValidateState(ctx context.Context, req c
 		return nil, ctrl.Result{RequeueAfter: requeueDuration}, nil
 	}
 
-	pods, err := listOwnedPods(ctx, r.Client, ec)
+	pods, err := listOwnedPods(ctx, r.Client, ec, members)
 	if err != nil {
 		logger.Error(err, "Failed to list pods. Requesting requeue")
 		return nil, ctrl.Result{RequeueAfter: requeueDuration}, nil
@@ -301,8 +301,8 @@ func (r *EtcdClusterReconciler) ensureClusterPrereqs(ctx context.Context, s *rec
 			logger.Error(err, "Failed to create Client Certificate.")
 		}
 		// Server/peer certs must exist before buildReconcileClientTLS below reads
-		// the server cert Secret. createMemberPod also calls this (idempotently)
-		// once a member's pod is created.
+		// the server cert Secret. reconcileProvisioning also calls this
+		// (idempotently) before creating a member's Pod.
 		// TODO: buildReconcileClientTLS reuses this member server
 		// certificate as the operator's own client identity (see its comment
 		// in utils.go) — that's the wrong cert for the operator to depend on;
@@ -370,11 +370,14 @@ func (r *EtcdClusterReconciler) refreshClusterState(ctx context.Context, s *reco
 // to the next; only an item that actually takes a mutating action ends the
 // loop.
 //
-// Steps 4-8 are TODO no-ops in this milestone (M2) — the mechanics they'd
+// Steps 4-7 are TODO no-ops in this milestone (M2) — the mechanics they'd
 // trigger (join/promote/repair/leave, CORRUPT/NOSPACE remediation,
 // lost-quorum recovery) land in M3-M5 — but the detection that decides
 // *whether* a step claims the loop is real, so the priority order itself is
 // reviewable now, ahead of any of that behavior landing.
+// Item 8 is partially implemented: the provisioning case reconciles one
+// EtcdMember at a time until it is Ready; the replacing case (§4.9 item 8's
+// second bullet) lands in a follow-up PR.
 func (r *EtcdClusterReconciler) dispatch(ctx context.Context, s *reconcileState) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
@@ -439,13 +442,10 @@ func (r *EtcdClusterReconciler) dispatch(ctx context.Context, s *reconcileState)
 	// and the cluster is still unhealthy (M5).
 
 	// 8. Advance whatever's left not-Ready (Pending/Provisioning/Replacing).
-	// An existing learner always wins this slot (requirement 11).
-	if notReady := pickNotReadyMember(s.members); notReady != nil {
-		// TODO: §4.9 item 8 — promote if a caught-up learner,
-		// otherwise continue the member's join/replace progress (§4.6, M3).
-		logger.Info("Member not Ready; join/promotion not implemented yet",
-			"member", notReady.Name, "phase", notReady.Status.Phase)
-		return ctrl.Result{RequeueAfter: requeueDuration}, nil
+	// An existing learner always wins this slot (requirement 11); with more
+	// than one not-ready member but no learner, the lowest ordinal wins.
+	if notReady := pickNotReadyMember(s); notReady != nil {
+		return r.reconcileEtcdMember(ctx, s, notReady)
 	}
 
 	// 9. Everything existing is Ready (§4.2's gate), so update-config/scale/upgrade
@@ -537,11 +537,8 @@ func (r *EtcdClusterReconciler) updateConfig(ctx context.Context, s *reconcileSt
 // the lowest gap, else max+1) and always removing the highest ordinal first
 // on scale-in (requirement 2).
 //
-// Creating the EtcdMember object — and, for ordinal 0, its cert/PVC/Pod
-// directly (the bootstrap special case, §4.6 step 2) — is the only mechanic
-// this milestone (M2) implements. For every other ordinal, the general join
-// mechanics (MemberAdd + cert/PVC/Pod) are §4.6's TODO (M3), so a
-// newly-created EtcdMember simply sits at Phase: Pending until then. Scale-in
+// Scale-out only creates one Pending EtcdMember. The shared member lifecycle
+// owns bootstrap, member addition, Pod creation, and learner promotion. Scale-in
 // deletes the EtcdMember directly; the finalizer (§4.3) blocks its actual
 // removal until the Terminating leave sequence (§4.6, M3) runs.
 func (r *EtcdClusterReconciler) scaleCluster(ctx context.Context, s *reconcileState) (ctrl.Result, error) {
@@ -558,20 +555,8 @@ func (r *EtcdClusterReconciler) scaleCluster(ctx context.Context, s *reconcileSt
 	if currentCount < desiredSize {
 		ordinal := nextOrdinal(memberOrdinals(s.members))
 		logger.Info("[Scale out] creating a new EtcdMember", "ordinal", ordinal)
-		member, err := createEtcdMember(ctx, r.Client, s.cluster, ordinal, r.Scheme)
-		if err != nil {
+		if _, err := createEtcdMember(ctx, r.Client, s.cluster, ordinal, r.Scheme); err != nil {
 			return ctrl.Result{}, err
-		}
-
-		if ordinal == 0 {
-			// Bootstrap special case: the first member starts as a full
-			// voting member with its Pod created directly — there's no
-			// cluster yet to MemberAdd(learner) into.
-			if err := createMemberPod(ctx, logger, r.Client, s.cluster, ordinal, r.Scheme); err != nil {
-				return ctrl.Result{}, err
-			}
-		} else {
-			logger.Info("Join mechanics not implemented yet; member stays Pending", "member", member.Name)
 		}
 		return ctrl.Result{RequeueAfter: requeueDuration}, nil
 	}
@@ -785,8 +770,6 @@ func (r *EtcdClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	builder := ctrl.NewControllerManagedBy(mgr).
 		For(&ecv1alpha1.EtcdCluster{}).
 		Owns(&ecv1alpha1.EtcdMember{}).
-		Owns(&corev1.Pod{}).
-		Owns(&corev1.PersistentVolumeClaim{}).
 		Owns(&corev1.Service{})
 
 	if isCertManagerCRDPresent(mgr) {

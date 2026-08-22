@@ -34,16 +34,35 @@ import (
 )
 
 // TestFetchAndValidateState verifies the fetchAndValidateState helper across
-// a range of conditions (missing cluster, no pods, pods owned by this cluster,
-// and pods owned by a different cluster).
+// a range of conditions (missing cluster, no pods, pods owned via their
+// EtcdMember by this cluster, and pods owned via a member of a different
+// cluster).
 func TestFetchAndValidateState(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
 	_ = ecv1alpha1.AddToScheme(scheme)
 
-	// helper to build a minimal owned pod with a specific etcd image tag.
-	ownedPod := func(clusterName, namespace, uid, imageTag string) *corev1.Pod {
-		return &corev1.Pod{
+	// helper to build a minimal EtcdMember together with its Pod (controlled
+	// by that member), running a specific etcd image tag. The member's
+	// controller reference points at an EtcdCluster with the given UID.
+	memberAndPod := func(clusterName, namespace, clusterUID, imageTag string) (*ecv1alpha1.EtcdMember, *corev1.Pod) {
+		member := &ecv1alpha1.EtcdMember{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      clusterName + "-0",
+				Namespace: namespace,
+				Labels:    clusterNameLabels(clusterName),
+				UID:       types.UID("member-" + clusterName + "-0"),
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: ecv1alpha1.GroupVersion.String(),
+					Kind:       "EtcdCluster",
+					Name:       clusterName,
+					UID:        types.UID(clusterUID),
+					Controller: new(true),
+				}},
+			},
+			Spec: ecv1alpha1.EtcdMemberSpec{ClusterName: clusterName, Ordinal: 0},
+		}
+		pod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      clusterName + "-0",
 				Namespace: namespace,
@@ -53,10 +72,10 @@ func TestFetchAndValidateState(t *testing.T) {
 				},
 				OwnerReferences: []metav1.OwnerReference{{
 					APIVersion: ecv1alpha1.GroupVersion.String(),
-					Kind:       "EtcdCluster",
-					Name:       clusterName,
-					UID:        types.UID(uid),
-					Controller: pointerToBool(true),
+					Kind:       "EtcdMember",
+					Name:       member.Name,
+					UID:        member.UID,
+					Controller: new(true),
 				}},
 			},
 			Spec: corev1.PodSpec{
@@ -65,14 +84,18 @@ func TestFetchAndValidateState(t *testing.T) {
 				},
 			},
 		}
+		return member, pod
 	}
+	ownedMember, ownedPod := memberAndPod("etcd", "default", "2", "3.5.17")
+	foreignMember, foreignPod := memberAndPod("etcd", "default", "other-uid", "3.5.17")
 
 	cases := []struct {
-		name   string
-		req    ctrl.Request
-		ec     *ecv1alpha1.EtcdCluster
-		pods   []*corev1.Pod
-		assert func(t *testing.T, state *reconcileState, res ctrl.Result, err error)
+		name    string
+		req     ctrl.Request
+		ec      *ecv1alpha1.EtcdCluster
+		members []*ecv1alpha1.EtcdMember
+		pods    []*corev1.Pod
+		assert  func(t *testing.T, state *reconcileState, res ctrl.Result, err error)
 	}{
 		{
 			name: "EtcdCluster Not Found",
@@ -104,8 +127,9 @@ func TestFetchAndValidateState(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{Name: "etcd", Namespace: "default", UID: "2"},
 				Spec:       ecv1alpha1.EtcdClusterSpec{Size: 1, Version: "3.5.17"},
 			},
-			pods: []*corev1.Pod{ownedPod("etcd", "default", "2", "3.5.17")},
-			req:  ctrl.Request{NamespacedName: types.NamespacedName{Name: "etcd", Namespace: "default"}},
+			members: []*ecv1alpha1.EtcdMember{ownedMember},
+			pods:    []*corev1.Pod{ownedPod},
+			req:     ctrl.Request{NamespacedName: types.NamespacedName{Name: "etcd", Namespace: "default"}},
 			assert: func(t *testing.T, state *reconcileState, res ctrl.Result, err error) {
 				require.NotNil(t, state)
 				assert.Equal(t, "etcd", state.cluster.Name)
@@ -120,9 +144,11 @@ func TestFetchAndValidateState(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{Name: "etcd", Namespace: "default", UID: "3"},
 				Spec:       ecv1alpha1.EtcdClusterSpec{Size: 1, Version: "3.5.17"},
 			},
-			// Pod has different UID owner → filtered out by listOwnedPods.
-			pods: []*corev1.Pod{ownedPod("etcd", "default", "other-uid", "3.5.17")},
-			req:  ctrl.Request{NamespacedName: types.NamespacedName{Name: "etcd", Namespace: "default"}},
+			// The Pod's controlling member belongs to a different cluster
+			// (UID mismatch) → filtered out by listOwnedPods.
+			members: []*ecv1alpha1.EtcdMember{foreignMember},
+			pods:    []*corev1.Pod{foreignPod},
+			req:     ctrl.Request{NamespacedName: types.NamespacedName{Name: "etcd", Namespace: "default"}},
 			assert: func(t *testing.T, state *reconcileState, res ctrl.Result, err error) {
 				require.NotNil(t, state)
 				assert.Empty(t, state.pods)
@@ -139,6 +165,9 @@ func TestFetchAndValidateState(t *testing.T) {
 			objs := []client.Object{}
 			if tc.ec != nil {
 				objs = append(objs, tc.ec)
+			}
+			for _, member := range tc.members {
+				objs = append(objs, member)
 			}
 			for _, pod := range tc.pods {
 				objs = append(objs, pod)
@@ -303,11 +332,10 @@ func TestEnsureClusterPrereqs(t *testing.T) {
 	})
 }
 
-// TestScaleClusterBootstrap verifies the scale-out dispatcher step's
-// bootstrap special case (§4.6 step 2): with zero existing members, it
-// creates EtcdMember ordinal 0 and its Pod directly. For any other ordinal,
-// only the EtcdMember shell is created — join mechanics are M3's TODO.
-func TestScaleClusterBootstrap(t *testing.T) {
+// TestScaleCluster verifies that scaling only changes the desired set of
+// EtcdMember objects. Provisioning is owned by reconcileEtcdMember and must
+// never run from this policy-level helper.
+func TestScaleCluster(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
 	_ = ecv1alpha1.AddToScheme(scheme)
@@ -324,7 +352,7 @@ func TestScaleClusterBootstrap(t *testing.T) {
 		},
 	}
 
-	t.Run("No members — creates EtcdMember ordinal 0 and its Pod", func(t *testing.T) {
+	t.Run("`scaleCluster` creates exactly one Pending member without a Pod", func(t *testing.T) {
 		ctx := t.Context()
 		fakeClient := fake.NewClientBuilder().
 			WithScheme(scheme).
@@ -345,11 +373,15 @@ func TestScaleClusterBootstrap(t *testing.T) {
 		assert.Contains(t, member.Finalizers, memberCleanupFinalizer)
 		require.Len(t, member.OwnerReferences, 1)
 		assert.Equal(t, ec.Name, member.OwnerReferences[0].Name)
+		assert.Equal(t, ec.Name, member.Labels[clusterNameLabel])
+
+		members := &ecv1alpha1.EtcdMemberList{}
+		require.NoError(t, fakeClient.List(ctx, members, client.InNamespace(ec.Namespace)))
+		assert.Len(t, members.Items, 1)
 
 		pod := &corev1.Pod{}
-		require.NoError(t, fakeClient.Get(ctx, client.ObjectKey{Name: "etcd-0", Namespace: ec.Namespace}, pod))
-		require.Len(t, pod.OwnerReferences, 1)
-		assert.Equal(t, ec.Name, pod.OwnerReferences[0].Name)
+		err = fakeClient.Get(ctx, client.ObjectKey{Name: "etcd-0", Namespace: ec.Namespace}, pod)
+		assert.True(t, apierrors.IsNotFound(err), "scaleCluster must not provision the bootstrap Pod")
 	})
 
 	t.Run("One ready member — creates EtcdMember shell only, no Pod", func(t *testing.T) {
@@ -364,7 +396,7 @@ func TestScaleClusterBootstrap(t *testing.T) {
 					Kind:       "EtcdCluster",
 					Name:       ec.Name,
 					UID:        ec.UID,
-					Controller: pointerToBool(true),
+					Controller: new(true),
 				}},
 			},
 			Spec:   ecv1alpha1.EtcdMemberSpec{ClusterName: ec.Name, Ordinal: 0, Version: ec.Spec.Version},
@@ -501,7 +533,11 @@ func TestDispatch(t *testing.T) {
 			Status:     ecv1alpha1.EtcdMemberStatus{Phase: ecv1alpha1.EtcdMemberPending},
 		}
 
-		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ec, &pending).Build()
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithStatusSubresource(&ecv1alpha1.EtcdMember{}).
+			WithObjects(ec, &pending).
+			Build()
 		r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
 		state := &reconcileState{cluster: ec, members: []ecv1alpha1.EtcdMember{pending}}
 
@@ -511,7 +547,8 @@ func TestDispatch(t *testing.T) {
 
 		list := &ecv1alpha1.EtcdMemberList{}
 		require.NoError(t, fakeClient.List(ctx, list, client.InNamespace(ec.Namespace)))
-		assert.Len(t, list.Items, 1)
+		require.Len(t, list.Items, 1)
+		assert.Equal(t, ecv1alpha1.EtcdMemberProvisioning, list.Items[0].Status.Phase)
 	})
 
 	t.Run("Falls through to scale-out when everything is Ready", func(t *testing.T) {
@@ -526,7 +563,7 @@ func TestDispatch(t *testing.T) {
 					Kind:       "EtcdCluster",
 					Name:       ec.Name,
 					UID:        ec.UID,
-					Controller: pointerToBool(true),
+					Controller: new(true),
 				}},
 			},
 			Spec:   ecv1alpha1.EtcdMemberSpec{ClusterName: ec.Name, Ordinal: 0, Version: ec.Spec.Version},
@@ -550,6 +587,65 @@ func TestDispatch(t *testing.T) {
 		require.NoError(t, fakeClient.Get(ctx, client.ObjectKey{Name: "etcd-1", Namespace: ec.Namespace}, member))
 		assert.Equal(t, 1, member.Spec.Ordinal)
 	})
+}
+
+func TestGapAwareScaleOutCreatesLowestMissingOrdinal(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+	require.NoError(t, ecv1alpha1.AddToScheme(scheme))
+
+	clusterUID := types.UID("cluster-uid")
+	cluster := &ecv1alpha1.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "etcd", Namespace: "default", UID: clusterUID},
+		Spec:       ecv1alpha1.EtcdClusterSpec{Size: 3, Version: "3.5.17"},
+	}
+	readyMember := func(ordinal int) ecv1alpha1.EtcdMember {
+		return ecv1alpha1.EtcdMember{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      etcdMemberName(cluster.Name, ordinal),
+				Namespace: cluster.Namespace,
+			},
+			Spec: ecv1alpha1.EtcdMemberSpec{
+				ClusterName: cluster.Name,
+				Ordinal:     ordinal,
+				Version:     cluster.Spec.Version,
+			},
+			Status: ecv1alpha1.EtcdMemberStatus{Phase: ecv1alpha1.EtcdMemberReady},
+		}
+	}
+	member0 := readyMember(0)
+	member2 := readyMember(2)
+	pod0 := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: member0.Name, Namespace: cluster.Namespace}}
+	pod2 := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: member2.Name, Namespace: cluster.Namespace}}
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&ecv1alpha1.EtcdMember{}).
+		WithObjects(cluster, &member0, &member2, pod0, pod2).
+		Build()
+	reconciler := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
+	state := &reconcileState{
+		cluster: cluster,
+		members: []ecv1alpha1.EtcdMember{member0, member2},
+		pods:    []*corev1.Pod{pod0, pod2},
+	}
+
+	result, err := reconciler.scaleCluster(t.Context(), state)
+	require.NoError(t, err)
+	assert.Equal(t, ctrl.Result{RequeueAfter: requeueDuration}, result)
+	target := &ecv1alpha1.EtcdMember{}
+	require.NoError(t, fakeClient.Get(t.Context(), client.ObjectKey{
+		Name: "etcd-1", Namespace: cluster.Namespace,
+	}, target))
+	require.Len(t, target.OwnerReferences, 1)
+	require.Equal(t, clusterUID, target.OwnerReferences[0].UID)
+	assert.Equal(t, 1, target.Spec.Ordinal)
+
+	// First lifecycle pass durably enters Provisioning.
+	state.members = []ecv1alpha1.EtcdMember{member0, *target, member2}
+	result, err = reconciler.reconcileEtcdMember(t.Context(), state, target)
+	require.NoError(t, err)
+	assert.Equal(t, ctrl.Result{RequeueAfter: requeueDuration}, result)
+	assert.Equal(t, ecv1alpha1.EtcdMemberProvisioning, target.Status.Phase)
 }
 
 // TestReconcilePaused verifies requirement 15's pause gate: Spec.Paused

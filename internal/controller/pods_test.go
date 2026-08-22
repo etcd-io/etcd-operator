@@ -36,49 +36,74 @@ func TestListOwnedPods(t *testing.T) {
 		Spec:       ecv1alpha1.EtcdClusterSpec{Size: 3, Version: "3.5.17"},
 	}
 
-	makePod := func(name, uid string, owned bool) *corev1.Pod {
-		pod := &corev1.Pod{
+	makePod := func(name string) *corev1.Pod {
+		return &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      name,
 				Namespace: "default",
 				Labels:    etcdClusterLabels(ec),
 			},
 		}
-		if owned {
-			pod.OwnerReferences = []metav1.OwnerReference{{
-				APIVersion: ecv1alpha1.GroupVersion.String(),
-				Kind:       "EtcdCluster",
-				Name:       ec.Name,
-				UID:        types.UID(uid),
-				Controller: pointerToBool(true),
-			}}
+	}
+	makeMember := func(name string, ordinal int, clusterUID string) *ecv1alpha1.EtcdMember {
+		return &ecv1alpha1.EtcdMember{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: ec.Namespace,
+				UID:       types.UID("member-" + name),
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: ecv1alpha1.GroupVersion.String(),
+					Kind:       "EtcdCluster",
+					Name:       ec.Name,
+					UID:        types.UID(clusterUID),
+					Controller: new(true),
+				}},
+			},
+			Spec: ecv1alpha1.EtcdMemberSpec{ClusterName: ec.Name, Ordinal: ordinal, Version: ec.Spec.Version},
 		}
+	}
+	// Pod owners are always EtcdMembers; the EtcdCluster never owns Pods
+	// directly.
+	makeMemberOwnedPod := func(name string, member *ecv1alpha1.EtcdMember) *corev1.Pod {
+		pod := makePod(name)
+		pod.OwnerReferences = []metav1.OwnerReference{{
+			APIVersion: ecv1alpha1.GroupVersion.String(),
+			Kind:       "EtcdMember",
+			Name:       member.Name,
+			UID:        member.UID,
+			Controller: new(true),
+		}}
 		return pod
 	}
 
-	t.Run("returns only owned pods sorted by ordinal", func(t *testing.T) {
+	t.Run("returns pods of the given members and ignores foreign or orphan pods", func(t *testing.T) {
 		ctx := t.Context()
-		pod0 := makePod("my-cluster-0", "abc", true)
-		pod2 := makePod("my-cluster-2", "abc", true)
-		pod1 := makePod("my-cluster-1", "abc", true)
-		foreign := makePod("my-cluster-3", "different-uid", false)
+		member0 := makeMember("my-cluster-0", 0, "abc")
+		member2 := makeMember("my-cluster-2", 2, "abc")
+		pod0 := makeMemberOwnedPod("my-cluster-0", member0)
+		pod2 := makeMemberOwnedPod("my-cluster-2", member2)
+		// Controlled by a member of a different cluster, which is absent
+		// from the caller's members list (listOwnedMembers filters it out).
+		foreignMember := makeMember("my-cluster-3", 3, "different-cluster-uid")
+		foreign := makeMemberOwnedPod("my-cluster-3", foreignMember)
+		// Carries the cluster labels but has no controller owner.
+		orphan := makePod("my-cluster-5")
 
 		fakeClient := fake.NewClientBuilder().WithScheme(scheme).
-			WithObjects(ec, pod0, pod1, pod2, foreign).Build()
+			WithObjects(ec, pod2, pod0, foreign, orphan).Build()
 
-		pods, err := listOwnedPods(ctx, fakeClient, ec)
+		pods, err := listOwnedPods(ctx, fakeClient, ec, []ecv1alpha1.EtcdMember{*member0, *member2})
 		require.NoError(t, err)
-		require.Len(t, pods, 3)
+		require.Len(t, pods, 2)
 		assert.Equal(t, "my-cluster-0", pods[0].Name)
-		assert.Equal(t, "my-cluster-1", pods[1].Name)
-		assert.Equal(t, "my-cluster-2", pods[2].Name)
+		assert.Equal(t, "my-cluster-2", pods[1].Name)
 	})
 
 	t.Run("returns empty slice when no pods exist", func(t *testing.T) {
 		ctx := t.Context()
 		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ec).Build()
 
-		pods, err := listOwnedPods(ctx, fakeClient, ec)
+		pods, err := listOwnedPods(ctx, fakeClient, ec, nil)
 		require.NoError(t, err)
 		assert.Empty(t, pods)
 	})
@@ -87,6 +112,54 @@ func TestListOwnedPods(t *testing.T) {
 // ---------------------------------------------------------------------------
 // createMemberPod
 // ---------------------------------------------------------------------------
+
+func TestBuildMemberPodUsesLifecycleInputs(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+	require.NoError(t, ecv1alpha1.AddToScheme(scheme))
+
+	cluster := &ecv1alpha1.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "etcd", Namespace: "default", UID: "cluster-uid"},
+		Spec: ecv1alpha1.EtcdClusterSpec{
+			Version:       "3.5.17",
+			ImageRegistry: "registry.example/etcd",
+		},
+	}
+	member := &ecv1alpha1.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: "etcd-1", Namespace: cluster.Namespace, UID: "member-uid"},
+		Spec: ecv1alpha1.EtcdMemberSpec{
+			ClusterName: cluster.Name,
+			Ordinal:     1,
+			Version:     "3.6.2",
+		},
+	}
+	builder, ok := any(buildMemberPod).(func(
+		*ecv1alpha1.EtcdCluster,
+		*ecv1alpha1.EtcdMember,
+		etcdClusterState,
+		string,
+		*runtime.Scheme,
+	) (*corev1.Pod, error))
+	require.True(t, ok, "buildMemberPod should accept the target EtcdMember and explicit topology")
+
+	for _, state := range []etcdClusterState{etcdClusterStateNew, etcdClusterStateExisting} {
+		t.Run(string(state), func(t *testing.T) {
+			const initialCluster = "etcd-0=http://peer-0:2380,etcd-1=http://peer-1:2380"
+			pod, err := builder(cluster, member, state, initialCluster, scheme)
+			require.NoError(t, err)
+
+			env := envVarsToMap(pod)
+			assert.Equal(t, string(state), env["ETCD_INITIAL_CLUSTER_STATE"])
+			assert.Equal(t, initialCluster, env["ETCD_INITIAL_CLUSTER"])
+			require.Len(t, pod.Spec.Containers, 1)
+			assert.Equal(t, "registry.example/etcd:3.6.2", pod.Spec.Containers[0].Image)
+			require.Len(t, pod.OwnerReferences, 1)
+			assert.Equal(t, member.Name, pod.OwnerReferences[0].Name)
+			assert.Equal(t, "EtcdMember", pod.OwnerReferences[0].Kind)
+			assert.True(t, *pod.OwnerReferences[0].Controller)
+		})
+	}
+}
 
 func TestCreateMemberPod(t *testing.T) {
 	scheme := runtime.NewScheme()
@@ -102,7 +175,18 @@ func TestCreateMemberPod(t *testing.T) {
 
 	t.Run("creates pod-0 with state=new", func(t *testing.T) {
 		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ec).Build()
-		err := createMemberPod(ctx, logger, fakeClient, ec, 0, scheme)
+		member := testMemberForCluster(ec, 0)
+		_, peerURL := peerEndpointForOrdinalIndex(ec, 0)
+		err := createMemberPod(
+			ctx,
+			logger,
+			fakeClient,
+			ec,
+			member,
+			etcdClusterStateNew,
+			member.Name+"="+peerURL,
+			scheme,
+		)
 		require.NoError(t, err)
 
 		pod := &corev1.Pod{}
@@ -116,12 +200,27 @@ func TestCreateMemberPod(t *testing.T) {
 		assert.Equal(t, etcdDataDir, envMap["ETCD_DATA_DIR"])
 
 		require.Len(t, pod.OwnerReferences, 1)
-		assert.Equal(t, ec.Name, pod.OwnerReferences[0].Name)
+		assert.Equal(t, member.Name, pod.OwnerReferences[0].Name)
 	})
 
 	t.Run("creates pod-2 with state=existing and full initial cluster", func(t *testing.T) {
 		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ec).Build()
-		err := createMemberPod(ctx, logger, fakeClient, ec, 2, scheme)
+		member := testMemberForCluster(ec, 2)
+		clusterParts := make([]string, 0, 3)
+		for ordinal := range 3 {
+			name, peerURL := peerEndpointForOrdinalIndex(ec, ordinal)
+			clusterParts = append(clusterParts, name+"="+peerURL)
+		}
+		err := createMemberPod(
+			ctx,
+			logger,
+			fakeClient,
+			ec,
+			member,
+			etcdClusterStateExisting,
+			strings.Join(clusterParts, ","),
+			scheme,
+		)
 		require.NoError(t, err)
 
 		pod := &corev1.Pod{}
@@ -133,6 +232,21 @@ func TestCreateMemberPod(t *testing.T) {
 		assert.Contains(t, envMap["ETCD_INITIAL_CLUSTER"], "test-etcd-1=")
 		assert.Contains(t, envMap["ETCD_INITIAL_CLUSTER"], "test-etcd-2=")
 	})
+}
+
+func testMemberForCluster(ec *ecv1alpha1.EtcdCluster, ordinal int) *ecv1alpha1.EtcdMember {
+	return &ecv1alpha1.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      etcdMemberName(ec.Name, ordinal),
+			Namespace: ec.Namespace,
+			UID:       types.UID(fmt.Sprintf("member-%d", ordinal)),
+		},
+		Spec: ecv1alpha1.EtcdMemberSpec{
+			ClusterName: ec.Name,
+			Ordinal:     ordinal,
+			Version:     ec.Spec.Version,
+		},
+	}
 }
 
 // envVarsToMap converts a container's env slice into a name→value map.
@@ -320,14 +434,24 @@ func TestCreateMemberPodWithAnnotations(t *testing.T) {
 
 			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ec).Build()
 
-			err := createMemberPod(ctx, logger, fakeClient, ec, 0, scheme)
+			member := testMemberForCluster(ec, 0)
+			err := createMemberPod(
+				ctx,
+				logger,
+				fakeClient,
+				ec,
+				member,
+				etcdClusterStateNew,
+				"ignored",
+				scheme,
+			)
 			require.NoError(t, err)
 
 			pod := &corev1.Pod{}
 			require.NoError(t, fakeClient.Get(ctx, client.ObjectKey{Name: tt.clusterName + "-0", Namespace: "default"}, pod))
 
 			require.Len(t, pod.OwnerReferences, 1)
-			assert.Equal(t, ec.Name, pod.OwnerReferences[0].Name)
+			assert.Equal(t, member.Name, pod.OwnerReferences[0].Name)
 
 			// the operator can insert more annotations, but we can guarantee that the expected KVs would be there
 			for k, v := range tt.expectedAnnotations {
@@ -425,14 +549,24 @@ func TestCreateMemberPodWithLabels(t *testing.T) {
 			}
 			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ec).Build()
 
-			err := createMemberPod(ctx, logger, fakeClient, ec, 0, scheme)
+			member := testMemberForCluster(ec, 0)
+			err := createMemberPod(
+				ctx,
+				logger,
+				fakeClient,
+				ec,
+				member,
+				etcdClusterStateNew,
+				"ignored",
+				scheme,
+			)
 			require.NoError(t, err)
 
 			pod := &corev1.Pod{}
 			require.NoError(t, fakeClient.Get(ctx, client.ObjectKey{Name: tt.clusterName + "-0", Namespace: "default"}, pod))
 			assert.Equal(t, tt.expectedLabels, pod.Labels)
 			require.Len(t, pod.OwnerReferences, 1)
-			assert.Equal(t, ec.Name, pod.OwnerReferences[0].Name)
+			assert.Equal(t, member.Name, pod.OwnerReferences[0].Name)
 		})
 	}
 }
@@ -690,6 +824,10 @@ func TestClientEndpointsFromPods(t *testing.T) {
 }
 
 func TestBuildMemberPodTLSVolumes(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+	require.NoError(t, ecv1alpha1.AddToScheme(scheme))
+
 	mkCluster := func(tls *ecv1alpha1.TLSCertificate, storage *ecv1alpha1.StorageSpec) *ecv1alpha1.EtcdCluster {
 		return &ecv1alpha1.EtcdCluster{
 			ObjectMeta: metav1.ObjectMeta{Name: "tls-cluster", Namespace: "default", UID: "1"},
@@ -704,7 +842,8 @@ func TestBuildMemberPodTLSVolumes(t *testing.T) {
 
 	t.Run("TLS cluster mounts both secrets readonly and adds TLS args", func(t *testing.T) {
 		ec := mkCluster(&ecv1alpha1.TLSCertificate{Provider: "auto"}, nil)
-		pod := buildMemberPod(ec, "tls-cluster-0", etcdClusterStateNew, "ignored")
+		pod, err := buildMemberPod(ec, testMemberForCluster(ec, 0), etcdClusterStateNew, "ignored", scheme)
+		require.NoError(t, err)
 
 		container := pod.Spec.Containers[0]
 
@@ -740,7 +879,8 @@ func TestBuildMemberPodTLSVolumes(t *testing.T) {
 
 	t.Run("non-TLS cluster adds no secret mounts and stays http", func(t *testing.T) {
 		ec := mkCluster(nil, nil)
-		pod := buildMemberPod(ec, "tls-cluster-0", etcdClusterStateNew, "ignored")
+		pod, err := buildMemberPod(ec, testMemberForCluster(ec, 0), etcdClusterStateNew, "ignored", scheme)
+		require.NoError(t, err)
 
 		for _, m := range pod.Spec.Containers[0].VolumeMounts {
 			assert.NotEqual(t, "server-secret", m.Name, "non-TLS pod must not mount server-secret")

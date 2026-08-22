@@ -100,7 +100,7 @@ func TestEtcdOptions(t *testing.T) {
 
 	feature.Assess("Check if the etcd pod is created and the cluster has the desired replicas",
 		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
-			if err := waitForPodReadiness(t, cfg, etcdCluster.Name, etcdCluster.Spec.Size); err != nil {
+			if err := waitForAllEtcdMemberReady(t, cfg, etcdCluster); err != nil {
 				t.Fatal(err)
 			}
 			return ctx

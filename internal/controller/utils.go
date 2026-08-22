@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/url"
 	"slices"
 	"strings"
 	"time"
@@ -58,9 +59,22 @@ func etcdClusterLabels(ec *ecv1alpha1.EtcdCluster) map[string]string {
 	}
 }
 
+// clusterNameLabel marks cluster-owned objects with their EtcdCluster's name,
+// letting owned objects be selected by label.
+const clusterNameLabel = "operator.etcd.io/cluster"
+
+// clusterNameLabels returns the label set that marks objects (EtcdMembers,
+// PVCs) with the name of the cluster they belong to, letting them be
+// selected by label.
+func clusterNameLabels(clusterName string) map[string]string {
+	return map[string]string{clusterNameLabel: clusterName}
+}
+
 // createPVCForMember creates a PVC for the given pod if one does not already
 // exist.  Naming mirrors StatefulSet VolumeClaimTemplates: "{volumeName}-{podName}".
-func createPVCForMember(ctx context.Context, c client.Client, ec *ecv1alpha1.EtcdCluster, podName string, scheme *runtime.Scheme) error {
+// The PVC is owned by the EtcdMember and labeled with the cluster name so
+// per-cluster PVCs can be listed by label selector.
+func createPVCForMember(ctx context.Context, c client.Client, ec *ecv1alpha1.EtcdCluster, member *ecv1alpha1.EtcdMember, podName string, scheme *runtime.Scheme) error {
 	pvcName := pvcNameForMember(podName)
 
 	existing := &corev1.PersistentVolumeClaim{}
@@ -85,6 +99,7 @@ func createPVCForMember(ctx context.Context, c client.Client, ec *ecv1alpha1.Etc
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      pvcName,
 			Namespace: ec.Namespace,
+			Labels:    clusterNameLabels(ec.Name),
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{
 			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
@@ -103,7 +118,7 @@ func createPVCForMember(ctx context.Context, c client.Client, ec *ecv1alpha1.Etc
 		pvc.Spec.StorageClassName = &ec.Spec.StorageSpec.StorageClassName
 	}
 
-	if err := controllerutil.SetControllerReference(ec, pvc, scheme); err != nil {
+	if err := controllerutil.SetControllerReference(member, pvc, scheme); err != nil {
 		return err
 	}
 
@@ -201,6 +216,22 @@ func peerEndpointForOrdinalIndex(ec *ecv1alpha1.EtcdCluster, index int) (string,
 	name := fmt.Sprintf("%s-%d", ec.Name, index)
 	return name, fmt.Sprintf("%s://%s-%d.%s.%s.svc.cluster.local:2380",
 		clusterScheme(clusterTLSEnabled(ec)), ec.Name, index, ec.Name, ec.Namespace)
+}
+
+// getMemberNameFromPeerURL returns the {cluster}-{ordinal} member name
+// encoded in a peer URL of the shape produced by peerEndpointForOrdinalIndex
+// — the hostname label before its first ".". Returns "" if the URL has no
+// host.
+func getMemberNameFromPeerURL(peerURL string) string {
+	u, err := url.Parse(peerURL)
+	if err != nil {
+		return ""
+	}
+	host := u.Hostname()
+	if idx := strings.Index(host, "."); idx != -1 {
+		return host[:idx]
+	}
+	return host
 }
 
 // ---------------------------------------------------------------------------

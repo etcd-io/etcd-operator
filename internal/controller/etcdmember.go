@@ -18,13 +18,21 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/util/retry"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
+	"go.etcd.io/etcd-operator/internal/etcdutils"
+	"go.etcd.io/etcd/api/v3/etcdserverpb"
 )
 
 // memberCleanupFinalizer is added to every EtcdMember at creation time so the
@@ -33,6 +41,389 @@ import (
 // controller-initiated scale-in or a human operator deleting it directly.
 const memberCleanupFinalizer = "operator.etcd.io/member-cleanup"
 
+// reconcileEtcdMember is the shared lifecycle entry point for every normal
+// provisioning attempt and its interruption recovery. Future lifecycle
+// phases attach focused handlers here without moving provisioning back into
+// scaleCluster or dispatch.
+func (r *EtcdClusterReconciler) reconcileEtcdMember(
+	ctx context.Context,
+	state *reconcileState,
+	member *ecv1alpha1.EtcdMember,
+) (ctrl.Result, error) {
+	switch member.Status.Phase {
+	// Creating the EtcdMember object and writing its status Phase are two
+	// separate calls in createEtcdMember. If the operator crashes in between,
+	// the object survives with an empty Phase, which must resume provisioning.
+	case "", ecv1alpha1.EtcdMemberPending, ecv1alpha1.EtcdMemberProvisioning:
+		return r.reconcileProvisioning(ctx, state, member)
+	// placeholder for Terminating, Recreating and Replacing
+	default:
+		return ctrl.Result{}, nil
+	}
+}
+
+// reconcileProvisioning establishes the durable write-before-mutate phase
+// boundary and drives normal provisioning as a linear sequence of idempotent
+// steps: prerequisites (certificates, PVC), membership registration, Pod
+// creation, and health convergence. Ordinal 0 with no live membership is the
+// bootstrap voter branch; every other unregistered peer is added as a
+// learner.
+func (r *EtcdClusterReconciler) reconcileProvisioning(
+	ctx context.Context,
+	state *reconcileState,
+	member *ecv1alpha1.EtcdMember,
+) (ctrl.Result, error) {
+	// 1. Phase boundary (write-before-mutate): persist Phase=Provisioning
+	// before any membership or Pod mutation. On first entry stop here and
+	// requeue, so a crash right after this write resumes provisioning instead
+	// of restarting it.
+	enteringProvisioning := member.Status.Phase == "" || member.Status.Phase == ecv1alpha1.EtcdMemberPending
+	if enteringProvisioning {
+		if err := r.updateEtcdMemberStatus(ctx, member, func(status *ecv1alpha1.EtcdMemberStatus) {
+			status.Phase = ecv1alpha1.EtcdMemberProvisioning
+		}); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: requeueDuration}, nil
+	}
+
+	// 2. Idempotent prerequisite: the shared TLS certificates must exist
+	// before the member's Pod mounts them.
+	if err := r.provisionCertificates(ctx, state); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// 3. Idempotent prerequisite: the member's own PVC for ReadWriteOnce
+	// storage.
+	if err := r.provisionPVC(ctx, state, member); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// 4. Initial state and membership registration. Bootstrap — ordinal 0
+	// with no live membership — starts the very first voter for the brand-new cluster; this is the only
+	// path that starts etcd with cluster-state=new. Every other unregistered
+	// peer is added as a learner (etcd admits only one learner at a time, so
+	// wait while another learner is still joining). Reaching this again after
+	// a crash between MemberAdd and Pod creation is expected — the add is
+	// idempotent here because registration is checked against live state.
+	bootstrap := member.Spec.Ordinal == 0 &&
+		(state.memberListResp == nil || len(state.memberListResp.Members) == 0)
+
+	if !bootstrap {
+		if etcdNode := findEtcdNodeForEtcdMember(state, member); etcdNode == nil {
+			if err := r.addLearner(state, member); err != nil {
+				return ctrl.Result{}, err
+			}
+			// addLearner updated the membership of etcd cluster, so
+			// we need to refresh the reconcileState by requeuing the request.
+			return ctrl.Result{RequeueAfter: requeueDuration}, nil
+		}
+	}
+
+	// 5. Pod creation: the member is registered (or is the bootstrap voter)
+	// but its Pod is absent (interrupted run, or the Pod was deleted
+	// mid-provisioning). Render ETCD_INITIAL_CLUSTER from the authoritative
+	// topology, create the Pod, and requeue to give it enough time to
+	// start.
+	if pod := findPodForEtcdMember(state, member); pod == nil {
+		if err := r.createPodForEtcdMember(ctx, state, member, bootstrap); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: requeueDuration}, nil
+	}
+
+	// 6. Convergence: wait until this member's endpoint reports healthy.
+	health, err := findHealthStatusForEtcdMember(state, member)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if !health.Health {
+		// TODO(#472): once a common recovery ladder exists, replace the
+		// member once RecreateCount has reached its limit; otherwise
+		// recreate the Pod and increment RecreateCount.
+		return ctrl.Result{RequeueAfter: requeueDuration}, nil
+	}
+
+	// 7. Promotion: if the member is still a learner, wait until the leader
+	// considers it caught up, then promote it to a voting member.
+	etcdNode := findEtcdNodeForEtcdMember(state, member)
+	if etcdNode == nil {
+		return ctrl.Result{}, fmt.Errorf("live etcd node for EtcdMember %q is not mapped", member.Name)
+	}
+	if etcdNode.IsLearner {
+		if res, err := r.promoteLearnerForEtcdMember(ctx, state, member, etcdNode); err != nil || !res.IsZero() {
+			return res, err
+		}
+	}
+
+	// 8. Completion: healthy voting member — mark it Ready.
+	if err := r.updateEtcdMemberStatus(ctx, member, func(status *ecv1alpha1.EtcdMemberStatus) {
+		status.Phase = ecv1alpha1.EtcdMemberReady
+		status.RecreateCount = 0
+	}); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	return ctrl.Result{RequeueAfter: requeueDuration}, nil
+}
+
+// provisionCertificates ensures the cluster's shared server/peer TLS
+// certificates exist before a member's Pod mounts them. Idempotent.
+func (r *EtcdClusterReconciler) provisionCertificates(ctx context.Context, state *reconcileState) error {
+	if err := applyEtcdMemberCerts(ctx, state.cluster, r.Client); err != nil {
+		return fmt.Errorf("provisioning certificates for EtcdCluster %q: %w", state.cluster.Name, err)
+	}
+	return nil
+}
+
+// provisionPVC ensures the member's own PVC exists. A per-member PVC is only
+// needed for ReadWriteOnce storage; clusters without a storage spec or with
+// ReadWriteMany storage skip it. Idempotent.
+func (r *EtcdClusterReconciler) provisionPVC(ctx context.Context, state *reconcileState, member *ecv1alpha1.EtcdMember) error {
+	cluster := state.cluster
+	// ReadWriteMany is assumed to be statically provisioned (e.g. a shared
+	// NFS-backed PVC) and managed outside the operator, so no per-member PVC
+	// is created for it.
+	if cluster.Spec.StorageSpec == nil || cluster.Spec.StorageSpec.AccessModes == corev1.ReadWriteMany {
+		return nil
+	}
+	podName := memberPodName(cluster.Name, member.Spec.Ordinal)
+	if err := createPVCForMember(ctx, r.Client, cluster, member, podName, r.Scheme); err != nil {
+		return fmt.Errorf("provisioning PVC for EtcdMember %q: %w", member.Name, err)
+	}
+	return nil
+}
+
+// addLearner registers the member in the live etcd membership as a learner.
+// The member's Pod is created in a later pass that renders
+// ETCD_INITIAL_CLUSTER from a fresh membership snapshot.
+func (r *EtcdClusterReconciler) addLearner(state *reconcileState, member *ecv1alpha1.EtcdMember) error {
+	endpoints := clientEndpointsFromPods(state.cluster.Name, state.cluster.Namespace, state.pods, clusterTLSEnabled(state.cluster))
+	if len(endpoints) == 0 {
+		return fmt.Errorf("cannot add learner for EtcdMember %q: no live client endpoints", member.Name)
+	}
+
+	_, peerURL := peerEndpointForOrdinalIndex(state.cluster, member.Spec.Ordinal)
+	if _, err := etcdutils.AddMember(etcdutils.ClientConfig{Endpoints: endpoints, TLS: state.tlsConfig}, []string{peerURL}, true); err != nil {
+		return fmt.Errorf("failed to add learner for EtcdMember %q: %w", member.Name, err)
+	}
+
+	return nil
+}
+
+// promoteLearnerForEtcdMember promotes the member's learner to a voting
+// member. A failed promotion is logged and retried on a later pass; the
+// absence of live client endpoints is an error because no endpoint exists to
+// reach the membership at all.
+func (r *EtcdClusterReconciler) promoteLearnerForEtcdMember(
+	ctx context.Context,
+	state *reconcileState,
+	member *ecv1alpha1.EtcdMember,
+	etcdNode *etcdserverpb.Member,
+) (ctrl.Result, error) {
+	endpoints := clientEndpointsFromPods(
+		state.cluster.Name,
+		state.cluster.Namespace,
+		state.pods,
+		clusterTLSEnabled(state.cluster),
+	)
+	if len(endpoints) == 0 {
+		return ctrl.Result{}, fmt.Errorf("promoting learner for EtcdMember %q: no live client endpoints", member.Name)
+	}
+	if err := etcdutils.PromoteLearner(
+		etcdutils.ClientConfig{Endpoints: endpoints, TLS: state.tlsConfig},
+		etcdNode.ID,
+	); err != nil {
+		log.FromContext(ctx).Error(err, fmt.Sprintf("failed to promote learner for EtcdMember %q", member.Name))
+		return ctrl.Result{RequeueAfter: requeueDuration}, nil
+	}
+	return ctrl.Result{}, nil
+}
+
+// createPodForEtcdMember creates the Pod for a member that is already
+// registered (or is the bootstrap voter): the initial cluster state is new
+// only for bootstrap, ETCD_INITIAL_CLUSTER is rendered from the authoritative
+// topology, and the Pod is created if absent. Idempotent.
+func (r *EtcdClusterReconciler) createPodForEtcdMember(
+	ctx context.Context,
+	state *reconcileState,
+	member *ecv1alpha1.EtcdMember,
+	bootstrap bool,
+) error {
+	initialClusterState := etcdClusterStateExisting
+	if bootstrap {
+		initialClusterState = etcdClusterStateNew
+	}
+	return r.ensureProvisioningPod(ctx, state, member, initialClusterState, initialClusterForPod(state, member, bootstrap))
+}
+
+// initialClusterForPod renders ETCD_INITIAL_CLUSTER for the member's Pod: a
+// self-contained one-member string for bootstrap, otherwise the cluster
+// membership rendered from the cluster's EtcdMembers.
+func initialClusterForPod(state *reconcileState, member *ecv1alpha1.EtcdMember, bootstrap bool) string {
+	if bootstrap {
+		name, peerURL := peerEndpointForOrdinalIndex(state.cluster, member.Spec.Ordinal)
+		return fmt.Sprintf("%s=%s", name, peerURL)
+	}
+	return renderInitialCluster(state.cluster, state.members)
+}
+
+func (r *EtcdClusterReconciler) ensureProvisioningPod(
+	ctx context.Context,
+	state *reconcileState,
+	member *ecv1alpha1.EtcdMember,
+	initialClusterState etcdClusterState,
+	initialCluster string,
+) error {
+	if findPodForEtcdMember(state, member) != nil {
+		return nil
+	}
+
+	if err := createMemberPod(
+		ctx,
+		log.FromContext(ctx),
+		r.Client,
+		state.cluster,
+		member,
+		initialClusterState,
+		initialCluster,
+		r.Scheme,
+	); err != nil {
+		return fmt.Errorf("creating Pod for EtcdMember %q: %w", member.Name, err)
+	}
+
+	if err := r.updateEtcdMemberStatus(ctx, member, func(status *ecv1alpha1.EtcdMemberStatus) {
+		status.RecreateCount++
+	}); err != nil {
+		return err
+	}
+	return nil
+}
+
+// findPodForEtcdMember looks up the member's Pod in the reconcile snapshot:
+// Pods are listed once per reconcile, so a nil result means the Pod was
+// absent at snapshot time.
+func findPodForEtcdMember(state *reconcileState, member *ecv1alpha1.EtcdMember) *corev1.Pod {
+	podName := memberPodName(state.cluster.Name, member.Spec.Ordinal)
+	for _, p := range state.pods {
+		if p.Name == podName {
+			return p
+		}
+	}
+	return nil
+}
+
+// updateEtcdMemberStatus applies a mutation to the latest persisted member
+// status, retries optimistic-lock conflicts, and avoids unchanged writes.
+func (r *EtcdClusterReconciler) updateEtcdMemberStatus(
+	ctx context.Context,
+	member *ecv1alpha1.EtcdMember,
+	mutate func(*ecv1alpha1.EtcdMemberStatus),
+) error {
+	key := client.ObjectKeyFromObject(member)
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		current := &ecv1alpha1.EtcdMember{}
+		if err := r.Get(ctx, key, current); err != nil {
+			return err
+		}
+
+		desired := current.DeepCopy()
+		mutate(&desired.Status)
+		if equality.Semantic.DeepEqual(current.Status, desired.Status) {
+			member.Status = desired.Status
+			member.ResourceVersion = current.ResourceVersion
+			return nil
+		}
+
+		if err := r.Status().Update(ctx, desired); err != nil {
+			return err
+		}
+		member.Status = desired.Status
+		member.ResourceVersion = desired.ResourceVersion
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("updating status for EtcdMember %q: %w", key.String(), err)
+	}
+	return nil
+}
+
+// findEtcdNodeForEtcdMember correlates an EtcdMember resource with the
+// current etcd membership by name: a live node matches when its etcd name —
+// or, while a newly added node has not started and is still unnamed, the name
+// encoded in its peer URL — equals the EtcdMember's name.
+func findEtcdNodeForEtcdMember(state *reconcileState, member *ecv1alpha1.EtcdMember) *etcdserverpb.Member {
+	if state.memberListResp == nil {
+		return nil
+	}
+
+	for _, node := range state.memberListResp.Members {
+		for _, peerURL := range node.PeerURLs {
+			memberName := node.Name
+			if memberName == "" {
+				memberName = getMemberNameFromPeerURL(peerURL)
+			}
+			if memberName == member.Name {
+				return node
+			}
+		}
+	}
+
+	return nil
+}
+
+// pickNotReadyMember selects from the current live snapshot: a live learner
+// mapped to its EtcdMember first, otherwise the lowest-ordinal member that
+// isn't Ready yet. state.members is assumed sorted by ordinal, so the first
+// match in the second pass is the lowest-ordinal one.
+func pickNotReadyMember(
+	state *reconcileState,
+) *ecv1alpha1.EtcdMember {
+	for i := range state.members {
+		member := &state.members[i]
+		if member.Status.Phase == ecv1alpha1.EtcdMemberReady {
+			continue
+		}
+		if etcdNode := findEtcdNodeForEtcdMember(state, member); etcdNode != nil && etcdNode.IsLearner {
+			return member
+		}
+	}
+	for i := range state.members {
+		member := &state.members[i]
+		if member.Status.Phase != ecv1alpha1.EtcdMemberReady {
+			return member
+		}
+	}
+	return nil
+}
+
+// findHealthStatusForEtcdMember looks up the member's health entry in the
+// reconcile snapshot by its deterministic Pod (= etcd member) name.
+func findHealthStatusForEtcdMember(state *reconcileState, member *ecv1alpha1.EtcdMember) (*etcdutils.EpHealth, error) {
+	memberName := memberPodName(state.cluster.Name, member.Spec.Ordinal)
+	if state.health != nil {
+		if memberHealthStatus, ok := state.health.Members[memberName]; ok {
+			return &memberHealthStatus, nil
+		}
+		return nil, fmt.Errorf("health status is not found for member %s", memberName)
+	}
+	return nil, fmt.Errorf("cannot find the health status for member %s as the health report is empty", memberName)
+}
+
+// renderInitialCluster renders ETCD_INITIAL_CLUSTER from the cluster's
+// EtcdMembers, assuming they are consistent with the live etcd membership.
+// It never infers topology from an ordinal range.
+func renderInitialCluster(cluster *ecv1alpha1.EtcdCluster, members []ecv1alpha1.EtcdMember) string {
+	entries := make([]string, 0, len(members))
+	for i := range members {
+		name, peerURL := peerEndpointForOrdinalIndex(cluster, members[i].Spec.Ordinal)
+		entries = append(entries, fmt.Sprintf("%s=%s", name, peerURL))
+	}
+
+	sort.Strings(entries)
+	return strings.Join(entries, ",")
+}
+
 // etcdMemberName returns the deterministic name for a member's EtcdMember
 // object, matching today's Pod naming so both stay stable and human-readable.
 func etcdMemberName(clusterName string, ordinal int) string {
@@ -40,10 +431,13 @@ func etcdMemberName(clusterName string, ordinal int) string {
 }
 
 // listOwnedMembers returns all EtcdMembers owned by ec, sorted in ascending
-// ordinal order.
+// ordinal order. The label selector and namespace filter members belonging to the cluster.
 func listOwnedMembers(ctx context.Context, c client.Client, ec *ecv1alpha1.EtcdCluster) ([]ecv1alpha1.EtcdMember, error) {
 	memberList := &ecv1alpha1.EtcdMemberList{}
-	if err := c.List(ctx, memberList, client.InNamespace(ec.Namespace)); err != nil {
+	if err := c.List(ctx, memberList,
+		client.InNamespace(ec.Namespace),
+		client.MatchingLabels(clusterNameLabels(ec.Name)),
+	); err != nil {
 		return nil, fmt.Errorf("failed to list EtcdMembers for cluster %s: %w", ec.Name, err)
 	}
 
@@ -84,8 +478,7 @@ func nextOrdinal(existing []int) int {
 }
 
 // allReady reports whether every member is Phase: Ready. Vacuously true for
-// zero members, which is what lets bootstrap (creating ordinal 0) proceed
-// through the §4.2 readiness gate with no special-case code.
+// zero members.
 func allReady(members []ecv1alpha1.EtcdMember) bool {
 	for _, m := range members {
 		if m.Status.Phase != ecv1alpha1.EtcdMemberReady {
@@ -93,33 +486,6 @@ func allReady(members []ecv1alpha1.EtcdMember) bool {
 		}
 	}
 	return true
-}
-
-// pickNotReadyMember returns the not-Ready member the dispatcher's §4.9 item
-// 8 should advance next: an existing learner always wins (requirement 11, so
-// a different member's Replacing rejoin never attempts a second
-// MemberAdd(learner) while one is already pending); otherwise the
-// lowest-ordinal not-Ready member (members is sorted by ordinal already, per
-// listOwnedMembers). Members already claimed by an earlier dispatch step —
-// Recreating (item 5) or Terminating/DeletionTimestamp set (item 7) — are
-// not this step's concern.
-func pickNotReadyMember(members []ecv1alpha1.EtcdMember) *ecv1alpha1.EtcdMember {
-	for i := range members {
-		if members[i].Status.IsLearner {
-			return &members[i]
-		}
-	}
-	for i := range members {
-		m := &members[i]
-		if m.DeletionTimestamp != nil {
-			continue
-		}
-		switch m.Status.Phase {
-		case ecv1alpha1.EtcdMemberPending, ecv1alpha1.EtcdMemberProvisioning, ecv1alpha1.EtcdMemberReplacing:
-			return m
-		}
-	}
-	return nil
 }
 
 // createEtcdMember creates the EtcdMember object for the given ordinal,
@@ -131,6 +497,7 @@ func createEtcdMember(ctx context.Context, c client.Client, ec *ecv1alpha1.EtcdC
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       etcdMemberName(ec.Name, ordinal),
 			Namespace:  ec.Namespace,
+			Labels:     clusterNameLabels(ec.Name),
 			Finalizers: []string{memberCleanupFinalizer},
 		},
 		Spec: ecv1alpha1.EtcdMemberSpec{
