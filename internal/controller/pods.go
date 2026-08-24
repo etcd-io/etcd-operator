@@ -162,53 +162,70 @@ func clusterTLSEnabled(ec *ecv1alpha1.EtcdCluster) bool {
 	return ec != nil && ec.Spec.TLS != nil
 }
 
-// areAllMembersHealthy returns true when every entry in the supplied health
-// slice reports healthy.  It uses already-fetched health data and does not make
-// additional network calls.
-func areAllMembersHealthy(memberHealth []etcdutils.EpHealth) bool {
-	for _, h := range memberHealth {
-		if !h.Health {
-			return false
-		}
-	}
-	return true
-}
-
-// healthCheck returns a MemberListResponse and per-endpoint health information
-// for the etcd cluster reachable through the given pods.
-func healthCheck(clusterName, namespace string, pods []*corev1.Pod, tlsEnabled bool, tlsConfig *tls.Config, lg klog.Logger) (*clientv3.MemberListResponse, []etcdutils.EpHealth, error) {
+// healthCheck returns a MemberListResponse and an etcdutils.ClusterHealth for
+// the etcd cluster reachable through the given pods.
+//
+// Cluster-wide health (ClusterHealth.Healthy) is derived from two
+// linearizable calls — MemberList and AlarmList — both of which go through
+// Raft consensus, so success proves the cluster has quorum. Per-member
+// health (ClusterHealth.Members) is derived separately, from a serializable
+// range request against each member (etcdutils.MemberHealth), so an
+// individual member can be reported healthy even while the cluster as a
+// whole lacks quorum.
+func healthCheck(clusterName, namespace string, pods []*corev1.Pod, tlsEnabled bool, tlsConfig *tls.Config, lg klog.Logger) (*clientv3.MemberListResponse, *etcdutils.ClusterHealth, error) {
 	if len(pods) == 0 {
 		return nil, nil, nil
 	}
 
 	endpoints := clientEndpointsFromPods(clusterName, namespace, pods, tlsEnabled)
 
-	memberlistResp, err := etcdutils.MemberList(etcdutils.ClientConfig{Endpoints: endpoints, TLS: tlsConfig})
-	if err != nil {
-		return nil, nil, err
+	memberlistResp, listErr := etcdutils.MemberList(etcdutils.ClientConfig{Endpoints: endpoints, TLS: tlsConfig})
+	alarmResp, alarmErr := etcdutils.AlarmList(etcdutils.ClientConfig{Endpoints: endpoints, TLS: tlsConfig})
+
+	health := &etcdutils.ClusterHealth{Healthy: listErr == nil && alarmErr == nil}
+	if alarmResp != nil {
+		health.Alarms = alarmResp.Alarms
 	}
-	memberCnt := len(memberlistResp.Members)
 
-	// Use the smaller of the two counts: pods that are starting up may not yet
-	// appear in the member list and already-removed members may have no pod.
-	cnt := min(len(pods), memberCnt)
-	lg.Info("health checking", "podCount", len(pods), "len(members)", memberCnt)
-	endpoints = endpoints[:cnt]
+	podNames := make([]string, 0, len(pods))
+	for _, pod := range pods {
+		podNames = append(podNames, pod.Name)
+	}
 
-	healthInfos, err := etcdutils.ClusterHealth(etcdutils.ClientConfig{Endpoints: endpoints, TLS: tlsConfig})
+	var memberNames []string
+	if memberlistResp != nil {
+		memberNames = make([]string, 0, len(memberlistResp.Members))
+		for _, member := range memberlistResp.Members {
+			memberNames = append(memberNames, member.Name)
+		}
+	}
+
+	lg.Info("health checking", "pods", podNames, "members", memberNames)
+
+	memberHealth, err := etcdutils.MemberHealth(etcdutils.ClientConfig{Endpoints: endpoints, Names: podNames, TLS: tlsConfig})
+	health.Members = make(map[string]etcdutils.EpHealth, len(memberHealth))
+	for _, h := range memberHealth {
+		health.Members[h.Name] = h
+	}
 	if err != nil {
-		return memberlistResp, nil, err
+		return memberlistResp, health, err
 	}
 
 	var memberErrors []error
-	for _, healthInfo := range healthInfos {
+	for _, healthInfo := range memberHealth {
 		if !healthInfo.Health {
 			memberErrors = append(memberErrors, errors.New(healthInfo.String()))
 		}
 		lg.Info(healthInfo.String())
 	}
+	if listErr != nil {
+		memberErrors = append(memberErrors, fmt.Errorf("member list failed: %w", listErr))
+	}
+	if alarmErr != nil {
+		memberErrors = append(memberErrors, fmt.Errorf("alarm list failed: %w", alarmErr))
+	}
 
-	return memberlistResp, healthInfos, utilerrors.NewAggregate(memberErrors)
+	return memberlistResp, health, utilerrors.NewAggregate(memberErrors)
 }
 
 // ---------------------------------------------------------------------------

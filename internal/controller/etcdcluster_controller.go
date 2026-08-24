@@ -69,7 +69,7 @@ type reconcileState struct {
 	members        []ecv1alpha1.EtcdMember      // EtcdMembers owned by this cluster, sorted by ordinal
 	pods           []*corev1.Pod                // member pods owned by this cluster, sorted by ordinal
 	memberListResp *clientv3.MemberListResponse // member list fetched from the etcd cluster
-	memberHealth   []etcdutils.EpHealth         // health information for each etcd member
+	health         *etcdutils.ClusterHealth     // cluster/member health and active alarms from the latest health check
 	tlsConfig      *tls.Config                  // etcd client TLS config used by every etcdutils call in this loop (nil for non-TLS clusters)
 }
 
@@ -168,9 +168,7 @@ func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	// 5. Always-on refresh: live member list/health (§4.2) — never gated.
-	if err = r.refreshClusterState(ctx, state); err != nil {
-		return ctrl.Result{}, err
-	}
+	r.refreshClusterState(ctx, state)
 
 	// 6. Pause (requirement 15): do nothing else at all this loop, ahead of
 	// dispatch (including an already-started lost-quorum recovery).
@@ -334,24 +332,36 @@ func (r *EtcdClusterReconciler) ensureClusterPrereqs(ctx context.Context, s *rec
 	return createHeadlessServiceIfNotExist(ctx, logger, r.Client, s.cluster, r.Scheme)
 }
 
-// refreshClusterState fetches the live etcd member list and per-endpoint
+// refreshClusterState fetches the live etcd member list and cluster/member
 // health and stores them on reconcileState for the dispatcher below. Always
 // runs, never gated by member readiness (§4.2).
-func (r *EtcdClusterReconciler) refreshClusterState(ctx context.Context, s *reconcileState) error {
+func (r *EtcdClusterReconciler) refreshClusterState(ctx context.Context, s *reconcileState) {
 	logger := log.FromContext(ctx)
 	logger.Info("Now checking health of the cluster members")
 
 	var err error
-	s.memberListResp, s.memberHealth, err = healthCheck(s.cluster.Name, s.cluster.Namespace, s.pods, clusterTLSEnabled(s.cluster), s.tlsConfig, logger)
+	s.memberListResp, s.health, err = healthCheck(s.cluster.Name, s.cluster.Namespace, s.pods, clusterTLSEnabled(s.cluster), s.tlsConfig, logger)
 	if err != nil {
-		return fmt.Errorf("health check failed: %w", err)
+		logger.Info("health check found errors", "errors", err)
 	}
 
-	if !areAllMembersHealthy(s.memberHealth) {
-		logger.Info("Found one or more unhealthy members")
-	}
+	if s.health != nil {
+		logger.Info("Cluster health check complete", "clusterHealthy", s.health.Healthy)
 
-	return nil
+		var unhealthyEndpoints []string
+		for _, m := range s.health.Members {
+			if !m.Health {
+				unhealthyEndpoints = append(unhealthyEndpoints, m.Ep)
+			}
+		}
+		if len(unhealthyEndpoints) > 0 {
+			logger.Info("Found one or more unhealthy members", "unhealthyEndpoints", unhealthyEndpoints)
+		}
+
+		if len(s.health.Alarms) > 0 {
+			logger.Info("Found active etcd alarms", "alarms", s.health.Alarms)
+		}
+	}
 }
 
 // dispatch implements design doc §4.9's priority order, items 2-9:
@@ -403,12 +413,12 @@ func (r *EtcdClusterReconciler) dispatch(ctx context.Context, s *reconcileState)
 
 	// 4. CORRUPT alarm on some member (§4.6/§4.7).
 	// TODO: §4.9 item 4 — force the tagged member to Phase: Replacing
-	// (M4). Detection needs etcdutils.AlarmList, not fetched yet in this
-	// milestone, so this step can never fire until M4 lands.
+	// (M4). s.health.Alarms (refreshClusterState) now carries active alarms;
+	// this step just doesn't act on them yet.
 
 	// 5. NOSPACE alarm remediation (§4.7).
 	// TODO: §4.9 item 5 — compact/defragment/disarm cycle (M4). Same
-	// as above, needs AlarmList.
+	// as above, s.health.Alarms already has the data.
 
 	// 6. Per-member repair: continue a member already Recreating, or start
 	// fixing exactly one newly-unhealthy Ready member (requirement 6).
@@ -613,16 +623,20 @@ func (r *EtcdClusterReconciler) updateStatus(ctx context.Context, s *reconcileSt
 
 	// etcd membership.
 	if s.memberListResp != nil {
+		var memberHealth map[string]etcdutils.EpHealth
+		if s.health != nil {
+			memberHealth = s.health.Members
+		}
+
 		s.cluster.Status.MemberCount = int32(len(s.memberListResp.Members))
 
 		s.cluster.Status.Members = make([]ecv1alpha1.MemberStatus, 0, len(s.memberListResp.Members))
-		for i, member := range s.memberListResp.Members {
+		for _, member := range s.memberListResp.Members {
 			memberStatus := ecv1alpha1.MemberStatus{
 				ID:   fmt.Sprintf("%x", member.ID),
 				Name: member.Name,
 			}
-			if i < len(s.memberHealth) {
-				health := s.memberHealth[i]
+			if health, ok := memberHealth[member.Name]; ok {
 				memberStatus.IsHealthy = health.Health
 				if health.Status != nil {
 					memberStatus.Version = health.Status.Version
@@ -633,15 +647,17 @@ func (r *EtcdClusterReconciler) updateStatus(ctx context.Context, s *reconcileSt
 			s.cluster.Status.Members = append(s.cluster.Status.Members, memberStatus)
 		}
 
-		_, leaderStatus := etcdutils.FindLeaderStatus(s.memberHealth, logger)
+		_, leaderStatus := etcdutils.FindLeaderStatus(memberHealth, logger)
 		if leaderStatus != nil {
 			s.cluster.Status.LeaderID = fmt.Sprintf("%x", leaderStatus.Leader)
-		}
-
-		if leaderStatus != nil {
 			s.cluster.Status.CurrentVersion = leaderStatus.Version
-		} else if len(s.memberHealth) > 0 && s.memberHealth[0].Status != nil {
-			s.cluster.Status.CurrentVersion = s.memberHealth[0].Status.Version
+		} else {
+			for _, health := range memberHealth {
+				if health.Status != nil {
+					s.cluster.Status.CurrentVersion = health.Status.Version
+					break
+				}
+			}
 		}
 	}
 
@@ -658,6 +674,11 @@ func (r *EtcdClusterReconciler) updateStatus(ctx context.Context, s *reconcileSt
 func (r *EtcdClusterReconciler) updateConditions(s *reconcileState) {
 	now := metav1.Now()
 
+	var memberHealth map[string]etcdutils.EpHealth
+	if s.health != nil {
+		memberHealth = s.health.Members
+	}
+
 	availableCondition := metav1.Condition{
 		Type:               "Available",
 		Status:             metav1.ConditionFalse,
@@ -669,7 +690,7 @@ func (r *EtcdClusterReconciler) updateConditions(s *reconcileState) {
 
 	if s.memberListResp != nil && len(s.memberListResp.Members) > 0 {
 		healthyCount := 0
-		for _, health := range s.memberHealth {
+		for _, health := range memberHealth {
 			if health.Health {
 				healthyCount++
 			}
@@ -730,11 +751,11 @@ func (r *EtcdClusterReconciler) updateConditions(s *reconcileState) {
 		Message:            "All etcd members are healthy",
 	}
 
-	if s.memberListResp != nil && len(s.memberHealth) > 0 {
+	if s.memberListResp != nil && len(memberHealth) > 0 {
 		var unhealthyMembers []string
-		for _, health := range s.memberHealth {
-			if !health.Health && health.Status != nil {
-				unhealthyMembers = append(unhealthyMembers, fmt.Sprintf("%x", health.Status.Header.MemberId))
+		for _, health := range memberHealth {
+			if !health.Health {
+				unhealthyMembers = append(unhealthyMembers, health.Ep)
 			}
 		}
 		if len(unhealthyMembers) > 0 {

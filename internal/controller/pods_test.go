@@ -214,48 +214,6 @@ func TestWaitForPodReady(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// areAllMembersHealthy
-// ---------------------------------------------------------------------------
-
-func TestAreAllMembersHealthy(t *testing.T) {
-	tests := []struct {
-		name     string
-		health   []etcdutils.EpHealth
-		expected bool
-	}{
-		{
-			name:     "empty slice — no unhealthy members",
-			health:   nil,
-			expected: true,
-		},
-		{
-			name: "all healthy",
-			health: []etcdutils.EpHealth{
-				{Health: true},
-				{Health: true},
-				{Health: true},
-			},
-			expected: true,
-		},
-		{
-			name: "one unhealthy",
-			health: []etcdutils.EpHealth{
-				{Health: true},
-				{Health: false},
-				{Health: true},
-			},
-			expected: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.expected, areAllMembersHealthy(tt.health))
-		})
-	}
-}
-
-// ---------------------------------------------------------------------------
 // IsLearnerReady (delegates to etcdutils)
 // ---------------------------------------------------------------------------
 
