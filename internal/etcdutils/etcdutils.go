@@ -14,15 +14,24 @@ import (
 	"go.uber.org/zap"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	"go.etcd.io/etcd/client/pkg/v3/logutil"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
+// defaultTimeout is the default timeout used for etcd client SDK calls.
+const defaultTimeout = 10 * time.Second
+
 // ClientConfig is the subset of etcd client settings consumed by the helpers in this package.
 type ClientConfig struct {
 	Endpoints []string
-	TLS       *tls.Config
+	// Names holds the Pod/etcd member name for each entry in Endpoints, in
+	// the same order (both share the same value, see EpHealth.Name). Only
+	// consumed by MemberHealth; optional, callers that don't need EpHealth.Name
+	// populated may leave it nil.
+	Names []string
+	TLS   *tls.Config
 }
 
 // buildConfig produces the clientv3.Config used by every helper.
@@ -44,19 +53,52 @@ func closeAndCancel(c *clientv3.Client, cancel context.CancelFunc) {
 	cancel()
 }
 
+// MemberList is a linearizable call: it goes through Raft consensus, so a
+// successful response confirms the cluster has quorum.
 func MemberList(cfg ClientConfig) (*clientv3.MemberListResponse, error) {
 	c, err := clientv3.New(cfg.buildConfig())
 	if err != nil {
 		return nil, err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 	defer func() { closeAndCancel(c, cancel) }()
 
 	return c.MemberList(ctx)
 }
 
+// AlarmList is, like MemberList, a linearizable call: it reports every
+// active alarm (e.g. NOSPACE, CORRUPT) across the cluster.
+func AlarmList(cfg ClientConfig) (*clientv3.AlarmResponse, error) {
+	c, err := clientv3.New(cfg.buildConfig())
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+	defer func() { closeAndCancel(c, cancel) }()
+
+	return c.AlarmList(ctx)
+}
+
+// ClusterHealth aggregates the results of a single health-check pass over an
+// etcd cluster: overall cluster health, per-member health, and any active
+// alarms.
+type ClusterHealth struct {
+	// Healthy reports whether the cluster's linearizable path is up: both
+	// MemberList and AlarmList round-tripped through Raft successfully.
+	Healthy bool
+	// Members holds the per-member health check result, keyed by member
+	// name, determined via a serializable range request against each
+	// member (see MemberHealth).
+	Members map[string]EpHealth
+	// Alarms lists any active etcd alarms (e.g. NOSPACE, CORRUPT).
+	Alarms []*etcdserverpb.AlarmMember
+}
+
 type EpHealth struct {
+	// Name is the Pod name, which is also the etcd member name.
+	Name   string `json:"name,omitempty"`
 	Ep     string `json:"endpoint"`
 	Health bool   `json:"health"`
 	Took   string `json:"took"`
@@ -80,6 +122,9 @@ func (r healthReport) Less(i, j int) bool {
 
 func (eh EpHealth) String() string {
 	var sb strings.Builder
+	if len(eh.Name) > 0 {
+		fmt.Fprintf(&sb, "name: %s, ", eh.Name)
+	}
 	fmt.Fprintf(&sb, "endpoint: %s, health: %t, took: %s", eh.Ep, eh.Health, eh.Took)
 	if eh.Status != nil {
 		fmt.Fprintf(&sb, ", isLearner: %t", eh.Status.IsLearner)
@@ -99,12 +144,15 @@ func IsLearnerReady(leaderStatus, learnerStatus *clientv3.StatusResponse) bool {
 	return learnerReadyPercent >= 0.9
 }
 
-func FindLeaderStatus(healthInfos []EpHealth, logger logr.Logger) (uint64, *clientv3.StatusResponse) {
+func FindLeaderStatus(healthInfos map[string]EpHealth, logger logr.Logger) (uint64, *clientv3.StatusResponse) {
 	var leader uint64
 	var leaderStatus *clientv3.StatusResponse
 	// Find the leader status
-	for i := range healthInfos {
-		status := healthInfos[i].Status
+	for _, healthInfo := range healthInfos {
+		status := healthInfo.Status
+		if status == nil {
+			continue
+		}
 		if status.Leader == status.Header.MemberId {
 			leader = status.Header.MemberId
 			leaderStatus = status
@@ -118,14 +166,18 @@ func FindLeaderStatus(healthInfos []EpHealth, logger logr.Logger) (uint64, *clie
 	return leader, leaderStatus
 }
 
-func FindLearnerStatus(healthInfos []EpHealth, logger logr.Logger) (uint64, *clientv3.StatusResponse) {
+func FindLearnerStatus(healthInfos map[string]EpHealth, logger logr.Logger) (uint64, *clientv3.StatusResponse) {
 	var learner uint64
 	var learnerStatus *clientv3.StatusResponse
 	logger.Info("Now checking if there is any pending learner member that needs to be promoted")
-	for i := range healthInfos {
-		if healthInfos[i].Status.IsLearner {
-			learner = healthInfos[i].Status.Header.MemberId
-			learnerStatus = healthInfos[i].Status
+	for _, healthInfo := range healthInfos {
+		status := healthInfo.Status
+		if status == nil {
+			continue
+		}
+		if status.IsLearner {
+			learner = status.Header.MemberId
+			learnerStatus = status
 			logger.Info("Learner member found", "memberID", learner)
 			break
 		}
@@ -133,32 +185,47 @@ func FindLearnerStatus(healthInfos []EpHealth, logger logr.Logger) (uint64, *cli
 	return learner, learnerStatus
 }
 
-func ClusterHealth(cfg ClientConfig) ([]EpHealth, error) {
+// MemberHealth checks each endpoint's health via a serializable range
+// request — the request succeeding (or failing only with PermissionDenied,
+// which still proves the member is serving) is the sole signal for
+// EpHealth.Health, matching etcd's own health-check convention of not
+// requiring quorum for a per-member check. Status is then fetched
+// best-effort, purely to populate metadata (version, leader, learner) for
+// callers; a Status failure does not affect Health.
+//
+// cfg.Names must have the same length as cfg.Endpoints, and every name in
+// it must be non-empty.
+func MemberHealth(cfg ClientConfig) ([]EpHealth, error) {
 	lg, err := logutil.CreateDefaultZapLogger(zap.InfoLevel)
 	if err != nil {
 		return nil, err
 	}
 
-	var cfgs = make([]*clientv3.Config, 0, len(cfg.Endpoints))
-	for _, ep := range cfg.Endpoints {
+	type epConfig struct {
+		cfg  *clientv3.Config
+		name string
+	}
+
+	var cfgs = make([]epConfig, 0, len(cfg.Endpoints))
+	for i, ep := range cfg.Endpoints {
 		epCfg := ClientConfig{Endpoints: []string{ep}, TLS: cfg.TLS}
 		built := epCfg.buildConfig()
-		cfgs = append(cfgs, &built)
+		cfgs = append(cfgs, epConfig{cfg: &built, name: cfg.Names[i]})
 	}
 
 	healthCh := make(chan EpHealth, len(cfg.Endpoints))
 
 	var wg sync.WaitGroup
-	for _, cfg := range cfgs {
+	for _, ec := range cfgs {
 		wg.Add(1)
-		go func(cfg *clientv3.Config) {
+		go func(cfg *clientv3.Config, name string) {
 			defer wg.Done()
 
 			ep := cfg.Endpoints[0]
 			cfg.Logger = lg.Named("client")
 			cli, err := clientv3.New(*cfg)
 			if err != nil {
-				healthCh <- EpHealth{Ep: ep, Health: false, Error: err.Error()}
+				healthCh <- EpHealth{Name: name, Ep: ep, Health: false, Error: err.Error()}
 				return
 			}
 			defer func() {
@@ -170,10 +237,10 @@ func ClusterHealth(cfg ClientConfig) ([]EpHealth, error) {
 			startTs := time.Now()
 			// get a random key. As long as we can get the response
 			// without an error, the endpoint is health.
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 			defer cancel()
 			_, err = cli.Get(ctx, "health", clientv3.WithSerializable())
-			eh := EpHealth{Ep: ep, Health: false, Took: time.Since(startTs).String()}
+			eh := EpHealth{Name: name, Ep: ep, Health: false, Took: time.Since(startTs).String()}
 			if err == nil || errors.Is(err, rpctypes.ErrPermissionDenied) {
 				eh.Health = true
 			} else {
@@ -181,20 +248,17 @@ func ClusterHealth(cfg ClientConfig) ([]EpHealth, error) {
 			}
 
 			if eh.Health {
-				epStatus, err := cli.Status(ctx, ep)
-				if err != nil {
-					eh.Health = false
-					eh.Error = fmt.Sprintf("Unable to fetch the status :%s", err.Error())
-				} else {
+				// Best-effort metadata fetch: its outcome does not affect
+				// Health, which is determined solely by the range request
+				// above.
+				if epStatus, err := cli.Status(ctx, ep); err == nil {
 					eh.Status = epStatus
-					if len(epStatus.Errors) > 0 {
-						eh.Health = false
-						eh.Error = strings.Join(epStatus.Errors, ",")
-					}
+				} else {
+					eh.Error = fmt.Sprintf("unable to fetch status: %s", err.Error())
 				}
 			}
 			healthCh <- eh
-		}(cfg)
+		}(ec.cfg, ec.name)
 	}
 	wg.Wait()
 	close(healthCh)
@@ -214,7 +278,7 @@ func AddMember(cfg ClientConfig, peerURLs []string, learner bool) (*clientv3.Mem
 		return nil, err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 	defer func() { closeAndCancel(c, cancel) }()
 
 	if learner {
@@ -230,7 +294,7 @@ func PromoteLearner(cfg ClientConfig, learnerId uint64) error {
 		return err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 	defer func() { closeAndCancel(c, cancel) }()
 
 	_, err = c.MemberPromote(ctx, learnerId)
@@ -243,7 +307,7 @@ func RemoveMember(cfg ClientConfig, memberID uint64) error {
 		return err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 	defer func() { closeAndCancel(c, cancel) }()
 
 	_, err = c.MemberRemove(ctx, memberID)
@@ -256,7 +320,7 @@ func MoveLeader(cfg ClientConfig, memberId uint64) error {
 		return err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 	defer func() { closeAndCancel(c, cancel) }()
 
 	_, err = c.MoveLeader(ctx, memberId)

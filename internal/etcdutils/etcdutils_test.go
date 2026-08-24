@@ -76,22 +76,23 @@ func TestMemberList(t *testing.T) {
 	})
 }
 
-func TestClusterHealth(t *testing.T) {
+func TestMemberHealth(t *testing.T) {
 	e := setupEtcdServer(t)
 	defer e.Close()
 
 	t.Run("ReturnsHealthStatus", func(t *testing.T) {
 		eps := []string{"http://localhost:2379"}
-		health, err := ClusterHealth(ClientConfig{Endpoints: eps})
+		health, err := MemberHealth(ClientConfig{Endpoints: eps, Names: []string{"etcd-0"}})
 		assert.NoError(t, err)
 		assert.NotNil(t, health)
 		assert.Greater(t, len(health), 0)
 		assert.True(t, health[0].Health)
+		assert.NotNil(t, health[0].Status)
 	})
 
 	t.Run("ReturnsErrorForInvalidEndpoint", func(t *testing.T) {
 		eps := []string{"http://invalid:2379"}
-		health, err := ClusterHealth(ClientConfig{Endpoints: eps})
+		health, err := MemberHealth(ClientConfig{Endpoints: eps, Names: []string{"etcd-0"}})
 		assert.NoError(t, err)
 		assert.Equal(t, "http://invalid:2379", health[0].Ep)
 		assert.Equal(t, false, health[0].Health)
@@ -176,8 +177,8 @@ func TestFindLeaderStatus(t *testing.T) {
 	logger := logr.Discard() // Use a no-op logger for testing
 
 	t.Run("FindsLeader", func(t *testing.T) {
-		healthInfos := []EpHealth{
-			{
+		healthInfos := map[string]EpHealth{
+			"http://localhost:2379": {
 				Ep:     "http://localhost:2379",
 				Health: true,
 				Status: &clientv3.StatusResponse{
@@ -187,7 +188,7 @@ func TestFindLeaderStatus(t *testing.T) {
 					Leader: 1,
 				},
 			},
-			{
+			"http://localhost:2380": {
 				Ep:     "http://localhost:2380",
 				Health: true,
 				Status: &clientv3.StatusResponse{
@@ -206,8 +207,8 @@ func TestFindLeaderStatus(t *testing.T) {
 	})
 
 	t.Run("NoLeaderFound", func(t *testing.T) {
-		healthInfos := []EpHealth{
-			{
+		healthInfos := map[string]EpHealth{
+			"http://localhost:2379": {
 				Ep:     "http://localhost:2379",
 				Health: true,
 				Status: &clientv3.StatusResponse{
@@ -217,7 +218,7 @@ func TestFindLeaderStatus(t *testing.T) {
 					Leader: 2,
 				},
 			},
-			{
+			"http://localhost:2380": {
 				Ep:     "http://localhost:2380",
 				Health: true,
 				Status: &clientv3.StatusResponse{
@@ -233,14 +234,34 @@ func TestFindLeaderStatus(t *testing.T) {
 		assert.Equal(t, uint64(0), leader)
 		assert.Nil(t, leaderStatus)
 	})
+
+	t.Run("SkipsNilStatus", func(t *testing.T) {
+		healthInfos := map[string]EpHealth{
+			"http://localhost:2379": {Ep: "http://localhost:2379", Health: true, Status: nil},
+			"http://localhost:2380": {
+				Ep:     "http://localhost:2380",
+				Health: true,
+				Status: &clientv3.StatusResponse{
+					Header: &etcdserverpb.ResponseHeader{
+						MemberId: 2,
+					},
+					Leader: 2,
+				},
+			},
+		}
+
+		leader, leaderStatus := FindLeaderStatus(healthInfos, logger)
+		assert.Equal(t, uint64(2), leader)
+		assert.NotNil(t, leaderStatus)
+	})
 }
 
 func TestFindLearnerStatus(t *testing.T) {
 	logger := logr.Discard() // Use a no-op logger for testing
 
 	t.Run("LearnerFound", func(t *testing.T) {
-		healthInfos := []EpHealth{
-			{
+		healthInfos := map[string]EpHealth{
+			"http://localhost:2379": {
 				Ep:     "http://localhost:2379",
 				Health: true,
 				Status: &clientv3.StatusResponse{
@@ -250,7 +271,7 @@ func TestFindLearnerStatus(t *testing.T) {
 					IsLearner: true,
 				},
 			},
-			{
+			"http://localhost:2380": {
 				Ep:     "http://localhost:2380",
 				Health: true,
 				Status: &clientv3.StatusResponse{
@@ -270,8 +291,8 @@ func TestFindLearnerStatus(t *testing.T) {
 	})
 
 	t.Run("NoLearnerFound", func(t *testing.T) {
-		healthInfos := []EpHealth{
-			{
+		healthInfos := map[string]EpHealth{
+			"http://localhost:2379": {
 				Ep:     "http://localhost:2379",
 				Health: true,
 				Status: &clientv3.StatusResponse{
@@ -281,7 +302,7 @@ func TestFindLearnerStatus(t *testing.T) {
 					IsLearner: false,
 				},
 			},
-			{
+			"http://localhost:2380": {
 				Ep:     "http://localhost:2380",
 				Health: true,
 				Status: &clientv3.StatusResponse{
@@ -296,6 +317,26 @@ func TestFindLearnerStatus(t *testing.T) {
 		learner, learnerStatus := FindLearnerStatus(healthInfos, logger)
 		assert.Equal(t, uint64(0), learner)
 		assert.Nil(t, learnerStatus)
+	})
+
+	t.Run("SkipsNilStatus", func(t *testing.T) {
+		healthInfos := map[string]EpHealth{
+			"http://localhost:2379": {Ep: "http://localhost:2379", Health: true, Status: nil},
+			"http://localhost:2380": {
+				Ep:     "http://localhost:2380",
+				Health: true,
+				Status: &clientv3.StatusResponse{
+					Header: &etcdserverpb.ResponseHeader{
+						MemberId: 2,
+					},
+					IsLearner: true,
+				},
+			},
+		}
+
+		learner, learnerStatus := FindLearnerStatus(healthInfos, logger)
+		assert.Equal(t, uint64(2), learner)
+		assert.NotNil(t, learnerStatus)
 	})
 }
 
@@ -345,8 +386,8 @@ func TestHealthReportSwap(t *testing.T) {
 
 func TestClientConfigBuild(t *testing.T) {
 	// buildConfig is the single point where every helper (MemberList,
-	// ClusterHealth, AddMember, PromoteLearner, RemoveMember) builds the
-	// clientv3.Config; asserting here covers all five call paths.
+	// AlarmList, MemberHealth, AddMember, PromoteLearner, RemoveMember)
+	// builds the clientv3.Config; asserting here covers all call paths.
 	eps := []string{"https://127.0.0.1:2379"}
 
 	t.Run("nil TLS leaves clientv3.Config.TLS nil", func(t *testing.T) {
