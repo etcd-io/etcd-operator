@@ -1,8 +1,8 @@
 module go.etcd.io/etcd-operator/tools/mod
 
-go 1.26.0
+go 1.27
 
-toolchain go1.26.7
+toolchain go1.27.0
 
 require (
 	github.com/elastic/crd-ref-docs v0.3.0
