@@ -439,7 +439,13 @@ func (r *EtcdClusterReconciler) dispatch(ctx context.Context, s *reconcileState)
 
 	// 7. Decide whether to *start* lost-quorum recovery (§4.8/§4.9 item 7).
 	// TODO: opt-in, and only once steps 3-6 above find nothing to do
-	// and the cluster is still unhealthy (M5).
+	// and the cluster is still unhealthy (M5). s.health.Healthy
+	// (refreshClusterState) can go false from a single failed
+	// MemberList/AlarmList call (healthCheck, pods.go) — a transient blip,
+	// not necessarily a real lost quorum — so this step must debounce (e.g.
+	// require the cluster to stay unhealthy for some minimum duration or
+	// number of consecutive reconciles) before declaring quorum lost,
+	// rather than triggering recovery off the first unhealthy reading.
 
 	// 8. Advance whatever's left not-Ready (Pending/Provisioning/Replacing).
 	// An existing learner always wins this slot (requirement 11); with more
