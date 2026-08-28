@@ -200,6 +200,10 @@ func healthCheck(clusterName, namespace string, pods []*corev1.Pod, tlsEnabled b
 	memberlistResp, listErr := etcdutils.MemberList(etcdutils.ClientConfig{Endpoints: endpoints, TLS: tlsConfig})
 	alarmResp, alarmErr := etcdutils.AlarmList(etcdutils.ClientConfig{Endpoints: endpoints, TLS: tlsConfig})
 
+	// Healthy requires both MemberList and AlarmList to succeed: the
+	// controller needs both responses to correctly reconcile the
+	// EtcdCluster/EtcdMember objects, so a failure on either call — not
+	// just both — is enough to mark the cluster unhealthy.
 	health := &etcdutils.ClusterHealth{Healthy: listErr == nil && alarmErr == nil}
 	if alarmResp != nil {
 		health.Alarms = alarmResp.Alarms
