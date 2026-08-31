@@ -543,3 +543,149 @@ func TestMarkMemberTerminating(t *testing.T) {
 	// Already Terminating: no error, no write needed.
 	assert.NoError(t, r.markMemberTerminating(ctx, member))
 }
+
+func TestPickMemberToUpdate(t *testing.T) {
+	expectedHash := "abc123def456"
+	staleHash := "fed654cba321"
+	ec := &ecv1alpha1.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "etcd", Namespace: "default", UID: "1"},
+		Spec:       ecv1alpha1.EtcdClusterSpec{Size: 3, Version: "3.5.17"},
+	}
+
+	// healthWithLeader returns the EpHealth map with the given ordinal as leader.
+	healthWithLeader := func(leaderOrdinal int) map[string]etcdutils.EpHealth {
+		return createClusterHealthWithLeader(ec, 3, leaderOrdinal).Members
+	}
+
+	tests := []struct {
+		name    string
+		members []ecv1alpha1.EtcdMember
+		pods    []*corev1.Pod
+		health  map[string]etcdutils.EpHealth
+		want    *ecv1alpha1.EtcdMember
+	}{
+		{
+			name:    "no pods returns nil",
+			members: createReadyMembers(ec, 3),
+			want:    nil,
+		},
+		{
+			name:    "all pods matching expected hash returns nil",
+			members: createReadyMembers(ec, 3),
+			pods: []*corev1.Pod{
+				makeConfigDriftPod(ec, 0, expectedHash),
+				makeConfigDriftPod(ec, 1, expectedHash),
+				makeConfigDriftPod(ec, 2, expectedHash),
+			},
+			want: nil,
+		},
+		{
+			name:    "highest ordinal drifted pod returns its member",
+			members: createReadyMembers(ec, 3),
+			pods: []*corev1.Pod{
+				makeConfigDriftPod(ec, 0, expectedHash),
+				makeConfigDriftPod(ec, 1, expectedHash),
+				makeConfigDriftPod(ec, 2, staleHash),
+			},
+			want: &createReadyMembers(ec, 3)[2],
+		},
+		{
+			name:    "middle ordinal drifted pod is picked when higher matches",
+			members: createReadyMembers(ec, 3),
+			pods: []*corev1.Pod{
+				makeConfigDriftPod(ec, 0, expectedHash),
+				makeConfigDriftPod(ec, 1, staleHash),
+				makeConfigDriftPod(ec, 2, expectedHash),
+			},
+			want: &createReadyMembers(ec, 3)[1],
+		},
+		{
+			name:    "pod without annotation is treated as drift",
+			members: createReadyMembers(ec, 3),
+			pods: []*corev1.Pod{
+				makeConfigDriftPod(ec, 0, expectedHash),
+				makeConfigDriftPod(ec, 1, ""), // no annotation
+				makeConfigDriftPod(ec, 2, expectedHash),
+			},
+			want: &createReadyMembers(ec, 3)[1],
+		},
+		{
+			name:    "skips the leader when another member is also drifted",
+			members: createReadyMembers(ec, 3),
+			pods: []*corev1.Pod{
+				makeConfigDriftPod(ec, 0, expectedHash),
+				makeConfigDriftPod(ec, 1, staleHash),
+				makeConfigDriftPod(ec, 2, staleHash),
+			},
+			health: healthWithLeader(2),
+			want:   &createReadyMembers(ec, 3)[1],
+		},
+		{
+			name:    "returns the leader when it is the only drifted pod",
+			members: createReadyMembers(ec, 3),
+			pods: []*corev1.Pod{
+				makeConfigDriftPod(ec, 0, expectedHash),
+				makeConfigDriftPod(ec, 1, expectedHash),
+				makeConfigDriftPod(ec, 2, staleHash),
+			},
+			health: healthWithLeader(2),
+			want:   &createReadyMembers(ec, 3)[2],
+		},
+		{
+			name:    "unknown leader does not defer the highest drifted pod",
+			members: createReadyMembers(ec, 3),
+			pods: []*corev1.Pod{
+				makeConfigDriftPod(ec, 0, staleHash),
+				makeConfigDriftPod(ec, 1, staleHash),
+				makeConfigDriftPod(ec, 2, staleHash),
+			},
+			want: &createReadyMembers(ec, 3)[2],
+		},
+		{
+			name:    "a drifted pod above the leader is not deferred",
+			members: createReadyMembers(ec, 3),
+			pods: []*corev1.Pod{
+				makeConfigDriftPod(ec, 0, staleHash),
+				makeConfigDriftPod(ec, 1, staleHash),
+				makeConfigDriftPod(ec, 2, staleHash),
+			},
+			health: healthWithLeader(0),
+			want:   &createReadyMembers(ec, 3)[2],
+		},
+		{
+			name:    "drifted pod with no matching member returns nil",
+			members: createReadyMembers(ec, 1),
+			pods: []*corev1.Pod{
+				makeConfigDriftPod(ec, 0, expectedHash),
+				makeConfigDriftPod(ec, 1, staleHash),
+			},
+			health: healthWithLeader(0),
+			want:   nil,
+		},
+		{
+			name:    "single matching pod returns nil",
+			members: createReadyMembers(ec, 1),
+			pods: []*corev1.Pod{
+				makeConfigDriftPod(ec, 0, expectedHash),
+			},
+			health: healthWithLeader(0),
+			want:   nil,
+		},
+		{
+			name:    "single drifted pod returns the only member",
+			members: createReadyMembers(ec, 1),
+			pods: []*corev1.Pod{
+				makeConfigDriftPod(ec, 0, staleHash),
+			},
+			health: healthWithLeader(0),
+			want:   &createReadyMembers(ec, 1)[0],
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := pickMemberToUpdate(tt.members, tt.pods, expectedHash, tt.health)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
