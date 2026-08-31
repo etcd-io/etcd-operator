@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -723,6 +724,299 @@ func TestEnsureClusterFinalizer(t *testing.T) {
 		require.NoError(t, r.ensureClusterFinalizer(ctx, state))
 		assert.Equal(t, []string{clusterCleanupFinalizer}, ec.Finalizers)
 	})
+}
+
+func TestFindConfigDriftingPod(t *testing.T) {
+	const expectedHash = "abc123def456"
+	const differentHash = "fed654cba321"
+
+	makePod := func(name, annotationHash string) *corev1.Pod {
+		p := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: "default",
+			},
+		}
+		if annotationHash != "" {
+			p.Annotations = map[string]string{HashMetadataKey: annotationHash}
+		}
+		return p
+	}
+
+	tests := []struct {
+		name           string
+		pods           []*corev1.Pod
+		expectedHash   string
+		expectedResult *corev1.Pod // nil means no drifted pod found
+	}{
+		{
+			name:           "no pods returns nil",
+			pods:           nil,
+			expectedHash:   expectedHash,
+			expectedResult: nil,
+		},
+		{
+			name:           "empty slice returns nil",
+			pods:           []*corev1.Pod{},
+			expectedHash:   expectedHash,
+			expectedResult: nil,
+		},
+		{
+			name: "all pods match expected hash returns nil",
+			pods: []*corev1.Pod{
+				makePod("etcd-0", expectedHash),
+				makePod("etcd-1", expectedHash),
+				makePod("etcd-2", expectedHash),
+			},
+			expectedHash:   expectedHash,
+			expectedResult: nil,
+		},
+		{
+			name: "highest ordinal drifted pod is returned",
+			pods: []*corev1.Pod{
+				makePod("etcd-0", expectedHash),
+				makePod("etcd-1", expectedHash),
+				makePod("etcd-2", differentHash), // highest ordinal drifted
+			},
+			expectedHash:   expectedHash,
+			expectedResult: makePod("etcd-2", differentHash),
+		},
+		{
+			name: "middle ordinal drifted pod is returned when higher matches",
+			pods: []*corev1.Pod{
+				makePod("etcd-0", expectedHash),
+				makePod("etcd-1", differentHash), // middle ordinal drifted
+				makePod("etcd-2", expectedHash),
+			},
+			expectedHash:   expectedHash,
+			expectedResult: makePod("etcd-1", differentHash),
+		},
+		{
+			name: "lowest ordinal drifted pod is returned when all higher match",
+			pods: []*corev1.Pod{
+				makePod("etcd-0", differentHash), // lowest ordinal drifted
+				makePod("etcd-1", expectedHash),
+				makePod("etcd-2", expectedHash),
+			},
+			expectedHash:   expectedHash,
+			expectedResult: makePod("etcd-0", differentHash),
+		},
+		{
+			name: "multiple drifted pods - highest ordinal wins",
+			pods: []*corev1.Pod{
+				makePod("etcd-0", differentHash),
+				makePod("etcd-1", differentHash),
+				makePod("etcd-2", differentHash),
+			},
+			expectedHash:   expectedHash,
+			expectedResult: makePod("etcd-2", differentHash),
+		},
+		{
+			name: "pod without annotation is treated as drifted",
+			pods: []*corev1.Pod{
+				makePod("etcd-0", expectedHash),
+				makePod("etcd-1", ""), // missing annotation
+				makePod("etcd-2", expectedHash),
+			},
+			expectedHash:   expectedHash,
+			expectedResult: makePod("etcd-1", ""),
+		},
+		{
+			name: "pod with nil annotations is treated as drifted",
+			pods: []*corev1.Pod{
+				makePod("etcd-0", expectedHash),
+				{ObjectMeta: metav1.ObjectMeta{Name: "etcd-1", Namespace: "default", Annotations: nil}},
+				makePod("etcd-2", expectedHash),
+			},
+			expectedHash:   expectedHash,
+			expectedResult: makePod("etcd-1", ""),
+		},
+		{
+			name: "unsorted input is sorted by name before checking",
+			pods: []*corev1.Pod{
+				makePod("etcd-2", expectedHash),
+				makePod("etcd-0", differentHash),
+				makePod("etcd-1", expectedHash),
+			},
+			expectedHash:   expectedHash,
+			expectedResult: makePod("etcd-0", differentHash),
+		},
+		{
+			name: "single pod matching returns nil",
+			pods: []*corev1.Pod{
+				makePod("etcd-0", expectedHash),
+			},
+			expectedHash:   expectedHash,
+			expectedResult: nil,
+		},
+		{
+			name: "single pod not matching returns that pod",
+			pods: []*corev1.Pod{
+				makePod("etcd-0", differentHash),
+			},
+			expectedHash:   expectedHash,
+			expectedResult: makePod("etcd-0", differentHash),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := findConfigDriftingPod(tt.pods, tt.expectedHash)
+			if tt.expectedResult == nil {
+				assert.Nil(t, result, "expected no drifted pod")
+			} else {
+				require.NotNil(t, result, "expected drifted pod")
+				assert.Equal(t, tt.expectedResult.Name, result.Name)
+				// Also verify annotations match
+				if tt.expectedResult.Annotations == nil {
+					assert.Nil(t, result.Annotations)
+				} else {
+					assert.Equal(t, tt.expectedResult.Annotations[HashMetadataKey], result.Annotations[HashMetadataKey])
+				}
+			}
+		})
+	}
+}
+
+func TestUpdateConfig(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+	require.NoError(t, ecv1alpha1.AddToScheme(scheme))
+
+	ec := &ecv1alpha1.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "etcd", Namespace: "default", UID: "1"},
+		Spec:       ecv1alpha1.EtcdClusterSpec{Size: 3, Version: "3.5.17"},
+	}
+	// The hash updateConfig will compare pod annotations against.
+	expectedHash := EtcdClusterHash(ec)
+	staleHash := "stale-hash-000001"
+
+	tests := []struct {
+		name           string
+		pods           []*corev1.Pod
+		members        []ecv1alpha1.EtcdMember
+		expectedResult ctrl.Result
+		expectErr      bool
+		wantRecreating []int
+	}{
+		{
+			name:           "no drifted pods is a no-op",
+			pods:           []*corev1.Pod{makeConfigDriftPod(ec, 0, expectedHash), makeConfigDriftPod(ec, 1, expectedHash), makeConfigDriftPod(ec, 2, expectedHash)},
+			members:        createReadyMembers(ec),
+			expectedResult: ctrl.Result{},
+			wantRecreating: nil,
+		},
+		{
+			name: "marks the matching member Recreating and requeues",
+			pods: []*corev1.Pod{
+				makeConfigDriftPod(ec, 0, expectedHash),
+				makeConfigDriftPod(ec, 1, staleHash), // middle ordinal drifted
+				makeConfigDriftPod(ec, 2, expectedHash),
+			},
+			members:        createReadyMembers(ec),
+			expectedResult: ctrl.Result{RequeueAfter: requeueDuration},
+			wantRecreating: []int{1},
+		},
+		{
+			name: "highest ordinal drifted pod is the one recreated",
+			pods: []*corev1.Pod{
+				makeConfigDriftPod(ec, 0, staleHash),
+				makeConfigDriftPod(ec, 1, staleHash),
+				makeConfigDriftPod(ec, 2, staleHash),
+			},
+			members:        createReadyMembers(ec),
+			expectedResult: ctrl.Result{RequeueAfter: requeueDuration},
+			wantRecreating: []int{2},
+		},
+		{
+			name: "pod with nil annotations is treated as drift",
+			pods: []*corev1.Pod{
+				makeConfigDriftPod(ec, 0, expectedHash),
+				makeConfigDriftPod(ec, 1, ""), // nil annotations
+				makeConfigDriftPod(ec, 2, expectedHash),
+			},
+			members:        createReadyMembers(ec),
+			expectedResult: ctrl.Result{RequeueAfter: requeueDuration},
+			wantRecreating: []int{1},
+		},
+		{
+			name: "drifted pod with no matching member returns an error",
+			pods: []*corev1.Pod{
+				makeConfigDriftPod(ec, 0, expectedHash),
+				makeConfigDriftPod(ec, 1, staleHash), // no EtcdMember exists for ordinal 1
+			},
+			members:        []ecv1alpha1.EtcdMember{createReadyMembers(ec)[0]},
+			expectedResult: ctrl.Result{},
+			expectErr:      true,
+			wantRecreating: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := t.Context()
+
+			objs := make([]client.Object, 0, len(tt.members))
+			for i := range tt.members {
+				objs = append(objs, &tt.members[i])
+			}
+			r := &EtcdClusterReconciler{
+				Client: fake.NewClientBuilder().
+					WithScheme(scheme).
+					WithStatusSubresource(&ecv1alpha1.EtcdMember{}).
+					WithObjects(objs...).
+					Build(),
+				Scheme: scheme,
+			}
+			state := &reconcileState{cluster: ec, members: tt.members, pods: tt.pods}
+
+			res, err := r.updateConfig(ctx, state)
+			if tt.expectErr {
+				assert.Error(t, err)
+				return
+			}
+			assert.NoError(t, err)
+			assert.Equal(t, tt.expectedResult, res)
+
+			for i := range tt.members {
+				m := &ecv1alpha1.EtcdMember{}
+				require.NoError(t, r.Get(ctx, client.ObjectKey{Name: tt.members[i].Name, Namespace: ec.Namespace}, m))
+				want := ecv1alpha1.EtcdMemberReady
+				if slices.Contains(tt.wantRecreating, tt.members[i].Spec.Ordinal) {
+					want = ecv1alpha1.EtcdMemberRecreating
+				}
+				assert.Equal(t, want, m.Status.Phase, "member %s phase", m.Name)
+			}
+		})
+	}
+}
+
+func createMemberWithPhase(ec *ecv1alpha1.EtcdCluster, ordinal int, phase ecv1alpha1.EtcdMemberPhase) *ecv1alpha1.EtcdMember {
+	m := testMemberForCluster(ec, ordinal)
+	m.Status.Phase = phase
+	return m
+}
+
+func makeConfigDriftPod(ec *ecv1alpha1.EtcdCluster, ordinal int, hash string) *corev1.Pod {
+	p := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      etcdMemberName(ec.Name, ordinal),
+			Namespace: ec.Namespace,
+		},
+	}
+	if hash != "" {
+		p.Annotations = map[string]string{HashMetadataKey: hash}
+	}
+	return p
+}
+
+func createReadyMembers(ec *ecv1alpha1.EtcdCluster) []ecv1alpha1.EtcdMember {
+	count := 3
+	members := make([]ecv1alpha1.EtcdMember, 0, count)
+	for ordinal := range count {
+		members = append(members, *createMemberWithPhase(ec, ordinal, ecv1alpha1.EtcdMemberReady))
+	}
+	return members
 }
 
 // TestFinalizeCluster verifies the EtcdCluster deletion path: owned
