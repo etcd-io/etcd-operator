@@ -17,6 +17,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
@@ -588,7 +589,8 @@ func etcdMemberName(clusterName string, ordinal int) string {
 // ordinal order. The label selector and namespace filter members belonging to the cluster.
 func listOwnedMembers(ctx context.Context, c client.Client, ec *ecv1alpha1.EtcdCluster) ([]ecv1alpha1.EtcdMember, error) {
 	memberList := &ecv1alpha1.EtcdMemberList{}
-	if err := c.List(ctx, memberList,
+	if err := c.List(
+		ctx, memberList,
 		client.InNamespace(ec.Namespace),
 		client.MatchingLabels(clusterNameLabels(ec.Name)),
 	); err != nil {
@@ -674,4 +676,30 @@ func createEtcdMember(ctx context.Context, c client.Client, ec *ecv1alpha1.EtcdC
 		return nil, err
 	}
 	return member, nil
+}
+
+// pickMemberToUpdate returns the member whose Pod has the highest ordinal with
+// a stored config hash different from expectedHash, skipping the leader when
+// another member is also drifted. Returns nil when no member has an outdated
+// config, or when the drifted Pod has no matching EtcdMember.
+func pickMemberToUpdate(members []ecv1alpha1.EtcdMember, pods []*corev1.Pod, expectedHash string, healthInfo map[string]etcdutils.EpHealth) *ecv1alpha1.EtcdMember {
+	drifter := findConfigDriftingPod(pods, expectedHash)
+	if drifter == nil {
+		return nil
+	}
+
+	// if the drifter is a leader, try finding another drifter first
+	if drifter.Name == findLeaderName(healthInfo) {
+		d := slices.Index(pods, drifter)
+		if another := findConfigDriftingPod(pods[:d], expectedHash); another != nil {
+			drifter = another
+		}
+	}
+
+	for i := range members {
+		if members[i].Name == drifter.Name {
+			return &members[i]
+		}
+	}
+	return nil
 }
