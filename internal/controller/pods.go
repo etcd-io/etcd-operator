@@ -467,11 +467,6 @@ func createMemberPod(
 		return err
 	}
 
-	logger.Info(
-		"Creating member pod",
-		"name", podName,
-		"ordinal", member.Spec.Ordinal,
-		"state", initialClusterState,
-	)
+	logger.Info("Creating member pod", "name", podName, "ordinal", member.Spec.Ordinal, "state", initialClusterState, "initialCluster", initialCluster)
 	return c.Create(ctx, pod)
 }
