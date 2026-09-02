@@ -54,7 +54,7 @@ func (r *EtcdClusterReconciler) reconcileEtcdMember(
 	// Creating the EtcdMember object and writing its status Phase are two
 	// separate calls in createEtcdMember. If the operator crashes in between,
 	// the object survives with an empty Phase, which must resume provisioning.
-	case "", ecv1alpha1.EtcdMemberPending, ecv1alpha1.EtcdMemberProvisioning:
+	case "", ecv1alpha1.EtcdMemberPending, ecv1alpha1.EtcdMemberProvisioning, ecv1alpha1.EtcdMemberUpgrading:
 		return r.reconcileProvisioning(ctx, state, member)
 	// placeholder for Terminating, Recreating and Replacing
 	default:
@@ -395,6 +395,38 @@ func pickNotReadyMember(
 		}
 	}
 	return nil
+}
+
+// pickMemberToUpgrade selects the next member to upgrade to targetVersion.
+// It iterates from highest to lowest ordinal and prefers non-leader members first,
+// leaving the leader member for last. If all members needing upgrade are leaders
+// (or leadership cannot be determined), the highest-ordinal member needing upgrade is returned.
+// Returns nil if all members are already at targetVersion.
+func pickMemberToUpgrade(members []ecv1alpha1.EtcdMember, targetVersion string) (*ecv1alpha1.EtcdMember, bool) {
+	var leaderCandidate *ecv1alpha1.EtcdMember
+
+	// members is sorted in ascending ordinal order. Iterate in reverse (highest ordinal first).
+	for i := len(members) - 1; i >= 0; i-- {
+		m := &members[i]
+		if m.Status.Phase == ecv1alpha1.EtcdMemberUpgrading {
+			return m, true
+		}
+		if m.DeletionTimestamp != nil {
+			continue
+		}
+		if m.Spec.Version == targetVersion {
+			continue
+		}
+		if m.Status.IsLeader {
+			if leaderCandidate == nil {
+				leaderCandidate = m
+			}
+			continue
+		}
+		return m, false
+	}
+
+	return leaderCandidate, false
 }
 
 // findHealthStatusForEtcdMember looks up the member's health entry in the
