@@ -99,6 +99,27 @@ func TestListOwnedPods(t *testing.T) {
 		assert.Equal(t, "my-cluster-2", pods[1].Name)
 	})
 
+	t.Run("sorts pods by ordinal ascending, not by name", func(t *testing.T) {
+		ctx := t.Context()
+		// Lexicographic name order would misplace my-cluster-10 before
+		// my-cluster-2; the result must follow the numeric ordinal.
+		member0 := makeMember("my-cluster-0", 0, "abc")
+		member2 := makeMember("my-cluster-2", 2, "abc")
+		member10 := makeMember("my-cluster-10", 10, "abc")
+		pod0 := makeMemberOwnedPod("my-cluster-0", member0)
+		pod2 := makeMemberOwnedPod("my-cluster-2", member2)
+		pod10 := makeMemberOwnedPod("my-cluster-10", member10)
+
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).
+			WithObjects(ec, pod10, pod2, pod0).Build()
+
+		pods, err := listOwnedPods(ctx, fakeClient, ec, []ecv1alpha1.EtcdMember{*member0, *member2, *member10})
+		require.NoError(t, err)
+		require.Len(t, pods, 3)
+		names := []string{pods[0].Name, pods[1].Name, pods[2].Name}
+		assert.Equal(t, []string{"my-cluster-0", "my-cluster-2", "my-cluster-10"}, names)
+	})
+
 	t.Run("returns empty slice when no pods exist", func(t *testing.T) {
 		ctx := t.Context()
 		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ec).Build()

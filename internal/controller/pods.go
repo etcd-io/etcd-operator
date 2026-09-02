@@ -61,7 +61,7 @@ func podOrdinal(podName, clusterName string) int {
 }
 
 // listOwnedPods returns all Pods controlled by one of the given EtcdMembers,
-// sorted by name. EtcdCluster never owns Pods directly; a Pod belongs to the
+// sorted by ordinal ascending. EtcdCluster never owns Pods directly; a Pod belongs to the
 // cluster when its controlling EtcdMember is in members. Checking against
 // this already-fetched slice avoids re-reading each Pod's controlling
 // EtcdMember from the API server.
@@ -82,8 +82,10 @@ func listOwnedPods(ctx context.Context, c client.Client, ec *ecv1alpha1.EtcdClus
 		}
 	}
 
+	// Sort by numeric ordinal, not by name: lexicographic order would
+	// misplace double-digit ordinals (e.g. <cluster>-10 before <cluster>-2).
 	sort.Slice(owned, func(i, j int) bool {
-		return owned[i].Name < owned[j].Name
+		return podOrdinal(owned[i].Name, ec.Name) < podOrdinal(owned[j].Name, ec.Name)
 	})
 	return owned, nil
 }
