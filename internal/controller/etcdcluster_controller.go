@@ -425,12 +425,9 @@ func (r *EtcdClusterReconciler) dispatch(ctx context.Context, s *reconcileState)
 
 	// 6. Per-member repair: continue a member already Recreating, or start
 	// fixing exactly one newly-unhealthy Ready member (requirement 6).
-	for _, m := range s.members {
-		if m.Status.Phase == ecv1alpha1.EtcdMemberRecreating {
-			// TODO: §4.9 item 6 — continue the shared Pod-recovery
-			// ladder (§4.6, M3).
-			logger.Info("Member is Recreating; per-member repair not implemented yet", "member", m.Name)
-			return ctrl.Result{RequeueAfter: requeueDuration}, nil
+	for i := range s.members {
+		if s.members[i].Status.Phase == ecv1alpha1.EtcdMemberRecreating {
+			return r.reconcileEtcdMember(ctx, s, &s.members[i])
 		}
 	}
 	// TODO: §4.9 item 6 — picking a newly-unhealthy Ready member to
@@ -576,76 +573,35 @@ func (r *EtcdClusterReconciler) scaleCluster(ctx context.Context, s *reconcileSt
 	return ctrl.Result{RequeueAfter: requeueDuration}, nil
 }
 
-// upgradeCluster rolls one member to the etcd version requested in
-// EtcdCluster.Spec.Version, preferring highest ordinal non-leader members first.
-// It stops the old member by deleting its Pod and restarts it by recreating the Pod
-// with the new container image version, retaining the existing PVC and cluster data.
+// upgradeCluster selects the next member to upgrade and marks it for
+// recreation by setting Spec.Version and Phase=Recreating. All pod-level work
+// (delete old pod, create new pod, health convergence) is handled by
+// reconcileRecreating once dispatch routes the Recreating member there.
 func (r *EtcdClusterReconciler) upgradeCluster(ctx context.Context, s *reconcileState) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
 	targetVersion := s.cluster.Spec.Version
-	memberToUpgrade, isUpgradeInProgress := pickMemberToUpgrade(s.members, targetVersion)
-
+	memberToUpgrade := pickMemberToUpgrade(s.members, targetVersion)
 	if memberToUpgrade == nil {
 		logger.V(1).Info("All members are at desired version", "version", targetVersion)
 		return ctrl.Result{}, nil
 	}
 
-	if isUpgradeInProgress {
-		logger.Info("Upgrade of one of the etcd members in progress", "member", memberPodName(memberToUpgrade.Spec.ClusterName, memberToUpgrade.Spec.Ordinal))
-		return ctrl.Result{RequeueAfter: requeueDuration}, nil
+	logger.Info("[Upgrade] marking member for recreation",
+		"member", memberToUpgrade.Name,
+		"targetVersion", targetVersion,
+	)
+
+	memberToUpgrade.Spec.Version = targetVersion
+	if err := r.Update(ctx, memberToUpgrade); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.updateEtcdMemberStatus(ctx, memberToUpgrade, func(status *ecv1alpha1.EtcdMemberStatus) {
+		status.Phase = ecv1alpha1.EtcdMemberRecreating
+	}); err != nil {
+		return ctrl.Result{}, err
 	}
 
-	expectedPodName := memberPodName(s.cluster.Name, memberToUpgrade.Spec.Ordinal)
-	var memberPod *corev1.Pod
-	for _, p := range s.pods {
-		if p.Name == expectedPodName {
-			memberPod = p
-			break
-		}
-	}
-
-	expectedImage := fmt.Sprintf("%s:%s", s.cluster.Spec.ImageRegistry, targetVersion)
-
-	// Step 1: Update EtcdMember spec to reflect targetVersion first if needed.
-	if memberToUpgrade.Spec.Version != targetVersion {
-		memberToUpgrade.Spec.Version = targetVersion
-		if err := r.Update(ctx, memberToUpgrade); err != nil {
-			return ctrl.Result{}, err
-		}
-		if err := r.updateEtcdMemberStatus(ctx, memberToUpgrade, func(status *ecv1alpha1.EtcdMemberStatus) {
-			status.Phase = ecv1alpha1.EtcdMemberUpgrading
-		}); err != nil {
-			return ctrl.Result{}, err
-		}
-	}
-
-	// Step 2: If Pod exists with an outdated image, delete the old Pod to stop the etcd process.
-	if memberPod != nil {
-		podImage := ""
-		for _, c := range memberPod.Spec.Containers {
-			if c.Name == "etcd" {
-				podImage = c.Image
-				break
-			}
-		}
-		if podImage != expectedImage {
-
-			logger.Info("[Upgrade] stopping member pod to upgrade version",
-				"member", memberToUpgrade.Name,
-				"pod", memberPod.Name,
-				"currentImage", podImage,
-				"targetImage", expectedImage,
-			)
-			if err := r.Delete(ctx, memberPod); err != nil {
-				return ctrl.Result{}, err
-			}
-			return ctrl.Result{RequeueAfter: requeueDuration}, nil
-		}
-
-	}
-
-	// If the memberPod is nil, the recreation should be taken care of as a part of the reconciliation process
 	return ctrl.Result{RequeueAfter: requeueDuration}, nil
 }
 

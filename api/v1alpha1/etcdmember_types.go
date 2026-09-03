@@ -45,8 +45,6 @@ const (
 	EtcdMemberPending EtcdMemberPhase = "Pending"
 	// EtcdMemberProvisioning means resource creation is under way: Pod not yet healthy, OR healthy but still an unpromoted learner.
 	EtcdMemberProvisioning EtcdMemberPhase = "Provisioning"
-	// EtcdMemberUpgrading means the member is upgrading from one version of etcd to another 
-	EtcdMemberUpgrading EtcdMemberPhase = "Upgrading"
 	// EtcdMemberReady means the member is healthy AND (bootstrap member OR promoted to voting member).
 	EtcdMemberReady EtcdMemberPhase = "Ready"
 	// EtcdMemberRecreating means the member is unhealthy and a Pod delete+recreate is in progress.
