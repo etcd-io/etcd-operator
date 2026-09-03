@@ -31,6 +31,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
+	"go.etcd.io/etcd-operator/internal/etcdutils"
+	"go.etcd.io/etcd/api/v3/etcdserverpb"
+	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 // TestFetchAndValidateState verifies the fetchAndValidateState helper across
@@ -819,4 +822,174 @@ func TestFinalizeCluster(t *testing.T) {
 			assert.True(t, apierrors.IsNotFound(err), "clearing the last finalizer should let the fake client remove it")
 		}
 	})
+}
+
+// TestUpgradeCluster verifies that upgradeCluster picks the correct member,
+// updates its Spec.Version, and sets Phase=Recreating on it — and that it is
+// a no-op when all members are already at the desired version.
+func TestUpgradeCluster(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = ecv1alpha1.AddToScheme(scheme)
+
+	const targetVersion = "v3.5.33"
+	const oldVersion = "v3.5.32"
+
+	ec := &ecv1alpha1.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "etcd", Namespace: "default", UID: "1"},
+		Spec: ecv1alpha1.EtcdClusterSpec{
+			Size:          3,
+			Version:       targetVersion,
+			ImageRegistry: "gcr.io/etcd-development/etcd",
+		},
+	}
+
+	// makeMember builds an EtcdMember owned by ec with the given ordinal and version.
+	makeMember := func(ordinal int, version string) *ecv1alpha1.EtcdMember {
+		return &ecv1alpha1.EtcdMember{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      etcdMemberName(ec.Name, ordinal),
+				Namespace: ec.Namespace,
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: ecv1alpha1.GroupVersion.String(),
+					Kind:       "EtcdCluster",
+					Name:       ec.Name,
+					UID:        ec.UID,
+					Controller: new(true),
+				}},
+			},
+			Spec:   ecv1alpha1.EtcdMemberSpec{ClusterName: ec.Name, Ordinal: ordinal, Version: version},
+			Status: ecv1alpha1.EtcdMemberStatus{Phase: ecv1alpha1.EtcdMemberReady},
+		}
+	}
+
+	// makeHealth builds a ClusterHealth snapshot. entries maps pod name → [memberID, leaderID].
+	makeHealth := func(entries map[string][2]uint64) *etcdutils.ClusterHealth {
+		members := make(map[string]etcdutils.EpHealth, len(entries))
+		for name, ids := range entries {
+			members[name] = etcdutils.EpHealth{
+				Health: true,
+				Status: &clientv3.StatusResponse{
+					Header: &etcdserverpb.ResponseHeader{MemberId: ids[0]},
+					Leader: ids[1],
+				},
+			}
+		}
+		return &etcdutils.ClusterHealth{Healthy: true, Members: members}
+	}
+
+	healthInfoWithLeader := func(leaderPod string) *etcdutils.ClusterHealth {
+		ids := map[string]uint64{"etcd-0": 10, "etcd-1": 20, "etcd-2": 30}
+		leaderID := ids[leaderPod]
+		entries := make(map[string][2]uint64, len(ids))
+		for name, memberID := range ids {
+			entries[name] = [2]uint64{memberID, leaderID}
+		}
+		return makeHealth(entries)
+	}
+
+	tests := []struct {
+		name           string
+		memberVersions [3]string // versions for ordinals 0, 1, 2
+		health         *etcdutils.ClusterHealth
+		wantResult     ctrl.Result
+		wantRecreating string   // pod name expected to be Phase=Recreating; "" means no-op
+		wantUntouched  []string // pod names that must remain Ready at their original version
+	}{
+		{
+			name:           "all members already at target version — no-op",
+			memberVersions: [3]string{targetVersion, targetVersion, targetVersion},
+			health:         nil,
+			wantResult:     ctrl.Result{},
+			wantRecreating: "",
+		},
+		{
+			name:           "highest-ordinal non-leader picked when no health info",
+			memberVersions: [3]string{oldVersion, oldVersion, oldVersion},
+			health:         nil,
+			wantResult:     ctrl.Result{RequeueAfter: requeueDuration},
+			wantRecreating: "etcd-2",
+			wantUntouched:  []string{"etcd-0", "etcd-1"},
+		},
+		{
+			name:           "leader deferred — highest non-leader picked instead",
+			memberVersions: [3]string{oldVersion, oldVersion, oldVersion},
+			health:         healthInfoWithLeader("etcd-2"),
+			wantResult:     ctrl.Result{RequeueAfter: requeueDuration},
+			wantRecreating: "etcd-1",
+			wantUntouched:  []string{"etcd-2"},
+		},
+		{
+			name:           "only the leader needs upgrading — leader picked as last resort",
+			memberVersions: [3]string{targetVersion, targetVersion, oldVersion},
+			health:         healthInfoWithLeader("etcd-2"),
+			wantResult:     ctrl.Result{RequeueAfter: requeueDuration},
+			wantRecreating: "etcd-2",
+			wantUntouched:  []string{"etcd-0", "etcd-1"},
+		},
+		{
+			name:           "mid-ordinal leader skipped, already-upgraded member skipped — lower ordinal member picked",
+			memberVersions: [3]string{oldVersion, oldVersion, targetVersion},
+			health:         healthInfoWithLeader("etcd-1"),
+			wantResult:     ctrl.Result{RequeueAfter: requeueDuration},
+			wantRecreating: "etcd-0",
+			wantUntouched:  []string{"etcd-1"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := t.Context()
+			members := [3]*ecv1alpha1.EtcdMember{
+				makeMember(0, tt.memberVersions[0]),
+				makeMember(1, tt.memberVersions[1]),
+				makeMember(2, tt.memberVersions[2]),
+			}
+
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).
+				WithStatusSubresource(&ecv1alpha1.EtcdMember{}).
+				WithObjects(ec, members[0], members[1], members[2]).Build()
+			r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
+			state := &reconcileState{
+				cluster: ec,
+				members: []ecv1alpha1.EtcdMember{*members[0], *members[1], *members[2]},
+				health:  tt.health,
+			}
+
+			res, err := r.upgradeCluster(ctx, state)
+			assert.NoError(t, err)
+			assert.Equal(t, tt.wantResult, res)
+
+			if tt.wantRecreating == "" {
+				// No-op: all members must remain Ready and unmodified.
+				for _, m := range members {
+					got := &ecv1alpha1.EtcdMember{}
+					require.NoError(t, fakeClient.Get(ctx, client.ObjectKey{Name: m.Name, Namespace: m.Namespace}, got))
+					assert.Equal(t, ecv1alpha1.EtcdMemberReady, got.Status.Phase)
+				}
+				return
+			}
+
+			// The target member must have Spec.Version updated and Phase=Recreating.
+			got := &ecv1alpha1.EtcdMember{}
+			require.NoError(t, fakeClient.Get(ctx, client.ObjectKey{Name: tt.wantRecreating, Namespace: ec.Namespace}, got))
+			assert.Equal(t, targetVersion, got.Spec.Version, "Spec.Version must be updated to target")
+			assert.Equal(t, ecv1alpha1.EtcdMemberRecreating, got.Status.Phase, "Phase must be Recreating")
+
+			// Untouched members must remain Ready at their original version.
+			for _, name := range tt.wantUntouched {
+				var originalVersion string
+				for _, m := range members {
+					if m.Name == name {
+						originalVersion = m.Spec.Version
+						break
+					}
+				}
+				got := &ecv1alpha1.EtcdMember{}
+				require.NoError(t, fakeClient.Get(ctx, client.ObjectKey{Name: name, Namespace: ec.Namespace}, got))
+				assert.Equal(t, originalVersion, got.Spec.Version)
+				assert.Equal(t, ecv1alpha1.EtcdMemberReady, got.Status.Phase)
+			}
+		})
+	}
 }

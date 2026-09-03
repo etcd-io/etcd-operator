@@ -24,6 +24,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
+	"go.etcd.io/etcd-operator/internal/etcdutils"
+	"go.etcd.io/etcd/api/v3/etcdserverpb"
+	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 func TestNextOrdinal(t *testing.T) {
@@ -124,4 +127,135 @@ func TestListOwnedMembers(t *testing.T) {
 	require.Len(t, members, 2)
 	assert.Equal(t, "my-cluster-0", members[0].Name)
 	assert.Equal(t, "my-cluster-2", members[1].Name)
+}
+
+func TestPickMemberToUpgrade(t *testing.T) {
+	// member builds an EtcdMember. isLeader is intentionally NOT set on
+	// Status — leadership is now determined from the live healthInfo map.
+	member := func(ordinal int, version string) ecv1alpha1.EtcdMember {
+		return ecv1alpha1.EtcdMember{
+			ObjectMeta: metav1.ObjectMeta{Name: etcdMemberName("etcd", ordinal)},
+			Spec:       ecv1alpha1.EtcdMemberSpec{Ordinal: ordinal, Version: version},
+			Status:     ecv1alpha1.EtcdMemberStatus{Phase: ecv1alpha1.EtcdMemberReady},
+		}
+	}
+
+	// epHealth builds an EpHealth entry that marks a member as leader or not
+	// by setting Header.MemberId == Leader (leader) or a different value (follower).
+	epHealth := func(memberID uint64, leaderID uint64) etcdutils.EpHealth {
+		return etcdutils.EpHealth{
+			Health: true,
+			Status: &clientv3.StatusResponse{
+				Header: &etcdserverpb.ResponseHeader{MemberId: memberID},
+				Leader: leaderID,
+			},
+		}
+	}
+
+	tests := []struct {
+		name          string
+		members       []ecv1alpha1.EtcdMember
+		healthInfo    map[string]etcdutils.EpHealth
+		targetVersion string
+		wantName      string // "" means expect nil
+	}{
+		{
+			name:          "all members already at target — returns nil",
+			members:       []ecv1alpha1.EtcdMember{member(0, "v3.5.33"), member(1, "v3.5.33")},
+			healthInfo:    nil,
+			targetVersion: "v3.5.33",
+			wantName:      "",
+		},
+		{
+			name:          "single member on old version — picked",
+			members:       []ecv1alpha1.EtcdMember{member(0, "v3.5.32")},
+			healthInfo:    nil,
+			targetVersion: "v3.5.33",
+			wantName:      "etcd-0",
+		},
+		{
+			name: "prefers highest ordinal non-leader first",
+			members: []ecv1alpha1.EtcdMember{
+				member(0, "v3.5.32"),
+				member(1, "v3.5.32"),
+				member(2, "v3.5.32"),
+			},
+			healthInfo:    nil, // no leader known — all treated as non-leader
+			targetVersion: "v3.5.33",
+			wantName:      "etcd-2",
+		},
+		{
+			name: "skips leader from live health, picks highest non-leader",
+			members: []ecv1alpha1.EtcdMember{
+				member(0, "v3.5.32"),
+				member(1, "v3.5.32"),
+				member(2, "v3.5.32"), // leader according to live health
+			},
+			healthInfo: map[string]etcdutils.EpHealth{
+				"etcd-0": epHealth(10, 30), // follower (id=10, leader=30)
+				"etcd-1": epHealth(20, 30), // follower (id=20, leader=30)
+				"etcd-2": epHealth(30, 30), // leader  (id=30, leader=30)
+			},
+			targetVersion: "v3.5.33",
+			wantName:      "etcd-1",
+		},
+		{
+			name: "only the leader needs upgrading — picks leader as last resort",
+			members: []ecv1alpha1.EtcdMember{
+				member(0, "v3.5.33"),
+				member(1, "v3.5.33"),
+				member(2, "v3.5.32"), // leader, still on old version
+			},
+			healthInfo: map[string]etcdutils.EpHealth{
+				"etcd-0": epHealth(10, 30),
+				"etcd-1": epHealth(20, 30),
+				"etcd-2": epHealth(30, 30), // leader
+			},
+			targetVersion: "v3.5.33",
+			wantName:      "etcd-2",
+		},
+		{
+			name: "nil health entry Status — treated as non-leader",
+			members: []ecv1alpha1.EtcdMember{
+				member(0, "v3.5.32"),
+				member(1, "v3.5.32"),
+				member(2, "v3.5.32"),
+			},
+			healthInfo: map[string]etcdutils.EpHealth{
+				"etcd-2": {Health: false, Status: nil}, // status unavailable
+			},
+			targetVersion: "v3.5.33",
+			wantName:      "etcd-2", // not deferred: nil Status means leader unknown, findLeaderName returns ""
+		},
+		{
+			name: "skips members already at target version",
+			members: []ecv1alpha1.EtcdMember{
+				member(0, "v3.5.32"),
+				member(1, "v3.5.33"), // already upgraded
+				member(2, "v3.5.33"), // already upgraded
+			},
+			healthInfo:    nil,
+			targetVersion: "v3.5.33",
+			wantName:      "etcd-0",
+		},
+		{
+			name:          "empty member list — returns nil",
+			members:       []ecv1alpha1.EtcdMember{},
+			healthInfo:    nil,
+			targetVersion: "v3.5.33",
+			wantName:      "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := pickMemberToUpgrade(tt.members, tt.healthInfo, tt.targetVersion)
+			if tt.wantName == "" {
+				assert.Nil(t, got)
+			} else {
+				require.NotNil(t, got)
+				assert.Equal(t, tt.wantName, got.Name)
+			}
+		})
+	}
 }

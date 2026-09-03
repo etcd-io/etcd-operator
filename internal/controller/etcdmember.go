@@ -392,6 +392,44 @@ func pickNotReadyMember(
 	return nil
 }
 
+// findLeaderName returns the pod name of the current etcd leader by scanning healthInfo
+func findLeaderName(healthInfo map[string]etcdutils.EpHealth) string {
+	for name, h := range healthInfo {
+		if h.Status != nil && h.Status.Header.MemberId == h.Status.Leader {
+			return name
+		}
+	}
+	return ""
+}
+
+// pickMemberToUpgrade selects the next member to upgrade to targetVersion.
+// It iterates from highest to lowest ordinal and prefers non-leader members first,
+// leaving the leader member for last.
+// Returns nil if all members are already at targetVersion.
+func pickMemberToUpgrade(members []ecv1alpha1.EtcdMember, healthInfo map[string]etcdutils.EpHealth, targetVersion string) *ecv1alpha1.EtcdMember {
+	// Resolve the leader's pod name once, outside the loop.
+	leaderName := findLeaderName(healthInfo)
+
+	var leaderCandidate *ecv1alpha1.EtcdMember
+
+	// members is sorted in ascending ordinal order. Iterate in reverse (highest ordinal first).
+	for i := len(members) - 1; i >= 0; i-- {
+		m := &members[i]
+		if m.Spec.Version == targetVersion {
+			continue
+		}
+		if leaderName != "" && m.Name == leaderName {
+			if leaderCandidate == nil {
+				leaderCandidate = m
+			}
+			continue
+		}
+		return m
+	}
+
+	return leaderCandidate
+}
+
 // findHealthStatusForEtcdMember looks up the member's health entry in the
 // reconcile snapshot by its deterministic Pod (= etcd member) name.
 func findHealthStatusForEtcdMember(state *reconcileState, member *ecv1alpha1.EtcdMember) (*etcdutils.EpHealth, error) {
