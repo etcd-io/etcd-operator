@@ -578,16 +578,42 @@ func (r *EtcdClusterReconciler) scaleCluster(ctx context.Context, s *reconcileSt
 
 // upgradeCluster rolls one member to the etcd version requested in
 // EtcdCluster.Spec.Version, highest ordinal first.
-//
-// TODO: not implemented yet. validateSpec already checks, by comparing
-// the first Pod's image tag against EtcdCluster.Spec.Version, whether the
-// upgrade path is supported when the two differ — but it doesn't persist
-// that comparison anywhere on reconcileState. This phase needs to redo the
-// same current-vs-target version comparison, then bump one EtcdMember.Spec.Version
-// at a time (highest ordinal, non-leader first as a preference); the member
-// notices the drift and recreates via §4.6's ladder (M3).
+
+// upgradeCluster selects the next member to upgrade and marks it for
+// recreation by setting Spec.Version and Phase=Recreating.
+// TODO: All pod-level work
+// (delete old pod, create new pod, health convergence) is handled by
+// reconcileRecreating once dispatch routes the Recreating member there.
 func (r *EtcdClusterReconciler) upgradeCluster(ctx context.Context, s *reconcileState) (ctrl.Result, error) {
-	return ctrl.Result{}, nil
+	logger := log.FromContext(ctx)
+	targetVersion := s.cluster.Spec.Version
+	var healthInfo map[string]etcdutils.EpHealth
+	if s.health != nil {
+		healthInfo = s.health.Members
+	}
+	memberToUpgrade := pickMemberToUpgrade(s.members, healthInfo, targetVersion)
+	if memberToUpgrade == nil {
+		logger.V(1).Info("All members are at desired version", "version", targetVersion)
+		return ctrl.Result{}, nil
+	}
+
+	logger.Info("[Upgrade] marking member for recreation",
+		"member", memberToUpgrade.Name,
+		"targetVersion", targetVersion, "currentVersion", memberToUpgrade.Spec.Version,
+	)
+
+	if err := r.updateEtcdMemberStatus(ctx, memberToUpgrade, func(status *ecv1alpha1.EtcdMemberStatus) {
+		status.Phase = ecv1alpha1.EtcdMemberRecreating
+	}); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	memberToUpgrade.Spec.Version = targetVersion
+	if err := r.Update(ctx, memberToUpgrade); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	return ctrl.Result{RequeueAfter: requeueDuration}, nil
 }
 
 // updateStatus reflects the current observed state onto EtcdCluster.Status.
