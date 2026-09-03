@@ -388,7 +388,7 @@ func verifyPodUsesPVC(t *testing.T, c *envconf.Config, podName string, expectedP
 
 // getClusterEndpointHashKVs executes `etcdctl endpoint hashkv --cluster -w json` inside the given pod
 // and returns the parsed HashKV responses from all known endpoints using etcd's native types.
-func getClusterEndpointHashKVs(t *testing.T, c *envconf.Config, podName string) []etcdserverpb.HashKVResponse {
+func getClusterEndpointHashKVs(t *testing.T, c *envconf.Config, podName string) []*etcdserverpb.HashKVResponse {
 	t.Helper()
 	cmd := []string{"etcdctl", "endpoint", "hashkv", "--cluster", "-w", "json"}
 	stdout, stderr, err := execInPod(t, c, podName, namespace, cmd)
@@ -404,9 +404,10 @@ func getClusterEndpointHashKVs(t *testing.T, c *envconf.Config, podName string) 
 	if err := json.Unmarshal([]byte(stdout), &entries); err != nil {
 		t.Fatalf("Failed to parse endpoint hashkv JSON: %v. Raw: %s", err, stdout)
 	}
-	out := make([]etcdserverpb.HashKVResponse, 0, len(entries))
-	for _, e := range entries {
-		out = append(out, e.HashKV)
+	out := make([]*etcdserverpb.HashKVResponse, 0, len(entries))
+	// Using a regular for loop, rather than range to avoid copylocks static check error.
+	for i := 0; i < len(entries); i++ {
+		out = append(out, &entries[i].HashKV)
 	}
 	return out
 }
