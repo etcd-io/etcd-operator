@@ -19,11 +19,14 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -57,7 +60,11 @@ func (r *EtcdClusterReconciler) reconcileEtcdMember(
 	// the object survives with an empty Phase, which must resume provisioning.
 	case "", ecv1alpha1.EtcdMemberPending, ecv1alpha1.EtcdMemberProvisioning:
 		return r.reconcileProvisioning(ctx, state, member)
-	// placeholder for Terminating, Recreating and Replacing
+	case ecv1alpha1.EtcdMemberRecreating:
+		return r.reconcileRecreating(ctx, state, member)
+	case ecv1alpha1.EtcdMemberReplacing:
+		return r.reconcileReplacing(ctx, state, member)
+	// placeholder for Terminating
 	default:
 		return ctrl.Result{}, nil
 	}
@@ -161,6 +168,239 @@ func (r *EtcdClusterReconciler) reconcileProvisioning(
 	log.FromContext(ctx).Info("Marking EtcdMember Ready", "EtcdMember", member.Name)
 	if err := r.updateEtcdMemberStatus(ctx, member, func(status *ecv1alpha1.EtcdMemberStatus) {
 		status.Phase = ecv1alpha1.EtcdMemberReady
+		status.RecreateCount = 0
+	}); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	return ctrl.Result{RequeueAfter: requeueDuration}, nil
+}
+
+// podStartTimeout is the maximum time a Pod is allowed to be running but not
+// Ready before the reconciler treats it as timed out and replaces it.
+const podStartTimeout = 2 * time.Minute
+
+// reconcileRecreating drives the Recreating lifecycle phase for a member whose
+// Pod needs to be replaced (e.g. after an upgrade or self-healing). It follows
+// the Recreating case in reconcile_member_v0.3.0.png:
+//  1. Perform a per-member health check.
+//  2. If healthy → reset to Ready.
+//  3. If unhealthy and Pod exists but hasn't timed out yet → requeue.
+//  4. If unhealthy and Pod is absent or timed out → delete the Pod (if present),
+//     create a fresh one and increment RecreateCount, unless RecreateCount >= 3,
+//     in which case escalate to Replacing.
+func (r *EtcdClusterReconciler) reconcileRecreating(
+	ctx context.Context,
+	state *reconcileState,
+	member *ecv1alpha1.EtcdMember,
+) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	// 1. Per-member health check.
+	health, err := findHealthStatusForEtcdMember(state, member)
+	if err != nil {
+		// Health data unavailable (e.g. member list empty mid-upgrade) — requeue.
+		logger.Info("[Recreating] health status unavailable, requeueing", "member", member.Name, "error", err)
+		return ctrl.Result{RequeueAfter: requeueDuration}, nil
+	}
+
+	// 2. Member is healthy — but only mark Ready if the pod is already running
+	// the target version. If it's still on the old image (upgrade in progress),
+	// fall through to delete and recreate it.
+	var memberPod *corev1.Pod
+	if health.Health {
+		memberPod = findPodForEtcdMember(state, member)
+		onTargetVersion := false
+		if memberPod != nil {
+			expectedImage := fmt.Sprintf("%s:%s", state.cluster.Spec.ImageRegistry, member.Spec.Version)
+			for _, c := range memberPod.Spec.Containers {
+				if c.Name == "etcd" && c.Image == expectedImage {
+					onTargetVersion = true
+					break
+				}
+			}
+		}
+		if onTargetVersion {
+			logger.Info("[Recreating] member is healthy on target version, marking Ready", "member", member.Name)
+			if err := r.updateEtcdMemberStatus(ctx, member, func(status *ecv1alpha1.EtcdMemberStatus) {
+				status.Phase = ecv1alpha1.EtcdMemberReady
+				status.RecreateCount = 0
+			}); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{RequeueAfter: requeueDuration}, nil
+		}
+		// Pod is healthy but still on old image — fall through to replace it.
+		logger.Info("[Recreating] member is healthy but on old image, will replace pod",
+			"member", member.Name,
+		)
+	}
+
+	// 3. Member is unhealthy (or healthy but on old image). Check the Pod.
+	if memberPod != nil {
+		timedOut := memberPod.Status.StartTime != nil &&
+			time.Since(memberPod.Status.StartTime.Time) > podStartTimeout
+		if !timedOut {
+			// Pod is still starting up — give it more time.
+			logger.Info("[Recreating] pod not yet timed out, requeueing", "member", member.Name, "pod", memberPod.Name)
+			return ctrl.Result{RequeueAfter: requeueDuration}, nil
+		}
+		// Pod has timed out — fall through to delete + recreate below.
+		logger.Info("[Recreating] pod timed out, will replace", "member", member.Name, "pod", memberPod.Name)
+	}
+
+	// 4. Escalate to Replacing if RecreateCount is exhausted.
+	if member.Status.RecreateCount >= 3 {
+		logger.Info("[Recreating] RecreateCount exhausted, escalating to Replacing", "member", member.Name, "recreateCount", member.Status.RecreateCount)
+		if err := r.updateEtcdMemberStatus(ctx, member, func(status *ecv1alpha1.EtcdMemberStatus) {
+			status.Phase = ecv1alpha1.EtcdMemberReplacing
+			status.RecreateCount = 0
+		}); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: requeueDuration}, nil
+	}
+
+	// 5. Transfer leadership away before taking this member offline, so the
+	// cluster doesn't lose its leader unnecessarily. This is a best-effort
+	// operation — if it fails, log and proceed with the pod deletion anyway.
+	if member.Status.IsLeader {
+		endpoints := clientEndpointsFromPods(state.cluster.Name, state.cluster.Namespace, state.pods, clusterTLSEnabled(state.cluster))
+		if len(endpoints) > 0 {
+			// Pick the lowest-ordinal member that is not this one as the transfer target.
+			var transferTargetID uint64
+			for i := range state.members {
+				other := &state.members[i]
+				if other.Name == member.Name {
+					continue
+				}
+				if node := findEtcdNodeForEtcdMember(state, other); node != nil {
+					transferTargetID = node.ID
+					break
+				}
+			}
+			if transferTargetID != 0 {
+				logger.Info("[Recreating] transferring leadership before pod deletion",
+					"member", member.Name,
+					"transferTargetID", fmt.Sprintf("%x", transferTargetID),
+				)
+				if err := etcdutils.MoveLeader(etcdutils.ClientConfig{Endpoints: endpoints, TLS: state.tlsConfig}, transferTargetID); err != nil {
+					logger.Info("[Recreating] leader transfer failed, proceeding with pod deletion anyway",
+						"member", member.Name,
+						"error", err,
+					)
+				}
+			}
+		}
+	}
+
+	// 6. Delete the timed-out Pod if it still exists.
+	if memberPod != nil {
+		logger.Info("[Recreating] deleting timed-out pod", "member", member.Name, "pod", memberPod.Name)
+		if err := r.Delete(ctx, memberPod); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: requeueDuration}, nil
+	}
+
+	// 6. Pod is absent — create a new one with the current spec and bump RecreateCount.
+	logger.Info("[Recreating] creating new pod", "member", member.Name)
+	if err := r.ensureProvisioningPod(ctx, state, member, etcdClusterStateExisting, initialClusterForPod(state, member, false)); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	return ctrl.Result{RequeueAfter: requeueDuration}, nil
+}
+
+
+// reconcileReplacing drives the Replacing lifecycle phase: the member is
+// removed from the live etcd cluster, its Pod and PVC are cleaned up, and it
+// is reset to Pending so the Provisioning case re-joins it from scratch.
+// It follows the Replacing case in reconcile_member_v0.3.0.png:
+//  1. Best-effort leader transfer (if this member is the leader).
+//  2. Remove the member from the live etcd membership if still registered.
+//  3. Delete its Pod if still present.
+//  4. Delete its PVC if still present (skipped when no storage spec).
+//  5. Certificates are cluster-level (not per-member) — no deletion needed.
+//  6. Reset phase to Pending so the Provisioning case re-joins it fresh.
+func (r *EtcdClusterReconciler) reconcileReplacing(
+	ctx context.Context,
+	state *reconcileState,
+	member *ecv1alpha1.EtcdMember,
+) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	// 1. Best-effort leader transfer.
+	if member.Status.IsLeader {
+		endpoints := clientEndpointsFromPods(state.cluster.Name, state.cluster.Namespace, state.pods, clusterTLSEnabled(state.cluster))
+		if len(endpoints) > 0 {
+			var transferTargetID uint64
+			for i := range state.members {
+				other := &state.members[i]
+				if other.Name == member.Name {
+					continue
+				}
+				if node := findEtcdNodeForEtcdMember(state, other); node != nil {
+					transferTargetID = node.ID
+					break
+				}
+			}
+			if transferTargetID != 0 {
+				logger.Info("[Replacing] transferring leadership before removal",
+					"member", member.Name,
+					"transferTargetID", fmt.Sprintf("%x", transferTargetID),
+				)
+				if err := etcdutils.MoveLeader(etcdutils.ClientConfig{Endpoints: endpoints, TLS: state.tlsConfig}, transferTargetID); err != nil {
+					logger.Info("[Replacing] leader transfer failed, proceeding anyway",
+						"member", member.Name, "error", err)
+				}
+			}
+		}
+	}
+
+	// 2. Remove from live etcd membership if still registered.
+	if node := findEtcdNodeForEtcdMember(state, member); node != nil {
+		endpoints := clientEndpointsFromPods(state.cluster.Name, state.cluster.Namespace, state.pods, clusterTLSEnabled(state.cluster))
+		if len(endpoints) == 0 {
+			return ctrl.Result{}, fmt.Errorf("cannot remove EtcdMember %q from cluster: no live client endpoints", member.Name)
+		}
+		logger.Info("[Replacing] removing member from etcd cluster", "member", member.Name)
+		if err := etcdutils.RemoveMember(etcdutils.ClientConfig{Endpoints: endpoints, TLS: state.tlsConfig}, node.ID); err != nil {
+			return ctrl.Result{}, fmt.Errorf("removing EtcdMember %q from etcd cluster: %w", member.Name, err)
+		}
+		return ctrl.Result{RequeueAfter: requeueDuration}, nil
+	}
+
+	// 3. Delete the Pod if still present.
+	if pod := findPodForEtcdMember(state, member); pod != nil {
+		logger.Info("[Replacing] deleting pod", "member", member.Name, "pod", pod.Name)
+		if err := r.Delete(ctx, pod); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: requeueDuration}, nil
+	}
+
+	// 4. Delete the PVC if still present (only when storage is configured).
+	if state.cluster.Spec.StorageSpec != nil && state.cluster.Spec.StorageSpec.AccessModes != corev1.ReadWriteMany {
+		podName := memberPodName(state.cluster.Name, member.Spec.Ordinal)
+		pvcName := pvcNameForMember(podName)
+		pvc := &corev1.PersistentVolumeClaim{}
+		err := r.Get(ctx, types.NamespacedName{Name: pvcName, Namespace: state.cluster.Namespace}, pvc)
+		if err == nil {
+			logger.Info("[Replacing] deleting PVC", "member", member.Name, "pvc", pvcName)
+			if err := r.Delete(ctx, pvc); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{RequeueAfter: requeueDuration}, nil
+		} else if !k8serrors.IsNotFound(err) {
+			return ctrl.Result{}, fmt.Errorf("checking PVC %q for EtcdMember %q: %w", pvcName, member.Name, err)
+		}
+	}
+
+	// 6. All cleanup done — reset to Pending so Provisioning re-joins fresh.
+	logger.Info("[Replacing] cleanup complete, resetting member to Pending", "member", member.Name)
+	if err := r.updateEtcdMemberStatus(ctx, member, func(status *ecv1alpha1.EtcdMemberStatus) {
+		status.Phase = ecv1alpha1.EtcdMemberPending
 		status.RecreateCount = 0
 	}); err != nil {
 		return ctrl.Result{}, err
@@ -390,6 +630,35 @@ func pickNotReadyMember(
 		}
 	}
 	return nil
+}
+
+// pickMemberToUpgrade selects the next member to upgrade to targetVersion.
+// It iterates from highest to lowest ordinal and prefers non-leader members first,
+// leaving the leader member for last. If all members needing upgrade are leaders
+// (or leadership cannot be determined), the highest-ordinal member needing upgrade is returned.
+// Returns nil if all members are already at targetVersion.
+func pickMemberToUpgrade(members []ecv1alpha1.EtcdMember, targetVersion string) *ecv1alpha1.EtcdMember {
+	var leaderCandidate *ecv1alpha1.EtcdMember
+
+	// members is sorted in ascending ordinal order. Iterate in reverse (highest ordinal first).
+	for i := len(members) - 1; i >= 0; i-- {
+		m := &members[i]
+		if m.DeletionTimestamp != nil {
+			continue
+		}
+		if m.Spec.Version == targetVersion {
+			continue
+		}
+		if m.Status.IsLeader {
+			if leaderCandidate == nil {
+				leaderCandidate = m
+			}
+			continue
+		}
+		return m
+	}
+
+	return leaderCandidate
 }
 
 // findHealthStatusForEtcdMember looks up the member's health entry in the

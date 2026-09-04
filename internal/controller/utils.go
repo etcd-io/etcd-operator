@@ -506,11 +506,11 @@ func validateEtcdUpgradePath(etcdVersions []semver.Version, current, target stri
 		currentIdx, targetIdx = -1, -1
 	)
 
-	currentVer, err = semver.NewVersion(current)
+	currentVer, err = semver.NewVersion(strings.TrimPrefix(current, "v"))
 	if err != nil {
 		return false, fmt.Errorf("failed to parse current version %s: %w", current, err)
 	}
-	targetVer, err = semver.NewVersion(target)
+	targetVer, err = semver.NewVersion(strings.TrimPrefix(target, "v"))
 	if err != nil {
 		return false, fmt.Errorf("failed to parse target version %s: %w", target, err)
 	}
