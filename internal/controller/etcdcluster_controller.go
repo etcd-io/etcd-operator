@@ -20,6 +20,8 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"slices"
+	"sort"
 	"strings"
 	"time"
 
@@ -262,8 +264,9 @@ func (r *EtcdClusterReconciler) validateSpec(ctx context.Context, s *reconcileSt
 			if currentVersion != targetVersion {
 				canParse, err := validateEtcdUpgradePath(etcdversions.AllVersions, currentVersion, targetVersion)
 				if !canParse {
-					logger.Info("error when parsing reconcile versions; it is your responsibility "+
-						"to validate if the upgrade path is supported",
+					logger.Info(
+						"error when parsing reconcile versions; it is your responsibility "+
+							"to validate if the upgrade path is supported",
 						"current", currentVersion,
 						"target", targetVersion,
 						"error", err,
@@ -271,7 +274,8 @@ func (r *EtcdClusterReconciler) validateSpec(ctx context.Context, s *reconcileSt
 					return nil
 				}
 				if err != nil {
-					logger.Error(err, "unsupported upgrade path between current and target versions",
+					logger.Error(
+						err, "unsupported upgrade path between current and target versions",
 						"current", currentVersion,
 						"target", targetVersion,
 					)
@@ -535,7 +539,43 @@ func (r *EtcdClusterReconciler) clearMemberFinalizer(ctx context.Context, m *ecv
 // this once M3 lands; recreating one member at a time, highest ordinal
 // first, transferring leadership first if needed (§4.5).
 func (r *EtcdClusterReconciler) updateConfig(ctx context.Context, s *reconcileState) (ctrl.Result, error) {
-	return ctrl.Result{}, nil
+	logger := log.FromContext(ctx)
+	hash := EtcdClusterHash(s.cluster)
+
+	drifter := findConfigDriftingPod(s.pods, hash)
+
+	if drifter == nil {
+		logger.Info("no pods with outdated config found")
+		return ctrl.Result{}, nil
+	}
+
+	logger.Info("a pod with outdated config found", "pod name", drifter.Name)
+	for i := range s.members {
+		if s.members[i].Name == drifter.Name {
+			s.members[i].Status.Phase = ecv1alpha1.EtcdMemberRecreating
+			if err := r.Status().Update(ctx, &s.members[i]); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{RequeueAfter: requeueDuration}, nil
+		}
+	}
+	return ctrl.Result{}, fmt.Errorf("could not find a member that matches the drifting pod %s", drifter.Name)
+}
+
+// findConfigDriftingPod finds the pod with the highest ordinal that has its config hash
+// not matched with the expected hash. It returns nil when all pods match the hash.
+func findConfigDriftingPod(pods []*corev1.Pod, expectedHash string) *corev1.Pod {
+	sort.Slice(pods, func(i, j int) bool {
+		return strings.Compare(pods[i].Name, pods[j].Name) < 0
+	})
+
+	for _, p := range slices.Backward(pods) {
+		if p.Annotations == nil || p.Annotations[HashMetadataKey] != expectedHash {
+			return p
+		}
+	}
+
+	return nil
 }
 
 // scaleCluster grows or shrinks the cluster by one member at a time towards
@@ -721,7 +761,8 @@ func (r *EtcdClusterReconciler) updateConditions(s *reconcileState) {
 		} else {
 			availableCondition.Message = fmt.Sprintf(
 				"Etcd cluster has %d/%d healthy members, quorum requires %d",
-				healthyCount, len(s.memberListResp.Members), quorum)
+				healthyCount, len(s.memberListResp.Members), quorum,
+			)
 		}
 	}
 
