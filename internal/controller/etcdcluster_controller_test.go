@@ -728,11 +728,13 @@ func TestEnsureClusterFinalizer(t *testing.T) {
 	})
 }
 
-// TestFinalizeCluster verifies the EtcdCluster deletion path: owned
-// EtcdMembers are removed one dispatch-step-7-style pass at a time, and only
-// once none remain does the cluster's own finalizer get released.
+// TestFinalizeCluster verifies the EtcdCluster deletion path: live members
+// are deleted, already-Terminating members have their finalizers released
+// directly so Kubernetes GC can remove their owned resources, and only once
+// no members remain does the cluster's own finalizer get released.
 func TestFinalizeCluster(t *testing.T) {
 	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
 	_ = ecv1alpha1.AddToScheme(scheme)
 
 	terminatingCluster := func() *ecv1alpha1.EtcdCluster {
@@ -775,7 +777,7 @@ func TestFinalizeCluster(t *testing.T) {
 		assert.Equal(t, []string{clusterCleanupFinalizer}, gotCluster.Finalizers)
 	})
 
-	t.Run("Clears an already-Terminating member's finalizer and requeues", func(t *testing.T) {
+	t.Run("Releases an already-Terminating member without directly deleting owned resources", func(t *testing.T) {
 		ctx := t.Context()
 		ec := terminatingCluster()
 		now := metav1.Now()
@@ -783,23 +785,92 @@ func TestFinalizeCluster(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{
 				Name:              "etcd-0",
 				Namespace:         ec.Namespace,
+				UID:               types.UID("member-0"),
 				DeletionTimestamp: &now,
 				Finalizers:        []string{memberCleanupFinalizer},
 			},
 			Spec: ecv1alpha1.EtcdMemberSpec{ClusterName: ec.Name, Ordinal: 0, Version: ec.Spec.Version},
 		}
+		memberOwner := *metav1.NewControllerRef(&member, ecv1alpha1.GroupVersion.WithKind("EtcdMember"))
+		pod := corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Name: "etcd-0", Namespace: ec.Namespace, OwnerReferences: []metav1.OwnerReference{memberOwner},
+		}}
+		pvc := corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+			Name: pvcNameForMember("etcd-0"), Namespace: ec.Namespace, OwnerReferences: []metav1.OwnerReference{memberOwner},
+		}}
 
-		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ec, &member).Build()
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ec, &member, &pod, &pvc).Build()
 		r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
-		state := &reconcileState{cluster: ec, members: []ecv1alpha1.EtcdMember{member}}
+		state := &reconcileState{cluster: ec, members: []ecv1alpha1.EtcdMember{member}, pods: []*corev1.Pod{&pod}}
 
 		res, err := r.finalizeCluster(ctx, state)
 		assert.NoError(t, err)
 		assert.Equal(t, ctrl.Result{RequeueAfter: requeueDuration}, res)
 
-		list := &ecv1alpha1.EtcdMemberList{}
-		require.NoError(t, fakeClient.List(ctx, list, client.InNamespace(ec.Namespace)))
-		assert.Empty(t, list.Items, "clearing the last finalizer should let the fake client remove it")
+		// §4.13 deliberately bypasses the single-member leave sequence: once
+		// every member is leaving, its membership no longer needs protecting.
+		// Releasing the member finalizer lets the real API server's garbage
+		// collector remove these owner-referenced resources. The fake client
+		// does not emulate GC, so their continued presence here proves the
+		// controller did not delete them directly.
+		require.NoError(t, fakeClient.Get(ctx, client.ObjectKeyFromObject(&pod), &corev1.Pod{}))
+		require.NoError(t, fakeClient.Get(ctx, client.ObjectKeyFromObject(&pvc), &corev1.PersistentVolumeClaim{}))
+
+		// Removing the last finalizer lets the fake client finish deleting the
+		// EtcdMember itself.
+		got := &ecv1alpha1.EtcdMember{}
+		err = fakeClient.Get(ctx, client.ObjectKey{Name: "etcd-0", Namespace: ec.Namespace}, got)
+		if err == nil {
+			assert.Empty(t, got.Finalizers, "finalizeCluster must clear memberCleanupFinalizer directly")
+		} else {
+			assert.True(t, apierrors.IsNotFound(err), "clearing the last finalizer should let the fake client remove it")
+		}
+	})
+
+	t.Run("Handles live and Terminating members independently in the same pass", func(t *testing.T) {
+		ctx := t.Context()
+		ec := terminatingCluster()
+		now := metav1.Now()
+		live := ecv1alpha1.EtcdMember{
+			ObjectMeta: metav1.ObjectMeta{Name: "etcd-0", Namespace: ec.Namespace, Finalizers: []string{memberCleanupFinalizer}},
+			Spec:       ecv1alpha1.EtcdMemberSpec{ClusterName: ec.Name, Ordinal: 0, Version: ec.Spec.Version},
+		}
+		terminating := ecv1alpha1.EtcdMember{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "etcd-1",
+				Namespace:         ec.Namespace,
+				DeletionTimestamp: &now,
+				Finalizers:        []string{memberCleanupFinalizer},
+			},
+			Spec: ecv1alpha1.EtcdMemberSpec{ClusterName: ec.Name, Ordinal: 1, Version: ec.Spec.Version},
+		}
+
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ec, &live, &terminating).Build()
+		r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
+		state := &reconcileState{cluster: ec, members: []ecv1alpha1.EtcdMember{live, terminating}}
+
+		res, err := r.finalizeCluster(ctx, state)
+		assert.NoError(t, err)
+		assert.Equal(t, ctrl.Result{RequeueAfter: requeueDuration}, res)
+
+		// Live member only had Delete called: DeletionTimestamp is now set,
+		// memberCleanupFinalizer stays — its leave sequence runs on a later
+		// pass, after the member watch re-enters this loop.
+		gotLive := &ecv1alpha1.EtcdMember{}
+		require.NoError(t, fakeClient.Get(ctx, client.ObjectKey{Name: "etcd-0", Namespace: ec.Namespace}, gotLive))
+		assert.NotNil(t, gotLive.DeletionTimestamp)
+		assert.Contains(t, gotLive.Finalizers, memberCleanupFinalizer)
+
+		// Terminating member had its finalizer released directly; the fake
+		// client then removed the object without running the member leave
+		// sequence.
+		gotTerm := &ecv1alpha1.EtcdMember{}
+		err = fakeClient.Get(ctx, client.ObjectKey{Name: "etcd-1", Namespace: ec.Namespace}, gotTerm)
+		if err == nil {
+			assert.Empty(t, gotTerm.Finalizers)
+		} else {
+			assert.True(t, apierrors.IsNotFound(err), "clearing the last finalizer should let the fake client remove it")
+		}
 	})
 
 	t.Run("Releases the cluster's own finalizer once no members remain", func(t *testing.T) {

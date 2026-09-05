@@ -116,9 +116,12 @@ func etcdClusterRef(name string, size int) *ecv1alpha1.EtcdCluster {
 
 // waitForAllEtcdMemberReady waits until the cluster converges to the size
 // recorded in ec.Spec.Size, checking every layer of readiness:
-//   - EtcdMember objects: exactly that many, all Phase Ready, provisioned
-//     strictly in ascending ordinal order (a higher ordinal appearing before
-//     every lower one is Ready fails immediately).
+//   - EtcdMember objects: exactly that many (Terminating members still
+//     running their leave sequence don't count), all Phase Ready, and no
+//     ordinal at or above the expected size. Both directions are polled,
+//     never hard-failed: scale-in shrinks one member at a time, so higher
+//     ordinals legitimately outlive the size change until their leave
+//     sequence finishes.
 //   - Pods: the same number of them, all Ready.
 //   - etcd membership itself, via the etcd client: that many members with no
 //     learner left unpromoted.
@@ -138,23 +141,29 @@ func waitForAllEtcdMemberReady(t *testing.T, c *envconf.Config, ec *ecv1alpha1.E
 		members := map[int]ecv1alpha1.EtcdMember{}
 		for i := range memberList.Items {
 			member := memberList.Items[i]
-			if member.Namespace == ec.Namespace && member.Spec.ClusterName == ec.Name {
+			// Terminating members are leaving for good (scale-in runs its
+			// leave sequence on them); they legitimately keep higher
+			// ordinals around until cleanup completes and must not fail the
+			// ordinal/size checks aimed at the shrinking cluster.
+			if member.Namespace == ec.Namespace && member.Spec.ClusterName == ec.Name &&
+				member.DeletionTimestamp == nil {
 				members[member.Spec.Ordinal] = member
 			}
 		}
 
+		// Both invariants below are checked as "keep polling", not hard
+		// errors: scale-in shrinks the cluster one member at a time through
+		// graceful leaves, so higher ordinals legitimately exist (live, then
+		// Terminating, then gone) for a while above the target size.
 		for ordinal := range members {
 			if ordinal >= expectedMembers {
-				return false, fmt.Errorf("unexpected EtcdMember ordinal %d for size %d", ordinal, expectedMembers)
+				t.Logf("cluster %s still scaling in: ordinal %d present for size %d", ec.Name, ordinal, expectedMembers)
+				return false, nil
 			}
 			for previousOrdinal := range ordinal {
 				previous, exists := members[previousOrdinal]
 				if !exists || previous.Status.Phase != ecv1alpha1.EtcdMemberReady {
-					return false, fmt.Errorf(
-						"EtcdMember %d appeared before ordinal %d was Ready",
-						ordinal,
-						previousOrdinal,
-					)
+					return false, nil
 				}
 			}
 		}
@@ -266,11 +275,10 @@ func cleanupEtcdCluster(ctx context.Context, t *testing.T, c *envconf.Config, na
 // all namespaces and waits for the controller to fully drain them before
 // returning. This must happen while the controller-manager is still running:
 // EtcdClusterReconciler.finalizeCluster deletes each owned EtcdMember and
-// clears its memberCleanupFinalizer itself once the EtcdCluster starts
-// Terminating, but only the running controller does that. If the global
-// undeploy teardown killed the controller-manager first, a cluster left
-// over by a test would sit stuck Terminating forever and hang namespace
-// deletion.
+// clears its memberCleanupFinalizer once the EtcdCluster starts Terminating,
+// allowing Kubernetes GC to remove member-owned resources. Only the running
+// controller releases those finalizers; if global teardown killed it first, a
+// cluster left by a test would stay Terminating and hang namespace deletion.
 //
 // It retries for a while rather than doing a single pass: draining an
 // EtcdCluster's members takes the controller a few reconcile passes, not
