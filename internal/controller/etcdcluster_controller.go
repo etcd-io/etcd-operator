@@ -403,14 +403,10 @@ func (r *EtcdClusterReconciler) dispatch(ctx context.Context, s *reconcileState)
 	for i := range s.members {
 		m := &s.members[i]
 		if m.DeletionTimestamp != nil {
-			// TODO: §4.6's real six-step leave sequence (M3); clearing the
-			// finalizer directly is an interim workaround.
-			logger.Info("Member is Terminating; leave sequence not implemented yet, "+
-				"clearing finalizer as an interim workaround", "member", m.Name)
-			if err := r.clearMemberFinalizer(ctx, m); err != nil {
+			if err := r.markMemberTerminating(ctx, m); err != nil {
 				return ctrl.Result{}, err
 			}
-			return ctrl.Result{RequeueAfter: requeueDuration}, nil
+			return r.reconcileEtcdMember(ctx, s, m)
 		}
 	}
 
@@ -501,13 +497,15 @@ func (r *EtcdClusterReconciler) finalizeCluster(ctx context.Context, s *reconcil
 		return ctrl.Result{}, nil
 	}
 
-	logger.Info("EtcdCluster is Terminating; removing owned EtcdMembers", "remaining", len(s.members))
+	logger.Info("EtcdCluster is Terminating; deleting owned EtcdMembers", "remaining", len(s.members))
 	for i := range s.members {
 		m := &s.members[i]
 		if m.DeletionTimestamp == nil {
 			if err := r.Delete(ctx, m); err != nil && !errors.IsNotFound(err) {
 				return ctrl.Result{}, err
 			}
+			// Delete only sets DeletionTimestamp while the member finalizer is
+			// present. A later pass enters the branch below and releases it.
 			continue
 		}
 		if err := r.clearMemberFinalizer(ctx, m); err != nil {
@@ -518,9 +516,9 @@ func (r *EtcdClusterReconciler) finalizeCluster(ctx context.Context, s *reconcil
 }
 
 // clearMemberFinalizer removes memberCleanupFinalizer from m, letting
-// Kubernetes finish deleting it. Shared by dispatch()'s Terminating-cleanup
-// step (a single Terminating member, cluster otherwise alive) and
-// finalizeCluster (every member, cluster itself being deleted).
+// Kubernetes finish deleting it. Normal single-member deletion calls this at
+// the end of §4.6's leave sequence; whole-cluster deletion calls it directly as
+// §4.13's explicit exception and relies on Kubernetes garbage collection.
 func (r *EtcdClusterReconciler) clearMemberFinalizer(ctx context.Context, m *ecv1alpha1.EtcdMember) error {
 	if !controllerutil.RemoveFinalizer(m, memberCleanupFinalizer) {
 		return nil

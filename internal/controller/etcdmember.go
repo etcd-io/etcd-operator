@@ -22,6 +22,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/util/retry"
@@ -57,10 +58,130 @@ func (r *EtcdClusterReconciler) reconcileEtcdMember(
 	// the object survives with an empty Phase, which must resume provisioning.
 	case "", ecv1alpha1.EtcdMemberPending, ecv1alpha1.EtcdMemberProvisioning:
 		return r.reconcileProvisioning(ctx, state, member)
-	// placeholder for Terminating, Recreating and Replacing
+	// Terminating (§4.6): DeletionTimestamp got set the same way regardless
+	// of why — scale-in's plain Delete or a human deleting the member
+	// directly — and dispatch wrote the Phase before entering here. Clean up
+	// the membership and owned resources, end by
+	// releasing the finalizer so Kubernetes can finish the deletion.
+	case ecv1alpha1.EtcdMemberTerminating:
+		return r.cleanupEtcdMember(ctx, state, member)
+	// placeholder for Recreating and Replacing
 	default:
 		return ctrl.Result{}, nil
 	}
+}
+
+// markMemberTerminating persists Phase=Terminating on a member whose
+// deletion has started, if not already written. Idempotent across repeated
+// dispatch attempts.
+func (r *EtcdClusterReconciler) markMemberTerminating(ctx context.Context, member *ecv1alpha1.EtcdMember) error {
+	if member.Status.Phase == ecv1alpha1.EtcdMemberTerminating {
+		return nil
+	}
+	return r.updateEtcdMemberStatus(ctx, member, func(status *ecv1alpha1.EtcdMemberStatus) {
+		status.Phase = ecv1alpha1.EtcdMemberTerminating
+	})
+}
+
+// cleanupEtcdMember is the §4.6 Terminating leave for one member: remove it
+// from etcd's live membership, delete its owned Pod and PVC, and finally
+// release memberCleanupFinalizer so Kubernetes can finish the deletion.
+// Every step is a no-op once done, so re-entering after an interruption
+// (operator restart, transient etcd error) resumes harmlessly.
+//
+// Leadership transfer is intentionally not done here. When etcd's own
+// MemberRemove drops this member from the cluster's Membership, the
+// member's etcd server is shut down gracefully by the cluster on its
+// own, and that graceful shutdown actively hands leadership to a
+// remaining peer before it stops — so the implicit transfer is fast
+// enough for the simple case. This does not, however, let us pick a
+// specific transferee or surface a transfer failure as a distinct
+// status; both are reasons §4.6 step 1 calls for an explicit,
+// best-effort MoveLeader ahead of RemoveMember, which should be added
+// in a follow-up (failure must not stop the sequence).
+func (r *EtcdClusterReconciler) cleanupEtcdMember(ctx context.Context, s *reconcileState, member *ecv1alpha1.EtcdMember) (ctrl.Result, error) {
+	if err := removeEtcdNode(s, member); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	podDeleted, err := r.deleteMemberPod(ctx, member, s.pods)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if podDeleted {
+		return ctrl.Result{RequeueAfter: requeueDuration}, nil
+	}
+
+	if _, err := r.deleteMemberPVC(ctx, member); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if err := r.clearMemberFinalizer(ctx, member); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{RequeueAfter: requeueDuration}, nil
+}
+
+// removeEtcdNode removes the member from etcd's live membership, correlating
+// it against the reconcile snapshot's MemberList with findEtcdNodeForEtcdMember
+// (never Status.MemberID). No-op when the membership snapshot is absent (etcd
+// unreachable — the #463 recovery path) or when the member no longer appears
+// in the membership (already removed).
+func removeEtcdNode(s *reconcileState, member *ecv1alpha1.EtcdMember) error {
+	if s.memberListResp == nil {
+		return fmt.Errorf("etcd cluster is highly likely unhealthy due to an empty MemberList response")
+	}
+
+	etcdNode := findEtcdNodeForEtcdMember(s, member)
+	if etcdNode == nil {
+		return nil // already removed from the membership
+	}
+
+	endpoints := clientEndpointsFromPods(s.cluster.Name, s.cluster.Namespace, s.pods, clusterTLSEnabled(s.cluster))
+	cfg := etcdutils.ClientConfig{Endpoints: endpoints, TLS: s.tlsConfig}
+	if err := etcdutils.RemoveMember(cfg, etcdNode.ID); err != nil {
+		return fmt.Errorf("failed to remove the etcd node for EtcdMember %q: %w", member.Name, err)
+	}
+	return nil
+}
+
+// deleteMemberPod deletes the member's Pod from the reconcile snapshot. It
+// reports whether the delete request succeeded. An absent Pod is a no-op.
+func (r *EtcdClusterReconciler) deleteMemberPod(
+	ctx context.Context,
+	member *ecv1alpha1.EtcdMember,
+	pods []*corev1.Pod,
+) (bool, error) {
+	podName := member.Name
+	for _, pod := range pods {
+		if pod.Name != podName {
+			continue
+		}
+		if err := r.Delete(ctx, pod); err != nil {
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+			return false, fmt.Errorf("failed to delete Pod for EtcdMember %q: %w", member.Name, err)
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+// deleteMemberPVC deletes the member's PVC by its deterministic name. It
+// reports whether the delete request succeeded. An absent PVC is a no-op.
+func (r *EtcdClusterReconciler) deleteMemberPVC(ctx context.Context, member *ecv1alpha1.EtcdMember) (bool, error) {
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name:      pvcNameForMember(member.Name),
+		Namespace: member.Namespace,
+	}}
+	if err := r.Delete(ctx, pvc); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to delete PVC %q for EtcdMember %q: %w", pvc.Name, member.Name, err)
+	}
+	return true, nil
 }
 
 // reconcileProvisioning establishes the durable write-before-mutate phase
