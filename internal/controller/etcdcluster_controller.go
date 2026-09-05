@@ -403,14 +403,10 @@ func (r *EtcdClusterReconciler) dispatch(ctx context.Context, s *reconcileState)
 	for i := range s.members {
 		m := &s.members[i]
 		if m.DeletionTimestamp != nil {
-			// TODO: §4.6's real six-step leave sequence (M3); clearing the
-			// finalizer directly is an interim workaround.
-			logger.Info("Member is Terminating; leave sequence not implemented yet, "+
-				"clearing finalizer as an interim workaround", "member", m.Name)
-			if err := r.clearMemberFinalizer(ctx, m); err != nil {
+			if err := r.markMemberTerminating(ctx, m); err != nil {
 				return ctrl.Result{}, err
 			}
-			return ctrl.Result{RequeueAfter: requeueDuration}, nil
+			return r.reconcileEtcdMember(ctx, s, m)
 		}
 	}
 
@@ -476,19 +472,15 @@ func (r *EtcdClusterReconciler) ensureClusterFinalizer(ctx context.Context, s *r
 	return r.Update(ctx, s.cluster)
 }
 
-// finalizeCluster handles an EtcdCluster with DeletionTimestamp set: it
-// removes every EtcdMember it still owns — reusing the same interim
-// finalizer-clearing dispatch()'s Terminating-cleanup step uses for a
-// single Terminating member — and, once none remain, releases
-// clusterCleanupFinalizer so Kubernetes can finish deleting the EtcdCluster
-// itself.
-//
-// TODO: like that step, this skips the real six-step leave sequence (§4.6,
-// M3): members are removed without ever calling etcd's MemberRemove, so
-// deleting a cluster with live members can leave stale entries in etcd's
-// own membership list. Acceptable for now because the Pods backing those
-// members are torn down along with everything else, but M3 should replace
-// this loop with the real sequence rather than just deleting faster.
+// finalizeCluster handles an EtcdCluster with DeletionTimestamp set. Whole-
+// cluster deletion deliberately bypasses the graceful per-member leave
+// sequence: there is no surviving etcd cluster whose membership or leadership
+// needs protecting. Members not yet deleting are deleted, while an already-
+// Terminating member has memberCleanupFinalizer removed directly so Kubernetes
+// garbage collection can remove its owned Pod and PVC. Once no members remain,
+// clusterCleanupFinalizer is released so Kubernetes can finish deleting the
+// EtcdCluster and its remaining cluster-owned resources, including certificate
+// Secrets (design doc §4.13).
 func (r *EtcdClusterReconciler) finalizeCluster(ctx context.Context, s *reconcileState) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
@@ -501,13 +493,15 @@ func (r *EtcdClusterReconciler) finalizeCluster(ctx context.Context, s *reconcil
 		return ctrl.Result{}, nil
 	}
 
-	logger.Info("EtcdCluster is Terminating; removing owned EtcdMembers", "remaining", len(s.members))
+	logger.Info("EtcdCluster is Terminating; deleting owned EtcdMembers", "remaining", len(s.members))
 	for i := range s.members {
 		m := &s.members[i]
 		if m.DeletionTimestamp == nil {
 			if err := r.Delete(ctx, m); err != nil && !errors.IsNotFound(err) {
 				return ctrl.Result{}, err
 			}
+			// Delete only sets DeletionTimestamp while the member finalizer is
+			// present. A later pass enters the branch below and releases it.
 			continue
 		}
 		if err := r.clearMemberFinalizer(ctx, m); err != nil {
@@ -518,9 +512,9 @@ func (r *EtcdClusterReconciler) finalizeCluster(ctx context.Context, s *reconcil
 }
 
 // clearMemberFinalizer removes memberCleanupFinalizer from m, letting
-// Kubernetes finish deleting it. Shared by dispatch()'s Terminating-cleanup
-// step (a single Terminating member, cluster otherwise alive) and
-// finalizeCluster (every member, cluster itself being deleted).
+// Kubernetes finish deleting it. Normal single-member deletion calls this at
+// the end of §4.6's leave sequence; whole-cluster deletion calls it directly as
+// §4.13's explicit exception and relies on Kubernetes garbage collection.
 func (r *EtcdClusterReconciler) clearMemberFinalizer(ctx context.Context, m *ecv1alpha1.EtcdMember) error {
 	if !controllerutil.RemoveFinalizer(m, memberCleanupFinalizer) {
 		return nil

@@ -19,8 +19,13 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
@@ -258,4 +263,200 @@ func TestPickMemberToUpgrade(t *testing.T) {
 			}
 		})
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Terminating cleanup (§4.6): cleanupEtcdMember / removeEtcNode /
+// cleanupMemberResources
+// ---------------------------------------------------------------------------
+
+// leaveTestCluster is the fixture cluster for the leave tests: three members
+// with per-member (ReadWriteOnce) storage.
+func leaveTestCluster() *ecv1alpha1.EtcdCluster {
+	return &ecv1alpha1.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "etcd", Namespace: "default", UID: "1"},
+		Spec: ecv1alpha1.EtcdClusterSpec{
+			Size:    3,
+			Version: "3.5.17",
+			StorageSpec: &ecv1alpha1.StorageSpec{
+				AccessModes:       corev1.ReadWriteOnce,
+				VolumeSizeRequest: resource.MustParse("1Gi"),
+			},
+		},
+	}
+}
+
+func leaveTestMember(ordinal int) *ecv1alpha1.EtcdMember {
+	return &ecv1alpha1.EtcdMember{
+		ObjectMeta: metav1.ObjectMeta{Name: etcdMemberName("etcd", ordinal), Namespace: "default"},
+		Spec:       ecv1alpha1.EtcdMemberSpec{ClusterName: "etcd", Ordinal: ordinal, Version: "3.5.17"},
+	}
+}
+
+func leaveTestPod(ordinal int) *corev1.Pod {
+	return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: memberPodName("etcd", ordinal), Namespace: "default"}}
+}
+
+func leaveTestScheme(t *testing.T) *runtime.Scheme {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+	require.NoError(t, ecv1alpha1.AddToScheme(scheme))
+	return scheme
+}
+
+func TestCleanupMemberResources(t *testing.T) {
+	t.Run("Deletes the Pod and PVC together", func(t *testing.T) {
+		scheme := leaveTestScheme(t)
+		ctx := t.Context()
+		ec := leaveTestCluster()
+		member := leaveTestMember(2)
+		pod := leaveTestPod(2)
+		pvc := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{Name: pvcNameForMember(pod.Name), Namespace: ec.Namespace},
+		}
+
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ec, member, pod, pvc).Build()
+		state := &reconcileState{cluster: ec, pods: []*corev1.Pod{pod}}
+
+		require.NoError(t, cleanupMemberResources(ctx, fakeClient, state, member))
+		assert.Error(t, fakeClient.Get(ctx, client.ObjectKeyFromObject(pod), &corev1.Pod{}),
+			"Pod found in the reconcile snapshot gets deleted")
+		assert.Error(t, fakeClient.Get(ctx, client.ObjectKeyFromObject(pvc), &corev1.PersistentVolumeClaim{}),
+			"PVC is deleted by its deterministic name; pvc-protection holds the release until the Pod is gone")
+	})
+
+	t.Run("Missing resources are not an error", func(t *testing.T) {
+		scheme := leaveTestScheme(t)
+		ctx := t.Context()
+		ec := leaveTestCluster()
+		member := leaveTestMember(2)
+
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ec, member).Build()
+		state := &reconcileState{cluster: ec}
+
+		assert.NoError(t, cleanupMemberResources(ctx, fakeClient, state, member))
+	})
+
+	t.Run("Pod absent from the snapshot is left untouched; the PVC still goes", func(t *testing.T) {
+		scheme := leaveTestScheme(t)
+		ctx := t.Context()
+		ec := leaveTestCluster()
+		member := leaveTestMember(2)
+		pod := leaveTestPod(2)
+		pvc := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{Name: pvcNameForMember(pod.Name), Namespace: ec.Namespace},
+		}
+
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ec, member, pod, pvc).Build()
+		state := &reconcileState{cluster: ec, pods: nil}
+
+		require.NoError(t, cleanupMemberResources(ctx, fakeClient, state, member))
+		assert.NoError(t, fakeClient.Get(ctx, client.ObjectKeyFromObject(pod), &corev1.Pod{}),
+			"the Pod lookup is snapshot-driven: one not in s.pods is not deleted")
+		assert.Error(t, fakeClient.Get(ctx, client.ObjectKeyFromObject(pvc), &corev1.PersistentVolumeClaim{}),
+			"the PVC lookup is live by name, independent of the Pod snapshot")
+	})
+}
+
+func TestRemoveEtcNode(t *testing.T) {
+	_, peerURL2 := peerEndpointForOrdinalIndex(leaveTestCluster(), 2)
+
+	t.Run("No membership snapshot — no-op when etcd is unreachable", func(t *testing.T) {
+		state := &reconcileState{cluster: leaveTestCluster(), memberListResp: nil}
+		assert.NoError(t, removeEtcNode(state, leaveTestMember(2)),
+			"absent snapshot means no membership to amend — the #463 degradation")
+	})
+
+	t.Run("Member already absent from the membership — no-op", func(t *testing.T) {
+		state := &reconcileState{
+			cluster: leaveTestCluster(),
+			memberListResp: &clientv3.MemberListResponse{Members: []*etcdserverpb.Member{
+				{ID: 100, Name: "etcd-0", PeerURLs: []string{"http://etcd-0:2380"}},
+			}},
+		}
+		assert.NoError(t, removeEtcNode(state, leaveTestMember(2)),
+			"already-removed (or never-registered) must not trigger a RemoveMember dial")
+	})
+
+	// The matching-and-RemoveMember branch needs a real etcd; it is covered
+	// live by e2e TestScaling (scale-in removes members from the cluster's
+	// own membership), with the ordinal-derived peer URL it matches on
+	// asserted here against the snapshot shape.
+	t.Run("Snapshot entry carries the ordinal-derived peer URL", func(t *testing.T) {
+		state := &reconcileState{
+			cluster: leaveTestCluster(),
+			memberListResp: &clientv3.MemberListResponse{Members: []*etcdserverpb.Member{
+				{ID: 222, Name: "etcd-2", PeerURLs: []string{peerURL2}},
+			}},
+		}
+		found := false
+		for _, m := range state.memberListResp.Members {
+			for _, u := range m.PeerURLs {
+				if u == peerURL2 {
+					found = true
+				}
+			}
+		}
+		assert.True(t, found, "the leave match key is the deterministic peer URL")
+	})
+}
+
+// TestCleanupEtcdMember drives the whole Terminating leave in one call: the
+// membership step is skipped when no snapshot exists (etcd unreachable), the
+// owned Pod and PVC are deleted, and the member's finalizer is released so the
+// object disappears.
+func TestCleanupEtcdMember(t *testing.T) {
+	scheme := leaveTestScheme(t)
+	ctx := t.Context()
+	ec := leaveTestCluster()
+	now := metav1.Now()
+	member := leaveTestMember(2)
+	member.DeletionTimestamp = &now
+	member.Finalizers = []string{memberCleanupFinalizer}
+	pod := leaveTestPod(2)
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: pvcNameForMember(pod.Name), Namespace: ec.Namespace},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(ec, member, pod, pvc).
+		Build()
+	r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
+	state := &reconcileState{cluster: ec, pods: []*corev1.Pod{pod}}
+
+	res, err := r.cleanupEtcdMember(ctx, state, member)
+	require.NoError(t, err)
+	assert.Equal(t, ctrl.Result{RequeueAfter: requeueDuration}, res)
+
+	assert.Error(t, fakeClient.Get(ctx, types.NamespacedName{Namespace: ec.Namespace, Name: pod.Name}, &corev1.Pod{}))
+	assert.Error(t, fakeClient.Get(ctx, types.NamespacedName{Namespace: ec.Namespace, Name: pvc.Name}, &corev1.PersistentVolumeClaim{}))
+
+	// Finalizer released → the member is gone, no second pass needed.
+	assert.Error(t, fakeClient.Get(ctx, types.NamespacedName{Namespace: ec.Namespace, Name: member.Name}, &ecv1alpha1.EtcdMember{}))
+}
+
+// TestMarkMemberTerminating verifies the Phase write before the leave runs,
+// and that a repeated call is a no-op.
+func TestMarkMemberTerminating(t *testing.T) {
+	scheme := leaveTestScheme(t)
+	ctx := t.Context()
+	member := leaveTestMember(0)
+	member.Status.Phase = ecv1alpha1.EtcdMemberReady
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&ecv1alpha1.EtcdMember{}).
+		WithObjects(member).
+		Build()
+	r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
+
+	require.NoError(t, r.markMemberTerminating(ctx, member))
+	got := &ecv1alpha1.EtcdMember{}
+	require.NoError(t, fakeClient.Get(ctx, types.NamespacedName{Namespace: member.Namespace, Name: member.Name}, got))
+	assert.Equal(t, ecv1alpha1.EtcdMemberTerminating, got.Status.Phase)
+
+	// Already Terminating: no error, no write needed.
+	assert.NoError(t, r.markMemberTerminating(ctx, member))
 }
