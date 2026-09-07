@@ -188,11 +188,15 @@ this alarm, don't redo it," etc.
     operator changed by hand in the meantime.
 16. **Deleting an `EtcdCluster` must cleanly tear down every `EtcdMember` it
     owns before the `EtcdCluster` object itself is allowed to disappear** —
-    but without paying for the graceful, one-at-a-time per-member leave
-    mechanics of requirement 10 (leadership transfer, `MemberRemove`, alarm
-    disarm), since those exist to protect a cluster that's still around
-    after the member leaves. When every member is leaving together, there's
-    no remaining cluster to protect. See §4.13.
+    but without the ordinary per-member leave mechanics (leadership
+    transfer, `MemberRemove`, alarm disarm): once the whole cluster is being
+    destroyed, there's no remaining etcd membership or alarm state left to
+    protect, so cluster deletion goes straight to Kubernetes-level cleanup
+    per member — delete the Pod, delete the PVC, remove that member's own
+    finalizer. The one exception: the TLS certificate `Secret`, which — for
+    now, since every `EtcdMember` still shares the same one — is left alone
+    by this per-member cleanup and deleted exactly once, right before the
+    `EtcdCluster`'s own finalizer comes off. See §4.13.
 
 ## 4. Proposed design
 
@@ -705,10 +709,10 @@ resuming after a crash at any point is safe:
 |---|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------|
 | 1 | Leadership transfer (§4.5), if currently leader                                                                                                                         | best-effort, not itself retried                                                       |
 | 2 | Find this member's current etcd identity — a live `MemberList` call, matched by this ordinal's deterministic peer URL, never `Status.MemberID` — then `MemberRemove` it | does a live `MemberList` no longer have an entry for that peer URL?                   |
-| 3 | If a `CORRUPT` alarm is tagged with the ID found live in step 2, `AlarmDisarm` it                                                                                       | does a live `AlarmList` no longer show it?                                            |
+| 3 | Disarm any alarm tagged with the ID found live in step 2                                                                                                                | does a live `AlarmList` no longer show anything tagged with that ID?                  |
 | 4 | Delete the Pod                                                                                                                                                          | does the Pod still exist? ("done" means fully gone, not just `deletionTimestamp` set) |
 | 5 | Delete the PVC                                                                                                                                                          | does the PVC still exist?                                                             |
-| 6 | Delete the TLS certificate `Secret`, if any                                                                                                                             | does it still exist?                                                                  |
+| 6 | *(skipped for now — see below)* Delete the TLS certificate `Secret`                                                                                                     | n/a                                                                                   |
 
 Step 4 must actually complete before step 5 can, not just be listed first:
 Kubernetes' `pvc-protection` finalizer blocks a PVC from being reclaimed
@@ -717,11 +721,23 @@ reuse the exact same ordinal-derived names as the old ones — so if the old
 Pod isn't gone first, rejoining would silently reuse the old (possibly
 corrupted) PVC, defeating the entire point of `Replacing`.
 
-Step 3 exists only for the `CORRUPT`-triggered case, and sits right after
-removal rather than at the end: the alarm (and the cluster's read-only
-mode) is caused by the corrupted member's *presence*, not by its
-replacement's absence, so the cluster can go back to read-write with N-1
-members as soon as it's out.
+Step 3 sits right after removal rather than before it, and isn't limited
+to `CORRUPT`: disarming first would leave a window, while the member is
+still part of the cluster, where the same underlying condition (data
+corruption, a still-oversized backend) could simply re-raise the alarm
+before removal ever completes — wasting the disarm call. Once the member
+is actually out of the cluster, whatever it was tagged with can't recur
+under that identity, so disarming only after `MemberRemove` succeeds is
+the only ordering that's actually durable.
+
+**Step 6 is skipped, not merely deferred, for now.** Every `EtcdMember` in
+a cluster currently shares the *same* server/peer certificate `Secret`,
+owned by the `EtcdCluster` itself — §4.10 describes moving to a genuinely
+per-member `Secret`, but until that migration lands, deleting it here
+would break TLS for every other member still running or still mid-leave
+itself. §4.13's whole-cluster finalization relies on this same reasoning
+for its own, separate per-member cert exception, even though it doesn't
+reuse this sequence (see there for why).
 
 **`Terminating`** runs steps 1–6, then removes the finalizer (§4.3), which
 is what finally lets the `EtcdMember` object disappear — regardless of
@@ -735,8 +751,9 @@ behind.
 
 **`Replacing`** runs the same steps 1–6, then sets `Phase: Pending` instead
 of removing the object — which sends the member straight back through
-"Joining the cluster" above to rejoin fresh, exactly as if it were a brand
-new ordinal. This reuses the join logic outright instead of duplicating a
+"Joining the cluster" above (step 1 there recreates the `Secret` if it
+doesn't already exist) to rejoin fresh, exactly as if it were a brand new
+ordinal. This reuses the join logic outright instead of duplicating a
 second "add member, create Pod" implementation inside `Replacing`.
 
 This is why step 2 never relies on `Status.MemberID`: that field can go
@@ -854,12 +871,13 @@ letting the controller pick automatically.
    reason, it naturally starts without it.
 3. Concurrently terminate every `EtcdMember` *other than*
    `Status.QuorumRecovery.Survivor` — the existing `Terminating` flow
-   (§4.6) already handles etcd-side removal and Pod/PVC/cert cleanup; no
-   new membership logic needed. (These other members are no longer part of
-   any cluster the survivor recognizes, so the ordinary `MemberRemove`
-   idempotency check in step 2 of §4.6's leave-sequence naturally becomes a
-   no-op for them — only Pod/PVC/cert cleanup and object deletion actually
-   happen.)
+   (§4.6) already handles etcd-side removal and Pod/PVC cleanup (cert
+   cleanup is skipped, per §4.6's interim exception); no new membership
+   logic needed. (These other members are no longer part of any cluster
+   the survivor recognizes, so the ordinary `MemberRemove` idempotency
+   check in step 2 of §4.6's `Terminating` leave-sequence naturally becomes
+   a no-op for them — only alarm disarm, Pod/PVC cleanup, and object
+   deletion actually happen.)
 4. Once the survivor is a healthy single-member cluster and the others are
    gone, clear `Status.QuorumRecovery` (set it back to `nil`) — this is
    what tells §4.9 recovery is no longer under way. The cluster is now
@@ -1089,15 +1107,26 @@ The last three rows only run once every existing `EtcdMember` is `Ready`
 
 ### 4.13 Finalizing an `EtcdCluster` (cluster deletion)
 
-Requirement 16. Conceptually a *different* teardown path from §4.6's
-`Terminating`: `Terminating` is what an individual `EtcdMember` goes
-through while the rest of the cluster keeps running (scale-in, or a human
-deleting one member by hand), so it earns the cost of a graceful,
-one-at-a-time leave — transfer leadership away first, `MemberRemove`
-before anything else, disarm a `CORRUPT` alarm tied to it. None of that
-needs to be paid for one member at a time when *every* member is leaving
-together, since the cluster those steps exist to protect won't exist a
-moment later either.
+Requirement 16. Cluster deletion deliberately does **not** reuse §4.6's
+`Terminating` leave sequence. `Terminating` exists to let one member leave
+gracefully *while the rest of the cluster keeps running* — leadership
+transfer so a leaving leader doesn't stall writes, `MemberRemove` so the
+remaining members' quorum math stays correct, alarm disarm so a lingering
+alarm doesn't outlive the member it was tagged to. None of that matters
+once *every* member is leaving together and the cluster itself is being
+destroyed: there's no remaining etcd membership view or alarm state worth
+protecting, and no other member left to disrupt. So cluster deletion skips
+straight to Kubernetes-level cleanup, per member: delete the Pod, delete
+the PVC, remove that member's own finalizer — no live etcd calls
+(`MemberList`, `MemberRemove`, `AlarmList`, `AlarmDisarm`) at all.
+
+The one exception: the TLS certificate `Secret`. For now — until §4.10's
+move to per-member cert ownership lands — every `EtcdMember` in a cluster
+shares the *same* `Secret`, owned by the `EtcdCluster` itself, so deleting
+it the moment the first member's cleanup finishes would break TLS for
+every member still mid-teardown. Instead, that shared `Secret` is deleted
+exactly once, right before the `EtcdCluster`'s own finalizer comes off
+(step 1 below).
 
 **Checked first, before anything else in the reconcile loop.** After
 fetching the `EtcdCluster` and the `EtcdMember`s/Pods it owns, the very
@@ -1126,29 +1155,37 @@ Recovery":
 case"), re-checked live every reconcile so a crash at any point resumes
 safely:
 
-1. **Are there zero `EtcdMember`s left?** → Yes: remove the `EtcdCluster`'s
-   own finalizer and stop — this is what finally lets the `EtcdCluster`
-   object itself disappear. No: continue to step 2.
-2. **Otherwise, handle every owned `EtcdMember` independently, in the same
-   pass** (not a barrier that waits for every member to reach the same
-   state before acting on any of them):
-   - A member that hasn't started deleting yet gets deleted (best effort;
-     already-gone is fine) — this is what starts it leaving.
-   - A member that's already mid-deletion (from an earlier loop's delete,
-     or a human deleting that one `EtcdMember` directly) has its own
-     finalizer removed right away, in the same pass — it does **not** wait
-     for every sibling member to also reach "already deleting" first.
-   Then requeue; the next reconcile re-checks from step 1, so a cluster
-   with a mix of fresh and already-deleting members converges over a
-   couple of loops rather than needing every member synchronized.
+1. **Are there zero `EtcdMember`s left?**
+   - **Yes** → delete the cluster's shared TLS certificate `Secret`(s), if
+     they still exist (the interim exception above), then remove the
+     `EtcdCluster`'s own finalizer, and stop — this is what finally lets
+     the `EtcdCluster` object itself disappear.
+   - **No** → continue to step 2.
+2. **Iterate every owned `EtcdMember`, in the same pass, and for each one:**
+   1. If it doesn't have a `DeletionTimestamp` set yet, `client.Delete()`
+      it (best effort) — this is what starts it leaving.
+   2. Delete its Pod if not yet gone, then delete its PVC once the Pod is
+      *fully* gone (not just `deletionTimestamp` set) — same
+      Pod-before-PVC ordering constraint as §4.6's leave sequence, and for
+      the same reason (`pvc-protection`). Because this is now just
+      ordinary Kubernetes resource deletion with no etcd-side coordination
+      needed, every member's Pod delete can be checked in one loop over
+      all members and every member's PVC delete in another, rather than
+      finishing one member completely before starting the next.
+   3. Once its Pod and PVC are both confirmed gone, remove that member's
+      own finalizer — this is what lets Kubernetes finish deleting the
+      `EtcdMember` object.
 
-   Removing a member's finalizer unblocks Kubernetes' own garbage
-   collector, which then deletes that member's owned Pod, PVC, and TLS
-   certificate `Secret` (§4.10) — no controller code needed for that part.
-   Once those are gone, Kubernetes finishes deleting the `EtcdMember`
-   object itself, which — the same owned-resource watch as everywhere else
-   in this design (§4.1) — re-enqueues the `EtcdCluster`, so a later
-   reconcile eventually finds zero members left and takes step 1.
+   Requeue once the pass finishes; the next reconcile re-checks from step
+   1, so it naturally converges as members finish disappearing, without
+   needing every member to reach the same state before any of them
+   progresses.
+
+This sequence intentionally has no leadership-transfer, `MemberRemove`, or
+alarm-disarm step, and so needs no live `MemberList`/`AlarmList` calls at
+all — seeing §4.6's `Terminating` sequence used for individual-member
+teardown might suggest reusing it here, but requirement 16 above explains
+why that machinery doesn't apply once the whole cluster is going away.
 
 ## 5. Alternatives considered
 
@@ -1205,6 +1242,20 @@ the CRD version.
    a majority be unreachable before this is even offered as an option,
    automatically or manually? Needs to be long enough to rule out a
    transient network partition.
+4. What should a `Terminating` member's leave sequence (§4.6) do if the
+   cluster is unhealthy enough that its linearizable calls (`MemberList`,
+   `AlarmList`, `MemberRemove`) themselves fail — e.g. no quorum? Leaning
+   towards: just return an error and let controller-runtime's standard
+   backoff retry later, rather than also trying to restore cluster health
+   from inside this path. Rationale: `Terminating` only ever starts from
+   scale-in (which only ever runs while the cluster is already healthy,
+   per §4.2's readiness gate) or a human operator deleting an `EtcdMember`
+   directly (assumed to have already checked cluster health first), so an
+   unhealthy cluster at this point should be the exception, not the norm —
+   most plausibly a transient environment issue this code has no special
+   ability to fix, making it unlikely reusing
+   `CORRUPT`/`NOSPACE`/per-member-repair/lost-quorum-recovery logic here
+   would actually help. Not yet settled as the final design.
 
 ## 8. Implementation plan
 
@@ -1222,11 +1273,13 @@ the CRD version.
   `SetupWithManager` adds `Owns(&EtcdMember{})`; the `EtcdCluster`'s own
   finalizer and the cluster-deletion check and finalize sequence (§4.13)
   landed already, checked right after fetch, ahead of
-  validation/bootstrap/health-check and of the rest of this list —
-  including its interim shortcut of removing each `EtcdMember`'s finalizer
-  directly (the same shortcut used for an ordinary single-member
-  `Terminating` cleanup) instead of the real six-step leave sequence, which
-  M3 below still needs to reconcile one way or the other; bootstrap creates
+  validation/bootstrap/health-check and of the rest of this list — for
+  each owned `EtcdMember` in the same pass: `client.Delete()` if not
+  already deleting, delete its Pod and PVC, then remove its own finalizer
+  (no `MemberRemove`/disarm/leadership-transfer — §4.13 explains why this
+  doesn't reuse M3's leave sequence below) — and deleting the shared cert
+  `Secret` once, right before the `EtcdCluster`'s own finalizer comes off;
+  bootstrap creates
   `EtcdMember` ordinal 0 and its cert/PVC/Pod directly; `nextOrdinal`/
   highest-first replace `nextPodOrdinal` (§4.4, gap-aware); the readiness
   gate (§4.2) with all four exemptions; the reconcile loop restructured
@@ -1253,12 +1306,11 @@ the CRD version.
   both `Ready` and `Replacing`), the `Replacing` state machine (including
   the `CORRUPT` trigger and the `Replacing`-ends-at-`Pending` reuse of join
   logic), the `etcdutils.MoveLeader` wrapper and leadership-transfer helper
-  (§4.5), the shared six-step leave sequence, `Terminating` via finalizer,
-  and PVC/cert ownership on `EtcdMember` (§4.10). Also decide, for
-  whole-cluster finalization (§4.13, landed in M2 as an interim shortcut),
-  whether to route it through this same six-step leave sequence per member
-  or keep relying on Pod/PVC/cert garbage collection alone — flagged as
-  unresolved, not a settled design choice.
+  (§4.5), the shared six-step leave sequence (§4.6: `MemberRemove`, disarm
+  any tagged alarm, Pod/PVC delete, cert-`Secret` step skipped for now),
+  `Terminating` via finalizer, and PVC/cert ownership on `EtcdMember`
+  (§4.10). M2's whole-cluster finalize sequence (§4.13) does *not* reuse
+  this six-step sequence — it's a separate, simpler per-member cleanup.
 - **M4 — Alarm remediation** (resolves M2's `CORRUPT`/`NOSPACE` TODO):
   `etcdutils.AlarmList`/`AlarmDisarm`/`Compact` wrappers; `NOSPACE`'s
   `Compacting`/`Defragmenting` state machine (§4.7) including leader-last
@@ -1293,14 +1345,14 @@ the CRD version.
   (no mutating action of any kind runs while set, including an
   already-triggered lost-quorum recovery; status/health refresh keeps
   updating; resuming picks up correctly with no special handling). Also
-  whole-cluster deletion (§4.13): each not-yet-deleting `EtcdMember` gets
-  deleted in the same pass (not gated on its siblings); each
-  already-deleting member's finalizer is removed directly rather than
-  running the six-step leave sequence, and Kubernetes' garbage collector is
-  what actually removes each member's owned Pod/PVC/cert; the
-  `EtcdCluster`'s own finalizer isn't removed until zero members are left;
-  and a crash at any point in the sequence resumes correctly on the next
-  reconcile.
+  whole-cluster deletion (§4.13): every not-yet-deleting `EtcdMember` gets
+  `client.Delete()`d in the same pass; each member's Pod and PVC get
+  deleted directly by the controller (Pod-before-PVC ordering preserved,
+  no `MemberRemove`/disarm/leadership-transfer involved) and its own
+  finalizer removed once both are confirmed gone; the shared cert `Secret`
+  is deleted exactly once, and the `EtcdCluster`'s own finalizer isn't
+  removed, until zero members are left; and a crash at any point in the
+  sequence resumes correctly on the next reconcile.
 - **M9 (stretch)**: real corruption detection for cases etcd's own
   `CORRUPT` alarm doesn't catch; PV/PVC retention-policy handling on
   replace.
