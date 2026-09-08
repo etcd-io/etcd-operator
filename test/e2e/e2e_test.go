@@ -128,85 +128,6 @@ func TestClusterHealthy(t *testing.T) {
 	_ = testEnv.Test(t, feature.Feature())
 }
 
-func TestNormalMemberProvisioning(t *testing.T) {
-	testCases := []struct {
-		name        string
-		initialSize int
-		desiredSize int
-	}{
-		{name: "CreateSize3", initialSize: 3, desiredSize: 3},
-		{name: "ScaleOutFrom1To3", initialSize: 1, desiredSize: 3},
-		{name: "ScaleOutFrom3To5", initialSize: 3, desiredSize: 5},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			feature := features.New(tc.name)
-			clusterName := "normal-" + strings.ToLower(tc.name)
-
-			feature.Setup(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-				createEtcdClusterWithPVC(ctx, t, c, clusterName, tc.initialSize)
-				if tc.initialSize < tc.desiredSize {
-					if err := waitForAllEtcdMemberReady(t, c, etcdClusterRef(clusterName, tc.initialSize)); err != nil {
-						t.Fatalf("initial members did not become Ready: %v", err)
-					}
-				}
-				return ctx
-			})
-
-			feature.Assess("provision members in ordinal order", func(
-				ctx context.Context,
-				t *testing.T,
-				c *envconf.Config,
-			) context.Context {
-				if tc.initialSize != tc.desiredSize {
-					scaleEtcdCluster(ctx, t, c, clusterName, tc.desiredSize)
-				}
-				if err := waitForAllEtcdMemberReady(t, c, etcdClusterRef(clusterName, tc.desiredSize)); err != nil {
-					t.Fatalf("EtcdMembers did not become Ready in order: %v", err)
-				}
-				return ctx
-			})
-
-			feature.Assess("all final members are voting", func(
-				ctx context.Context,
-				t *testing.T,
-				c *envconf.Config,
-			) context.Context {
-				var pods corev1.PodList
-				if err := c.Client().Resources().List(
-					ctx,
-					&pods,
-					resources.WithLabelSelector("app="+clusterName),
-				); err != nil {
-					t.Fatalf("failed to list final Pods: %v", err)
-				}
-				if len(pods.Items) != tc.desiredSize {
-					t.Fatalf("expected %d Pods, got %d", tc.desiredSize, len(pods.Items))
-				}
-
-				memberList := getEtcdMemberListPB(t, c, clusterName+"-0")
-				if len(memberList.Members) != tc.desiredSize {
-					t.Fatalf("expected %d live etcd members, got %d", tc.desiredSize, len(memberList.Members))
-				}
-				for _, member := range memberList.Members {
-					if member.IsLearner {
-						t.Fatalf("member %s (%d) remained a learner", member.Name, member.ID)
-					}
-				}
-				return ctx
-			})
-
-			feature.Teardown(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-				cleanupEtcdCluster(ctx, t, c, clusterName)
-				return ctx
-			})
-
-			_ = testEnv.Test(t, feature.Feature())
-		})
-	}
-}
-
 func TestScaling(t *testing.T) {
 	testCases := []struct {
 		name            string
@@ -227,6 +148,8 @@ func TestScaling(t *testing.T) {
 			initialSize: 1, scaleTo: 3, expectedMembers: 3,
 			failpoint: "exceptionAfterMemberAdd", term: "panic",
 		},
+		{name: "ScaleOutFrom3To5", initialSize: 3, scaleTo: 5, expectedMembers: 5},
+		{name: "ScaleInFrom5To3", initialSize: 5, scaleTo: 3, expectedMembers: 3},
 	}
 
 	for _, tc := range testCases {

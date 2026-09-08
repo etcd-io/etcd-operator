@@ -81,6 +81,28 @@ func AlarmList(cfg ClientConfig) (*clientv3.AlarmResponse, error) {
 	return c.AlarmList(ctx)
 }
 
+// AlarmDisarm disarms each of the supplied alarms.
+func AlarmDisarm(cfg ClientConfig, alarms []*etcdserverpb.AlarmMember) error {
+	if len(alarms) == 0 {
+		return nil
+	}
+
+	c, err := clientv3.New(cfg.buildConfig())
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+	defer func() { closeAndCancel(c, cancel) }()
+
+	for _, alarm := range alarms {
+		if _, err := c.AlarmDisarm(ctx, (*clientv3.AlarmMember)(alarm)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // ClusterHealth aggregates the results of a single health-check pass over an
 // etcd cluster: overall cluster health, per-member health, and any active
 // alarms.

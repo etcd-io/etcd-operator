@@ -336,13 +336,20 @@ func createAutoCertificateConfig(ec *ecv1alpha1.EtcdCluster) (*certInterface.Con
 	}, nil
 }
 
+// getCertificateProvider returns the cert provider matching providerType, or
+// an error if the type is unknown. An empty providerType defaults to "auto",
+// matching the convention used elsewhere when no provider is set on the
+// cluster spec.
+func getCertificateProvider(providerType string, c client.Client) (certInterface.Provider, error) {
+	if providerType == "" {
+		providerType = string(certificate.Auto)
+	}
+	return certificate.NewProvider(certificate.ProviderType(providerType), c)
+}
+
 func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client.Client, certName string) error {
 	providerName := ec.Spec.TLS.Provider
-	if providerName == "" {
-		providerName = string(certificate.Auto)
-	}
-
-	cert, certErr := certificate.NewProvider(certificate.ProviderType(providerName), c)
+	cert, certErr := getCertificateProvider(providerName, c)
 	if certErr != nil {
 		return certErr
 	}
@@ -411,6 +418,32 @@ func applyEtcdMemberCerts(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c cli
 			return err
 		}
 		return createPeerCertificate(ctx, ec, c)
+	}
+	return nil
+}
+
+// deleteClusterCertificateSecrets removes the cluster's TLS certificate
+// Secrets listed in certNames via the cluster's cert provider.
+//
+// The actual cleanup is delegated to the cert provider: "auto" removes the
+// Secret directly; "cert-manager" first deletes the Certificate CR and then
+// the Secret (cert-manager does not auto-clean its Secrets). Each provider's
+// DeleteCertificateSecret is NotFound-tolerant: certs that were never
+// created, or were already removed, are silently skipped.
+//
+// Returns nil immediately if the cluster has no TLS configured.
+func deleteClusterCertificateSecrets(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client, certNames []string) error {
+	if ec.Spec.TLS == nil {
+		return nil
+	}
+	provider, err := getCertificateProvider(ec.Spec.TLS.Provider, c)
+	if err != nil {
+		return fmt.Errorf("unknown TLS certificate provider %q: %w", ec.Spec.TLS.Provider, err)
+	}
+	for _, name := range certNames {
+		if err := provider.DeleteCertificateSecret(ctx, client.ObjectKey{Name: name, Namespace: ec.Namespace}); err != nil {
+			return fmt.Errorf("failed to delete certificate %q: %w", name, err)
+		}
 	}
 	return nil
 }
