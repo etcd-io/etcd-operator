@@ -526,23 +526,22 @@ func (r *EtcdClusterReconciler) ensureClusterFinalizer(ctx context.Context, s *r
 	return r.Update(ctx, s.cluster)
 }
 
-// finalizeCluster handles an EtcdCluster with DeletionTimestamp set: it
-// removes every EtcdMember it still owns — reusing the same interim
-// finalizer-clearing dispatch()'s Terminating-cleanup step uses for a
-// single Terminating member — and, once none remain, releases
-// clusterCleanupFinalizer so Kubernetes can finish deleting the EtcdCluster
-// itself.
-//
-// TODO: like that step, this skips the real six-step leave sequence (§4.6,
-// M3): members are removed without ever calling etcd's MemberRemove, so
-// deleting a cluster with live members can leave stale entries in etcd's
-// own membership list. Acceptable for now because the Pods backing those
-// members are torn down along with everything else, but M3 should replace
-// this loop with the real sequence rather than just deleting faster.
+// finalizeCluster performs Kubernetes-only cleanup for whole-cluster deletion.
+// Each member's Pod and PVC delete requests must succeed before its finalizer
+// is released. Once no members remain, the cluster's shared TLS certificate
+// Secrets are deleted and then the cluster's own finalizer is released,
+// letting the EtcdCluster object disappear. No live etcd calls are needed.
 func (r *EtcdClusterReconciler) finalizeCluster(ctx context.Context, s *reconcileState) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
 	if len(s.members) == 0 {
+		if err := deleteClusterCertificateSecrets(ctx, s.cluster, r.Client, []string{
+			getClientCertName(s.cluster.Name),
+			getServerCertName(s.cluster.Name),
+			getPeerCertName(s.cluster.Name),
+		}); err != nil {
+			return ctrl.Result{}, err
+		}
 		if controllerutil.RemoveFinalizer(s.cluster, clusterCleanupFinalizer) {
 			if err := r.Update(ctx, s.cluster); err != nil {
 				return ctrl.Result{}, err
@@ -553,26 +552,42 @@ func (r *EtcdClusterReconciler) finalizeCluster(ctx context.Context, s *reconcil
 
 	logger.Info("EtcdCluster is Terminating; deleting owned EtcdMembers", "remaining", len(s.members))
 	for i := range s.members {
-		m := &s.members[i]
-		if m.DeletionTimestamp == nil {
-			if err := r.Delete(ctx, m); err != nil && !errors.IsNotFound(err) {
-				return ctrl.Result{}, err
-			}
-			// Delete only sets DeletionTimestamp while the member finalizer is
-			// present. A later pass enters the branch below and releases it.
-			continue
-		}
-		if err := r.clearMemberFinalizer(ctx, m); err != nil {
-			return ctrl.Result{}, err
+		if err := r.finalizeClusterMember(ctx, &s.members[i]); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to finalize EtcdMember %q: %w", s.members[i].Name, err)
 		}
 	}
 	return ctrl.Result{RequeueAfter: requeueDuration}, nil
 }
 
+// finalizeClusterMember requests Pod and PVC deletion before releasing the member finalizer.
+func (r *EtcdClusterReconciler) finalizeClusterMember(ctx context.Context, member *ecv1alpha1.EtcdMember) error {
+	if member.DeletionTimestamp == nil {
+		if err := r.Delete(ctx, member); client.IgnoreNotFound(err) != nil {
+			return err
+		}
+	}
+
+	resources := []client.Object{
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: member.Name, Namespace: member.Namespace}},
+		&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: pvcNameForMember(member.Name), Namespace: member.Namespace}},
+	}
+	for _, resource := range resources {
+		if err := r.Delete(ctx, resource); client.IgnoreNotFound(err) != nil {
+			return err
+		}
+	}
+
+	// Delete may have changed the member's resource version in this pass.
+	if err := r.Get(ctx, client.ObjectKeyFromObject(member), member); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	return client.IgnoreNotFound(r.clearMemberFinalizer(ctx, member))
+}
+
 // clearMemberFinalizer removes memberCleanupFinalizer from m, letting
 // Kubernetes finish deleting it. Normal single-member deletion calls this at
-// the end of §4.6's leave sequence; whole-cluster deletion calls it directly as
-// §4.13's explicit exception and relies on Kubernetes garbage collection.
+// the end of §4.6's leave sequence; whole-cluster deletion calls it after
+// successfully requesting deletion of the member's Pod and PVC.
 func (r *EtcdClusterReconciler) clearMemberFinalizer(ctx context.Context, m *ecv1alpha1.EtcdMember) error {
 	if !controllerutil.RemoveFinalizer(m, memberCleanupFinalizer) {
 		return nil

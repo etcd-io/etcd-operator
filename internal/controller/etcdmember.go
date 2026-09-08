@@ -85,10 +85,12 @@ func (r *EtcdClusterReconciler) markMemberTerminating(ctx context.Context, membe
 }
 
 // cleanupEtcdMember is the §4.6 Terminating leave for one member: remove it
-// from etcd's live membership, delete its owned Pod and PVC, and finally
-// release memberCleanupFinalizer so Kubernetes can finish the deletion.
-// Every step is a no-op once done, so re-entering after an interruption
-// (operator restart, transient etcd error) resumes harmlessly.
+// from etcd's live membership, disarm its alarms, delete its owned Pod and PVC,
+// and finally release memberCleanupFinalizer so Kubernetes can finish the deletion.
+// Membership and resource cleanup are no-ops once done, so re-entering after
+// an interruption (operator restart, transient etcd error) resumes harmlessly.
+// Alarm cleanup currently requires the pre-removal membership snapshot;
+// retrying it across reconciles needs the removed ID to be retained separately.
 //
 // Leadership transfer is intentionally not done here. When etcd's own
 // MemberRemove drops this member from the cluster's Membership, the
@@ -102,6 +104,10 @@ func (r *EtcdClusterReconciler) markMemberTerminating(ctx context.Context, membe
 // in a follow-up (failure must not stop the sequence).
 func (r *EtcdClusterReconciler) cleanupEtcdMember(ctx context.Context, s *reconcileState, member *ecv1alpha1.EtcdMember) (ctrl.Result, error) {
 	if err := removeEtcdNode(s, member); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if err := disarmForEtcdMember(s, member); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -142,6 +148,26 @@ func removeEtcdNode(s *reconcileState, member *ecv1alpha1.EtcdMember) error {
 	cfg := etcdutils.ClientConfig{Endpoints: endpoints, TLS: s.tlsConfig}
 	if err := etcdutils.RemoveMember(cfg, etcdNode.ID); err != nil {
 		return fmt.Errorf("failed to remove the etcd node for EtcdMember %q: %w", member.Name, err)
+	}
+	return nil
+}
+
+// disarmForEtcdMember disarms the member's alarms from the reconcile snapshot.
+func disarmForEtcdMember(s *reconcileState, member *ecv1alpha1.EtcdMember) error {
+	var alarms []*etcdserverpb.AlarmMember
+	if etcdNode := findEtcdNodeForEtcdMember(s, member); etcdNode != nil && s.health != nil {
+		for _, alarm := range s.health.Alarms {
+			if alarm.MemberID == etcdNode.ID {
+				alarms = append(alarms, alarm)
+			}
+		}
+	}
+	if len(alarms) > 0 {
+		endpoints := clientEndpointsFromPods(s.cluster.Name, s.cluster.Namespace, s.pods, clusterTLSEnabled(s.cluster))
+		cfg := etcdutils.ClientConfig{Endpoints: endpoints, TLS: s.tlsConfig}
+		if err := etcdutils.AlarmDisarm(cfg, alarms); err != nil {
+			return fmt.Errorf("failed to disarm alarms for EtcdMember %q: %w", member.Name, err)
+		}
 	}
 	return nil
 }
