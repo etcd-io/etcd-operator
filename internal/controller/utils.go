@@ -16,7 +16,6 @@ import (
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -86,13 +85,14 @@ func createPVCForMember(ctx context.Context, c client.Client, ec *ecv1alpha1.Etc
 		return fmt.Errorf("failed to check PVC %s: %w", pvcName, err)
 	}
 
-	if ec.Spec.StorageSpec.VolumeSizeRequest.Cmp(resource.MustParse("1Mi")) < 0 {
-		return fmt.Errorf("VolumeSizeRequest must be at least 1Mi")
-	}
-
 	volumeSizeLimit := ec.Spec.StorageSpec.VolumeSizeLimit
 	if volumeSizeLimit.IsZero() {
 		volumeSizeLimit = ec.Spec.StorageSpec.VolumeSizeRequest
+	}
+
+	accessMode := ec.Spec.StorageSpec.AccessModes
+	if accessMode == "" {
+		accessMode = corev1.ReadWriteOnce
 	}
 
 	pvc := &corev1.PersistentVolumeClaim{
@@ -102,7 +102,7 @@ func createPVCForMember(ctx context.Context, c client.Client, ec *ecv1alpha1.Etc
 			Labels:    clusterNameLabels(ec.Name),
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{
-			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			AccessModes: []corev1.PersistentVolumeAccessMode{accessMode},
 			Resources: corev1.VolumeResourceRequirements{
 				Requests: corev1.ResourceList{
 					corev1.ResourceStorage: ec.Spec.StorageSpec.VolumeSizeRequest,
