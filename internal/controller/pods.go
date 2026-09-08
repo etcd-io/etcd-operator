@@ -371,14 +371,18 @@ func buildMemberPod(
 
 	// Persistent storage volumes.
 	if ec.Spec.StorageSpec != nil {
-		podSpec.Containers[0].VolumeMounts = []corev1.VolumeMount{{
+		volumeMount := corev1.VolumeMount{
 			Name:      volumeName,
 			MountPath: etcdDataDir,
-		}}
+		}
 
 		switch ec.Spec.StorageSpec.AccessModes {
 		case corev1.ReadWriteMany:
-			// All pods share a single pre-existing PVC.
+			// All pods share a single pre-existing PVC, so each member gets
+			// its own subdirectory (keyed by its own Pod name) within it —
+			// otherwise every member would write its data directory on top
+			// of the others'.
+			volumeMount.SubPath = podName
 			podSpec.Volumes = append(podSpec.Volumes, corev1.Volume{
 				Name: volumeName,
 				VolumeSource: corev1.VolumeSource{
@@ -397,6 +401,8 @@ func buildMemberPod(
 				},
 			})
 		}
+
+		podSpec.Containers[0].VolumeMounts = []corev1.VolumeMount{volumeMount}
 	}
 
 	// setup TLS certificate volumes. Both the pod Volume and VolumeMount are

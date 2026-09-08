@@ -305,6 +305,7 @@ func (r *EtcdClusterReconciler) provisionCertificates(ctx context.Context, state
 // ReadWriteMany storage skip it. Idempotent.
 func (r *EtcdClusterReconciler) provisionPVC(ctx context.Context, state *reconcileState, member *ecv1alpha1.EtcdMember) error {
 	cluster := state.cluster
+
 	// ReadWriteMany is assumed to be statically provisioned (e.g. a shared
 	// NFS-backed PVC) and managed outside the operator, so no per-member PVC
 	// is created for it.

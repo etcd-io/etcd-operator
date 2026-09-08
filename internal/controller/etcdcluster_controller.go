@@ -28,6 +28,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/events"
@@ -243,6 +244,18 @@ func (r *EtcdClusterReconciler) buildReconcileClientTLS(ctx context.Context, ec 
 // done via an admission webhook instead of here. Add any further spec
 // validation as a new check below.
 func (r *EtcdClusterReconciler) validateSpec(ctx context.Context, s *reconcileState) error {
+	if err := r.validateUpgradeVersion(ctx, s); err != nil {
+		return err
+	}
+
+	if err := r.validateStorageSpec(ctx, s.cluster); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (r *EtcdClusterReconciler) validateUpgradeVersion(ctx context.Context, s *reconcileState) error {
 	logger := log.FromContext(ctx)
 
 	// Validate the upgrade path using the image tag of the first pod.
@@ -286,6 +299,44 @@ func (r *EtcdClusterReconciler) validateSpec(ctx context.Context, s *reconcileSt
 			}
 			break
 		}
+	}
+
+	return nil
+}
+
+func (r *EtcdClusterReconciler) validateStorageSpec(ctx context.Context, ec *ecv1alpha1.EtcdCluster) error {
+	logger := log.FromContext(ctx)
+
+	storageSpec := ec.Spec.StorageSpec
+	if storageSpec == nil {
+		return nil
+	}
+
+	// ReadWriteMany is assumed to be statically provisioned (e.g. a shared
+	// NFS-backed PVC) and managed outside the operator, and no per-member PVC
+	// is created for it. Empty defaults to ReadWriteOnce (createPVCForMember
+	// applies the same default when building each member's PVC), so it's
+	// left out of this check rather than rejected.
+	if storageSpec.AccessModes != "" && storageSpec.AccessModes != corev1.ReadWriteOnce && storageSpec.AccessModes != corev1.ReadWriteMany {
+		err := fmt.Errorf("invalid storageSpec.accessModes %q: only %q and %q are supported (empty defaults to %q)",
+			storageSpec.AccessModes, corev1.ReadWriteOnce, corev1.ReadWriteMany, corev1.ReadWriteOnce)
+		logger.Error(err, "Invalid StorageSpec")
+		return err
+	}
+
+	minVolumeSize := resource.MustParse("1Mi")
+	if storageSpec.VolumeSizeRequest.Cmp(minVolumeSize) < 0 {
+		err := fmt.Errorf("invalid storageSpec.volumeSizeRequest %s: must be >= %s",
+			storageSpec.VolumeSizeRequest.String(), minVolumeSize.String())
+		logger.Error(err, "Invalid StorageSpec")
+		return err
+	}
+
+	if !storageSpec.VolumeSizeLimit.IsZero() && storageSpec.VolumeSizeLimit.Cmp(storageSpec.VolumeSizeRequest) < 0 {
+		err := fmt.Errorf("invalid storageSpec.volumeSizeLimit %s: must be 0 (no limit) or >= volumeSizeRequest %s",
+			storageSpec.VolumeSizeLimit.String(), storageSpec.VolumeSizeRequest.String())
+		logger.Error(err, "Invalid StorageSpec")
+		return err
 	}
 
 	return nil

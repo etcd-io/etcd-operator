@@ -23,22 +23,32 @@ import (
 	"log"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/e2e-framework/klient"
+	"sigs.k8s.io/e2e-framework/klient/wait"
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
 	"sigs.k8s.io/e2e-framework/pkg/features"
 
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 )
 
+// TestDataPersistence verifies that an etcd member's data survives its Pod
+// being deleted and recreated, as long as the underlying PVC is left alone:
+// it writes a key, deletes the Pod, recreates an equivalent one under the
+// same name (the controller doesn't yet do this itself — see podForRecreate),
+// and confirms the key reads back from the recreated Pod.
+//
+// TODO: add a ReadWriteMany sub case (shared PVC, per-member SubPath) once
+// the e2e environment has a StorageClass that supports it.
 func TestDataPersistence(t *testing.T) {
 	feature := features.New("data-persistence")
 
 	const etcdClusterName = "etcd-cluster-test"
-	const size = 1
 	const key = "key"
 	const input_value = "value"
 
@@ -52,7 +62,7 @@ func TestDataPersistence(t *testing.T) {
 			Namespace: namespace,
 		},
 		Spec: ecv1alpha1.EtcdClusterSpec{
-			Size:    size,
+			Size:    1,
 			Version: "v3.5.18",
 			StorageSpec: &ecv1alpha1.StorageSpec{
 				AccessModes:       corev1.ReadWriteOnce,
@@ -109,6 +119,14 @@ func TestDataPersistence(t *testing.T) {
 		},
 	)
 
+	// podSpec is captured from the live Pod just before it's deleted, so the
+	// next step can recreate an equivalent Pod by hand — the controller does
+	// not yet notice or repair a member's Pod disappearing out-of-band, so
+	// this test drives the recreation itself rather than waiting on that behavior.
+	//
+	// TODO: remove this after the Recreating workflow is supported
+	var podSpec *corev1.Pod
+
 	feature.Assess("Delete the etcd pod",
 		func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
 			client := c.Client()
@@ -118,34 +136,46 @@ func TestDataPersistence(t *testing.T) {
 			if err := client.Resources().Get(ctx, fmt.Sprintf("%s-%d", etcdClusterName, 0), namespace, &pod); err != nil {
 				log.Fatalf("unable to get the etcd pod: %s", err)
 			}
+			podSpec = podForRecreate(&pod)
 
 			// delete the pod
 			if err := client.Resources().Delete(ctx, &pod); err != nil {
 				t.Fatalf("unable to delete pod")
 			}
 
+			// wait until the Pod is fully gone before recreating it under the
+			// same name — its PVC is untouched, so the data directory on disk
+			// survives and the recreated Pod picks the same etcd member state
+			// back up.
+			if err := wait.For(func(ctx context.Context) (bool, error) {
+				var gone corev1.Pod
+				err := client.Resources().Get(ctx, pod.Name, namespace, &gone)
+				if apierrors.IsNotFound(err) {
+					return true, nil
+				}
+				return false, nil
+			}, wait.WithTimeout(2*time.Minute), wait.WithInterval(2*time.Second)); err != nil {
+				t.Fatalf("pod %s was not fully deleted: %s", pod.Name, err)
+			}
+
 			return ctx
 		},
 	)
 
-	feature.Assess("Read data from the newly created pod",
+	feature.Assess("Recreate the pod and read data back from it",
 		func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-			// TODO: deleting a member's Pod is never noticed and repaired —
-			// the live-health-to-EtcdMember mapping that would flip a Ready
-			// member to Recreating, and the Recreating-phase repair step
-			// itself, are both M3 (see
-			// internal/controller/etcdcluster_controller.go dispatch, item 5
-			// and its "not implemented yet" branches). Unskip once M3's
-			// Pod-recovery ladder lands.
-			t.Skip("blocked on M3 pod-recovery ladder; see internal/controller/etcdcluster_controller.go dispatch item 5")
-
 			client := c.Client()
 
-			if err := waitForAllEtcdMemberReady(t, c, etcdCluster); err != nil {
-				t.Fatalf("unable to scale the etcd pod back post pod deletion: %s", err)
+			// TODO: remove this after the Recreating workflow is supported
+			if err := client.Resources().Create(ctx, podSpec); err != nil {
+				t.Fatalf("unable to recreate the etcd pod: %s", err)
 			}
 
-			// get the etcd pod
+			if err := waitForAllEtcdMemberReady(t, c, etcdCluster); err != nil {
+				t.Fatalf("recreated etcd pod never became ready: %s", err)
+			}
+
+			// get the recreated etcd pod
 			var pod corev1.Pod
 			if err := client.Resources().Get(ctx, fmt.Sprintf("%s-%d", etcdClusterName, 0), namespace, &pod); err != nil {
 				log.Fatalf("unable to get the etcd pod: %s", err)
@@ -161,7 +191,7 @@ func TestDataPersistence(t *testing.T) {
 
 			// compare the value read against the value written
 			if val != input_value {
-				t.Fatalf("value fetched does not match the waitForPodReadinessinput value...input value=%s, fetched value=%s",
+				t.Fatalf("value fetched does not match the input value...input value=%s, fetched value=%s",
 					input_value, val)
 			}
 
@@ -177,14 +207,34 @@ func TestDataPersistence(t *testing.T) {
 	_ = testEnv.Test(t, feature.Feature())
 }
 
-func writeDataToPod(ctx context.Context, pod *corev1.Pod, client klient.Client, key, input_value string) error {
+// podForRecreate returns a new Pod, built from a live Pod's Name/Namespace/
+// Labels/Annotations/OwnerReferences/Spec, suitable for a fresh Create call.
+// It's used to manually recreate a member's Pod after deleting it, since
+// server-populated fields (ResourceVersion, UID, Status, ...) would make
+// Create reject a verbatim copy of the fetched object.
+//
+// TODO: remove this after the Recreating workflow is supported
+func podForRecreate(pod *corev1.Pod) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            pod.Name,
+			Namespace:       pod.Namespace,
+			Labels:          pod.Labels,
+			Annotations:     pod.Annotations,
+			OwnerReferences: pod.OwnerReferences,
+		},
+		Spec: pod.Spec,
+	}
+}
+
+func writeDataToPod(ctx context.Context, pod *corev1.Pod, client klient.Client, key, val string) error {
 	var stdout, stderr bytes.Buffer
 	if err := client.Resources().ExecInPod(
 		ctx,
 		namespace,
 		pod.GetObjectMeta().GetName(),
 		pod.Spec.Containers[0].Name,
-		[]string{"etcdctl", "put", key, input_value}, &stdout, &stderr); err != nil {
+		[]string{"etcdctl", "put", key, val}, &stdout, &stderr); err != nil {
 		return err
 	}
 	return nil

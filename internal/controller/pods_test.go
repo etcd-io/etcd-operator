@@ -916,3 +916,56 @@ func TestBuildMemberPodTLSVolumes(t *testing.T) {
 		assert.Contains(t, args, "--listen-client-urls=http://0.0.0.0:2379")
 	})
 }
+
+func TestBuildMemberPodStorageVolumes(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+	require.NoError(t, ecv1alpha1.AddToScheme(scheme))
+
+	mkCluster := func(storage *ecv1alpha1.StorageSpec) *ecv1alpha1.EtcdCluster {
+		return &ecv1alpha1.EtcdCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: "storage-cluster", Namespace: "default", UID: "1"},
+			Spec: ecv1alpha1.EtcdClusterSpec{
+				Size:        3,
+				Version:     "3.5.17",
+				StorageSpec: storage,
+			},
+		}
+	}
+
+	t.Run("ReadWriteOnce mounts a per-member PVC with no SubPath", func(t *testing.T) {
+		ec := mkCluster(&ecv1alpha1.StorageSpec{AccessModes: corev1.ReadWriteOnce})
+		member := testMemberForCluster(ec, 0)
+		podName := memberPodName(ec.Name, member.Spec.Ordinal)
+
+		pod, err := buildMemberPod(ec, member, etcdClusterStateNew, "ignored", scheme)
+		require.NoError(t, err)
+
+		require.Len(t, pod.Spec.Containers[0].VolumeMounts, 1)
+		mount := pod.Spec.Containers[0].VolumeMounts[0]
+		assert.Equal(t, volumeName, mount.Name)
+		assert.Equal(t, etcdDataDir, mount.MountPath)
+		assert.Empty(t, mount.SubPath, "a per-member PVC needs no SubPath")
+
+		require.Len(t, pod.Spec.Volumes, 1)
+		assert.Equal(t, pvcNameForMember(podName), pod.Spec.Volumes[0].PersistentVolumeClaim.ClaimName)
+	})
+
+	t.Run("ReadWriteMany mounts the shared PVC under a per-pod SubPath", func(t *testing.T) {
+		ec := mkCluster(&ecv1alpha1.StorageSpec{AccessModes: corev1.ReadWriteMany, PVCName: "shared-pvc"})
+		member := testMemberForCluster(ec, 0)
+		podName := memberPodName(ec.Name, member.Spec.Ordinal)
+
+		pod, err := buildMemberPod(ec, member, etcdClusterStateNew, "ignored", scheme)
+		require.NoError(t, err)
+
+		require.Len(t, pod.Spec.Containers[0].VolumeMounts, 1)
+		mount := pod.Spec.Containers[0].VolumeMounts[0]
+		assert.Equal(t, volumeName, mount.Name)
+		assert.Equal(t, etcdDataDir, mount.MountPath)
+		assert.Equal(t, podName, mount.SubPath, "each member must get its own subdirectory of the shared PVC")
+
+		require.Len(t, pod.Spec.Volumes, 1)
+		assert.Equal(t, "shared-pvc", pod.Spec.Volumes[0].PersistentVolumeClaim.ClaimName)
+	})
+}

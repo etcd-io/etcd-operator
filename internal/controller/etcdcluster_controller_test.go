@@ -24,6 +24,7 @@ import (
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -190,10 +191,10 @@ func TestFetchAndValidateState(t *testing.T) {
 	}
 }
 
-// TestValidateSpec verifies the validateSpec helper's upgrade-path validation,
+// TestValidateUpgradeVersion verifies the upgrade-path validation,
 // which checks the desired version in EtcdCluster.Spec against the version
 // currently running in the first pod's image tag.
-func TestValidateSpec(t *testing.T) {
+func TestValidateUpgradeVersion(t *testing.T) {
 	// helper to build a minimal pod with a specific etcd image tag.
 	podWithImage := func(imageTag string) *corev1.Pod {
 		return &corev1.Pod{
@@ -281,7 +282,128 @@ func TestValidateSpec(t *testing.T) {
 				},
 				pods: tc.pods,
 			}
-			err := r.validateSpec(ctx, state)
+			err := r.validateUpgradeVersion(ctx, state)
+			tc.assert(t, err)
+		})
+	}
+}
+
+// TestValidateStorageSpec verifies validateStorageSpec's accessModes,
+// volumeSizeRequest, and volumeSizeLimit checks.
+func TestValidateStorageSpec(t *testing.T) {
+	cases := []struct {
+		name    string
+		storage *ecv1alpha1.StorageSpec
+		assert  func(t *testing.T, err error)
+	}{
+		{
+			name: "nil StorageSpec is a no-op",
+			assert: func(t *testing.T, err error) {
+				assert.NoError(t, err)
+			},
+		},
+		{
+			name: "Valid ReadWriteOnce",
+			storage: &ecv1alpha1.StorageSpec{
+				AccessModes:       corev1.ReadWriteOnce,
+				VolumeSizeRequest: resource.MustParse("1Gi"),
+			},
+			assert: func(t *testing.T, err error) {
+				assert.NoError(t, err)
+			},
+		},
+		{
+			name: "Empty AccessModes defaults to ReadWriteOnce",
+			storage: &ecv1alpha1.StorageSpec{
+				VolumeSizeRequest: resource.MustParse("1Gi"),
+			},
+			assert: func(t *testing.T, err error) {
+				assert.NoError(t, err)
+			},
+		},
+		{
+			name: "Valid ReadWriteMany",
+			storage: &ecv1alpha1.StorageSpec{
+				AccessModes:       corev1.ReadWriteMany,
+				VolumeSizeRequest: resource.MustParse("1Gi"),
+			},
+			assert: func(t *testing.T, err error) {
+				assert.NoError(t, err)
+			},
+		},
+		{
+			name: "ReadOnlyMany is rejected",
+			storage: &ecv1alpha1.StorageSpec{
+				AccessModes:       corev1.ReadOnlyMany,
+				VolumeSizeRequest: resource.MustParse("1Gi"),
+			},
+			assert: func(t *testing.T, err error) {
+				assert.Error(t, err)
+			},
+		},
+		{
+			name: "VolumeSizeRequest below 1Mi is rejected",
+			storage: &ecv1alpha1.StorageSpec{
+				AccessModes:       corev1.ReadWriteOnce,
+				VolumeSizeRequest: resource.MustParse("512Ki"),
+			},
+			assert: func(t *testing.T, err error) {
+				assert.Error(t, err)
+			},
+		},
+		{
+			name: "VolumeSizeRequest exactly 1Mi is accepted",
+			storage: &ecv1alpha1.StorageSpec{
+				AccessModes:       corev1.ReadWriteOnce,
+				VolumeSizeRequest: resource.MustParse("1Mi"),
+			},
+			assert: func(t *testing.T, err error) {
+				assert.NoError(t, err)
+			},
+		},
+		{
+			name: "Zero VolumeSizeLimit means no limit",
+			storage: &ecv1alpha1.StorageSpec{
+				AccessModes:       corev1.ReadWriteOnce,
+				VolumeSizeRequest: resource.MustParse("1Gi"),
+				VolumeSizeLimit:   resource.MustParse("0"),
+			},
+			assert: func(t *testing.T, err error) {
+				assert.NoError(t, err)
+			},
+		},
+		{
+			name: "VolumeSizeLimit below VolumeSizeRequest is rejected",
+			storage: &ecv1alpha1.StorageSpec{
+				AccessModes:       corev1.ReadWriteOnce,
+				VolumeSizeRequest: resource.MustParse("1Gi"),
+				VolumeSizeLimit:   resource.MustParse("512Mi"),
+			},
+			assert: func(t *testing.T, err error) {
+				assert.Error(t, err)
+			},
+		},
+		{
+			name: "VolumeSizeLimit equal to VolumeSizeRequest is accepted",
+			storage: &ecv1alpha1.StorageSpec{
+				AccessModes:       corev1.ReadWriteOnce,
+				VolumeSizeRequest: resource.MustParse("1Gi"),
+				VolumeSizeLimit:   resource.MustParse("1Gi"),
+			},
+			assert: func(t *testing.T, err error) {
+				assert.NoError(t, err)
+			},
+		},
+	}
+
+	r := &EtcdClusterReconciler{}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ec := &ecv1alpha1.EtcdCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: "etcd", Namespace: "default"},
+				Spec:       ecv1alpha1.EtcdClusterSpec{Size: 1, StorageSpec: tc.storage},
+			}
+			err := r.validateStorageSpec(t.Context(), ec)
 			tc.assert(t, err)
 		})
 	}

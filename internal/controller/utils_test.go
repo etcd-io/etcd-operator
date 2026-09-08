@@ -128,16 +128,6 @@ func TestCreatePVCForMember(t *testing.T) {
 		require.NoError(t, fakeClient.Get(ctx, client.ObjectKey{Name: "etcd-data-test-etcd-0", Namespace: "default"}, pvc))
 		assert.Empty(t, pvc.OwnerReferences)
 	})
-
-	t.Run("rejects VolumeSizeRequest below 1Mi", func(t *testing.T) {
-		ec := newCluster()
-		ec.Spec.StorageSpec.VolumeSizeRequest = resource.MustParse("1Ki")
-		member := testMemberForCluster(ec, 0)
-		fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
-
-		err := createPVCForMember(ctx, fakeClient, ec, member, memberPodName(ec.Name, 0), scheme)
-		assert.ErrorContains(t, err, "VolumeSizeRequest must be at least 1Mi")
-	})
 }
 
 // ---------------------------------------------------------------------------
