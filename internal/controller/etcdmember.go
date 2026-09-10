@@ -47,12 +47,24 @@ const memberCleanupFinalizer = "operator.etcd.io/member-cleanup"
 // provisioning attempt and its interruption recovery. Future lifecycle
 // phases attach focused handlers here without moving provisioning back into
 // scaleCluster or dispatch.
+//
+// Every exit path also refreshes the member's observed status, deferred so it
+// runs once the branch's mutations have landed — see refreshMemberStatus.
 func (r *EtcdClusterReconciler) reconcileEtcdMember(
 	ctx context.Context,
 	state *reconcileState,
 	member *ecv1alpha1.EtcdMember,
 ) (ctrl.Result, error) {
 	log.FromContext(ctx).Info("Reconciling an EtcdMember", "EtcdMember", member.Name, "EtcdMemberSpec", member.Spec)
+
+	defer func() {
+		if member.DeletionTimestamp == nil {
+			if err := r.refreshMemberStatus(ctx, state, member); err != nil {
+				log.FromContext(ctx).Error(err, "failed to refresh EtcdMember status")
+			}
+		}
+	}()
+
 	switch member.Status.Phase {
 	// Creating the EtcdMember object and writing its status Phase are two
 	// separate calls in createEtcdMember. If the operator crashes in between,
@@ -107,6 +119,8 @@ func (r *EtcdClusterReconciler) cleanupEtcdMember(ctx context.Context, s *reconc
 		return ctrl.Result{}, err
 	}
 
+	// TODO: interrupted here leaves the member's alarms armed — the next pass
+	// has no member ID to look them up by. See cleanupEtcdMember docstring.
 	if err := disarmForEtcdMember(s, member); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -431,6 +445,51 @@ func (r *EtcdClusterReconciler) createPodForEtcdMember(
 		return err
 	}
 	return nil
+}
+
+// refreshMemberStatus observes the member via one etcd Status call and writes
+// the result to EtcdMember.Status. Deferred from reconcileEtcdMember so the
+// probe reflects any mutation this pass just made; a failed refresh is
+// logged, not propagated.
+func (r *EtcdClusterReconciler) refreshMemberStatus(ctx context.Context, s *reconcileState, member *ecv1alpha1.EtcdMember) error {
+	logger := log.FromContext(ctx)
+
+	endpoint := clientEndpointForOrdinal(s.cluster.Name, s.cluster.Namespace, member.Spec.Ordinal, clusterTLSEnabled(s.cluster))
+	probes, err := etcdutils.MemberHealth(etcdutils.ClientConfig{
+		Endpoints: []string{endpoint},
+		Names:     []string{member.Name},
+		TLS:       s.tlsConfig,
+	})
+	if err != nil {
+		logger.Error(err, "failed to fetch health info of member", "EtcdMember", member.Name)
+		return nil
+	}
+	if len(probes) == 0 {
+		logger.Error(fmt.Errorf("failed to fetch health info of member"), "EtcdMember", member.Name, "endpoint", endpoint)
+		return nil
+	}
+
+	ep := probes[0]
+	err = r.updateEtcdMemberStatus(ctx, member, func(status *ecv1alpha1.EtcdMemberStatus) {
+		status.MemberName = member.Name
+		status.IsHealthy = ep.Health
+
+		// On probe failure ep.Status is nil
+		if ep.Status == nil || ep.Status.Header == nil {
+			return
+		}
+		// The MemberID is needed to disarm leftovers.
+		// Same hex encoding as EtcdCluster.Status.Members[].ID.
+		status.MemberID = fmt.Sprintf("%x", ep.Status.Header.MemberId)
+		status.CurrentVersion = ep.Status.Version
+		status.IsLearner = ep.Status.IsLearner
+		status.IsLeader = ep.Status.Leader == ep.Status.Header.MemberId
+	})
+	if err != nil && !apierrors.IsNotFound(err) {
+		logger.Error(err, "failed to update EtcdMember status", "EtcdMember", member.Name)
+	}
+	// NotFound is a tolerable race (e.g. finalizer cleared elsewhere); don't log it.
+	return err
 }
 
 // initialClusterForPod renders ETCD_INITIAL_CLUSTER for the member's Pod: a
