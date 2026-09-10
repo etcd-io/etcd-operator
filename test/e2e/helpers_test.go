@@ -117,11 +117,13 @@ func etcdClusterRef(name string, size int) *ecv1alpha1.EtcdCluster {
 // waitForAllEtcdMemberReady waits until the cluster converges to the size
 // recorded in ec.Spec.Size, checking every layer of readiness:
 //   - EtcdMember objects: exactly that many (Terminating members still
-//     running their leave sequence don't count), all Phase Ready, and no
-//     ordinal at or above the expected size. Both directions are polled,
-//     never hard-failed: scale-in shrinks one member at a time, so higher
-//     ordinals legitimately outlive the size change until their leave
-//     sequence finishes.
+//     running their leave sequence don't count), all Phase Ready AND with a
+//     non-empty Status.MemberID (proof that refreshMemberStatus has run
+//     against the live etcd endpoint), and no ordinal at or above the
+//     expected size. Both directions are polled, never hard-failed:
+//     scale-in shrinks one member at a time, so higher ordinals
+//     legitimately outlive the size change until their leave sequence
+//     finishes.
 //   - Pods: the same number of them, all Ready.
 //   - etcd membership itself, via the etcd client: that many members with no
 //     learner left unpromoted.
@@ -151,6 +153,14 @@ func waitForAllEtcdMemberReady(t *testing.T, c *envconf.Config, ec *ecv1alpha1.E
 			}
 		}
 
+		// memberObserved = Phase=Ready AND Status.MemberID populated. Phase
+		// alone is set earlier in provisioning (step 8); MemberID only lands
+		// once refreshMemberStatus has probed the live etcd endpoint, so it
+		// is the signal that observation has actually caught up.
+		memberObserved := func(m ecv1alpha1.EtcdMember) bool {
+			return m.Status.Phase == ecv1alpha1.EtcdMemberReady && m.Status.MemberID != ""
+		}
+
 		// Both invariants below are checked as "keep polling", not hard
 		// errors: scale-in shrinks the cluster one member at a time through
 		// graceful leaves, so higher ordinals legitimately exist (live, then
@@ -162,7 +172,7 @@ func waitForAllEtcdMemberReady(t *testing.T, c *envconf.Config, ec *ecv1alpha1.E
 			}
 			for previousOrdinal := range ordinal {
 				previous, exists := members[previousOrdinal]
-				if !exists || previous.Status.Phase != ecv1alpha1.EtcdMemberReady {
+				if !exists || !memberObserved(previous) {
 					return false, nil
 				}
 			}
@@ -173,7 +183,7 @@ func waitForAllEtcdMemberReady(t *testing.T, c *envconf.Config, ec *ecv1alpha1.E
 		}
 		for ordinal := range expectedMembers {
 			member, exists := members[ordinal]
-			if !exists || member.Status.Phase != ecv1alpha1.EtcdMemberReady {
+			if !exists || !memberObserved(member) {
 				return false, nil
 			}
 		}
