@@ -748,7 +748,7 @@ func (r *EtcdClusterReconciler) updateStatus(ctx context.Context, s *reconcileSt
 		s.cluster.Status.Members = make([]ecv1alpha1.MemberStatus, 0, len(s.memberListResp.Members))
 		for _, member := range s.memberListResp.Members {
 			memberStatus := ecv1alpha1.MemberStatus{
-				ID:   fmt.Sprintf("%x", member.ID),
+				ID:   memberIDString(member.ID),
 				Name: member.Name,
 			}
 			if health, ok := memberHealth[member.Name]; ok {
@@ -764,7 +764,7 @@ func (r *EtcdClusterReconciler) updateStatus(ctx context.Context, s *reconcileSt
 
 		_, leaderStatus := etcdutils.FindLeaderStatus(memberHealth, logger)
 		if leaderStatus != nil {
-			s.cluster.Status.LeaderID = fmt.Sprintf("%x", leaderStatus.Leader)
+			s.cluster.Status.LeaderID = memberIDString(leaderStatus.Leader)
 			s.cluster.Status.CurrentVersion = leaderStatus.Version
 		} else {
 			for _, health := range memberHealth {

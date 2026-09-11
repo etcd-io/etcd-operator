@@ -101,8 +101,8 @@ func (r *EtcdClusterReconciler) markMemberTerminating(ctx context.Context, membe
 // and finally release memberCleanupFinalizer so Kubernetes can finish the deletion.
 // Membership and resource cleanup are no-ops once done, so re-entering after
 // an interruption (operator restart, transient etcd error) resumes harmlessly.
-// Alarm cleanup currently requires the pre-removal membership snapshot;
-// retrying it across reconciles needs the removed ID to be retained separately.
+// Alarm cleanup uses the persisted Status.MemberID, so it can resume across
+// reconciles even after the node has been removed from etcd's membership.
 //
 // Leadership transfer is intentionally not done here. When etcd's own
 // MemberRemove drops this member from the cluster's Membership, the
@@ -119,8 +119,8 @@ func (r *EtcdClusterReconciler) cleanupEtcdMember(ctx context.Context, s *reconc
 		return ctrl.Result{}, err
 	}
 
-	// TODO: interrupted here leaves the member's alarms armed — the next pass
-	// has no member ID to look them up by. See cleanupEtcdMember docstring.
+	// An interruption here does not prevent alarm cleanup: the next pass uses
+	// the persisted Status.MemberID to disarm the removed member's alarms.
 	if err := disarmForEtcdMember(s, member); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -166,19 +166,40 @@ func removeEtcdNode(s *reconcileState, member *ecv1alpha1.EtcdMember) error {
 	return nil
 }
 
-// disarmForEtcdMember disarms the member's alarms from the reconcile snapshot.
+// disarmForEtcdMember disarms the member's alarms from the reconcile snapshot
+// through the leader's endpoint.
 func disarmForEtcdMember(s *reconcileState, member *ecv1alpha1.EtcdMember) error {
+	if s.health == nil {
+		return fmt.Errorf("cluster health unavailable while disarming alarms for EtcdMember %q", member.Name)
+	}
+
+	var (
+		leaderName = findLeaderName(s.health.Members)
+		leader     *ecv1alpha1.EtcdMember
+	)
+	if leaderName == "" {
+		return fmt.Errorf("leader not found while disarming alarms for EtcdMember %q", member.Name)
+	}
+
+	for i := range s.members {
+		if s.members[i].Name == leaderName {
+			leader = &s.members[i]
+			break
+		}
+	}
+	if leader == nil {
+		return fmt.Errorf("failed to find EtcdMember for leader %q not found", leaderName)
+	}
+
 	var alarms []*etcdserverpb.AlarmMember
-	if etcdNode := findEtcdNodeForEtcdMember(s, member); etcdNode != nil && s.health != nil {
-		for _, alarm := range s.health.Alarms {
-			if alarm.MemberID == etcdNode.ID {
-				alarms = append(alarms, alarm)
-			}
+	for _, alarm := range s.health.Alarms {
+		if memberIDString(alarm.MemberID) == member.Status.MemberID {
+			alarms = append(alarms, alarm)
 		}
 	}
 	if len(alarms) > 0 {
-		endpoints := clientEndpointsFromPods(s.cluster.Name, s.cluster.Namespace, s.pods, clusterTLSEnabled(s.cluster))
-		cfg := etcdutils.ClientConfig{Endpoints: endpoints, TLS: s.tlsConfig}
+		leaderEp := clientEndpointForOrdinal(s.cluster.Name, s.cluster.Namespace, leader.Spec.Ordinal, clusterTLSEnabled(s.cluster))
+		cfg := etcdutils.ClientConfig{Endpoints: []string{leaderEp}, TLS: s.tlsConfig}
 		if err := etcdutils.AlarmDisarm(cfg, alarms); err != nil {
 			return fmt.Errorf("failed to disarm alarms for EtcdMember %q: %w", member.Name, err)
 		}
@@ -480,7 +501,7 @@ func (r *EtcdClusterReconciler) refreshMemberStatus(ctx context.Context, s *reco
 		}
 		// The MemberID is needed to disarm leftovers.
 		// Same hex encoding as EtcdCluster.Status.Members[].ID.
-		status.MemberID = fmt.Sprintf("%x", ep.Status.Header.MemberId)
+		status.MemberID = memberIDString(ep.Status.Header.MemberId)
 		status.CurrentVersion = ep.Status.Version
 		status.IsLearner = ep.Status.IsLearner
 		status.IsLeader = ep.Status.Leader == ep.Status.Header.MemberId
@@ -788,4 +809,9 @@ func pickMemberToUpdate(members []ecv1alpha1.EtcdMember, pods []*corev1.Pod, exp
 		}
 	}
 	return nil
+}
+
+// memberIDString formats an etcd member ID as a lowercase hexadecimal string.
+func memberIDString(id uint64) string {
+	return fmt.Sprintf("%x", id)
 }

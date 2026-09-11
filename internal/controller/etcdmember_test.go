@@ -481,6 +481,7 @@ func TestCleanupEtcdMember(t *testing.T) {
 	scheme := leaveTestScheme(t)
 	ctx := t.Context()
 	ec := leaveTestCluster()
+	leader := createMemberWithPhase(ec, 1, ecv1alpha1.EtcdMemberReady)
 	now := metav1.Now()
 	member := leaveTestMember(2)
 	member.DeletionTimestamp = &now
@@ -492,13 +493,18 @@ func TestCleanupEtcdMember(t *testing.T) {
 
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(ec, member, pod, pvc).
+		WithObjects(ec, leader, member, pod, pvc).
 		Build()
 	r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
 	state := &reconcileState{
-		cluster:        ec,
-		pods:           []*corev1.Pod{pod},
-		memberListResp: &clientv3.MemberListResponse{},
+		cluster: ec,
+		pods:    []*corev1.Pod{pod},
+		members: []ecv1alpha1.EtcdMember{*leader, *member},
+		// The departing node is already removed; the surviving leader has no alarms.
+		memberListResp: &clientv3.MemberListResponse{Members: []*etcdserverpb.Member{
+			{ID: 1, Name: leader.Name, PeerURLs: []string{"http://etcd-1:2380"}},
+		}},
+		health: createClusterHealthWithLeader(ec, 2, 1),
 	}
 
 	res, err := r.cleanupEtcdMember(ctx, state, member)

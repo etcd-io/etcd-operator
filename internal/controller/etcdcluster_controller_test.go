@@ -622,6 +622,7 @@ func TestDispatch(t *testing.T) {
 	t.Run("Terminating member stops the loop before scale-out is attempted", func(t *testing.T) {
 		ctx := t.Context()
 		ec := baseCluster()
+		leader := createMemberWithPhase(ec, 1, ecv1alpha1.EtcdMemberReady)
 		now := metav1.Now()
 		terminating := ecv1alpha1.EtcdMember{
 			ObjectMeta: metav1.ObjectMeta{
@@ -634,24 +635,27 @@ func TestDispatch(t *testing.T) {
 			Status: ecv1alpha1.EtcdMemberStatus{Phase: ecv1alpha1.EtcdMemberTerminating},
 		}
 
-		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ec, &terminating).Build()
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ec, &terminating, leader).Build()
 		r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
 		state := &reconcileState{
-			cluster:        ec,
-			members:        []ecv1alpha1.EtcdMember{terminating},
-			memberListResp: &clientv3.MemberListResponse{},
+			cluster: ec,
+			members: []ecv1alpha1.EtcdMember{terminating, *leader},
+			memberListResp: &clientv3.MemberListResponse{Members: []*etcdserverpb.Member{
+				{ID: 1, Name: leader.Name, PeerURLs: []string{"http://etcd-1:2380"}},
+			}},
+			health: createClusterHealthWithLeader(ec, 2, 1),
 		}
 
 		res, err := r.dispatch(ctx, state)
 		assert.NoError(t, err)
 		assert.Equal(t, ctrl.Result{RequeueAfter: requeueDuration}, res)
 
-		// The interim finalizer-removal workaround (step 7) lets the
-		// Terminating member actually disappear, and scale-out must not
-		// have run in the same call to replace it.
+		// Cleanup releases the terminating member's finalizer. Only the existing
+		// leader remains; scale-out must not run in the same call.
 		list := &ecv1alpha1.EtcdMemberList{}
 		require.NoError(t, fakeClient.List(ctx, list, client.InNamespace(ec.Namespace)))
-		assert.Empty(t, list.Items)
+		require.Len(t, list.Items, 1)
+		assert.Equal(t, leader.Name, list.Items[0].Name)
 	})
 
 	t.Run("Not-ready member stops the loop before scale-out is attempted", func(t *testing.T) {
