@@ -32,6 +32,7 @@ import (
 	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/e2e-framework/klient"
@@ -402,6 +403,45 @@ func verifyPodUsesPVC(t *testing.T, c *envconf.Config, podName string, expectedP
 	}
 
 	t.Errorf("Pod %s does not use expected PVC with prefix %s", podName, expectedPVCPrefix)
+}
+
+// resourceIDSnapshot records the identity of one member's EtcdMember, Pod and PVC,
+// plus the etcd member ID the operator last observed for it. Reading all four
+// in one pass lets a test tell "the object was deleted and recreated under the
+// same deterministic name" apart from "the object was never touched" — a
+// distinction plain existence checks cannot make, since the operator rebuilds
+// a deleted member back into the same names.
+type resourceIDSnapshot struct {
+	memberUID types.UID
+	podUID    types.UID
+	pvcUID    types.UID
+	memberID  string
+}
+
+func takeResourceIDSnapshot(t *testing.T, c *envconf.Config, memberName, pvcName string) resourceIDSnapshot {
+	t.Helper()
+	res := c.Client().Resources()
+	ctx := t.Context()
+
+	member := &ecv1alpha1.EtcdMember{}
+	if err := res.Get(ctx, memberName, namespace, member); err != nil {
+		t.Fatalf("Failed to get EtcdMember %s: %v", memberName, err)
+	}
+	pod := &corev1.Pod{}
+	if err := res.Get(ctx, memberName, namespace, pod); err != nil {
+		t.Fatalf("Failed to get Pod %s: %v", memberName, err)
+	}
+	pvc := &corev1.PersistentVolumeClaim{}
+	if err := res.Get(ctx, pvcName, namespace, pvc); err != nil {
+		t.Fatalf("Failed to get PVC %s: %v", pvcName, err)
+	}
+
+	return resourceIDSnapshot{
+		memberUID: member.UID,
+		podUID:    pod.UID,
+		pvcUID:    pvc.UID,
+		memberID:  member.Status.MemberID,
+	}
 }
 
 // getClusterEndpointHashKVs executes `etcdctl endpoint hashkv --cluster -w json` inside the given pod

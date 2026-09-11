@@ -315,6 +315,82 @@ func TestClusterDeletionCleansUpResources(t *testing.T) {
 	_ = testEnv.Test(t, feature.Feature())
 }
 
+// TestEtcdMemberDeletionRecreatesResources verifies that deleting a single
+// EtcdMember out of an otherwise healthy cluster drives the leave sequence all
+// the way through: etcd drops the member, then its Pod and PVC are deleted, the
+// finalizer is released, and scaleCluster rebuilds the ordinal from scratch.
+//
+// The assertion is on identity, not absence. EtcdCluster.Spec.Size stays at 3,
+// so the operator recreates everything under the same deterministic names and
+// "the Pod is gone" is never a stable end state a poll can observe. Instead the
+// test snapshots the EtcdMember/Pod/PVC UIDs and the recorded etcd member ID
+// before the delete and requires all four to differ afterwards — an unchanged
+// PVC UID means the leave sequence skipped its PVC step, and an unchanged etcd
+// member ID means objects churned for some unrelated reason without the member
+// ever leaving the cluster.
+func TestEtcdMemberDeletionRecreatesResources(t *testing.T) {
+	feature := features.New("member-deletion-recreate")
+	clusterName := "etcd-member-del"
+	targetOrdinal := 2
+
+	// internal/controller's memberPodName/pvcNameForMember give the member, its
+	// Pod and its PVC their names: "{cluster}-{ordinal}" for the first two,
+	// "etcd-data-{cluster}-{ordinal}" for the PVC.
+	memberName := fmt.Sprintf("%s-%d", clusterName, targetOrdinal)
+	pvcName := "etcd-data-" + memberName
+
+	feature.Setup(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+		createEtcdClusterWithPVC(ctx, t, c, clusterName, 3)
+		if err := waitForAllEtcdMemberReady(t, c, etcdClusterRef(clusterName, 3)); err != nil {
+			t.Fatalf("etcd pods of cluster %s failed to reach readiness: %v", clusterName, err)
+		}
+		return ctx
+	})
+
+	feature.Assess(
+		"deleting one member replaces its EtcdMember, Pod, PVC and etcd identity",
+		func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+			before := takeResourceIDSnapshot(t, c, memberName, pvcName)
+
+			member := &ecv1alpha1.EtcdMember{
+				ObjectMeta: metav1.ObjectMeta{Name: memberName, Namespace: namespace},
+			}
+			if err := c.Client().Resources().Delete(ctx, member); err != nil {
+				t.Fatalf("Failed to delete EtcdMember %s: %v", memberName, err)
+			}
+
+			if err := waitForAllEtcdMemberReady(t, c, etcdClusterRef(clusterName, 3)); err != nil {
+				t.Fatalf("cluster %s did not rebuild member %s: %v", clusterName, memberName, err)
+			}
+
+			after := takeResourceIDSnapshot(t, c, memberName, pvcName)
+
+			if after.memberUID == before.memberUID {
+				t.Errorf("EtcdMember %s was not recreated: UID %s is unchanged", memberName, after.memberUID)
+			}
+			if after.podUID == before.podUID {
+				t.Errorf("Pod %s was not deleted by the leave sequence: UID %s is unchanged",
+					memberName, after.podUID)
+			}
+			if after.pvcUID == before.pvcUID {
+				t.Errorf("PVC %s was not deleted by the leave sequence: UID %s is unchanged",
+					pvcName, after.pvcUID)
+			}
+			if after.memberID == before.memberID {
+				t.Errorf("member %s rejoined with its old etcd ID %s; MemberRemove never ran",
+					memberName, after.memberID)
+			}
+			return ctx
+		})
+
+	feature.Teardown(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+		cleanupEtcdCluster(ctx, t, c, clusterName)
+		return ctx
+	})
+
+	_ = testEnv.Test(t, feature.Feature())
+}
+
 // TestManualScaleInWithoutEndpoints verifies the issue #463 acceptance case:
 // a deadlocked cluster can be manually scaled in even when none of its etcd
 // processes is reachable. Per the recovery recipe, the user shrinks
