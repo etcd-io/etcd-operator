@@ -29,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/e2e-framework/klient/k8s/resources"
 	"sigs.k8s.io/e2e-framework/klient/wait"
 	"sigs.k8s.io/e2e-framework/klient/wait/conditions"
@@ -379,6 +380,99 @@ func TestEtcdMemberDeletionRecreatesResources(t *testing.T) {
 			if after.memberID == before.memberID {
 				t.Errorf("member %s rejoined with its old etcd ID %s; MemberRemove never ran",
 					memberName, after.memberID)
+			}
+			return ctx
+		})
+
+	feature.Teardown(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+		cleanupEtcdCluster(ctx, t, c, clusterName)
+		return ctx
+	})
+
+	_ = testEnv.Test(t, feature.Feature())
+}
+
+// TestEtcdMemberReplacing sets ordinal 2 to Phase Replacing,
+// preserving its EtcdMember while recreating its Pod and PVC.
+func TestEtcdMemberReplacing(t *testing.T) {
+	feature := features.New("member-replacing")
+	clusterName := "etcd-member-replacing"
+	memberName := clusterName + "-2"
+	pvcName := "etcd-data-" + memberName
+
+	feature.Setup(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+		createEtcdClusterWithPVC(ctx, t, c, clusterName, 3)
+		if err := waitForAllEtcdMemberReady(t, c, etcdClusterRef(clusterName, 3)); err != nil {
+			t.Fatalf("cluster %s did not become Ready before replacement: %v", clusterName, err)
+		}
+		return ctx
+	})
+
+	feature.Assess("all members recover to Ready with a new Pod and PVC for ordinal 2",
+		func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+			before := takeResourceIDSnapshot(t, c, memberName, pvcName)
+			if before.podUID == "" || before.pvcUID == "" {
+				t.Fatal("expected non-empty Pod and PVC UIDs before replacement")
+			}
+			t.Logf("before replacement: Pod UID=%s, PVC UID=%s", before.podUID, before.pvcUID)
+
+			// Persist replacement intent directly; the status update also
+			// enqueues the owning cluster through its EtcdMember watch.
+			if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+				var target ecv1alpha1.EtcdMember
+				if err := c.Client().Resources().Get(ctx, memberName, namespace, &target); err != nil {
+					return err
+				}
+				target.Status.Phase = ecv1alpha1.EtcdMemberReplacing
+				target.Status.RecreateCount = 0
+				return c.Client().Resources().UpdateStatus(ctx, &target)
+			}); err != nil {
+				t.Fatalf("failed to mark member %s Replacing: %v", memberName, err)
+			}
+
+			// Wait for changed identities first: the original Ready state
+			// must not satisfy the post-replacement readiness assertion.
+			if err := wait.For(func(ctx context.Context) (bool, error) {
+				var pod corev1.Pod
+				if err := c.Client().Resources().Get(ctx, memberName, namespace, &pod); err != nil {
+					if errors.IsNotFound(err) {
+						return false, nil
+					}
+					return false, err
+				}
+				var pvc corev1.PersistentVolumeClaim
+				if err := c.Client().Resources().Get(ctx, pvcName, namespace, &pvc); err != nil {
+					if errors.IsNotFound(err) {
+						return false, nil
+					}
+					return false, err
+				}
+				var member ecv1alpha1.EtcdMember
+				if err := c.Client().Resources().Get(ctx, memberName, namespace, &member); err != nil {
+					return false, err
+				}
+				// Ready and the observed etcd ID are separate status writes.
+				// Wait for observation to catch up before comparing snapshots.
+				return pod.DeletionTimestamp == nil && pvc.DeletionTimestamp == nil &&
+					pod.UID != before.podUID && pvc.UID != before.pvcUID &&
+					member.Status.MemberID != "" && member.Status.MemberID != before.memberID, nil
+			}, wait.WithContext(ctx), wait.WithTimeout(5*time.Minute), wait.WithInterval(2*time.Second)); err != nil {
+				t.Fatalf("member %s did not get a new Pod, PVC and etcd identity: %v", memberName, err)
+			}
+			if err := waitForAllEtcdMemberReady(t, c, etcdClusterRef(clusterName, 3)); err != nil {
+				t.Fatalf("cluster %s did not recover all three members to Ready: %v", clusterName, err)
+			}
+
+			after := takeResourceIDSnapshot(t, c, memberName, pvcName)
+			t.Logf("after replacement: Pod UID=%s, PVC UID=%s", after.podUID, after.pvcUID)
+			if after.podUID == before.podUID || after.pvcUID == before.pvcUID {
+				t.Error("replacement must change both Pod and PVC UIDs")
+			}
+			if after.memberUID != before.memberUID {
+				t.Error("replacement must retain the original EtcdMember object")
+			}
+			if after.memberID == before.memberID {
+				t.Error("replacement must rejoin with a new etcd member ID")
 			}
 			return ctx
 		})
