@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"slices"
 	"testing"
 	"time"
 
@@ -126,6 +127,86 @@ func TestEtcdOptions(t *testing.T) {
 			return ctx
 		},
 	)
+
+	_ = testEnv.Test(t, feature.Feature())
+}
+
+// TestConfigUpdate verifies that all Pods adopt updated EtcdOptions, the leader
+// is recreated last, and members return to Ready.
+func TestConfigUpdate(t *testing.T) {
+	feature := features.New("config-update")
+
+	etcdClusterName := "etcd-config-update"
+	clusterSize := 3
+	addedOption := "--metrics=extensive"
+
+	feature.Setup(func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+		createEtcdClusterWithPVC(ctx, t, cfg, etcdClusterName, clusterSize)
+		if err := waitForAllEtcdMemberReady(t, cfg, etcdClusterRef(etcdClusterName, clusterSize)); err != nil {
+			t.Fatalf("etcd pods of cluster %s failed to reach readiness for %d replicas: %v",
+				etcdClusterName, clusterSize, err)
+		}
+		return ctx
+	})
+
+	feature.Assess("updating Spec.EtcdOptions rebuilds the Pod with the new arg",
+		func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+			client := cfg.Client()
+
+			leaderName, err := getLeaderPodName(t, cfg, etcdClusterName)
+			if err != nil {
+				t.Fatalf("failed to get leader before config update: %v", err)
+			}
+
+			var ec ecv1alpha1.EtcdCluster
+			if err := client.Resources().Get(ctx, etcdClusterName, namespace, &ec); err != nil {
+				t.Fatalf("failed to get etcd cluster %s: %s", etcdClusterName, err)
+			}
+			ec.Spec.EtcdOptions = append(ec.Spec.EtcdOptions, addedOption)
+			if err := client.Resources().Update(ctx, &ec); err != nil {
+				t.Fatalf("failed to update etcd cluster %s: %s", etcdClusterName, err)
+			}
+
+			if err := waitForAllPodHashAligned(t, cfg, etcdClusterRef(etcdClusterName, clusterSize)); err != nil {
+				t.Fatalf("pods did not adopt the updated config: %v", err)
+			}
+			if err := waitForAllEtcdMemberReady(t, cfg, etcdClusterRef(etcdClusterName, clusterSize)); err != nil {
+				t.Fatalf("cluster did not return to Ready after config update: %v", err)
+			}
+
+			newLeaderName, err := getLeaderPodName(t, cfg, etcdClusterName)
+			if err != nil {
+				t.Fatalf("failed to get leader after config update: %v", err)
+			}
+			if newLeaderName == leaderName {
+				t.Errorf("expected leader to change after config update, still %s", leaderName)
+			}
+
+			var pods corev1.PodList
+			if err := client.Resources(namespace).List(ctx, &pods,
+				resources.WithLabelSelector("app="+etcdClusterName)); err != nil {
+				t.Fatalf("failed to list pods after config update: %v", err)
+			}
+			leaderIndex := slices.IndexFunc(pods.Items, func(p corev1.Pod) bool { return p.Name == leaderName })
+			if leaderIndex == -1 {
+				t.Fatalf("original leader pod %s is missing after config update", leaderName)
+			}
+			leaderPod := &pods.Items[leaderIndex]
+			for _, pod := range pods.Items {
+				if pod.Name != leaderName && pod.CreationTimestamp.After(leaderPod.CreationTimestamp.Time) {
+					t.Errorf("original leader pod %s (created %s) must be recreated last, pod %s was created at %s",
+						leaderName, leaderPod.CreationTimestamp, pod.Name, pod.CreationTimestamp)
+				}
+			}
+
+			return ctx
+		},
+	)
+
+	feature.Teardown(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+		cleanupEtcdCluster(ctx, t, c, etcdClusterName)
+		return ctx
+	})
 
 	_ = testEnv.Test(t, feature.Feature())
 }

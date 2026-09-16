@@ -41,6 +41,7 @@ import (
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
 
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
+	"go.etcd.io/etcd-operator/internal/controller"
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
 )
 
@@ -113,6 +114,36 @@ func etcdClusterRef(name string, size int) *ecv1alpha1.EtcdCluster {
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
 		Spec:       ecv1alpha1.EtcdClusterSpec{Size: size},
 	}
+}
+
+// waitForAllPodHashAligned waits for every cluster Pod to carry the current spec hash.
+func waitForAllPodHashAligned(t *testing.T, c *envconf.Config, ec *ecv1alpha1.EtcdCluster) error {
+	t.Helper()
+	var current ecv1alpha1.EtcdCluster
+	if err := c.Client().Resources().Get(t.Context(), ec.Name, ec.Namespace, &current); err != nil {
+		return fmt.Errorf("get EtcdCluster %s: %w", ec.Name, err)
+	}
+	reconciler := &controller.EtcdClusterReconciler{ImageRegistry: controller.DefaultImageRegistry}
+	reconciler.PopulateDefaultValues(&current)
+	expectedHash := controller.EtcdClusterHash(&current)
+
+	return wait.For(func(ctx context.Context) (bool, error) {
+		var pods corev1.PodList
+		if err := c.Client().Resources(ec.Namespace).List(ctx, &pods,
+			resources.WithLabelSelector("app="+ec.Name)); err != nil {
+			t.Logf("failed to list Pods for %s: %v", ec.Name, err)
+			return false, nil
+		}
+		if len(pods.Items) != ec.Spec.Size {
+			return false, nil
+		}
+		for _, pod := range pods.Items {
+			if pod.DeletionTimestamp != nil || pod.Annotations[controller.HashMetadataKey] != expectedHash {
+				return false, nil
+			}
+		}
+		return true, nil
+	}, wait.WithContext(t.Context()), wait.WithTimeout(5*time.Minute), wait.WithInterval(2*time.Second))
 }
 
 // waitForAllEtcdMemberReady waits until the cluster converges to the size
@@ -351,6 +382,36 @@ func getEtcdMemberList(
 		return nil, fmt.Errorf("parsing etcd member list JSON: %w", err)
 	}
 	return &memberList, nil
+}
+
+// getLeaderPodName returns the current leader's Pod name from live etcd status.
+func getLeaderPodName(t *testing.T, c *envconf.Config, clusterName string) (string, error) {
+	t.Helper()
+	podName := clusterName + "-0"
+	stdout, stderr, err := execInPod(t, c, podName, namespace,
+		[]string{"etcdctl", "endpoint", "status", "-w", "json"})
+	if err != nil {
+		return "", fmt.Errorf("get endpoint status via %s: %w, stderr: %s", podName, err, stderr)
+	}
+	var epStatuses []struct {
+		Status etcdserverpb.StatusResponse `json:"Status"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &epStatuses); err != nil {
+		return "", fmt.Errorf("parse endpoint status: %w", err)
+	}
+	if len(epStatuses) != 1 || epStatuses[0].Status.Leader == 0 {
+		return "", fmt.Errorf("expected one endpoint with an elected leader, got: %s", stdout)
+	}
+	members, err := getEtcdMemberList(t, c, namespace, podName, clusterName, false)
+	if err != nil {
+		return "", err
+	}
+	for _, member := range members.Members {
+		if member.ID == epStatuses[0].Status.Leader && member.Name != "" {
+			return member.Name, nil
+		}
+	}
+	return "", fmt.Errorf("leader %x not found in named etcd members", epStatuses[0].Status.Leader)
 }
 
 // getEtcdMemberListPB is the fatal-on-error wrapper around getEtcdMemberList
