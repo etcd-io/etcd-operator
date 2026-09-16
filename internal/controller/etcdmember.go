@@ -78,10 +78,54 @@ func (r *EtcdClusterReconciler) reconcileEtcdMember(
 	// releasing the finalizer so Kubernetes can finish the deletion.
 	case ecv1alpha1.EtcdMemberTerminating:
 		return r.cleanupEtcdMember(ctx, state, member)
-	// placeholder for Recreating and Replacing
+	case ecv1alpha1.EtcdMemberReplacing:
+		return r.replaceEtcdMember(ctx, state, member)
+	// placeholder for Recreating
 	default:
 		return ctrl.Result{}, nil
 	}
+}
+
+// markMemberReplacing persists the replacement intent before cleanup starts.
+// Resetting the count gives the replacement a fresh provisioning retry budget.
+//
+//nolint:unused // The shared recovery ladder will call this when #472 is implemented.
+func (r *EtcdClusterReconciler) markMemberReplacing(ctx context.Context, member *ecv1alpha1.EtcdMember) error {
+	return r.updateEtcdMemberStatus(ctx, member, func(status *ecv1alpha1.EtcdMemberStatus) {
+		status.Phase = ecv1alpha1.EtcdMemberReplacing
+		status.RecreateCount = 0
+	})
+}
+
+// replaceEtcdMember cleans up the old member and waits for its Pod and PVC
+// to disappear before rejoining through the existing provisioning workflow.
+func (r *EtcdClusterReconciler) replaceEtcdMember(ctx context.Context, state *reconcileState, member *ecv1alpha1.EtcdMember) (ctrl.Result, error) {
+	if _, err := r.cleanupEtcdMember(ctx, state, member); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// Both Pod and PVC must be deleted before provisioning new ones.
+	resources := []client.Object{
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: member.Name, Namespace: member.Namespace}},
+		&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: pvcNameForMember(member.Name), Namespace: member.Namespace}},
+	}
+	for _, resource := range resources {
+		if err := r.Get(ctx, client.ObjectKeyFromObject(resource), resource); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return ctrl.Result{}, fmt.Errorf("checking resource %q for replacing EtcdMember %q: %w", resource.GetName(), member.Name, err)
+		}
+		return ctrl.Result{RequeueAfter: requeueDuration}, nil
+	}
+
+	if err := r.updateEtcdMemberStatus(ctx, member, func(status *ecv1alpha1.EtcdMemberStatus) {
+		status.Phase = ecv1alpha1.EtcdMemberProvisioning
+	}); err != nil {
+		return ctrl.Result{}, err
+	}
+	// Joining must use a fresh membership snapshot on the next reconcile.
+	return ctrl.Result{RequeueAfter: requeueDuration}, nil
 }
 
 // markMemberTerminating persists Phase=Terminating on a member whose
@@ -96,9 +140,10 @@ func (r *EtcdClusterReconciler) markMemberTerminating(ctx context.Context, membe
 	})
 }
 
-// cleanupEtcdMember is the §4.6 Terminating leave for one member: remove it
-// from etcd's live membership, disarm its alarms, delete its owned Pod and PVC,
-// and finally release memberCleanupFinalizer so Kubernetes can finish the deletion.
+// cleanupEtcdMember is the §4.6 leave for one member: remove it from etcd's
+// live membership, disarm its alarms, and delete its owned Pod and PVC.
+// Only the Terminating case removes the memberCleanupFinalizer
+// so Kubernetes can finish the deletion.
 // Membership and resource cleanup are no-ops once done, so re-entering after
 // an interruption (operator restart, transient etcd error) resumes harmlessly.
 // Alarm cleanup currently requires the pre-removal membership snapshot;
@@ -137,8 +182,10 @@ func (r *EtcdClusterReconciler) cleanupEtcdMember(ctx context.Context, s *reconc
 		return ctrl.Result{}, err
 	}
 
-	if err := r.clearMemberFinalizer(ctx, member); err != nil {
-		return ctrl.Result{}, err
+	if member.Status.Phase == ecv1alpha1.EtcdMemberTerminating {
+		if err := r.clearMemberFinalizer(ctx, member); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 	return ctrl.Result{RequeueAfter: requeueDuration}, nil
 }

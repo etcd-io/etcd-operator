@@ -485,6 +485,7 @@ func TestCleanupEtcdMember(t *testing.T) {
 	member := leaveTestMember(2)
 	member.DeletionTimestamp = &now
 	member.Finalizers = []string{memberCleanupFinalizer}
+	member.Status.Phase = ecv1alpha1.EtcdMemberTerminating
 	pod := leaveTestPod(2)
 	pvc := &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{Name: pvcNameForMember(pod.Name), Namespace: ec.Namespace},
@@ -518,6 +519,83 @@ func TestCleanupEtcdMember(t *testing.T) {
 
 	// Finalizer released after both resources are gone.
 	assert.Error(t, fakeClient.Get(ctx, types.NamespacedName{Namespace: ec.Namespace, Name: member.Name}, &ecv1alpha1.EtcdMember{}))
+}
+
+// TestReplaceEtcdMember verifies that replacement waits for complete Pod/PVC
+// deletion, retains the member finalizer, and resumes directly in Provisioning.
+func TestReplaceEtcdMember(t *testing.T) {
+	ctx := t.Context()
+	scheme := leaveTestScheme(t)
+	ec := leaveTestCluster()
+	member := leaveTestMember(2)
+	member.Status.Phase = ecv1alpha1.EtcdMemberReplacing
+	member.Finalizers = []string{memberCleanupFinalizer}
+	pod := leaveTestPod(2)
+	pod.Finalizers = []string{"test.etcd.io/hold"}
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name: pvcNameForMember(pod.Name), Namespace: ec.Namespace,
+		Finalizers: []string{"test.etcd.io/hold"},
+	}}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&ecv1alpha1.EtcdMember{}).
+		WithObjects(ec, member, pod, pvc).Build()
+	r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
+	state := &reconcileState{
+		cluster: ec, pods: []*corev1.Pod{pod},
+		// Resume after the old etcd identity has been removed.
+		memberListResp: &clientv3.MemberListResponse{},
+	}
+	assertReplacing := func() {
+		t.Helper()
+		require.NoError(t, fakeClient.Get(ctx, client.ObjectKeyFromObject(member), member))
+		assert.Equal(t, ecv1alpha1.EtcdMemberReplacing, member.Status.Phase)
+		assert.Equal(t, []string{memberCleanupFinalizer}, member.Finalizers)
+	}
+
+	// Repeated passes must wait for the Pod and leave the PVC untouched.
+	for range 2 {
+		res, err := r.replaceEtcdMember(ctx, state, member)
+		require.NoError(t, err)
+		assert.Equal(t, ctrl.Result{RequeueAfter: requeueDuration}, res)
+		require.NoError(t, fakeClient.Get(ctx, client.ObjectKeyFromObject(pod), pod))
+		assert.NotNil(t, pod.DeletionTimestamp)
+		require.NoError(t, fakeClient.Get(ctx, client.ObjectKeyFromObject(pvc), pvc))
+		assert.Nil(t, pvc.DeletionTimestamp)
+		assertReplacing()
+	}
+	pod.Finalizers = nil
+	require.NoError(t, fakeClient.Update(ctx, pod))
+	state.pods = nil
+
+	// Once the Pod is gone, a terminating PVC still blocks provisioning.
+	for range 2 {
+		res, err := r.replaceEtcdMember(ctx, state, member)
+		require.NoError(t, err)
+		assert.Equal(t, ctrl.Result{RequeueAfter: requeueDuration}, res)
+		require.NoError(t, fakeClient.Get(ctx, client.ObjectKeyFromObject(pvc), pvc))
+		assert.NotNil(t, pvc.DeletionTimestamp)
+		assertReplacing()
+	}
+	pvc.Finalizers = nil
+	require.NoError(t, fakeClient.Update(ctx, pvc))
+
+	// Exercise phase dispatch after cleanup completes. It must persist
+	// Provisioning and requeue without creating resources in this pass.
+	res, err := r.reconcileEtcdMember(ctx, state, member)
+	require.NoError(t, err)
+	assert.Equal(t, ctrl.Result{RequeueAfter: requeueDuration}, res)
+	require.NoError(t, fakeClient.Get(ctx, client.ObjectKeyFromObject(member), member))
+	assert.Equal(t, ecv1alpha1.EtcdMemberProvisioning, member.Status.Phase)
+	assert.Equal(t, []string{memberCleanupFinalizer}, member.Finalizers)
+	assert.Nil(t, member.DeletionTimestamp)
+	assert.Zero(t, member.Status.RecreateCount)
+	assert.Equal(t, leaveTestMember(2).Spec, member.Spec)
+	pods := &corev1.PodList{}
+	require.NoError(t, fakeClient.List(ctx, pods))
+	assert.Empty(t, pods.Items)
+	pvcs := &corev1.PersistentVolumeClaimList{}
+	require.NoError(t, fakeClient.List(ctx, pvcs))
+	assert.Empty(t, pvcs.Items)
 }
 
 // TestMarkMemberTerminating verifies the Phase write before the leave runs,
