@@ -20,6 +20,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
@@ -80,7 +81,8 @@ func (r *EtcdClusterReconciler) reconcileEtcdMember(
 		return r.cleanupEtcdMember(ctx, state, member)
 	case ecv1alpha1.EtcdMemberReplacing:
 		return r.replaceEtcdMember(ctx, state, member)
-	// placeholder for Recreating
+	case ecv1alpha1.EtcdMemberRecreating:
+		return r.reconcileRecreating(ctx, state, member)
 	default:
 		return ctrl.Result{}, nil
 	}
@@ -93,6 +95,16 @@ func (r *EtcdClusterReconciler) reconcileEtcdMember(
 func (r *EtcdClusterReconciler) markMemberReplacing(ctx context.Context, member *ecv1alpha1.EtcdMember) error {
 	return r.updateEtcdMemberStatus(ctx, member, func(status *ecv1alpha1.EtcdMemberStatus) {
 		status.Phase = ecv1alpha1.EtcdMemberReplacing
+		status.RecreateCount = 0
+	})
+}
+
+// markMemberReady transitions the member to Phase=Ready and resets RecreateCount
+// to zero. It is called once a member's Pod is confirmed healthy and running the
+// expected version, signalling that it has fully rejoined the cluster.
+func (r *EtcdClusterReconciler) markMemberReady(ctx context.Context, member *ecv1alpha1.EtcdMember) error {
+	return r.updateEtcdMemberStatus(ctx, member, func(status *ecv1alpha1.EtcdMemberStatus) {
+		status.Phase = ecv1alpha1.EtcdMemberReady
 		status.RecreateCount = 0
 	})
 }
@@ -368,14 +380,184 @@ func (r *EtcdClusterReconciler) reconcileProvisioning(
 
 	// 8. Completion: healthy voting member — mark it Ready.
 	log.FromContext(ctx).Info("Marking EtcdMember Ready", "EtcdMember", member.Name)
-	if err := r.updateEtcdMemberStatus(ctx, member, func(status *ecv1alpha1.EtcdMemberStatus) {
-		status.Phase = ecv1alpha1.EtcdMemberReady
-		status.RecreateCount = 0
-	}); err != nil {
+	if err := r.markMemberReady(ctx, member); err != nil {
 		return ctrl.Result{}, err
 	}
 
 	return ctrl.Result{RequeueAfter: requeueDuration}, nil
+}
+
+const (
+	// podStartTimeout is the maximum time a Pod is allowed to be running but not
+	// Ready before the reconciler treats it as timed out and replaces it.
+	// TODO: consider exposing this as a configurable field in a future release.
+	podStartTimeout = 30 * time.Second
+	// maxRecreates is the maximum number of consecutive Pod recreations attempted
+	// before the reconciler gives up and escalates the member to Phase=EtcdMemberReplacing
+	// TODO: consider exposing this as a configurable field in a future release.
+	maxRecreates = 3
+)
+
+// reconcileRecreating drives the Recreating lifecycle phase for a member whose
+// Pod needs to be recreated (e.g. after an upgrade or self-healing). It follows
+// the Recreating case in reconcile_member_v0.3.0.png
+func (r *EtcdClusterReconciler) reconcileRecreating(
+	ctx context.Context,
+	state *reconcileState,
+	member *ecv1alpha1.EtcdMember,
+) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	memberPod := findPodForEtcdMember(state, member)
+
+	// 1. If pod is in the middle of deletion, requeue the request
+	if memberPod != nil && memberPod.DeletionTimestamp != nil {
+		return ctrl.Result{RequeueAfter: requeueDuration}, nil
+	}
+
+	// 2. If pod does not exist
+	if memberPod == nil {
+		// mark Phase=Replacing if RecreateCount >= maxRecreates;
+		if member.Status.RecreateCount >= maxRecreates {
+			logger.Info("[Recreating] RecreateCount exhausted, escalating to Replacing", "member", member.Name, "recreateCount", member.Status.RecreateCount)
+			if err := r.markMemberReplacing(ctx, member); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{RequeueAfter: requeueDuration}, nil
+		}
+
+		// create new pod if RecreateCount < maxRecreates
+		logger.Info("[Recreating] creating new pod", "member", member.Name)
+		if err := r.createPodForEtcdMember(ctx, state, member, false); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		return ctrl.Result{RequeueAfter: requeueDuration}, nil
+	}
+
+	// 3. Member health check.
+	health, err := findHealthStatusForEtcdMember(state, member)
+	if err != nil {
+		// Health data unavailable (e.g. member list empty mid-upgrade) — requeue.
+		logger.Info("[Recreating] health status unavailable, requeueing", "member", member.Name, "error", err)
+		return ctrl.Result{RequeueAfter: requeueDuration}, nil
+	}
+
+	// 4. Node is healthy and conditions(configs, version) are all met, set Phase=Ready
+	configMatches := memberPod.Annotations[HashMetadataKey] ==
+		EtcdClusterHash(state.cluster)
+	expectedImage := fmt.Sprintf("%s:%s", state.cluster.Spec.ImageRegistry, member.Spec.Version)
+	onTargetVersion := memberPod.Spec.Containers[0].Image == expectedImage
+
+	if health.Health && configMatches && onTargetVersion {
+		logger.Info("[Recreating] member is healthy on target version, marking Ready", "member", member.Name)
+		if err := r.markMemberReady(ctx, member); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: requeueDuration}, nil
+	}
+
+	// 5. If Node is not healthy
+	if !health.Health {
+		timedOut := time.Since(memberPod.CreationTimestamp.Time) > podStartTimeout
+
+		if !timedOut {
+			// Pod is still starting up — give it more time.
+			logger.Info("[Recreating] pod not yet timed out, requeueing", "member", member.Name, "pod", memberPod.Name, "elapsed", time.Since(memberPod.CreationTimestamp.Time), "timeout", podStartTimeout)
+			return ctrl.Result{RequeueAfter: requeueDuration}, nil
+		}
+		// Pod has timed out
+		logger.Info("[Recreating] pod timed out", "member", member.Name, "pod", memberPod.Name)
+
+		// if RecreateCount >=3, set Phase=Replacing
+		if member.Status.RecreateCount >= maxRecreates {
+			logger.Info("[Recreating] RecreateCount exhausted, escalating to Replacing", "member", member.Name, "recreateCount", member.Status.RecreateCount)
+			if err := r.markMemberReplacing(ctx, member); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{RequeueAfter: requeueDuration}, nil
+		}
+	}
+
+	// 5. Transfer leadership away before taking this member offline, so the
+	// cluster doesn't lose its leader unnecessarily. This is a best-effort
+	// operation — if it fails, requeue
+	// TODO: The target member should be healthy before making it the leader
+	if member.Status.IsLeader {
+		endpoints := clientEndpointsFromPods(state.cluster.Name, state.cluster.Namespace, state.pods, clusterTLSEnabled(state.cluster))
+		if len(endpoints) > 0 {
+			tgt := selectTransferTarget(state, member)
+			if err := r.transferLeader(ctx, state, member, endpoints, tgt); err != nil {
+				return ctrl.Result{RequeueAfter: requeueDuration}, err
+			}
+		}
+	}
+
+	// 6. Delete the pod — reason depends on which condition triggered this path.
+	var deleteReason string
+	var extraFields []any
+
+	if !health.Health {
+		deleteReason = "[Recreating] deleting pod: unhealthy and timed out"
+		extraFields = []any{"elapsed", time.Since(memberPod.CreationTimestamp.Time), "timeout", podStartTimeout}
+	} else if !onTargetVersion {
+		deleteReason = "[Recreating] deleting pod: healthy but running outdated image"
+		extraFields = []any{"currentImage", memberPod.Spec.Containers[0].Image, "targetImage", expectedImage}
+	} else if !configMatches {
+		deleteReason = "[Recreating] deleting pod: healthy but config hash mismatch"
+		extraFields = []any{"podConfigHash", memberPod.Annotations[HashMetadataKey], "expectedConfigHash", EtcdClusterHash(state.cluster)}
+	} else {
+		deleteReason = "[Recreating] deleting pod"
+	}
+
+	logger.Info(deleteReason, append([]any{"member", member.Name, "pod", memberPod.Name}, extraFields...)...)
+	if err := r.Delete(ctx, memberPod); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{RequeueAfter: requeueDuration}, nil
+}
+
+// selectTransferTarget picks the lowest-ordinal etcd member (other than the
+// given member) that has a known node ID. Returns 0 if none is found.
+func selectTransferTarget(state *reconcileState, member *ecv1alpha1.EtcdMember) uint64 {
+	for i := range state.members {
+		other := &state.members[i]
+		if other.Name == member.Name {
+			continue
+		}
+		if node := findEtcdNodeForEtcdMember(state, other); node != nil {
+			return node.ID
+		}
+	}
+	return 0
+}
+
+// transferLeader moves etcd leadership to targetID. It is a best-effort
+// operation: if targetID is 0 it is a no-op. On failure it returns a requeue
+func (r *EtcdClusterReconciler) transferLeader(
+	ctx context.Context,
+	state *reconcileState,
+	member *ecv1alpha1.EtcdMember,
+	endpoints []string,
+	targetID uint64,
+) error {
+	if targetID == 0 {
+		return nil
+	}
+
+	logger := log.FromContext(ctx)
+	logger.Info("[Recreating] transferring leadership before pod deletion",
+		"member", member.Name,
+		"transferTargetID", fmt.Sprintf("%x", targetID),
+	)
+	if err := etcdutils.MoveLeader(etcdutils.ClientConfig{Endpoints: endpoints, TLS: state.tlsConfig}, targetID); err != nil {
+		logger.Info("[Recreating] leader transfer failed, requeueing",
+			"member", member.Name,
+			"error", err,
+		)
+		return err
+	}
+	return nil
 }
 
 // provisionCertificates ensures the cluster's shared server/peer TLS

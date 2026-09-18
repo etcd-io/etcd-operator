@@ -767,3 +767,72 @@ func TestPickMemberToUpdate(t *testing.T) {
 		})
 	}
 }
+
+func TestMarkMemberReady(t *testing.T) {
+	scheme := leaveTestScheme(t)
+
+	makeMember := func(phase ecv1alpha1.EtcdMemberPhase, recreateCount int32) *ecv1alpha1.EtcdMember {
+		m := leaveTestMember(0)
+		m.Status.Phase = phase
+		m.Status.RecreateCount = recreateCount
+		return m
+	}
+
+	t.Run("sets Phase=Ready and resets RecreateCount to zero", func(t *testing.T) {
+		ctx := t.Context()
+		member := makeMember(ecv1alpha1.EtcdMemberRecreating, 2)
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithStatusSubresource(&ecv1alpha1.EtcdMember{}).
+			WithObjects(member).
+			Build()
+		r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
+
+		require.NoError(t, r.markMemberReady(ctx, member))
+
+		got := &ecv1alpha1.EtcdMember{}
+		require.NoError(t, fakeClient.Get(ctx, client.ObjectKeyFromObject(member), got))
+		assert.Equal(t, ecv1alpha1.EtcdMemberReady, got.Status.Phase)
+		assert.Equal(t, int32(0), got.Status.RecreateCount)
+	})
+
+	t.Run("Already Ready member stays Ready with zero RecreateCount", func(t *testing.T) {
+		ctx := t.Context()
+		member := makeMember(ecv1alpha1.EtcdMemberReady, 0)
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithStatusSubresource(&ecv1alpha1.EtcdMember{}).
+			WithObjects(member).
+			Build()
+		r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
+
+		require.NoError(t, r.markMemberReady(ctx, member))
+
+		got := &ecv1alpha1.EtcdMember{}
+		require.NoError(t, fakeClient.Get(ctx, client.ObjectKeyFromObject(member), got))
+		assert.Equal(t, ecv1alpha1.EtcdMemberReady, got.Status.Phase)
+		assert.Equal(t, int32(0), got.Status.RecreateCount)
+	})
+
+	t.Run("propagates client errors", func(t *testing.T) {
+		ctx := t.Context()
+		member := makeMember(ecv1alpha1.EtcdMemberRecreating, 1)
+		updateErr := errors.New("status update failed")
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(member).
+			WithInterceptorFuncs(interceptor.Funcs{
+				SubResourceUpdate: func(_ context.Context, _ client.Client, _ string, _ client.Object, _ ...client.SubResourceUpdateOption) error {
+					return updateErr
+				},
+			}).
+			Build()
+		r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
+
+		err := r.markMemberReady(ctx, member)
+		assert.ErrorIs(t, err, updateErr)
+	})
+}
