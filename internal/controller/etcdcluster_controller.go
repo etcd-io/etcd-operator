@@ -475,12 +475,9 @@ func (r *EtcdClusterReconciler) dispatch(ctx context.Context, s *reconcileState)
 
 	// 6. Per-member repair: continue a member already Recreating, or start
 	// fixing exactly one newly-unhealthy Ready member (requirement 6).
-	for _, m := range s.members {
-		if m.Status.Phase == ecv1alpha1.EtcdMemberRecreating {
-			// TODO: §4.9 item 6 — continue the shared Pod-recovery
-			// ladder (§4.6, M3).
-			logger.Info("Member is Recreating; per-member repair not implemented yet", "member", m.Name)
-			return ctrl.Result{RequeueAfter: requeueDuration}, nil
+	for i := range s.members {
+		if s.members[i].Status.Phase == ecv1alpha1.EtcdMemberRecreating {
+			return r.reconcileEtcdMember(ctx, s, &s.members[i])
 		}
 	}
 	// TODO: §4.9 item 6 — picking a newly-unhealthy Ready member to
