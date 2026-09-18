@@ -523,11 +523,11 @@ not including itself. This is a best-effort opeartion. </panel_attributes>
       <x>950</x>
       <y>360</y>
       <w>50</w>
-      <h>80</h>
+      <h>90</h>
     </coordinates>
     <panel_attributes>lt=&lt;-
 No</panel_attributes>
-    <additional_attributes>10.0;60.0;10.0;10.0</additional_attributes>
+    <additional_attributes>10.0;70.0;10.0;10.0</additional_attributes>
   </element>
   <element>
     <id>Relation</id>
@@ -643,7 +643,7 @@ learner if needed.</panel_attributes>
     <id>UMLSpecialState</id>
     <coordinates>
       <x>900</x>
-      <y>560</y>
+      <y>690</y>
       <w>120</w>
       <h>60</h>
     </coordinates>
@@ -668,32 +668,32 @@ updte RecreateCount</panel_attributes>
     <id>Relation</id>
     <coordinates>
       <x>1010</x>
-      <y>580</y>
+      <y>710</y>
       <w>100</w>
-      <h>410</h>
+      <h>280</h>
     </coordinates>
     <panel_attributes>lt=&lt;-
 No</panel_attributes>
-    <additional_attributes>60.0;390.0;60.0;10.0;10.0;10.0</additional_attributes>
+    <additional_attributes>60.0;260.0;60.0;10.0;10.0;10.0</additional_attributes>
   </element>
   <element>
     <id>UMLSpecialState</id>
     <coordinates>
-      <x>900</x>
-      <y>670</y>
-      <w>120</w>
-      <h>60</h>
+      <x>880</x>
+      <y>430</y>
+      <w>160</w>
+      <h>70</h>
     </coordinates>
     <panel_attributes>type=decision
-Is the
-POD timedout?</panel_attributes>
+Is the POD Readiness
+Wait timedout?</panel_attributes>
     <additional_attributes/>
   </element>
   <element>
     <id>Relation</id>
     <coordinates>
       <x>950</x>
-      <y>610</y>
+      <y>740</y>
       <w>50</w>
       <h>80</h>
     </coordinates>
@@ -702,22 +702,10 @@ Yes</panel_attributes>
     <additional_attributes>10.0;60.0;10.0;10.0</additional_attributes>
   </element>
   <element>
-    <id>Relation</id>
-    <coordinates>
-      <x>850</x>
-      <y>690</y>
-      <w>70</w>
-      <h>70</h>
-    </coordinates>
-    <panel_attributes>lt=&lt;-
-No</panel_attributes>
-    <additional_attributes>10.0;50.0;10.0;10.0;50.0;10.0</additional_attributes>
-  </element>
-  <element>
     <id>UMLState</id>
     <coordinates>
-      <x>810</x>
-      <y>740</y>
+      <x>1080</x>
+      <y>440</y>
       <w>100</w>
       <h>40</h>
     </coordinates>
@@ -728,19 +716,19 @@ No</panel_attributes>
     <id>Relation</id>
     <coordinates>
       <x>950</x>
-      <y>720</y>
+      <y>490</y>
       <w>50</w>
-      <h>100</h>
+      <h>90</h>
     </coordinates>
     <panel_attributes>lt=&lt;-
 Yes</panel_attributes>
-    <additional_attributes>10.0;80.0;10.0;10.0</additional_attributes>
+    <additional_attributes>10.0;70.0;10.0;10.0</additional_attributes>
   </element>
   <element>
     <id>UMLSpecialState</id>
     <coordinates>
       <x>890</x>
-      <y>420</y>
+      <y>560</y>
       <w>140</w>
       <h>60</h>
     </coordinates>
@@ -753,19 +741,19 @@ RecreateCount
     <id>Relation</id>
     <coordinates>
       <x>950</x>
-      <y>470</y>
+      <y>610</y>
       <w>50</w>
-      <h>110</h>
+      <h>100</h>
     </coordinates>
     <panel_attributes>lt=&lt;-
 No</panel_attributes>
-    <additional_attributes>10.0;90.0;10.0;10.0</additional_attributes>
+    <additional_attributes>10.0;80.0;10.0;10.0</additional_attributes>
   </element>
   <element>
     <id>UMLState</id>
     <coordinates>
-      <x>1070</x>
-      <y>420</y>
+      <x>1080</x>
+      <y>560</y>
       <w>150</w>
       <h>60</h>
     </coordinates>
@@ -778,19 +766,19 @@ RecreateCount</panel_attributes>
     <id>Relation</id>
     <coordinates>
       <x>1020</x>
-      <y>430</y>
-      <w>70</w>
+      <y>570</y>
+      <w>80</w>
       <h>40</h>
     </coordinates>
     <panel_attributes>lt=&lt;-
 Yes</panel_attributes>
-    <additional_attributes>50.0;20.0;10.0;20.0</additional_attributes>
+    <additional_attributes>60.0;20.0;10.0;20.0</additional_attributes>
   </element>
   <element>
     <id>UMLNote</id>
     <coordinates>
-      <x>1060</x>
-      <y>510</y>
+      <x>1070</x>
+      <y>650</y>
       <w>180</w>
       <h>50</h>
     </coordinates>
@@ -802,8 +790,8 @@ bg=blue</panel_attributes>
   <element>
     <id>Relation</id>
     <coordinates>
-      <x>1130</x>
-      <y>470</y>
+      <x>1140</x>
+      <y>610</y>
       <w>30</w>
       <h>60</h>
     </coordinates>
@@ -927,10 +915,13 @@ No</panel_attributes>
       <x>740</x>
       <y>360</y>
       <w>150</w>
-      <h>550</h>
+      <h>580</h>
     </coordinates>
     <panel_attributes>lt=&lt;-
 Yes
+
+
+
 
 
 
@@ -1048,5 +1039,17 @@ bg=blue</panel_attributes>
     </coordinates>
     <panel_attributes>lt=&lt;.</panel_attributes>
     <additional_attributes>90.0;10.0;10.0;40.0</additional_attributes>
+  </element>
+  <element>
+    <id>Relation</id>
+    <coordinates>
+      <x>1030</x>
+      <y>440</y>
+      <w>70</w>
+      <h>40</h>
+    </coordinates>
+    <panel_attributes>lt=&lt;-
+No</panel_attributes>
+    <additional_attributes>50.0;20.0;10.0;20.0</additional_attributes>
   </element>
 </diagram>
