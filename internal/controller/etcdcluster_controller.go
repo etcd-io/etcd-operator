@@ -658,6 +658,9 @@ func (r *EtcdClusterReconciler) scaleCluster(ctx context.Context, s *reconcileSt
 		if _, err := createEtcdMember(ctx, r.Client, s.cluster, ordinal, r.Scheme); err != nil {
 			return ctrl.Result{}, err
 		}
+
+		// gofail: var scaleOutAfterMemberAdd struct{}
+
 		return ctrl.Result{RequeueAfter: requeueDuration}, nil
 	}
 
@@ -667,6 +670,9 @@ func (r *EtcdClusterReconciler) scaleCluster(ctx context.Context, s *reconcileSt
 	if err := r.Delete(ctx, &highest); err != nil {
 		return ctrl.Result{}, err
 	}
+
+	// gofail: var scaleInAfterMemberDelete struct{}
+
 	return ctrl.Result{RequeueAfter: requeueDuration}, nil
 }
 

@@ -141,13 +141,13 @@ func TestScaling(t *testing.T) {
 		{
 			name:        "ScaleInFrom3To1WithPanicFailpoint",
 			initialSize: 3, scaleTo: 1, expectedMembers: 1,
-			failpoint: "exceptionAfterMemberDelete", term: "panic",
+			failpoint: "scaleInAfterMemberDelete", term: "panic",
 		},
 		{name: "ScaleOutFrom1To3", initialSize: 1, scaleTo: 3, expectedMembers: 3},
 		{
 			name:        "ScaleOutFrom1To3WithPanicFailpoint",
 			initialSize: 1, scaleTo: 3, expectedMembers: 3,
-			failpoint: "exceptionAfterMemberAdd", term: "panic",
+			failpoint: "scaleOutAfterMemberAdd", term: "panic",
 		},
 		{name: "ScaleOutFrom3To5", initialSize: 3, scaleTo: 5, expectedMembers: 5},
 		{name: "ScaleInFrom5To3", initialSize: 5, scaleTo: 3, expectedMembers: 3},
@@ -159,9 +159,6 @@ func TestScaling(t *testing.T) {
 			// wired into the rewritten controller yet (issue #471 follow-up:
 			// member leave sequence landed without its crash-injection points).
 			// Re-enable these cases once the failpoints are restored.
-			if tc.failpoint != "" {
-				t.Skip("blocked on gofail points not yet present in the rewritten controller")
-			}
 			feature := features.New(tc.name)
 			etcdClusterName := fmt.Sprintf("etcd-%s", strings.ToLower(tc.name))
 
@@ -306,7 +303,8 @@ func TestClusterDeletionCleansUpResources(t *testing.T) {
 				t.Fatalf("EtcdCluster deletion left owned resources behind: %v", err)
 			}
 			return ctx
-		})
+		},
+	)
 
 	feature.Teardown(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
 		cleanupEtcdCluster(ctx, t, c, clusterName)
@@ -382,7 +380,8 @@ func TestEtcdMemberDeletionRecreatesResources(t *testing.T) {
 					memberName, after.memberID)
 			}
 			return ctx
-		})
+		},
+	)
 
 	feature.Teardown(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
 		cleanupEtcdCluster(ctx, t, c, clusterName)
@@ -567,7 +566,8 @@ func TestManualScaleInWithoutEndpoints(t *testing.T) {
 				t.Fatalf("Manual scale-in did not finish member cleanup without endpoints: %v", err)
 			}
 			return ctx
-		})
+		},
+	)
 
 	feature.Teardown(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
 		cleanupEtcdCluster(ctx, t, c, clusterName)
