@@ -479,17 +479,10 @@ func (r *EtcdClusterReconciler) reconcileRecreating(
 		}
 	}
 
-	// 5. Transfer leadership away before taking this member offline, so the
-	// cluster doesn't lose its leader unnecessarily. This is a best-effort
-	// operation — if it fails, requeue
-	// TODO: The target member should be healthy before making it the leader
-	if member.Status.IsLeader {
-		endpoints := clientEndpointsFromPods(state.cluster.Name, state.cluster.Namespace, state.pods, clusterTLSEnabled(state.cluster))
-		if len(endpoints) > 0 {
-			tgt := selectTransferTarget(state, member)
-			if err := r.transferLeader(ctx, state, member, endpoints, tgt); err != nil {
-				return ctrl.Result{RequeueAfter: requeueDuration}, err
-			}
+	// 5. Best-effort: transfer leadership away to avoid an unnecessary election.
+	if health.Status != nil && health.Status.Leader == health.Status.Header.MemberId {
+		if err := r.transferLeader(ctx, state, member); err != nil {
+			logger.Error(err, "[Recreating] leader transfer failed", "member", member.Name)
 		}
 	}
 
@@ -517,47 +510,43 @@ func (r *EtcdClusterReconciler) reconcileRecreating(
 	return ctrl.Result{RequeueAfter: requeueDuration}, nil
 }
 
-// selectTransferTarget picks the lowest-ordinal etcd member (other than the
-// given member) that has a known node ID. Returns 0 if none is found.
-func selectTransferTarget(state *reconcileState, member *ecv1alpha1.EtcdMember) uint64 {
+// transferLeader picks the lowest-ordinal healthy etcd member (other than
+// the given member) and moves leadership to it. It is a best-effort
+// operation: if no healthy target is found, or there are no live client
+// endpoints, it is a no-op.
+func (r *EtcdClusterReconciler) transferLeader(ctx context.Context, state *reconcileState, member *ecv1alpha1.EtcdMember) error {
+	endpoints := clientEndpointsFromPods(state.cluster.Name, state.cluster.Namespace, state.pods, clusterTLSEnabled(state.cluster))
+	if len(endpoints) == 0 {
+		return nil
+	}
+
+	var targetID uint64
+	var targetName string
 	for i := range state.members {
 		other := &state.members[i]
 		if other.Name == member.Name {
 			continue
 		}
+		health, err := findHealthStatusForEtcdMember(state, other)
+		if err != nil || !health.Health {
+			continue
+		}
 		if node := findEtcdNodeForEtcdMember(state, other); node != nil {
-			return node.ID
+			targetID = node.ID
+			targetName = other.Name
+			break
 		}
 	}
-	return 0
-}
-
-// transferLeader moves etcd leadership to targetID. It is a best-effort
-// operation: if targetID is 0 it is a no-op. On failure it returns a requeue
-func (r *EtcdClusterReconciler) transferLeader(
-	ctx context.Context,
-	state *reconcileState,
-	member *ecv1alpha1.EtcdMember,
-	endpoints []string,
-	targetID uint64,
-) error {
 	if targetID == 0 {
 		return nil
 	}
 
-	logger := log.FromContext(ctx)
-	logger.Info("[Recreating] transferring leadership before pod deletion",
+	log.FromContext(ctx).Info("transferring leadership",
 		"member", member.Name,
 		"transferTargetID", fmt.Sprintf("%x", targetID),
+		"transferTargetName", targetName,
 	)
-	if err := etcdutils.MoveLeader(etcdutils.ClientConfig{Endpoints: endpoints, TLS: state.tlsConfig}, targetID); err != nil {
-		logger.Info("[Recreating] leader transfer failed, requeueing",
-			"member", member.Name,
-			"error", err,
-		)
-		return err
-	}
-	return nil
+	return etcdutils.MoveLeader(etcdutils.ClientConfig{Endpoints: endpoints, TLS: state.tlsConfig}, targetID)
 }
 
 // provisionCertificates ensures the cluster's shared server/peer TLS
