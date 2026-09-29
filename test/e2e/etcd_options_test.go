@@ -49,7 +49,7 @@ func TestEtcdOptions(t *testing.T) {
 		"--listen-client-urls=http://0.0.0.0:2379",
 		"--initial-advertise-peer-urls=http://$(POD_NAME).example.$(POD_NAMESPACE).svc.cluster.local:2380",
 		"--advertise-client-urls=http://$(POD_NAME).example.$(POD_NAMESPACE).svc.cluster.local:2379",
-		"--experimental-peer-skip-client-san-verification",
+		"--peer-skip-client-san-verification",
 	}
 
 	etcdCluster := &ecv1alpha1.EtcdCluster{
@@ -65,7 +65,7 @@ func TestEtcdOptions(t *testing.T) {
 			Size:    1,
 			Version: os.Getenv("ETCD_VERSION"),
 			EtcdOptions: []string{
-				"--experimental-peer-skip-client-san-verification",
+				"--peer-skip-client-san-verification",
 			},
 		},
 	}
