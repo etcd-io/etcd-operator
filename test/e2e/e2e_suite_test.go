@@ -176,72 +176,33 @@ func TestMain(m *testing.M) {
 
 	// Use the Environment.Finish method to define clean up steps
 	testEnv.Finish(
-		// cleanup environment
+		// Force-drain EtcdCluster/EtcdMember finalizers while the operator is
+		// still running.  This MUST happen before the cluster is destroyed;
+		// the operator needs to be alive to process the finalizers.
 		func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
 			if skipTeardown {
-				log.Println("ETCD_E2E_SKIP_TEARDOWN=true, skipping environment cleanup")
+				log.Println("ETCD_E2E_SKIP_TEARDOWN=true, skipping etcd resource cleanup")
 				return ctx, nil
 			}
-			log.Println("Finishing tests, cleaning cluster ...")
-
 			log.Println("Force-cleaning leftover EtcdCluster/EtcdMember resources...")
 			forceCleanupEtcdResources(ctx, cfg.Client().Resources())
-
-			log.Println("Undeploy etcd controller...")
-			cmd := exec.Command("make", "undeploy", "DEPLOY_MODE=e2e", "ignore-not-found=true")
-			if _, err := test_utils.Run(cmd); err != nil {
-				log.Printf("Warning: Failed to undeploy controller: %s", err)
-			}
-
-			// uninstall crd
-			log.Println("Uninstalling crd...")
-			cmd = exec.Command("make", "uninstall", "ignore-not-found=true")
-			if _, err := test_utils.Run(cmd); err != nil {
-				log.Printf("Warning: Failed to install crd: %s", err)
-			}
-
-			// remove namespace
-			var err error
-			log.Println("Destroying namespace...")
-			ctx, err = envfuncs.DeleteNamespace(namespace)(ctx, cfg)
-			if err != nil {
-				log.Printf("failed to delete namespace: %s", err)
-			}
-
 			return ctx, nil
 		},
 
-		// remove the installed dependencies
+		// Destroy the KinD cluster.  Everything inside it (operator, CRDs,
+		// namespace, Prometheus, cert-manager) is deleted automatically when
+		// the cluster is gone, so no explicit teardown steps are needed.
 		func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
 			if skipTeardown {
-				log.Println("Skipping dependency cleanup")
+				log.Println("ETCD_E2E_SKIP_TEARDOWN=true, skipping KinD cluster destruction")
 				return ctx, nil
 			}
-			log.Println("Removing dependencies...")
-
-			// remove prometheus
-			test_utils.UninstallPrometheusOperator()
-
-			// remove cert-manager
-			test_utils.UninstallCertManager()
-
-			return ctx, nil
-		},
-
-		// Destroy environment
-		func(ctx context.Context, cfg *envconf.Config) (context.Context, error) {
-			if skipTeardown {
-				log.Println("Skipping KinD cluster destruction")
-				return ctx, nil
-			}
+			log.Println("Destroying KinD cluster...")
 			var err error
-
-			log.Println("Destroying cluster...")
 			ctx, err = envfuncs.DestroyCluster(kindClusterName)(ctx, cfg)
 			if err != nil {
 				log.Printf("failed to delete cluster: %s", err)
 			}
-
 			return ctx, nil
 		},
 	)
