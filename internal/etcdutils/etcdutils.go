@@ -348,3 +348,29 @@ func MoveLeader(cfg ClientConfig, memberId uint64) error {
 	_, err = c.MoveLeader(ctx, memberId)
 	return err
 }
+
+func Compact(cfg ClientConfig, targetRev int64) error {
+	c, err := clientv3.New(cfg.buildConfig())
+	if err != nil {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+	defer func() { closeAndCancel(c, cancel) }()
+	_, err = c.Compact(ctx, targetRev, clientv3.WithCompactPhysical())
+
+	return err
+}
+
+func Defrag(cfg ClientConfig, endpoint string) error {
+	c, err := clientv3.New(cfg.buildConfig())
+	if err != nil {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+	defer func() { closeAndCancel(c, cancel) }()
+
+	_, err = c.Defragment(ctx, endpoint)
+	return err
+}
