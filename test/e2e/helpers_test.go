@@ -35,6 +35,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/e2e-framework/klient"
 	"sigs.k8s.io/e2e-framework/klient/k8s/resources"
 	"sigs.k8s.io/e2e-framework/klient/wait"
@@ -288,6 +289,28 @@ func execInPod(
 	// Exec command
 	err := client.Resources().ExecInPod(t.Context(), namespace, podName, containerName, command, &stdout, &stderr)
 	return stdout.String(), stderr.String(), err
+}
+
+func updateEtcdCluster(
+	ctx context.Context,
+	t *testing.T,
+	c *envconf.Config,
+	name string,
+	mutate func(*ecv1alpha1.EtcdCluster),
+) {
+	t.Helper()
+
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var etcdCluster ecv1alpha1.EtcdCluster
+		if err := c.Client().Resources().Get(ctx, name, namespace, &etcdCluster); err != nil {
+			return err
+		}
+		mutate(&etcdCluster)
+		return c.Client().Resources().Update(ctx, &etcdCluster)
+	})
+	if err != nil {
+		t.Fatalf("Failed to update EtcdCluster %s: %v", name, err)
+	}
 }
 
 func scaleEtcdCluster(ctx context.Context, t *testing.T, c *envconf.Config, name string, size int) {
@@ -544,7 +567,8 @@ func etcdctlCmd(podName, etcdClusterName, namespace string, tlsEnabled bool) []s
 	if tlsEnabled {
 		endpoint := fmt.Sprintf("https://%s.%s.%s.svc.cluster.local:2379",
 			podName, etcdClusterName, namespace)
-		args = append(args,
+		args = append(
+			args,
 			"--cacert="+etcdServerCAFile,
 			"--cert="+etcdServerCertFile,
 			"--key="+etcdServerKeyFile,
