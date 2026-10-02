@@ -280,3 +280,26 @@ mv $(1) $(1)-$(3) ;\
 } ;\
 ln -sf $(1)-$(3) $(1)
 endef
+
+##@ Helm Chart
+
+HELM ?= helm
+HELM_CHART = charts/etcd-operator
+
+.PHONY: helm-crds
+helm-crds: ## Copy config/crd/bases into the chart's templates/crds, wrapped in a crds.enabled guard. Run after `make manifests`.
+	@mkdir -p $(HELM_CHART)/templates/crds
+	@rm -f $(HELM_CHART)/templates/crds/*.yaml
+	@for f in config/crd/bases/*.yaml; do \
+		out=$(HELM_CHART)/templates/crds/$$(basename $$f); \
+		echo "syncing $$f -> $$out"; \
+		{ \
+			echo '{{- if .Values.crds.enabled }}'; \
+			sed -e 's/{{/{{ "{{" }}/g' $$f; \
+			echo '{{- end }}'; \
+		} > $$out; \
+	done
+
+.PHONY: helm-lint
+helm-lint: ## Lint the Helm chart.
+	$(HELM) lint $(HELM_CHART)

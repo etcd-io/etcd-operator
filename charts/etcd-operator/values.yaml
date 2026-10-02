@@ -1,0 +1,70 @@
+nameOverride: ""
+fullnameOverride: ""
+
+crds:
+  # Disable when CRDs are installed by a separate release (see README: split install).
+  enabled: true
+
+controller:
+  enabled: true
+  replicas: 1
+  image:
+    repository: gcr.io/etcd-development/etcd-operator
+    # Defaults to the chart appVersion.
+    tag: ""
+    # When set, the image is pinned by digest (repository@digest) and tag is ignored.
+    digest: ""
+    pullPolicy: IfNotPresent
+  imagePullSecrets: []
+  # OPERATOR_IMAGE env: image for operator-run utility containers (e.g. restore).
+  # Defaults to the manager image ref. kustomize `images:` cannot rewrite env
+  # values; here it follows the image automatically.
+  operatorImage: ""
+  leaderElection: true
+  # Scope the operator to one namespace: renders a namespaced Role/RoleBinding in
+  # that namespace instead of ClusterRole/ClusterRoleBinding and passes
+  # --watch-namespace / WATCH_NAMESPACE.
+  watchNamespace: ""
+  # RESTRICT_CLUSTER_ISSUER=true: the admission webhook rejects
+  # spec.tls.certManager.issuerKind: ClusterIssuer.
+  restrictClusterIssuer: false
+  resources:
+    limits:
+      cpu: 500m
+      memory: 128Mi
+    requests:
+      cpu: 10m
+      memory: 64Mi
+  serviceAccount:
+    annotations: {}
+
+metrics:
+  # true: HTTPS with authn/authz (needs the cluster-scoped metrics-auth RBAC this
+  # chart then installs). false: plain HTTP, no cluster-scoped metrics RBAC.
+  secure: true
+  port: 8443
+  serviceMonitor:
+    enabled: false
+    additionalLabels: {}
+  networkPolicy:
+    # Restrict metrics ingress to namespaces labeled metrics=enabled.
+    enabled: false
+
+webhook:
+  # Admission webhook server: webhook Service plus serving-cert mount and port on
+  # the Deployment. Requires an operator build with the EtcdCluster webhooks.
+  enabled: false
+  certManager:
+    # SelfSigned Issuer + serving Certificate, and the CA-injection annotation on
+    # the WebhookConfigurations. Disable to manage the
+    # <fullname>-webhook-server-cert Secret yourself.
+    enabled: true
+
+admissionWebhooks:
+  # The cluster-scoped Validating/Mutating WebhookConfigurations. Separate from
+  # webhook.enabled so the split install can render them without the runtime
+  # (see README).
+  enabled: false
+  # Constrain the fail-closed webhooks to matching namespaces; empty selects all
+  # namespaces.
+  namespaceSelector: {}

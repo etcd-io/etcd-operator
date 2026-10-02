@@ -1,0 +1,9 @@
+apiVersion: v2
+name: etcd-operator
+description: Operator managing etcd clusters on Kubernetes
+type: application
+version: 0.1.0
+appVersion: "v0.2.0"
+kubeVersion: ">=1.30.0-0"
+sources:
+  - https://github.com/etcd-io/etcd-operator
