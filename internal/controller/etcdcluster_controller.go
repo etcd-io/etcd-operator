@@ -470,8 +470,37 @@ func (r *EtcdClusterReconciler) dispatch(ctx context.Context, s *reconcileState)
 	// this step just doesn't act on them yet.
 
 	// 5. NOSPACE alarm remediation (§4.7).
-	// TODO: §4.9 item 5 — compact/defragment/disarm cycle (M4). Same
-	// as above, s.health.Alarms already has the data.
+	if len(s.health.Alarms) > 0 {
+		currentRev := s.memberListResp.Header.Revision
+		cfg := etcdutils.ClientConfig{
+			Endpoints: clientEndpointsFromPods(s.cluster.Name, s.cluster.Namespace, s.pods, clusterTLSEnabled(s.cluster)),
+			TLS:       s.tlsConfig,
+		}
+		if err := etcdutils.Compact(cfg, currentRev); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		endpoints := make([]string, 0, len(s.pods))
+		var leaderEp string
+		for _, m := range s.health.Members {
+			if m.Status.Leader == m.Status.Header.MemberId {
+				leaderEp = m.Ep
+				continue
+			}
+			endpoints = append(endpoints, m.Ep)
+		}
+		endpoints = append(endpoints, leaderEp)
+
+		for _, ep := range endpoints {
+			if err := etcdutils.Defrag(cfg, ep); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+
+		if err := etcdutils.AlarmDisarm(cfg, s.health.Alarms); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
 
 	// 6. Per-member repair: continue a member already Recreating, or start
 	// fixing exactly one newly-unhealthy Ready member (requirement 6).
