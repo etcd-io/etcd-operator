@@ -22,6 +22,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -834,5 +835,93 @@ func TestMarkMemberReady(t *testing.T) {
 
 		err := r.markMemberReady(ctx, member)
 		assert.ErrorIs(t, err, updateErr)
+	})
+}
+
+// TestReconcileProvisioning covers how a Provisioning member is registered
+// against the live membership. refreshClusterState leaves memberListResp nil
+// both when there are no Pods to ask yet and when MemberList fails; only the
+// first one is a bootstrap.
+func TestReconcileProvisioning(t *testing.T) {
+	scheme := leaveTestScheme(t)
+
+	provisioningMember := func(ordinal int) *ecv1alpha1.EtcdMember {
+		m := leaveTestMember(ordinal)
+		m.Status.Phase = ecv1alpha1.EtcdMemberProvisioning
+		return m
+	}
+	readyMember := func(ordinal int) ecv1alpha1.EtcdMember {
+		m := leaveTestMember(ordinal)
+		m.Status.Phase = ecv1alpha1.EtcdMemberReady
+		return *m
+	}
+
+	// Ordinal 0 is provisioned again after its EtcdMember was deleted (the
+	// scale-out reuses the gap) or replaced. Starting it with
+	// --initial-cluster-state=new here would split it off into a second
+	// cluster next to etcd-1 and etcd-2.
+	t.Run("Ordinal 0 waits instead of bootstrapping while MemberList fails", func(t *testing.T) {
+		ctx := t.Context()
+		ec := leaveTestCluster()
+		member := provisioningMember(0)
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).
+			WithStatusSubresource(&ecv1alpha1.EtcdMember{}).
+			WithObjects(ec, member).Build()
+		r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
+		state := &reconcileState{
+			cluster: ec,
+			members: []ecv1alpha1.EtcdMember{*member, readyMember(1), readyMember(2)},
+			pods:    []*corev1.Pod{leaveTestPod(1), leaveTestPod(2)},
+			health:  &etcdutils.ClusterHealth{Healthy: false},
+		}
+
+		res, err := r.reconcileProvisioning(ctx, state, member)
+		require.NoError(t, err)
+		assert.Equal(t, ctrl.Result{RequeueAfter: requeueDuration}, res)
+		err = fakeClient.Get(ctx, client.ObjectKeyFromObject(leaveTestPod(0)), &corev1.Pod{})
+		assert.True(t, apierrors.IsNotFound(err), "etcd-0 must not be started while the live membership is unknown")
+	})
+
+	t.Run("Other ordinals wait instead of adding a learner while MemberList fails", func(t *testing.T) {
+		ctx := t.Context()
+		ec := leaveTestCluster()
+		member := provisioningMember(2)
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).
+			WithStatusSubresource(&ecv1alpha1.EtcdMember{}).
+			WithObjects(ec, member).Build()
+		r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
+		state := &reconcileState{
+			cluster: ec,
+			members: []ecv1alpha1.EtcdMember{readyMember(0), readyMember(1), *member},
+			pods:    []*corev1.Pod{leaveTestPod(0), leaveTestPod(1)},
+			health:  &etcdutils.ClusterHealth{Healthy: false},
+		}
+
+		res, err := r.reconcileProvisioning(ctx, state, member)
+		require.NoError(t, err)
+		assert.Equal(t, ctrl.Result{RequeueAfter: requeueDuration}, res)
+		err = fakeClient.Get(ctx, client.ObjectKeyFromObject(leaveTestPod(2)), &corev1.Pod{})
+		assert.True(t, apierrors.IsNotFound(err))
+	})
+
+	t.Run("Ordinal 0 bootstraps a new cluster when there are no Pods yet", func(t *testing.T) {
+		ctx := t.Context()
+		ec := leaveTestCluster()
+		member := provisioningMember(0)
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).
+			WithStatusSubresource(&ecv1alpha1.EtcdMember{}).
+			WithObjects(ec, member).Build()
+		r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
+		state := &reconcileState{cluster: ec, members: []ecv1alpha1.EtcdMember{*member}}
+
+		res, err := r.reconcileProvisioning(ctx, state, member)
+		require.NoError(t, err)
+		assert.Equal(t, ctrl.Result{RequeueAfter: requeueDuration}, res)
+		pod := &corev1.Pod{}
+		require.NoError(t, fakeClient.Get(ctx, client.ObjectKeyFromObject(leaveTestPod(0)), pod))
+		env := envVarsToMap(pod)
+		_, peerURL := peerEndpointForOrdinalIndex(ec, 0)
+		assert.Equal(t, string(etcdClusterStateNew), env["ETCD_INITIAL_CLUSTER_STATE"])
+		assert.Equal(t, "etcd-0="+peerURL, env["ETCD_INITIAL_CLUSTER"])
 	})
 }

@@ -328,6 +328,14 @@ func (r *EtcdClusterReconciler) reconcileProvisioning(
 	// wait while another learner is still joining). Reaching this again after
 	// a crash between MemberAdd and Pod creation is expected — the add is
 	// idempotent here because registration is checked against live state.
+	//
+	// A nil member list while Pods exist means MemberList failed. The live
+	// membership is unknown then, not empty, so wait for a fresh snapshot
+	// instead of bootstrapping a second cluster or adding a learner blind.
+	if state.memberListResp == nil && len(state.pods) > 0 {
+		log.FromContext(ctx).Info("Live etcd membership is unknown; requeueing", "EtcdMember", member.Name)
+		return ctrl.Result{RequeueAfter: requeueDuration}, nil
+	}
 	bootstrap := member.Spec.Ordinal == 0 &&
 		(state.memberListResp == nil || len(state.memberListResp.Members) == 0)
 
