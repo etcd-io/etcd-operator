@@ -924,4 +924,36 @@ func TestReconcileProvisioning(t *testing.T) {
 		assert.Equal(t, string(etcdClusterStateNew), env["ETCD_INITIAL_CLUSTER_STATE"])
 		assert.Equal(t, "etcd-0="+peerURL, env["ETCD_INITIAL_CLUSTER"])
 	})
+
+	// Once its own Pod is serving, the cluster counts as bootstrapped:
+	// ordinal 0 is found in the live membership and marked Ready, without a
+	// second bootstrap or a learner add.
+	t.Run("Ordinal 0 becomes Ready once its own Pod is serving", func(t *testing.T) {
+		ctx := t.Context()
+		ec := leaveTestCluster()
+		member := provisioningMember(0)
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).
+			WithStatusSubresource(&ecv1alpha1.EtcdMember{}).
+			WithObjects(ec, member).Build()
+		r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
+		_, peerURL := peerEndpointForOrdinalIndex(ec, 0)
+		state := &reconcileState{
+			cluster: ec,
+			members: []ecv1alpha1.EtcdMember{*member},
+			pods:    []*corev1.Pod{leaveTestPod(0)},
+			memberListResp: &clientv3.MemberListResponse{Members: []*etcdserverpb.Member{
+				{ID: 1, Name: "etcd-0", PeerURLs: []string{peerURL}},
+			}},
+			health: &etcdutils.ClusterHealth{Healthy: true, Members: map[string]etcdutils.EpHealth{
+				"etcd-0": {Name: "etcd-0", Health: true},
+			}},
+		}
+
+		res, err := r.reconcileProvisioning(ctx, state, member)
+		require.NoError(t, err)
+		assert.Equal(t, ctrl.Result{RequeueAfter: requeueDuration}, res)
+		got := &ecv1alpha1.EtcdMember{}
+		require.NoError(t, fakeClient.Get(ctx, client.ObjectKeyFromObject(member), got))
+		assert.Equal(t, ecv1alpha1.EtcdMemberReady, got.Status.Phase)
+	})
 }

@@ -322,22 +322,22 @@ func (r *EtcdClusterReconciler) reconcileProvisioning(
 	}
 
 	// 4. Initial state and membership registration. Bootstrap — ordinal 0
-	// with no live membership — starts the very first voter for the brand-new cluster; this is the only
+	// before any member Pod exists — starts the very first voter for the brand-new cluster; this is the only
 	// path that starts etcd with cluster-state=new. Every other unregistered
 	// peer is added as a learner (etcd admits only one learner at a time, so
 	// wait while another learner is still joining). Reaching this again after
 	// a crash between MemberAdd and Pod creation is expected — the add is
 	// idempotent here because registration is checked against live state.
 	//
-	// A nil member list while Pods exist means MemberList failed. The live
-	// membership is unknown then, not empty, so wait for a fresh snapshot
-	// instead of bootstrapping a second cluster or adding a learner blind.
-	if state.memberListResp == nil && len(state.pods) > 0 {
+	// A nil member list once the cluster is bootstrapped means MemberList
+	// failed. The live membership is unknown then, not empty, so wait for a
+	// fresh snapshot instead of bootstrapping a second cluster or adding a
+	// learner blind.
+	if state.memberListResp == nil && state.clusterBootstrapped() {
 		log.FromContext(ctx).Info("Live etcd membership is unknown; requeueing", "EtcdMember", member.Name)
 		return ctrl.Result{RequeueAfter: requeueDuration}, nil
 	}
-	bootstrap := member.Spec.Ordinal == 0 &&
-		(state.memberListResp == nil || len(state.memberListResp.Members) == 0)
+	bootstrap := member.Spec.Ordinal == 0 && !state.clusterBootstrapped()
 
 	if !bootstrap {
 		if etcdNode := findEtcdNodeForEtcdMember(state, member); etcdNode == nil {
