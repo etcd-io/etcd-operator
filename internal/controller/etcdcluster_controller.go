@@ -493,6 +493,18 @@ func (r *EtcdClusterReconciler) dispatch(ctx context.Context, s *reconcileState)
 	// require the cluster to stay unhealthy for some minimum duration or
 	// number of consecutive reconciles) before declaring quorum lost,
 	// rather than triggering recovery off the first unhealthy reading.
+	//
+	// Automatic recovery is disabled in v0.3.0, so an unhealthy cluster waits
+	// here for a human operator: steps 8 and 9 assume a healthy cluster. The
+	// operator can't tell a lost quorum from etcd being unreachable, so it
+	// treats both as unhealthy. With no Pods there is no health to read: a
+	// cluster that is still bootstrapping has a single EtcdMember, since
+	// scale-out waits for it to be Ready, so more EtcdMembers mean every Pod
+	// is gone. See etcd-io/etcd-operator#476.
+	if (len(s.pods) > 0 || len(s.members) > 1) && (s.health == nil || !s.health.Healthy) {
+		logger.Info("EtcdCluster is not healthy; waiting for it to recover or for a human operator to intervene")
+		return ctrl.Result{RequeueAfter: requeueDuration}, nil
+	}
 
 	// 8. Advance whatever's left not-Ready (Pending/Provisioning/Replacing).
 	// An existing learner always wins this slot (requirement 11); with more

@@ -717,6 +717,145 @@ func TestDispatch(t *testing.T) {
 		require.NoError(t, fakeClient.Get(ctx, client.ObjectKey{Name: "etcd-1", Namespace: ec.Namespace}, member))
 		assert.Equal(t, 1, member.Spec.Ordinal)
 	})
+
+	// Health comes from MemberList and AlarmList, so the operator can't tell a
+	// lost quorum from etcd being unreachable. Either way the loop must stop at
+	// RecoverCluster: provisioning etcd-0 here would bootstrap a second, empty
+	// cluster. See etcd-io/etcd-operator#476 and #526.
+	t.Run("Unhealthy cluster stops the loop before a not-ready member is advanced", func(t *testing.T) {
+		ctx := t.Context()
+		ec := baseCluster()
+		provisioning := createMemberWithPhase(ec, 0, ecv1alpha1.EtcdMemberProvisioning)
+		members := append([]ecv1alpha1.EtcdMember{*provisioning}, createReadyMembers(ec, 3)[1:]...)
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithStatusSubresource(&ecv1alpha1.EtcdMember{}).
+			WithObjects(ec, provisioning).
+			Build()
+		r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
+		state := &reconcileState{
+			cluster: ec,
+			members: members,
+			pods: []*corev1.Pod{
+				makeConfigDriftPod(ec, 1, EtcdClusterHash(ec)),
+				makeConfigDriftPod(ec, 2, EtcdClusterHash(ec)),
+			},
+			health: &etcdutils.ClusterHealth{Healthy: false},
+		}
+
+		res, err := r.dispatch(ctx, state)
+		require.NoError(t, err)
+		assert.Equal(t, ctrl.Result{RequeueAfter: requeueDuration}, res)
+		err = fakeClient.Get(ctx, client.ObjectKey{Name: "etcd-0", Namespace: ec.Namespace}, &corev1.Pod{})
+		assert.True(t, apierrors.IsNotFound(err), "etcd-0 must not be started while the cluster is unhealthy")
+	})
+
+	t.Run("Unhealthy cluster stops the loop before scale-out is attempted", func(t *testing.T) {
+		ctx := t.Context()
+		ec := baseCluster()
+		ready := createMemberWithPhase(ec, 0, ecv1alpha1.EtcdMemberReady)
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithStatusSubresource(&ecv1alpha1.EtcdMember{}).
+			WithObjects(ec, ready).
+			Build()
+		r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
+		state := &reconcileState{
+			cluster: ec,
+			members: []ecv1alpha1.EtcdMember{*ready},
+			pods:    []*corev1.Pod{makeConfigDriftPod(ec, 0, EtcdClusterHash(ec))},
+			health:  &etcdutils.ClusterHealth{Healthy: false},
+		}
+
+		res, err := r.dispatch(ctx, state)
+		require.NoError(t, err)
+		assert.Equal(t, ctrl.Result{RequeueAfter: requeueDuration}, res)
+		err = fakeClient.Get(ctx, client.ObjectKey{Name: "etcd-1", Namespace: ec.Namespace}, &ecv1alpha1.EtcdMember{})
+		assert.True(t, apierrors.IsNotFound(err), "scale-out must wait while the cluster is unhealthy")
+	})
+
+	// With no Pods there is no health to read. A cluster that is still
+	// bootstrapping has a single EtcdMember, so with more the cluster has lost
+	// every Pod, and provisioning etcd-0 would bootstrap a second, empty
+	// cluster next to the other members' data.
+	t.Run("Cluster without member Pods stops the loop before etcd-0 bootstraps again", func(t *testing.T) {
+		ctx := t.Context()
+		ec := baseCluster()
+		provisioning := createMemberWithPhase(ec, 0, ecv1alpha1.EtcdMemberProvisioning)
+		members := append([]ecv1alpha1.EtcdMember{*provisioning}, createReadyMembers(ec, 3)[1:]...)
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithStatusSubresource(&ecv1alpha1.EtcdMember{}).
+			WithObjects(ec, provisioning).
+			Build()
+		r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
+		state := &reconcileState{cluster: ec, members: members}
+
+		res, err := r.dispatch(ctx, state)
+		require.NoError(t, err)
+		assert.Equal(t, ctrl.Result{RequeueAfter: requeueDuration}, res)
+		err = fakeClient.Get(ctx, client.ObjectKey{Name: "etcd-0", Namespace: ec.Namespace}, &corev1.Pod{})
+		assert.True(t, apierrors.IsNotFound(err), "etcd-0 must not bootstrap a new cluster while the other members have no Pods")
+	})
+
+	// Steps 2 to 6 run before RecoverCluster, so a repair already under way
+	// keeps going while the cluster is unhealthy.
+	t.Run("Unhealthy cluster still continues a member that is already Recreating", func(t *testing.T) {
+		ctx := t.Context()
+		ec := baseCluster()
+		recreating := createMemberWithPhase(ec, 1, ecv1alpha1.EtcdMemberRecreating)
+		members := createReadyMembers(ec, 3)
+		members[1] = *recreating
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithStatusSubresource(&ecv1alpha1.EtcdMember{}).
+			WithObjects(ec, recreating).
+			Build()
+		r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
+		state := &reconcileState{
+			cluster: ec,
+			members: members,
+			pods: []*corev1.Pod{
+				makeConfigDriftPod(ec, 0, EtcdClusterHash(ec)),
+				makeConfigDriftPod(ec, 2, EtcdClusterHash(ec)),
+			},
+			health: &etcdutils.ClusterHealth{Healthy: false},
+		}
+
+		res, err := r.dispatch(ctx, state)
+		require.NoError(t, err)
+		assert.Equal(t, ctrl.Result{RequeueAfter: requeueDuration}, res)
+		assert.NoError(t, fakeClient.Get(ctx, client.ObjectKey{Name: "etcd-1", Namespace: ec.Namespace}, &corev1.Pod{}),
+			"a member already Recreating must get its Pod back while the cluster is unhealthy")
+	})
+
+	t.Run("Healthy cluster with running members falls through to scale-out", func(t *testing.T) {
+		ctx := t.Context()
+		ec := baseCluster()
+		ready := createMemberWithPhase(ec, 0, ecv1alpha1.EtcdMemberReady)
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithStatusSubresource(&ecv1alpha1.EtcdMember{}).
+			WithObjects(ec, ready).
+			Build()
+		r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
+		state := &reconcileState{
+			cluster: ec,
+			members: []ecv1alpha1.EtcdMember{*ready},
+			pods:    []*corev1.Pod{makeConfigDriftPod(ec, 0, EtcdClusterHash(ec))},
+			health:  &etcdutils.ClusterHealth{Healthy: true},
+		}
+
+		res, err := r.dispatch(ctx, state)
+		require.NoError(t, err)
+		assert.Equal(t, ctrl.Result{RequeueAfter: requeueDuration}, res)
+		require.NoError(t, fakeClient.Get(ctx, client.ObjectKey{Name: "etcd-1", Namespace: ec.Namespace}, &ecv1alpha1.EtcdMember{}))
+	})
 }
 
 func TestGapAwareScaleOutCreatesLowestMissingOrdinal(t *testing.T) {
