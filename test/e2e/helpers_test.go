@@ -554,6 +554,32 @@ func etcdctlCmd(podName, etcdClusterName, namespace string, tlsEnabled bool) []s
 	return args
 }
 
+// raiseCorruptAlarm raises a CORRUPT alarm for memberID through the etcd gRPC gateway of podName.
+func raiseCorruptAlarm(t *testing.T, c *envconf.Config, podName string, memberID uint64) {
+	t.Helper()
+	body := fmt.Sprintf(`{"action":"ACTIVATE","memberID":"%d","alarm":"CORRUPT"}`, memberID)
+	client := kubernetes.NewForConfigOrDie(c.Client().RESTConfig())
+	if err := client.CoreV1().RESTClient().Post().
+		Namespace(namespace).Resource("pods").SubResource("proxy").
+		Name(podName + ":2379").Suffix("v3/maintenance/alarm").
+		Body(strings.NewReader(body)).Do(t.Context()).Error(); err != nil {
+		t.Fatalf("Failed to raise a CORRUPT alarm for etcd member %x via %s: %v", memberID, podName, err)
+	}
+}
+
+// waitForNoAlarms waits until `etcdctl alarm list` on podName reports no alarm.
+func waitForNoAlarms(t *testing.T, c *envconf.Config, podName string) error {
+	t.Helper()
+	return wait.For(func(ctx context.Context) (bool, error) {
+		stdout, stderr, err := execInPod(t, c, podName, namespace, []string{"etcdctl", "alarm", "list"})
+		if err != nil {
+			t.Logf("etcdctl alarm list via %s: %v, stderr: %s", podName, err, stderr)
+			return false, nil
+		}
+		return strings.TrimSpace(stdout) == "", nil
+	}, wait.WithTimeout(3*time.Minute), wait.WithInterval(2*time.Second))
+}
+
 func verifyDataOperations(t *testing.T, c *envconf.Config, etcdClusterName, key, val string, tlsEnabled bool) {
 	podName := fmt.Sprintf("%s-0", etcdClusterName)
 

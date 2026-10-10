@@ -654,6 +654,56 @@ func TestDispatch(t *testing.T) {
 		assert.Empty(t, list.Items)
 	})
 
+	t.Run("CORRUPT alarm claims the loop before a Recreating member is continued", func(t *testing.T) {
+		ctx := t.Context()
+		ec := baseCluster()
+		recreating := createMemberWithPhase(ec, 0, ecv1alpha1.EtcdMemberRecreating)
+		corrupted := createMemberWithPhase(ec, 1, ecv1alpha1.EtcdMemberReady)
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithStatusSubresource(&ecv1alpha1.EtcdMember{}).
+			WithObjects(ec, recreating, corrupted).
+			Build()
+		r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
+		_, peerURL := peerEndpointForOrdinalIndex(ec, 1)
+		state := &reconcileState{
+			cluster: ec,
+			members: []ecv1alpha1.EtcdMember{*recreating, *corrupted},
+			memberListResp: &clientv3.MemberListResponse{Members: []*etcdserverpb.Member{
+				{ID: 2, Name: corrupted.Name, PeerURLs: []string{peerURL}},
+			}},
+			health: &etcdutils.ClusterHealth{Alarms: []*etcdserverpb.AlarmMember{
+				{MemberID: 2, Alarm: etcdserverpb.AlarmType_CORRUPT},
+			}},
+		}
+
+		// Without Pods the removal fails, after the member was marked Replacing.
+		_, err := r.dispatch(ctx, state)
+		require.ErrorContains(t, err, "failed to remove the etcd node")
+
+		got := &ecv1alpha1.EtcdMember{}
+		require.NoError(t, fakeClient.Get(ctx, client.ObjectKeyFromObject(corrupted), got))
+		assert.Equal(t, ecv1alpha1.EtcdMemberReplacing, got.Status.Phase)
+		require.NoError(t, fakeClient.Get(ctx, client.ObjectKeyFromObject(recreating), got))
+		assert.Equal(t, ecv1alpha1.EtcdMemberRecreating, got.Status.Phase)
+		pods := &corev1.PodList{}
+		require.NoError(t, fakeClient.List(ctx, pods))
+		assert.Empty(t, pods.Items, "the Recreating member must not get a new Pod in the same loop")
+	})
+
+	t.Run("Settled cluster still requeues so alarms raised inside etcd are noticed", func(t *testing.T) {
+		ctx := t.Context()
+		ec := baseCluster()
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ec).Build()
+		r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
+		state := &reconcileState{cluster: ec, members: createReadyMembers(ec, 3)}
+
+		res, err := r.dispatch(ctx, state)
+		require.NoError(t, err)
+		assert.Equal(t, ctrl.Result{RequeueAfter: requeueDuration}, res)
+	})
+
 	t.Run("Not-ready member stops the loop before scale-out is attempted", func(t *testing.T) {
 		ctx := t.Context()
 		ec := baseCluster()

@@ -484,6 +484,113 @@ func TestEtcdMemberReplacing(t *testing.T) {
 	_ = testEnv.Test(t, feature.Feature())
 }
 
+// TestCorruptAlarm verifies that a member tagged by a CORRUPT alarm is replaced and the alarm disarmed.
+func TestCorruptAlarm(t *testing.T) {
+	feature := features.New("corrupt-alarm")
+	clusterName := "etcd-corrupt"
+	podName := clusterName + "-0"
+	var removedID uint64
+
+	// replaceMember arms a CORRUPT alarm on memberName and waits until it rejoins with a new identity.
+	replaceMember := func(ctx context.Context, t *testing.T, c *envconf.Config, memberName string) {
+		t.Helper()
+		pvcName := "etcd-data-" + memberName
+		before := takeResourceIDSnapshot(t, c, memberName, pvcName)
+		removedID = getEtcdMembersName2IDMapping(t, c, podName)[memberName]
+		raiseCorruptAlarm(t, c, podName, removedID)
+
+		if err := wait.For(func(ctx context.Context) (bool, error) {
+			var member ecv1alpha1.EtcdMember
+			if err := c.Client().Resources().Get(ctx, memberName, namespace, &member); err != nil {
+				return false, err
+			}
+			return member.Status.MemberID != "" && member.Status.MemberID != before.memberID, nil
+		}, wait.WithContext(ctx), wait.WithTimeout(5*time.Minute), wait.WithInterval(2*time.Second)); err != nil {
+			t.Fatalf("member %s did not rejoin with a new etcd identity: %v", memberName, err)
+		}
+		if err := waitForAllEtcdMemberReady(t, c, etcdClusterRef(clusterName, 3)); err != nil {
+			t.Fatalf("cluster %s did not recover all three members to Ready: %v", clusterName, err)
+		}
+		if err := waitForNoAlarms(t, c, podName); err != nil {
+			t.Fatalf("CORRUPT alarm was not disarmed: %v", err)
+		}
+
+		after := takeResourceIDSnapshot(t, c, memberName, pvcName)
+		if after.podUID == before.podUID || after.pvcUID == before.pvcUID {
+			t.Error("replacement must change both Pod and PVC UIDs")
+		}
+		for _, m := range getEtcdMemberListPB(t, c, podName).Members {
+			if m.ID == removedID {
+				t.Errorf("corrupted etcd member %x is still in the cluster", removedID)
+			}
+		}
+		verifyDataOperations(t, c, clusterName, "after-corrupt-"+memberName, "ok", false)
+	}
+
+	feature.Setup(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+		createEtcdClusterWithPVC(ctx, t, c, clusterName, 3)
+		if err := waitForAllEtcdMemberReady(t, c, etcdClusterRef(clusterName, 3)); err != nil {
+			t.Fatalf("cluster %s did not become Ready: %v", clusterName, err)
+		}
+		return ctx
+	})
+
+	feature.Assess("the corrupted member is replaced and the alarm is disarmed",
+		func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+			replaceMember(ctx, t, c, clusterName+"-1")
+			return ctx
+		})
+
+	feature.Assess("an alarm left behind by a removed member is just disarmed",
+		func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+			before := make(map[string]resourceIDSnapshot)
+			for ordinal := range 3 {
+				name := fmt.Sprintf("%s-%d", clusterName, ordinal)
+				before[name] = takeResourceIDSnapshot(t, c, name, "etcd-data-"+name)
+			}
+
+			raiseCorruptAlarm(t, c, podName, removedID)
+			if err := waitForNoAlarms(t, c, podName); err != nil {
+				t.Fatalf("leftover CORRUPT alarm was not disarmed: %v", err)
+			}
+			if err := waitForAllEtcdMemberReady(t, c, etcdClusterRef(clusterName, 3)); err != nil {
+				t.Fatalf("cluster %s is not Ready: %v", clusterName, err)
+			}
+			for name, snapshot := range before {
+				if after := takeResourceIDSnapshot(t, c, name, "etcd-data-"+name); after != snapshot {
+					t.Errorf("member %s must not be replaced for a leftover alarm: before %+v, after %+v", name, snapshot, after)
+				}
+			}
+			return ctx
+		})
+
+	feature.Assess("a replacement interrupted after the member removal completes",
+		func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+			const failpoint = "corruptAlarmAfterMemberRemove"
+			etcdOperator, err := getEtcdOperatorPod(t, c.Client())
+			if err != nil {
+				t.Fatalf("Unable to get the etcd-operator pod: %s", err)
+			}
+			if err := enableGoFailPoint(t, c, etcdOperator, failpoint, "panic"); err != nil {
+				t.Fatalf("Unable to enable the go failpoint %s on pod %s: %s", failpoint, etcdOperator.Name, err)
+			}
+			defer func() {
+				if err := disableGoFailPoint(t, c, etcdOperator, failpoint); err != nil {
+					t.Errorf("Unable to disable the go failpoint %s: %s", failpoint, err)
+				}
+			}()
+			replaceMember(ctx, t, c, clusterName+"-2")
+			return ctx
+		})
+
+	feature.Teardown(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+		cleanupEtcdCluster(ctx, t, c, clusterName)
+		return ctx
+	})
+
+	_ = testEnv.Test(t, feature.Feature())
+}
+
 // TestManualScaleInWithoutEndpoints verifies the issue #463 acceptance case:
 // a deadlocked cluster can be manually scaled in even when none of its etcd
 // processes is reachable. Per the recovery recipe, the user shrinks

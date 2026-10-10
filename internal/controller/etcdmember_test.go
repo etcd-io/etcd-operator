@@ -598,6 +598,112 @@ func TestReplaceEtcdMember(t *testing.T) {
 	assert.Empty(t, pvcs.Items)
 }
 
+// TestHandleCorruptAlarm runs without Pods, so every etcd call fails fast and the error shows the step reached.
+func TestHandleCorruptAlarm(t *testing.T) {
+	scheme := leaveTestScheme(t)
+	ready, replacing := ecv1alpha1.EtcdMemberReady, ecv1alpha1.EtcdMemberReplacing
+	corrupt := func(id uint64) []*etcdserverpb.AlarmMember {
+		return []*etcdserverpb.AlarmMember{{MemberID: id, Alarm: etcdserverpb.AlarmType_CORRUPT}}
+	}
+
+	tests := []struct {
+		name   string
+		alarms []*etcdserverpb.AlarmMember
+		// mutate adjusts the default state: three Ready members with etcd IDs 10+ordinal.
+		mutate     func(s *reconcileState)
+		wantErr    string // empty means no error and a zero Result
+		wantPhases []ecv1alpha1.EtcdMemberPhase
+	}{
+		{
+			name:       "No CORRUPT alarm does not claim the loop",
+			alarms:     []*etcdserverpb.AlarmMember{{MemberID: 11, Alarm: etcdserverpb.AlarmType_NOSPACE}},
+			wantPhases: []ecv1alpha1.EtcdMemberPhase{ready, ready, ready},
+		},
+		{
+			name:       "Alarm with member ID 0 is left for a human operator",
+			alarms:     corrupt(0),
+			wantPhases: []ecv1alpha1.EtcdMemberPhase{ready, ready, ready},
+		},
+		{
+			name:       "Missing MemberList response returns an error",
+			alarms:     corrupt(11),
+			mutate:     func(s *reconcileState) { s.memberListResp = nil },
+			wantErr:    "without a MemberList response",
+			wantPhases: []ecv1alpha1.EtcdMemberPhase{ready, ready, ready},
+		},
+		{
+			name:   "Live etcd member without an EtcdMember is neither removed nor disarmed",
+			alarms: corrupt(99),
+			mutate: func(s *reconcileState) {
+				s.memberListResp.Members = append(s.memberListResp.Members,
+					&etcdserverpb.Member{ID: 99, Name: "unmanaged", PeerURLs: []string{"http://unmanaged:2380"}})
+			},
+			wantErr:    "maps to no EtcdMember",
+			wantPhases: []ecv1alpha1.EtcdMemberPhase{ready, ready, ready},
+		},
+		{
+			name:   "Corrupted member is marked Replacing before it is removed",
+			alarms: corrupt(11),
+			mutate: func(s *reconcileState) {
+				s.members[1].Status.Phase = ecv1alpha1.EtcdMemberRecreating
+				s.members[1].Status.RecreateCount = 2
+			},
+			wantErr:    `failed to remove the etcd node for EtcdMember "etcd-1"`,
+			wantPhases: []ecv1alpha1.EtcdMemberPhase{ready, replacing, ready},
+		},
+		{
+			name:       "Alarm of a member no longer in the membership is just disarmed",
+			alarms:     corrupt(42),
+			wantErr:    "failed to disarm the CORRUPT alarm of etcd member 2a",
+			wantPhases: []ecv1alpha1.EtcdMemberPhase{ready, ready, ready},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := t.Context()
+			ec := leaveTestCluster()
+			state := &reconcileState{
+				cluster:        ec,
+				memberListResp: &clientv3.MemberListResponse{},
+				health:         &etcdutils.ClusterHealth{Healthy: true, Alarms: tt.alarms},
+			}
+			for ordinal := range 3 {
+				member := leaveTestMember(ordinal)
+				member.Status.Phase = ready
+				state.members = append(state.members, *member)
+				name, peerURL := peerEndpointForOrdinalIndex(ec, ordinal)
+				state.memberListResp.Members = append(state.memberListResp.Members,
+					&etcdserverpb.Member{ID: uint64(10 + ordinal), Name: name, PeerURLs: []string{peerURL}})
+			}
+			if tt.mutate != nil {
+				tt.mutate(state)
+			}
+			builder := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&ecv1alpha1.EtcdMember{})
+			for i := range state.members {
+				builder = builder.WithObjects(state.members[i].DeepCopy())
+			}
+			r := &EtcdClusterReconciler{Client: builder.Build(), Scheme: scheme}
+
+			res, err := r.handleCorruptAlarm(ctx, state)
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+				assert.True(t, res.IsZero())
+			} else {
+				require.ErrorContains(t, err, tt.wantErr)
+			}
+			for ordinal, phase := range tt.wantPhases {
+				member := leaveTestMember(ordinal)
+				require.NoError(t, r.Get(ctx, client.ObjectKeyFromObject(member), member))
+				assert.Equal(t, phase, member.Status.Phase, "phase of %s", member.Name)
+				if phase == replacing {
+					assert.Zero(t, member.Status.RecreateCount, "RecreateCount of %s", member.Name)
+				}
+			}
+		})
+	}
+}
+
 // TestMarkMemberTerminating verifies the Phase write before the leave runs,
 // and that a repeated call is a no-op.
 func TestMarkMemberTerminating(t *testing.T) {
