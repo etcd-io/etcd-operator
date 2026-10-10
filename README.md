@@ -103,6 +103,18 @@ Users can just run kubectl apply -f <URL for YAML BUNDLE> to install the project
 kubectl apply -f https://raw.githubusercontent.com/<org>/etcd-operator/<tag or branch>/dist/install.yaml
 ```
 
+## Testing
+
+### Running E2E Tests
+
+The etcd-operator includes comprehensive end-to-end tests. To run them locally:
+
+```sh
+make test-e2e
+```
+
+For detailed instructions on running e2e tests, configuration options and manual setup, see the [test documentation](test/README.md).
+
 ## Contributing
 
 // TODO(user): Add detailed information on how you would like others to contribute to this project
