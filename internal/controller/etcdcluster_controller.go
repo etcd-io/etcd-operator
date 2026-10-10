@@ -465,9 +465,9 @@ func (r *EtcdClusterReconciler) dispatch(ctx context.Context, s *reconcileState)
 	}
 
 	// 4. CORRUPT alarm on some member (§4.6/§4.7).
-	// TODO: §4.9 item 4 — force the tagged member to Phase: Replacing
-	// (M4). s.health.Alarms (refreshClusterState) now carries active alarms;
-	// this step just doesn't act on them yet.
+	if res, err := r.handleCorruptAlarm(ctx, s); err != nil || !res.IsZero() {
+		return res, err
+	}
 
 	// 5. NOSPACE alarm remediation (§4.7).
 	// TODO: §4.9 item 5 — compact/defragment/disarm cycle (M4). Same
@@ -511,7 +511,11 @@ func (r *EtcdClusterReconciler) dispatch(ctx context.Context, s *reconcileState)
 		return res, err
 	}
 
-	return r.upgradeCluster(ctx, s)
+	if res, err := r.upgradeCluster(ctx, s); err != nil || !res.IsZero() {
+		return res, err
+	}
+
+	return ctrl.Result{}, nil
 }
 
 // ensureClusterFinalizer adds clusterCleanupFinalizer to s.cluster if it

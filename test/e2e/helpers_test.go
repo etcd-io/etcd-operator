@@ -35,6 +35,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/e2e-framework/klient"
 	"sigs.k8s.io/e2e-framework/klient/k8s/resources"
 	"sigs.k8s.io/e2e-framework/klient/wait"
@@ -552,6 +553,47 @@ func etcdctlCmd(podName, etcdClusterName, namespace string, tlsEnabled bool) []s
 		)
 	}
 	return args
+}
+
+// raiseCorruptAlarm raises a CORRUPT alarm for memberID through the etcd gRPC gateway of podName.
+func raiseCorruptAlarm(t *testing.T, c *envconf.Config, podName string, memberID uint64) {
+	t.Helper()
+	body := fmt.Sprintf(`{"action":"ACTIVATE","memberID":"%d","alarm":"CORRUPT"}`, memberID)
+	client := kubernetes.NewForConfigOrDie(c.Client().RESTConfig())
+	if err := client.CoreV1().RESTClient().Post().
+		Namespace(namespace).Resource("pods").SubResource("proxy").
+		Name(podName + ":2379").Suffix("v3/maintenance/alarm").
+		Body(strings.NewReader(body)).Do(t.Context()).Error(); err != nil {
+		t.Fatalf("Failed to raise a CORRUPT alarm for etcd member %x via %s: %v", memberID, podName, err)
+	}
+}
+
+// requestReconcile updates an annotation on the EtcdCluster, since an etcd alarm alone triggers no reconcile.
+func requestReconcile(ctx context.Context, t *testing.T, c *envconf.Config, clusterName string) {
+	t.Helper()
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var ec ecv1alpha1.EtcdCluster
+		if err := c.Client().Resources().Get(ctx, clusterName, namespace, &ec); err != nil {
+			return err
+		}
+		metav1.SetMetaDataAnnotation(&ec.ObjectMeta, "e2e.etcd.io/reconcile-at", time.Now().Format(time.RFC3339Nano))
+		return c.Client().Resources().Update(ctx, &ec)
+	}); err != nil {
+		t.Fatalf("Failed to request a reconcile of EtcdCluster %s: %v", clusterName, err)
+	}
+}
+
+// waitForNoAlarms waits until `etcdctl alarm list` on podName reports no alarm.
+func waitForNoAlarms(t *testing.T, c *envconf.Config, podName string) error {
+	t.Helper()
+	return wait.For(func(ctx context.Context) (bool, error) {
+		stdout, stderr, err := execInPod(t, c, podName, namespace, []string{"etcdctl", "alarm", "list"})
+		if err != nil {
+			t.Logf("etcdctl alarm list via %s: %v, stderr: %s", podName, err, stderr)
+			return false, nil
+		}
+		return strings.TrimSpace(stdout) == "", nil
+	}, wait.WithTimeout(3*time.Minute), wait.WithInterval(2*time.Second))
 }
 
 func verifyDataOperations(t *testing.T, c *envconf.Config, etcdClusterName, key, val string, tlsEnabled bool) {
