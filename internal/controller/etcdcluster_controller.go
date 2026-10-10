@@ -122,8 +122,9 @@ type reconcileState struct {
 // See docs/design/etcd-member-lifecycle-and-self-healing-v0.3.0.md and
 // reconcile_loop_v0.3.0.png for the full workflow this implements. Several
 // dispatch branches are intentionally TODO no-ops in this milestone (M2) —
-// per-member repair, CORRUPT/NOSPACE remediation, lost-quorum recovery, and
-// the EtcdMember/EtcdClusterStatus status roll-up — resolved by M3-M6.
+// per-member repair, CORRUPT/NOSPACE remediation, starting lost-quorum
+// recovery automatically, and the EtcdMember/EtcdClusterStatus status
+// roll-up — resolved by M3-M6.
 func (r *EtcdClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var (
 		state *reconcileState
@@ -394,7 +395,7 @@ func (r *EtcdClusterReconciler) refreshClusterState(ctx context.Context, s *reco
 	logger.Info("Now checking health of the cluster members")
 
 	var err error
-	s.memberListResp, s.health, err = healthCheck(s.cluster.Name, s.cluster.Namespace, s.pods, clusterTLSEnabled(s.cluster), s.tlsConfig, logger)
+	s.memberListResp, s.health, err = healthCheck(s.cluster.Name, s.cluster.Namespace, healthCheckPods(s), clusterTLSEnabled(s.cluster), s.tlsConfig, logger)
 	if err != nil {
 		logger.Info("health check found errors", "errors", err)
 	}
@@ -424,28 +425,31 @@ func (r *EtcdClusterReconciler) refreshClusterState(ctx context.Context, s *reco
 // to the next; only an item that actually takes a mutating action ends the
 // loop.
 //
-// Steps 4-7 are TODO no-ops in this milestone (M2) — the mechanics they'd
-// trigger (join/promote/repair/leave, CORRUPT/NOSPACE remediation,
-// lost-quorum recovery) land in M3-M5 — but the detection that decides
-// *whether* a step claims the loop is real, so the priority order itself is
-// reviewable now, ahead of any of that behavior landing.
+// Steps 4-6 are TODO no-ops in this milestone (M2) — the mechanics they'd
+// trigger (join/promote/repair/leave, CORRUPT/NOSPACE remediation) land in
+// M3-M5 — but the detection that decides *whether* a step claims the loop is
+// real, so the priority order itself is reviewable now, ahead of any of that
+// behavior landing. Step 7 never starts lost-quorum recovery on its own: it
+// waits for a human operator, who starts it with QuorumRecoveryAnnotation.
 // Item 8 is partially implemented: the provisioning case reconciles one
 // EtcdMember at a time until it is Ready; the replacing case (§4.9 item 8's
 // second bullet) lands in a follow-up PR.
 func (r *EtcdClusterReconciler) dispatch(ctx context.Context, s *reconcileState) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	// 2. Continue an already-started lost-quorum recovery (§4.8).
-	// We should check whether the cluster is healthy first. If yes,
-	// cleanup the Status.QuorumRecovery; if no, then check whether
-	// it's an already-started lost-quorum recovery, and continue to
-	// do it if present.
+	// 2. Continue an already-started lost-quorum recovery (§4.8), or start
+	// the one a human operator asked for with QuorumRecoveryAnnotation. With
+	// automatic recovery disabled, that request stands in for
+	// reconcile_loop_v0.3.0.png's "Set EtcdCluster phase to Recover", and it
+	// is read here rather than at step 7 because a Terminating member that
+	// can't finish without quorum would keep step 3 busy forever.
+	if s.cluster.Status.QuorumRecovery == nil {
+		if res, err := r.startRequestedQuorumRecovery(ctx, s); err != nil || !res.IsZero() {
+			return res, err
+		}
+	}
 	if s.cluster.Status.QuorumRecovery != nil {
-		// TODO: §4.8/§4.9 item 2 — force-new-cluster the survivor,
-		// terminate the rest, let scale-out rebuild (M5).
-		logger.Info("Lost-quorum recovery in progress; continuation not implemented yet",
-			"survivor", s.cluster.Status.QuorumRecovery.Survivor)
-		return ctrl.Result{RequeueAfter: requeueDuration}, nil
+		return r.continueQuorumRecovery(ctx, s)
 	}
 
 	// 3. Clean up any EtcdMember already Terminating (§4.6/§4.9 item 3,
@@ -493,6 +497,18 @@ func (r *EtcdClusterReconciler) dispatch(ctx context.Context, s *reconcileState)
 	// require the cluster to stay unhealthy for some minimum duration or
 	// number of consecutive reconciles) before declaring quorum lost,
 	// rather than triggering recovery off the first unhealthy reading.
+	//
+	// Automatic recovery is disabled in v0.3.0, so an unhealthy cluster waits
+	// here for a human operator: steps 8 and 9 assume a healthy cluster. The
+	// operator can't tell a lost quorum from etcd being unreachable, so it
+	// treats both as unhealthy (see clusterUnhealthy). The human starts the
+	// recovery with QuorumRecoveryAnnotation, read at step 2. See
+	// etcd-io/etcd-operator#476.
+	if clusterUnhealthy(s) {
+		logger.Info("EtcdCluster is not healthy; waiting for it to recover or for a human operator to intervene",
+			"quorumRecoveryAnnotation", QuorumRecoveryAnnotation)
+		return ctrl.Result{RequeueAfter: requeueDuration}, nil
+	}
 
 	// 8. Advance whatever's left not-Ready (Pending/Provisioning/Replacing).
 	// An existing learner always wins this slot (requirement 11); with more
