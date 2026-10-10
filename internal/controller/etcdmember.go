@@ -245,6 +245,53 @@ func disarmForEtcdMember(s *reconcileState, member *ecv1alpha1.EtcdMember) error
 	return nil
 }
 
+// handleCorruptAlarm replaces the member that a CORRUPT alarm tags and then disarms the alarm.
+func (r *EtcdClusterReconciler) handleCorruptAlarm(ctx context.Context, s *reconcileState) (ctrl.Result, error) {
+	if s.health == nil {
+		return ctrl.Result{}, nil
+	}
+	// Member ID 0 means etcd can't tell which member is corrupted, so it is left to a human.
+	i := slices.IndexFunc(s.health.Alarms, func(a *etcdserverpb.AlarmMember) bool {
+		return a.Alarm == etcdserverpb.AlarmType_CORRUPT && a.MemberID != 0
+	})
+	if i < 0 {
+		return ctrl.Result{}, nil
+	}
+	alarm := s.health.Alarms[i]
+	logger := log.FromContext(ctx).WithValues("memberID", fmt.Sprintf("%x", alarm.MemberID))
+
+	if s.memberListResp == nil {
+		return ctrl.Result{}, fmt.Errorf("cannot handle the CORRUPT alarm of etcd member %x without a MemberList response", alarm.MemberID)
+	}
+	member := findEtcdMemberForEtcdNodeID(s, alarm.MemberID)
+	if member != nil {
+		// Replacing is persisted before the removal so an interruption can't strand a removed member as Ready.
+		if member.Status.Phase != ecv1alpha1.EtcdMemberReplacing {
+			logger.Info("CORRUPT alarm found, replacing the EtcdMember", "EtcdMember", member.Name)
+			if err := r.markMemberReplacing(ctx, member); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+		if err := removeEtcdNode(s, member); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		// gofail: var corruptAlarmAfterMemberRemove struct{}
+	} else if slices.ContainsFunc(s.memberListResp.Members, func(m *etcdserverpb.Member) bool { return m.ID == alarm.MemberID }) {
+		return ctrl.Result{}, fmt.Errorf("etcd member %x has a CORRUPT alarm but maps to no EtcdMember", alarm.MemberID)
+	}
+
+	logger.Info("Disarming the CORRUPT alarm")
+	// The removed member's raft has stopped, so its endpoint can't serve the disarm.
+	pods := slices.DeleteFunc(slices.Clone(s.pods), func(p *corev1.Pod) bool { return member != nil && p.Name == member.Name })
+	endpoints := clientEndpointsFromPods(s.cluster.Name, s.cluster.Namespace, pods, clusterTLSEnabled(s.cluster))
+	cfg := etcdutils.ClientConfig{Endpoints: endpoints, TLS: s.tlsConfig}
+	if err := etcdutils.AlarmDisarm(cfg, []*etcdserverpb.AlarmMember{alarm}); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to disarm the CORRUPT alarm of etcd member %x: %w", alarm.MemberID, err)
+	}
+	return ctrl.Result{RequeueAfter: requeueDuration}, nil
+}
+
 // deleteMemberPod deletes the member's Pod from the reconcile snapshot. It
 // reports whether the delete request succeeded. An absent Pod is a no-op.
 func (r *EtcdClusterReconciler) deleteMemberPod(
@@ -790,6 +837,16 @@ func findEtcdNodeForEtcdMember(state *reconcileState, member *ecv1alpha1.EtcdMem
 		}
 	}
 
+	return nil
+}
+
+// findEtcdMemberForEtcdNodeID returns the EtcdMember whose live etcd node has the given ID, or nil.
+func findEtcdMemberForEtcdNodeID(state *reconcileState, id uint64) *ecv1alpha1.EtcdMember {
+	for i := range state.members {
+		if node := findEtcdNodeForEtcdMember(state, &state.members[i]); node != nil && node.ID == id {
+			return &state.members[i]
+		}
+	}
 	return nil
 }
 
