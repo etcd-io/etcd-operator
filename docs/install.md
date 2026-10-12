@@ -1,22 +1,27 @@
 # Install the etcd operator on Kubernetes
 
-Welcome to version 0.1.0 of the etcd-operator!  At this point it doesn't do a lot, but it can be installed, and you can play with it.
+Welcome to version 0.2.0 of the etcd-operator!  At this point, the operator can do the following:
+
+* create etcd clusters, with TLS-protected networking
+* grow and shrink clusters while online
+* support etcd upgrades
 
 ## Prerequisites
 
 * A Kubernetes cluster running version 1.30+.
 * You must have `kubectl` installed, or have a tool which lets you run Kubernetes YAML files.
 * You must use a service account or user that can create ClusterRoles, ClusterRoleBindings, CustomResourceDefinitions, Deployments, Namespaces, Roles, RoleBindings, Services, and ServiceAccounts.
+* If you are using managed TLS certificates with your cluster, you should have [Cert-Manager](https://cert-manager.io/docs/installation/) installed in the kubernetes cluster.
 
 ## Install the Operator
 
 To install the default generated operator, run the following command:
 
 ```bash
-curl -L https://raw.githubusercontent.com/etcd-io/etcd-operator/refs/heads/main/dist/install-v0.1.0.yaml | kubectl apply -f -
+curl -L https://raw.githubusercontent.com/etcd-io/etcd-operator/refs/heads/main/dist/install-v0.2.0.yaml | kubectl apply -f -
 ```
 
-If this isn't a good approach for your environment, download the `install-v0.1.0.yaml` installation file from GitHub, and use your chosen Kubernetes management tool to apply it.
+If this isn't a good approach for your environment, download the `install-v0.2.0.yaml` installation file from GitHub, and use your chosen Kubernetes management tool to apply it.
 
 You should see the operator objects being created:
 
@@ -59,7 +64,7 @@ kind: EtcdCluster
 metadata:
   name: test-cluster
 spec:
-  version: v3.6.0-rc.3
+  version: v3.6.8
   size: 3
 ```
 
@@ -99,7 +104,7 @@ pod "etcd-client" deleted
 Read the written key from the cluster:
 
 ```bash
-kubectl run etcd-client --attach --restart=Never --rm --image gcr.io/etcd-development/etcd:v3.6.0-rc.3 -- etcdctl --endpoints="$ETCD_CLUSTER_IP_ADDRESSES" get foo
+kubectl run etcd-client --attach --restart=Never --rm --image gcr.io/etcd-development/etcd:v3.6.8 -- etcdctl --endpoints="$ETCD_CLUSTER_IP_ADDRESSES" get foo
 
 foo
 bar
@@ -118,11 +123,11 @@ Execute: `kubectl delete etcdcluster test-cluster`
 To completely remove the operator from the Kubernetes cluster, run the following:
 
 ```bash
-$ curl -L https://raw.githubusercontent.com/etcd-io/etcd-operator/refs/heads/main/dist/install-v0.1.0.yaml | kubectl delete -f -
+$ curl -L https://raw.githubusercontent.com/etcd-io/etcd-operator/refs/heads/main/dist/install-v0.2.0.yaml | kubectl delete -f -
 ```
 
 Or, if you've downloaded the install file:
 
 ```bash
-kubectl delete -f install-v0.1.0.yaml
+kubectl delete -f install-v0.2.0.yaml
 ```
