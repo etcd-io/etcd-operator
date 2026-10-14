@@ -448,6 +448,11 @@ func (r *EtcdClusterReconciler) dispatch(ctx context.Context, s *reconcileState)
 	for i := range s.members {
 		m := &s.members[i]
 		if m.DeletionTimestamp != nil {
+			if !clusterHealthy(s) {
+				// It can't leave without quorum; skip it so step 7 can still start a recovery.
+				log.FromContext(ctx).Error(errClusterUnhealthy, "Skipping a Terminating EtcdMember until the cluster is healthy", "EtcdMember", m.Name)
+				continue
+			}
 			if err := r.markMemberTerminating(ctx, m); err != nil {
 				return ctrl.Result{}, err
 			}
@@ -477,7 +482,9 @@ func (r *EtcdClusterReconciler) dispatch(ctx context.Context, s *reconcileState)
 
 	// 7. Decide whether to *start* lost-quorum recovery (§4.8/§4.9 item 7):
 	// only once steps 3-6 above find nothing to do, the cluster is still
-	// unhealthy, and a human set the recover-cluster-from annotation.
+	// unhealthy, and a human set the recover-cluster-from annotation. An
+	// unhealthy cluster without it waits here: steps 8 and 9 assume a
+	// healthy one.
 	if res, err := r.maybeStartQuorumRecovery(ctx, s); err != nil || !res.IsZero() {
 		return res, err
 	}

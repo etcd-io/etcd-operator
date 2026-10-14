@@ -654,6 +654,38 @@ func TestDispatch(t *testing.T) {
 		assert.Empty(t, list.Items)
 	})
 
+	t.Run("Terminating member claims the loop before a Recreating member is continued", func(t *testing.T) {
+		ctx := t.Context()
+		ec := baseCluster()
+		now := metav1.Now()
+		terminating := ecv1alpha1.EtcdMember{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "etcd-0",
+				Namespace:         ec.Namespace,
+				DeletionTimestamp: &now,
+				Finalizers:        []string{memberCleanupFinalizer},
+			},
+			Spec:   ecv1alpha1.EtcdMemberSpec{ClusterName: ec.Name, Ordinal: 0, Version: ec.Spec.Version},
+			Status: ecv1alpha1.EtcdMemberStatus{Phase: ecv1alpha1.EtcdMemberTerminating},
+		}
+		recreating := createMemberWithPhase(ec, 1, ecv1alpha1.EtcdMemberRecreating)
+
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ec, &terminating, recreating).Build()
+		r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
+		state := &reconcileState{
+			cluster:        ec,
+			members:        []ecv1alpha1.EtcdMember{terminating, *recreating},
+			memberListResp: &clientv3.MemberListResponse{},
+			health:         &etcdutils.ClusterHealth{Healthy: true},
+		}
+
+		_, err := r.dispatch(ctx, state)
+		require.NoError(t, err)
+
+		err = fakeClient.Get(ctx, client.ObjectKeyFromObject(&terminating), &ecv1alpha1.EtcdMember{})
+		assert.True(t, apierrors.IsNotFound(err), "a healthy cluster must clean up the Terminating member first")
+	})
+
 	t.Run("CORRUPT alarm claims the loop before a Recreating member is continued", func(t *testing.T) {
 		ctx := t.Context()
 		ec := baseCluster()
@@ -697,7 +729,16 @@ func TestDispatch(t *testing.T) {
 		ec := baseCluster()
 		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ec).Build()
 		r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
-		state := &reconcileState{cluster: ec, members: createReadyMembers(ec, 3)}
+		state := &reconcileState{
+			cluster: ec,
+			members: createReadyMembers(ec, 3),
+			pods: []*corev1.Pod{
+				makeConfigDriftPod(ec, 0, EtcdClusterHash(ec)),
+				makeConfigDriftPod(ec, 1, EtcdClusterHash(ec)),
+				makeConfigDriftPod(ec, 2, EtcdClusterHash(ec)),
+			},
+			health: &etcdutils.ClusterHealth{Healthy: true},
+		}
 
 		res, err := r.dispatch(ctx, state)
 		require.NoError(t, err)

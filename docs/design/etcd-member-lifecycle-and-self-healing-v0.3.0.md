@@ -1005,7 +1005,9 @@ the loop.
    found nothing to do, recovery isn't already under way (step 2), and the
    operator has set the `operator.etcd.io/recover-cluster-from` annotation,
    begin it by setting `Status.QuorumRecovery` — the next reconcile that finds it already running picks it up
-   via step 2. Deliberately low priority: recovery discards every other
+   via step 2. Without the annotation, an unhealthy cluster waits here: the
+   loop ends and requeues, since everything below assumes a healthy
+   cluster. Deliberately low priority: recovery discards every other
    member's data, so it's tried only once the cheaper remedies above have
    had a chance to restore quorum on their own.
 8. **Otherwise, advance whatever's left not-`Ready` (`Pending`/
