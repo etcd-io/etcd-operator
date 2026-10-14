@@ -27,6 +27,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	eventsv1 "k8s.io/api/events/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/e2e-framework/klient/wait"
 	"sigs.k8s.io/e2e-framework/klient/wait/conditions"
@@ -169,6 +170,7 @@ func TestMain(m *testing.M) {
 			_ = corev1.AddToScheme(client.Resources().GetScheme())
 			_ = metav1.AddMetaToScheme(client.Resources().GetScheme())
 			_ = ecv1alpha1.AddToScheme(client.Resources().GetScheme())
+			_ = eventsv1.AddToScheme(client.Resources().GetScheme())
 
 			return ctx, nil
 		},
