@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strconv"
@@ -27,34 +28,50 @@ const recoverClusterFromAnnotation = "operator.etcd.io/recover-cluster-from"
 // existing data.
 const forceNewClusterFlag = "--force-new-cluster"
 
-// Event reason and action for a lost-quorum recovery (§4.8).
+// Event reasons and action for a lost-quorum recovery (§4.8) and for an
+// unhealthy cluster waiting at §4.9 item 7.
 const (
-	reasonQuorumRecoveryStarted = "QuorumRecoveryStarted"
-	actionRecoverCluster        = "RecoverCluster"
+	reasonQuorumRecoveryStarted  = "QuorumRecoveryStarted"
+	reasonClusterUnhealthy       = "ClusterUnhealthy"
+	reasonQuorumRecoveryRejected = "QuorumRecoveryRejected"
+	actionRecoverCluster         = "RecoverCluster"
 )
+
+// errClusterUnhealthy is logged while an unhealthy cluster waits for quorum
+// to come back or for a human operator to request a recovery.
+var errClusterUnhealthy = errors.New("the etcd cluster is not healthy")
+
+// clusterHealthy reports whether the cluster is shown to have quorum:
+// MemberList and AlarmList succeeded (healthCheck). A cluster that is still
+// bootstrapping, with a single EtcdMember and no Pod yet, counts as healthy
+// too, since scale-out waits for that member to be Ready. The survivor of a
+// lost-quorum recovery is also alone without a Pod while its Pod is
+// recreated, so that exception only applies when no recovery is under way.
+func clusterHealthy(s *reconcileState) bool {
+	if s.health != nil && s.health.Healthy {
+		return true
+	}
+
+	return s.cluster.Status.QuorumRecovery == nil && len(s.pods) == 0 && len(s.members) <= 1
+}
 
 // maybeStartQuorumRecovery decides whether to *start* a lost-quorum recovery
 // (§4.8 "Starting", §4.9 item 7, the Start lost-quorum recovery row of §4.12).
 //
 // It is only reached after CORRUPT/NOSPACE/per-member repair found nothing to
 // do. It starts recovery only when all of these hold:
-//   - the etcd cluster is still unhealthy;
+//   - the etcd cluster is still unhealthy (!clusterHealthy);
 //   - the recoverClusterFromAnnotation annotation is set on the EtcdCluster
 //     and holds a valid ordinal of an existing EtcdMember that
 //     checkQuorumRecoverySurvivor accepts.
 //
 // Starting means writing Status.QuorumRecovery = {Survivor: <ordinal>} before
 // touching anything else; the next reconcile then picks it up through
-// continueQuorumRecovery (§4.9 item 2). Without the annotation this is a
-// no-op and the loop moves on to the next dispatch step.
+// continueQuorumRecovery (§4.9 item 2). On a healthy cluster this is a no-op
+// and the loop moves on to the next dispatch step. An unhealthy cluster
+// without a usable annotation ends the loop here, as
+// reconcile_loop_v0.3.0.png shows: steps 8 and 9 assume a healthy cluster.
 func (r *EtcdClusterReconciler) maybeStartQuorumRecovery(ctx context.Context, s *reconcileState) (ctrl.Result, error) {
-	logger := log.FromContext(ctx)
-
-	value, ok := s.cluster.Annotations[recoverClusterFromAnnotation]
-	if !ok {
-		return ctrl.Result{}, nil
-	}
-
 	// No debounce is needed for now. s.health.Healthy can go false from a
 	// single failed MemberList/AlarmList call (healthCheck, pods.go) — a
 	// transient blip, not necessarily a real lost quorum — but recovery is
@@ -63,8 +80,19 @@ func (r *EtcdClusterReconciler) maybeStartQuorumRecovery(ctx context.Context, s 
 	// cluster to stay unhealthy for some minimum duration or number of
 	// consecutive reconciles) would only matter for automatic recovery,
 	// which isn't supported yet; revisit it if that is ever added.
-	if s.health == nil || s.health.Healthy {
+	if clusterHealthy(s) {
 		return ctrl.Result{}, nil
+	}
+	logger := log.FromContext(ctx)
+
+	value, ok := s.cluster.Annotations[recoverClusterFromAnnotation]
+	if !ok {
+		logger.Error(errClusterUnhealthy, "Waiting for the cluster to recover, or for a human operator to request a lost-quorum recovery",
+			"annotation", recoverClusterFromAnnotation)
+		r.Recorder.Eventf(s.cluster, nil, corev1.EventTypeWarning, reasonClusterUnhealthy, actionRecoverCluster,
+			"The cluster is not healthy. If it lost quorum, set the %s annotation to the ordinal of the member to recover from",
+			recoverClusterFromAnnotation)
+		return ctrl.Result{RequeueAfter: requeueDuration}, nil
 	}
 
 	// TODO: reject an invalid value when the annotation is set, with a
@@ -76,7 +104,9 @@ func (r *EtcdClusterReconciler) maybeStartQuorumRecovery(ctx context.Context, s 
 	if err != nil {
 		logger.Error(err, "Ignoring invalid lost-quorum recovery annotation",
 			"annotation", recoverClusterFromAnnotation, "value", value)
-		return ctrl.Result{}, nil
+		r.Recorder.Eventf(s.cluster, nil, corev1.EventTypeWarning, reasonQuorumRecoveryRejected, actionRecoverCluster,
+			"Cannot recover from %s=%q: %v", recoverClusterFromAnnotation, value, err)
+		return ctrl.Result{RequeueAfter: requeueDuration}, nil
 	}
 
 	logger.Info("[Quorum recovery] starting", "survivor", etcdMemberName(s.cluster.Name, survivor))
@@ -121,7 +151,7 @@ func (r *EtcdClusterReconciler) continueQuorumRecovery(ctx context.Context, s *r
 	}
 
 	// 2. Check live state: is the etcd cluster healthy?
-	if s.health == nil || !s.health.Healthy {
+	if !clusterHealthy(s) {
 		// Not healthy: --force-new-cluster hasn't taken effect yet.
 		if err := r.recreateSurvivorWithForceNewCluster(ctx, s, survivor); err != nil {
 			return ctrl.Result{}, err

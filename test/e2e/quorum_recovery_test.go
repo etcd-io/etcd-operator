@@ -110,6 +110,18 @@ func TestQuorumRecovery(t *testing.T) {
 			return ctx
 		})
 
+	feature.Assess("the operator waits for a recovery request",
+		func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+			// Pods aren't watched, so touch the EtcdCluster to start a
+			// reconcile. While the cluster is unhealthy it requeues on its own.
+			annotateEtcdCluster(ctx, t, c, clusterName, "e2e.etcd.io/poke", time.Now().Format(time.RFC3339Nano))
+			waitForClusterEvent(t, c, clusterName, "ClusterUnhealthy")
+			if qr := getEtcdCluster(ctx, t, c, clusterName).Status.QuorumRecovery; qr != nil {
+				t.Fatalf("Status.QuorumRecovery = %+v, want nil before anyone requests a recovery", qr)
+			}
+			return ctx
+		})
+
 	feature.Assess("the annotation rebuilds the cluster from the survivor",
 		func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
 			annotateEtcdCluster(ctx, t, c, clusterName, recoverClusterFromAnnotation, "1")

@@ -202,33 +202,50 @@ func TestMaybeStartQuorumRecovery(t *testing.T) {
 		}
 	})
 
-	// A request that names a member the recovery can't start from is ignored:
-	// recreating that member's Pod would lose data.
+	// The annotation is only acted on while the cluster is unhealthy.
+	t.Run("Ignores a request on a healthy cluster", func(t *testing.T) {
+		f := newRecoveryFixture()
+		f.requestRecoveryFrom("1")
+		f.addPod(0)
+		f.addPod(1)
+		f.addPod(2)
+		r := f.reconciler(t)
+
+		res, err := r.maybeStartQuorumRecovery(t.Context(), readState(t, r, f.cluster, healthy))
+		require.NoError(t, err)
+		assert.Equal(t, ctrl.Result{}, res)
+
+		s := readState(t, r, f.cluster, nil)
+		assert.Nil(t, s.cluster.Status.QuorumRecovery)
+		assert.Equal(t, "1", s.cluster.Annotations[recoverClusterFromAnnotation])
+	})
+
+	// A request that names a member the recovery can't start from is
+	// rejected, since recreating that member's Pod would lose data. The
+	// cluster keeps waiting, and the event tells the human operator why.
 	tests := []struct {
-		name   string
-		value  string
-		health *etcdutils.ClusterHealth
-		tweak  func(f *recoveryFixture)
+		name  string
+		value string
+		tweak func(f *recoveryFixture)
 	}{
-		{name: "the cluster is healthy", value: "1", health: healthy},
-		{name: "the value is not an ordinal", value: "etcd-1", health: unhealthy},
-		{name: "the ordinal is negative", value: "-1", health: unhealthy},
-		{name: "no member has the ordinal", value: "7", health: unhealthy},
+		{name: "the value is not an ordinal", value: "etcd-1"},
+		{name: "the ordinal is negative", value: "-1"},
+		{name: "no member has the ordinal", value: "7"},
 		{
-			name: "the member is being deleted", value: "1", health: unhealthy,
+			name: "the member is being deleted", value: "1",
 			tweak: func(f *recoveryFixture) { f.members[1].DeletionTimestamp = &now },
 		},
 		{
-			name: "the member is not a voting member", value: "1", health: unhealthy,
+			name: "the member is not a voting member", value: "1",
 			tweak: func(f *recoveryFixture) { f.members[1].Status.Phase = ecv1alpha1.EtcdMemberReplacing },
 		},
 		{
-			name: "the member is being recreated", value: "1", health: unhealthy,
+			name: "the member is being recreated", value: "1",
 			tweak: func(f *recoveryFixture) { f.members[1].Status.Phase = ecv1alpha1.EtcdMemberRecreating },
 		},
 	}
 	for _, tt := range tests {
-		t.Run("Ignores a request when "+tt.name, func(t *testing.T) {
+		t.Run("Rejects a request when "+tt.name, func(t *testing.T) {
 			f := newRecoveryFixture()
 			f.requestRecoveryFrom(tt.value)
 			f.addPod(1)
@@ -237,16 +254,127 @@ func TestMaybeStartQuorumRecovery(t *testing.T) {
 			}
 			r := f.reconciler(t)
 
-			res, err := r.maybeStartQuorumRecovery(t.Context(), readState(t, r, f.cluster, tt.health))
+			res, err := r.maybeStartQuorumRecovery(t.Context(), readState(t, r, f.cluster, unhealthy))
 			require.NoError(t, err)
-			assert.Equal(t, ctrl.Result{}, res)
+			assert.Equal(t, ctrl.Result{RequeueAfter: requeueDuration}, res, "the unhealthy cluster must keep waiting")
 
 			s := readState(t, r, f.cluster, nil)
 			assert.Nil(t, s.cluster.Status.QuorumRecovery)
 			assert.Equal(t, tt.value, s.cluster.Annotations[recoverClusterFromAnnotation])
 			assert.NotNil(t, survivorPod(t, r, f.cluster))
+			assert.Contains(t, nextEvent(r), "Warning QuorumRecoveryRejected Cannot recover from "+recoverClusterFromAnnotation+"=")
 		})
 	}
+}
+
+// Steps 8 and 9 assume a healthy cluster (reconcile_loop_v0.3.0.png), so an
+// unhealthy one waits at step 7 for quorum to come back or for a human
+// operator to request a recovery.
+func TestDispatchWhileClusterUnhealthy(t *testing.T) {
+	// Step 8 starts ordinal 0 as a new cluster when it sees no membership,
+	// and a failed MemberList looks the same. That would put a second, empty
+	// cluster next to the other members' data (#526).
+	t.Run("Waits instead of starting etcd-0 as a new cluster", func(t *testing.T) {
+		f := newRecoveryFixture()
+		f.members[0].Status.Phase = ecv1alpha1.EtcdMemberProvisioning
+		f.addPod(1)
+		f.addPod(2)
+		r := f.reconciler(t)
+
+		res, err := r.dispatch(t.Context(), readState(t, r, f.cluster, unhealthy))
+		require.NoError(t, err)
+		assert.Equal(t, ctrl.Result{RequeueAfter: requeueDuration}, res)
+
+		err = r.Get(t.Context(), client.ObjectKey{Name: memberPodName(f.cluster.Name, 0), Namespace: f.cluster.Namespace}, &corev1.Pod{})
+		assert.True(t, apierrors.IsNotFound(err), "etcd-0 must not start while the cluster is unhealthy")
+		assert.Contains(t, nextEvent(r), "Warning ClusterUnhealthy The cluster is not healthy. If it lost quorum, set the "+recoverClusterFromAnnotation+" annotation")
+	})
+
+	t.Run("Waits instead of scaling out", func(t *testing.T) {
+		f := newRecoveryFixture()
+		f.members = f.members[:1]
+		f.addPod(0)
+		r := f.reconciler(t)
+
+		res, err := r.dispatch(t.Context(), readState(t, r, f.cluster, unhealthy))
+		require.NoError(t, err)
+		assert.Equal(t, ctrl.Result{RequeueAfter: requeueDuration}, res)
+
+		assert.Len(t, readState(t, r, f.cluster, nil).members, 1, "scale-out must wait while the cluster is unhealthy")
+		assert.Contains(t, nextEvent(r), "Warning ClusterUnhealthy")
+	})
+
+	// A member can't leave without quorum. If its cleanup failed on every
+	// loop, step 7 would never read the annotation.
+	t.Run("Starts a requested recovery while a member is Terminating", func(t *testing.T) {
+		f := newRecoveryFixture()
+		f.members[0].DeletionTimestamp = &now
+		f.requestRecoveryFrom("1")
+		f.addPod(1)
+		r := f.reconciler(t)
+
+		_, err := r.dispatch(t.Context(), readState(t, r, f.cluster, unhealthy))
+		require.NoError(t, err)
+
+		s := readState(t, r, f.cluster, nil)
+		require.NotNil(t, s.cluster.Status.QuorumRecovery)
+		assert.Equal(t, 1, s.cluster.Status.QuorumRecovery.Survivor)
+	})
+
+	// Without Pods there is no health to read. With more than one member the
+	// cluster has lost every Pod, rather than not started yet.
+	t.Run("Starts a requested recovery when no member has a Pod", func(t *testing.T) {
+		f := newRecoveryFixture()
+		f.requestRecoveryFrom("1")
+		r := f.reconciler(t)
+
+		_, err := r.dispatch(t.Context(), readState(t, r, f.cluster, nil))
+		require.NoError(t, err)
+
+		s := readState(t, r, f.cluster, nil)
+		require.NotNil(t, s.cluster.Status.QuorumRecovery)
+		assert.Equal(t, 1, s.cluster.Status.QuorumRecovery.Survivor)
+	})
+
+	// Per-member repair (step 6) still runs first: it may bring quorum back
+	// on its own.
+	t.Run("Still continues a member that is already Recreating", func(t *testing.T) {
+		f := newRecoveryFixture()
+		f.members[1].Status.Phase = ecv1alpha1.EtcdMemberRecreating
+		f.addPod(0)
+		f.addPod(2)
+		r := f.reconciler(t)
+
+		_, err := r.dispatch(t.Context(), readState(t, r, f.cluster, unhealthy))
+		require.NoError(t, err)
+
+		assert.NotNil(t, survivorPod(t, r, f.cluster), "the Recreating member must get its Pod back")
+		assert.Empty(t, nextEvent(r))
+	})
+
+	t.Run("Still bootstraps a new cluster", func(t *testing.T) {
+		f := newRecoveryFixture()
+		f.members = f.members[:1]
+		f.members[0].Status.Phase = ecv1alpha1.EtcdMemberPending
+		r := f.reconciler(t)
+
+		_, err := r.dispatch(t.Context(), readState(t, r, f.cluster, nil))
+		require.NoError(t, err)
+
+		assert.Equal(t, ecv1alpha1.EtcdMemberProvisioning, readState(t, r, f.cluster, nil).members[0].Status.Phase)
+	})
+
+	t.Run("Still scales out a healthy cluster", func(t *testing.T) {
+		f := newRecoveryFixture()
+		f.members = f.members[:1]
+		f.addPod(0)
+		r := f.reconciler(t)
+
+		_, err := r.dispatch(t.Context(), readState(t, r, f.cluster, healthy))
+		require.NoError(t, err)
+
+		assert.Len(t, readState(t, r, f.cluster, nil).members, 2)
+	})
 }
 
 func TestContinueQuorumRecovery(t *testing.T) {
