@@ -3,6 +3,7 @@ package e2e
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -145,6 +146,16 @@ func TestQuorumRecovery(t *testing.T) {
 				t.Fatalf("cluster %s was not rebuilt to 3 members: %v", clusterName, err)
 			}
 			waitForNoLearners(t, c, survivor, 3, 2*time.Minute)
+
+			// etcd applies the flag on every restart of the container, which
+			// would drop the members scale-out added back.
+			pod := &corev1.Pod{}
+			if err := c.Client().Resources().Get(ctx, survivor, namespace, pod); err != nil {
+				t.Fatalf("Failed to get Pod %s: %v", survivor, err)
+			}
+			if slices.Contains(pod.Spec.Containers[0].Args, "--force-new-cluster") {
+				t.Errorf("Pod %s still starts etcd with --force-new-cluster", survivor)
+			}
 
 			for ordinal := range 3 {
 				name := fmt.Sprintf("%s-%d", clusterName, ordinal)
