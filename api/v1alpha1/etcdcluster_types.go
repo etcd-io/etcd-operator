@@ -263,12 +263,13 @@ type NoSpaceRemediationStatus struct {
 
 // QuorumRecoveryStatus tracks an in-progress lost-quorum recovery.
 type QuorumRecoveryStatus struct {
-	// Survivor is the ordinal EtcdClusterReconciler selected (or a human
-	// operator specified) to become the new single-member cluster. This is
-	// a decision, not something re-derivable live once other members are
-	// gone — there may be nothing left to compare commit indices against —
-	// and terminating every other member needs to know exactly which one to
-	// spare.
+	// Survivor is the ordinal of the member that becomes the new
+	// single-member cluster. For now it is only ever specified by a human
+	// operator, through the operator.etcd.io/recover-cluster-from
+	// annotation on the EtcdCluster; automatic recovery isn't supported.
+	// This is a decision, not something re-derivable live once other
+	// members are gone, and terminating every other member needs to know
+	// exactly which one to spare.
 	Survivor int `json:"survivor"`
 }
 

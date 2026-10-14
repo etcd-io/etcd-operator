@@ -433,19 +433,9 @@ func (r *EtcdClusterReconciler) refreshClusterState(ctx context.Context, s *reco
 // EtcdMember at a time until it is Ready; the replacing case (§4.9 item 8's
 // second bullet) lands in a follow-up PR.
 func (r *EtcdClusterReconciler) dispatch(ctx context.Context, s *reconcileState) (ctrl.Result, error) {
-	logger := log.FromContext(ctx)
-
 	// 2. Continue an already-started lost-quorum recovery (§4.8).
-	// We should check whether the cluster is healthy first. If yes,
-	// cleanup the Status.QuorumRecovery; if no, then check whether
-	// it's an already-started lost-quorum recovery, and continue to
-	// do it if present.
 	if s.cluster.Status.QuorumRecovery != nil {
-		// TODO: §4.8/§4.9 item 2 — force-new-cluster the survivor,
-		// terminate the rest, let scale-out rebuild (M5).
-		logger.Info("Lost-quorum recovery in progress; continuation not implemented yet",
-			"survivor", s.cluster.Status.QuorumRecovery.Survivor)
-		return ctrl.Result{RequeueAfter: requeueDuration}, nil
+		return r.continueQuorumRecovery(ctx, s)
 	}
 
 	// 3. Clean up any EtcdMember already Terminating (§4.6/§4.9 item 3,
@@ -484,15 +474,12 @@ func (r *EtcdClusterReconciler) dispatch(ctx context.Context, s *reconcileState)
 	// start Recreating needs the live-health-to-EtcdMember mapping M3/M6
 	// add; not wired up yet, so this half of the step never fires either.
 
-	// 7. Decide whether to *start* lost-quorum recovery (§4.8/§4.9 item 7).
-	// TODO: opt-in, and only once steps 3-6 above find nothing to do
-	// and the cluster is still unhealthy (M5). s.health.Healthy
-	// (refreshClusterState) can go false from a single failed
-	// MemberList/AlarmList call (healthCheck, pods.go) — a transient blip,
-	// not necessarily a real lost quorum — so this step must debounce (e.g.
-	// require the cluster to stay unhealthy for some minimum duration or
-	// number of consecutive reconciles) before declaring quorum lost,
-	// rather than triggering recovery off the first unhealthy reading.
+	// 7. Decide whether to *start* lost-quorum recovery (§4.8/§4.9 item 7):
+	// only once steps 3-6 above find nothing to do, the cluster is still
+	// unhealthy, and a human set the recover-cluster-from annotation.
+	if res, err := r.maybeStartQuorumRecovery(ctx, s); err != nil || !res.IsZero() {
+		return res, err
+	}
 
 	// 8. Advance whatever's left not-Ready (Pending/Provisioning/Replacing).
 	// An existing learner always wins this slot (requirement 11); with more
