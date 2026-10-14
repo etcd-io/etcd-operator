@@ -179,8 +179,9 @@ func (r *EtcdClusterReconciler) continueQuorumRecovery(ctx context.Context, s *r
 
 // recreateSurvivorWithForceNewCluster deletes and recreates the survivor's
 // Pod with "--force-new-cluster" so it restarts as a single-member cluster.
-// The flag is not persisted anywhere: it only applies to that one startup,
-// so a later recreate of this Pod naturally starts without it.
+// etcd applies the flag on every start of the container, not only the first,
+// so the Pod is created with an empty spec hash: once the cluster is healthy,
+// updateConfig recreates it without the flag before scale-out adds any member.
 //
 // It must be idempotent: if the Pod was already recreated with the flag, do
 // not recreate it again. Deleting the old Pod and creating the new one take
@@ -200,6 +201,7 @@ func (r *EtcdClusterReconciler) recreateSurvivorWithForceNewCluster(ctx context.
 			return err
 		}
 		newPod.Spec.Containers[0].Args = append(newPod.Spec.Containers[0].Args, forceNewClusterFlag)
+		newPod.Annotations[HashMetadataKey] = ""
 		if err := r.Create(ctx, newPod); err != nil {
 			return fmt.Errorf("failed to create Pod %q with %s: %w", newPod.Name, forceNewClusterFlag, err)
 		}

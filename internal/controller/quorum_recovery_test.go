@@ -538,3 +538,29 @@ func TestContinueQuorumRecovery(t *testing.T) {
 		assert.Equal(t, []string{"etcd-0", "etcd-2"}, memberNames(s))
 	})
 }
+
+// etcd applies --force-new-cluster on every start of the survivor's
+// container, not just the first, so a restart after scale-out added members
+// back would drop them again. The survivor's Pod must be recreated without
+// the flag before scale-out runs.
+func TestRecoveredSurvivorIsRecreatedBeforeScaleOut(t *testing.T) {
+	f := newRecoveryFixture()
+	f.cluster.Status.QuorumRecovery = &ecv1alpha1.QuorumRecoveryStatus{Survivor: 1}
+	f.members = f.members[1:2]
+	r := f.reconciler(t)
+
+	_, err := r.dispatch(t.Context(), readState(t, r, f.cluster, unhealthy))
+	require.NoError(t, err)
+	require.True(t, podForcesNewCluster(survivorPod(t, r, f.cluster)))
+
+	_, err = r.dispatch(t.Context(), readState(t, r, f.cluster, healthy))
+	require.NoError(t, err)
+	require.Nil(t, readState(t, r, f.cluster, nil).cluster.Status.QuorumRecovery, "the recovery must have completed")
+
+	_, err = r.dispatch(t.Context(), readState(t, r, f.cluster, healthy))
+	require.NoError(t, err)
+
+	s := readState(t, r, f.cluster, nil)
+	require.Len(t, s.members, 1, "scale-out must wait until the survivor runs without --force-new-cluster")
+	assert.Equal(t, ecv1alpha1.EtcdMemberRecreating, s.members[0].Status.Phase)
+}
