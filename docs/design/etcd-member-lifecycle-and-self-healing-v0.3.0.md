@@ -169,11 +169,11 @@ this alarm, don't redo it," etc.
     unless the member was already removed, in which case just disarm. See
     §4.6/§4.7/§4.9.
 14. **Total quorum loss needs a distinct, opt-in recovery path** — restarting
-    the member with the most up-to-date data as a brand-new single-member
+    the member chosen by a human operator as a brand-new single-member
     cluster, then discarding and rejoining the rest via the *existing*
-    scale in/out mechanics rather than any new membership logic. Off by
-    default; should support a human operator triggering and steering it
-    manually. See §4.8.
+    scale in/out mechanics rather than any new membership logic. Never
+    automatic: triggered manually via the
+    `operator.etcd.io/recover-cluster-from` annotation. See §4.8.
 15. **Pause for manual intervention.** Expose an API (e.g.
     `EtcdClusterSpec.Paused`) letting a human operator pause
     `EtcdClusterReconciler`'s reconciliation of a cluster, so they can debug
@@ -415,8 +415,8 @@ type NoSpaceRemediationStatus struct {
 }
 
 type QuorumRecoveryStatus struct {
-    // Survivor is the ordinal EtcdClusterReconciler selected (or a human
-    // operator specified) to become the new single-member cluster. This is
+    // Survivor is the ordinal a human operator specified (via the
+    // operator.etcd.io/recover-cluster-from annotation) to become the new single-member cluster. This is
     // a decision, not something re-derivable live once other members are
     // gone — there may be nothing left to compare commit indices against —
     // and step 3's "terminate every *other* member" needs to know exactly
@@ -848,42 +848,65 @@ only way forward is etcd's own disaster-recovery procedure: restart the
 member with the most up-to-date data as a brand-new single-member cluster,
 then rebuild the rest around it.
 
-**Off by default, and always available to a human.** Given the blast
-radius (this discards the other members' data), automatic recovery must be
-an explicit opt-in (`EtcdClusterSpec` flag, off by default); when it's off
-— or always, as a manual override — an operator can trigger it directly and
-optionally choose which member (or a snapshot) to recover from, rather than
-letting the controller pick automatically.
+**Manual trigger only, for now.** Given the blast radius (this discards the
+other members' data), recovery is never started automatically; automatic
+recovery is not supported yet. A human operator triggers it by adding the
+annotation `operator.etcd.io/recover-cluster-from` to the `EtcdCluster`,
+whose value is the ordinal of the member to recover from (the human operator
+picks the survivor, typically the member with the most up-to-date data).
 
-**Mechanism**, once triggered (automatically or manually):
+**Mechanism**, in two stages:
 
-1. Select the member with the highest Raft commit index (or the
-   operator-specified one), and write `Status.QuorumRecovery =
-   {Survivor: <ordinal>}` (§4.3) *before* touching anything — this is what
-   durably marks recovery as started, both for step 3 below and for §4.9's
-   priority check, and is the one thing that can't be re-derived live once
-   other members start disappearing.
-2. Check live state: is the survivor already running as a single-member
-   cluster (i.e. has the `--force-new-cluster` recreate already taken
-   effect)? If not, delete and recreate its Pod with that flag set. The
-   flag itself isn't persisted anywhere — it only needs to be present for
-   that one startup, so the *next* time this Pod is recreated for any other
-   reason, it naturally starts without it.
-3. Concurrently terminate every `EtcdMember` *other than*
-   `Status.QuorumRecovery.Survivor` — the existing `Terminating` flow
-   (§4.6) already handles etcd-side removal and Pod/PVC cleanup (cert
-   cleanup is skipped, per §4.6's interim exception); no new membership
-   logic needed. (These other members are no longer part of any cluster
-   the survivor recognizes, so the ordinary `MemberRemove` idempotency
-   check in step 2 of §4.6's `Terminating` leave-sequence naturally becomes
-   a no-op for them — only alarm disarm, Pod/PVC cleanup, and object
-   deletion actually happen.)
-4. Once the survivor is a healthy single-member cluster and the others are
-   gone, clear `Status.QuorumRecovery` (set it back to `nil`) — this is
-   what tells §4.9 recovery is no longer under way. The cluster is now
-   undersized; the *existing* scale-out path (§4.4/§4.6) brings it back to
-   `EtcdCluster.Spec.Size` one member at a time, exactly as it would after
-   any other scale-out.
+*Starting* (§4.9 item 7). If the cluster is still unhealthy after `CORRUPT`,
+`NOSPACE`, and per-member repair found nothing to do, and the
+`operator.etcd.io/recover-cluster-from` annotation is set, write
+`Status.QuorumRecovery = {Survivor: <ordinal>}` (§4.3) *before* touching
+anything. This is what durably marks recovery as started, both for the
+stage below and for §4.9's priority check, and is the one thing that can't
+be re-derived live once other members start disappearing. If the annotation
+isn't set, nothing happens and the loop moves on.
+
+*Continuing* (§4.9 item 2). While `Status.QuorumRecovery != nil`, each
+reconcile does the following (`reconcile_cluster_v0.3.0.png`, "recover
+cluster from lost-quorum case"):
+
+1. Find the `EtcdMember` matching `Status.QuorumRecovery.Survivor`.
+2. Check live state: is the etcd cluster healthy?
+   - **Not healthy** (the `--force-new-cluster` recreate hasn't taken
+     effect yet): publish an event naming the member the recovery started
+     from, *then* delete and recreate the survivor's Pod with
+     `--force-new-cluster`, terminate every other `EtcdMember`, and
+     requeue. The event goes out before the Pod is recreated, so it is
+     recorded even if the recreate fails, and it is only published when
+     the Pod is actually about to be recreated, not on every retry. The
+     flag isn't persisted anywhere, so there's nothing to remove
+     afterwards — it only applies to that one startup, and the *next* time
+     this Pod is recreated for any other reason it naturally starts
+     without it.
+   - **Healthy** (the survivor is now a working single-member cluster):
+     remove the `operator.etcd.io/recover-cluster-from` annotation if it
+     still exists, terminate every other `EtcdMember` if any are left, then
+     clear `Status.QuorumRecovery` (set it back to `nil`), and requeue.
+     Clearing it is what tells §4.9 recovery is no longer under way.
+
+"Terminate" reuses the existing `Terminating` flow (§4.6), which already
+handles etcd-side removal and Pod/PVC cleanup (cert cleanup is skipped, per
+§4.6's interim exception); no new membership logic needed. These other
+members are no longer part of any cluster the survivor recognizes, so the
+ordinary `MemberRemove` idempotency check in step 2 of §4.6's `Terminating`
+leave-sequence naturally becomes a no-op for them — only alarm disarm,
+Pod/PVC cleanup, and object deletion actually happen.
+
+**Fail fast, so recovery can be retried.** If any step fails, the
+reconciler returns the error immediately, and `Status.QuorumRecovery` (and
+the annotation) are deliberately *not* cleaned up, so the next reconcile
+resumes recovery from live state rather than losing track that it was
+started.
+
+**Rebuilding the cluster.** After `Status.QuorumRecovery` is cleared the
+cluster is undersized, and the *existing* scale-out path (§4.4/§4.6) brings
+it back to `EtcdCluster.Spec.Size` one member at a time, exactly as after
+any other scale-out. Recovery itself never adds members.
 
 `Status.QuorumRecovery` is the one exception to the rule right below it —
 see its comment in §4.3 for why "are we already recovering" can't be
@@ -893,9 +916,8 @@ re-derived live the way every other sub-question here can.
 (`LastRecoveryTime`, `RecoveryCount`, `LastRecoveredFrom`, §4.3) —
 `EtcdClusterReconciler` must never make a decision from them, only report
 them; "is `--force-new-cluster` already applied" and "are the other
-members gone yet" are answered from a
-live read of the environment, the same discipline as everywhere else in
-this design.
+members gone yet" are answered from a live read of the environment, the
+same discipline as everywhere else in this design.
 
 **Priority (§4.9): entry and continuation rank very differently.**
 *Continuing* an already-started recovery ranks just below a human-triggered
@@ -907,17 +929,17 @@ deliberately so: unlike "has `--force-new-cluster` taken effect" or "are
 the other members gone," *whether we're recovering at all* isn't something
 a live topology snapshot can answer, since the same "only one member
 exists" picture also describes an ordinary bootstrap or a cluster
-legitimately scaled down to one. *Deciding to start* recovery in the
-first place ranks much lower — only after `CORRUPT`, `NOSPACE`, and a
-per-member repair attempt have all had a chance to run and found nothing
-to do, and the cluster is *still* unhealthy, does `EtcdClusterReconciler`
-begin the mechanism above (§4.9). The reasoning: an unhealthy cluster
-isn't necessarily a lost-quorum situation — an ordinary member repair
-might restore quorum on its own — so this data-discarding remedy is a last
-resort, never a first response. A pause (requirement 15) overrides both
-stages — if an operator is manually intervening, the controller's own
-automated recovery must not kick in underneath them, whether starting or
-continuing.
+legitimately scaled down to one. *Starting* recovery ranks much lower —
+only after `CORRUPT`, `NOSPACE`, and per-member `Recreating` handling have
+all had a chance to run and found nothing to do, and the cluster is *still*
+unhealthy *and* the operator has set the annotation, does
+`EtcdClusterReconciler` write `Status.QuorumRecovery` (§4.9). The
+reasoning: an unhealthy cluster isn't necessarily a lost-quorum situation —
+an ordinary member repair might restore quorum on its own — so this
+data-discarding remedy is a last resort, never a first response. A pause
+(requirement 15) overrides both stages — if an operator is manually
+intervening, the controller's own recovery must not kick in underneath
+them, whether starting or continuing.
 
 ### 4.9 Picking the one action to take this loop
 
@@ -980,8 +1002,9 @@ the loop.
    `Recreating`.
 7. **Otherwise, decide whether to *start* lost-quorum recovery (§4.8).** If
    the cluster still can't serve a linearizable request after steps 3–6
-   found nothing to do, and recovery isn't already under way (step 2),
-   begin it — the next reconcile that finds it already running picks it up
+   found nothing to do, recovery isn't already under way (step 2), and the
+   operator has set the `operator.etcd.io/recover-cluster-from` annotation,
+   begin it by setting `Status.QuorumRecovery` — the next reconcile that finds it already running picks it up
    via step 2. Deliberately low priority: recovery discards every other
    member's data, so it's tried only once the cheaper remedies above have
    had a chance to restore quorum on their own.
@@ -1091,12 +1114,12 @@ one reconcile pass does, in order:
 |---------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | Finalize cluster                      | Only runs if `EtcdCluster.DeletionTimestamp` is set; short-circuits everything else in this table for that loop (§4.13).                                                                                                                                                                                                  |
 | Pause                                 | Nothing else runs this loop (§4.9 item 1, requirement 15).                                                                                                                                                                                                                                                                |
-| Continue lost-quorum recovery         | §4.8: force-new-cluster the most up-to-date member, terminate the rest, let scale-out rebuild. Off by default; only reachable once `Status.QuorumRecovery != nil` (§4.9 item 2).                                                                                                                                          |
+| Continue lost-quorum recovery         | §4.8: force-new-cluster the survivor, terminate the rest, clean up the annotation and `Status.QuorumRecovery`, let scale-out rebuild. Manual trigger only; only reachable once `Status.QuorumRecovery != nil` (§4.9 item 2).                                                                                              |
 | Clean up `Terminating` members        | Continues the leave sequence for any `EtcdMember` with `DeletionTimestamp` set (§4.6). Ranked above `CORRUPT`/`NOSPACE`/per-member repair (§4.9 item 3): a member that's already leaving is never worth trying to fix, only touches its own Pod/PVC/cert/membership state, and shouldn't linger behind other remediation. |
 | `CORRUPT` alarm remediation           | Forces the tagged member directly to `Phase: Replacing` (§4.6) — reuses that state machine rather than a new one.                                                                                                                                                                                                         |
 | `NOSPACE` alarm remediation           | §4.7's compact → defragment (one member per loop, leader last) → disarm cycle.                                                                                                                                                                                                                                            |
 | Per-member repair                     | Continues the one member already `Recreating`, if any (there's never more than one); otherwise picks exactly one newly-unhealthy `Ready` member and starts `Recreating` it. Runs the shared Pod-recovery ladder (§4.6) — the same ladder a still-`Provisioning` member whose Pod never came up is already running.        |
-| Start lost-quorum recovery            | Only once `CORRUPT`/`NOSPACE`/per-member repair found nothing to do and the cluster is still unhealthy (§4.9 item 7) — a last resort, since it discards every other member's data.                                                                                                                                        |
+| Start lost-quorum recovery            | Only once `CORRUPT`/`NOSPACE`/per-member repair found nothing to do, the cluster is still unhealthy, and the `operator.etcd.io/recover-cluster-from` annotation is set (§4.9 item 7) — sets `Status.QuorumRecovery`. A last resort, since it discards every other member's data.                                          |
 | Promote learner / advance not-`Ready` | An existing learner always wins this slot (requirement 11); otherwise the lowest-ordinal not-`Ready` member (`Pending`/`Provisioning`/`Replacing`, including bootstrapping ordinal 0) continues its progress.                                                                                                             |
 | Update config                         | Decides *which* member updates first (highest ordinal, one at a time), runs the §4.5 transfer first if needed, then recreates the Pod.                                                                                                                                                                                    |
 | Scale out/in                          | Scale-out creates an `EtcdMember` at the lowest missing ordinal, or `max+1` if there's no gap to reuse (§4.4), and does the join mechanics (§4.6). Scale-in calls plain `client.Delete()` on the highest ordinal; the actual cleanup happens via the finalizer-driven `Terminating` flow.                                 |
@@ -1233,11 +1256,10 @@ the CRD version.
    (§4.6) grace period before an unhealthy Pod counts as a failed attempt,
    a hardcoded constant for v1, or should either be user-configurable via
    `EtcdClusterSpec`?
-2. What's the exact API shape for a human operator to manually trigger
-   lost-quorum recovery and pick a source member/snapshot (§4.8)? The
-   mechanism (force-new-cluster + terminate + scale-out) is decided; the
-   trigger surface (annotation? `EtcdClusterSpec` field? separate
-   sub-resource?) isn't.
+2. Should lost-quorum recovery (§4.8) eventually support automatic
+   triggering, or recovering from a snapshot rather than a surviving
+   member? Today it's manual only: the `operator.etcd.io/recover-cluster-from`
+   annotation, whose value is the survivor's ordinal.
 3. What's the detection threshold for "quorum lost" (§4.8) — how long must
    a majority be unreachable before this is even offered as an option,
    automatically or manually? Needs to be long enough to rule out a
@@ -1318,10 +1340,10 @@ the CRD version.
   that check (or `Disarm` itself) doesn't clear the alarm; `CORRUPT`
   detection wired into M3's `Replacing` trigger.
 - **M5 — Lost-quorum recovery** (resolves M2's lost-quorum TODO): the
-  opt-in flag, manual-trigger surface (pending Open Question 2),
-  highest-commit-index selection, `--force-new-cluster` recreate,
-  concurrent termination of the rest via the existing `Terminating` flow,
-  and deferring to the existing scale-out path (§4.8).
+  `operator.etcd.io/recover-cluster-from` annotation trigger,
+  `Status.QuorumRecovery`, `--force-new-cluster` recreate of the survivor,
+  termination of the rest via the existing `Terminating` flow, annotation/
+  status cleanup, and deferring to the existing scale-out path (§4.8).
 - **M6 — Status** (resolves M2's status-roll-up TODO): `EtcdMember.Status`
   and `EtcdClusterStatus.Members` written from the same live snapshot each
   reconcile (§4.11); skip the write when unchanged; conditions.
