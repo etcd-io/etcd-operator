@@ -39,6 +39,7 @@ import (
 
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 	"go.etcd.io/etcd-operator/internal/etcdutils"
+	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	etcdversions "go.etcd.io/etcd/api/v3/version"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
@@ -419,6 +420,19 @@ func (r *EtcdClusterReconciler) refreshClusterState(ctx context.Context, s *reco
 	}
 }
 
+func getCurrentRevision(members map[string]etcdutils.EpHealth) int64 {
+	var revision int64
+	for _, m := range members {
+		if m.Status == nil {
+			continue
+		}
+		if rev := m.Status.Header.Revision; rev > revision {
+			revision = rev
+		}
+	}
+	return revision
+}
+
 // dispatch implements design doc §4.9's priority order, items 2-9:
 // at most one mutating action per reconcile. Each numbered step either
 // claims the loop (returns a non-zero Result or an error) or falls through
@@ -466,8 +480,45 @@ func (r *EtcdClusterReconciler) dispatch(ctx context.Context, s *reconcileState)
 	}
 
 	// 5. NOSPACE alarm remediation (§4.7).
-	// TODO: §4.9 item 5 — compact/defragment/disarm cycle (M4). Same
-	// as above, s.health.Alarms already has the data.
+	if s.health != nil && s.health.Healthy && slices.ContainsFunc(s.health.Alarms,
+		func(a *etcdserverpb.AlarmMember) bool { return a.Alarm == etcdserverpb.AlarmType_NOSPACE }) {
+		currentRev := getCurrentRevision(s.health.Members)
+		if currentRev == 0 {
+			return ctrl.Result{}, fmt.Errorf("cannot determine the revision to compact at: no member reported a status")
+		}
+
+		cfg := etcdutils.ClientConfig{
+			Endpoints: clientEndpointsFromPods(s.cluster.Name, s.cluster.Namespace, s.pods, clusterTLSEnabled(s.cluster)),
+			TLS:       s.tlsConfig,
+		}
+		if err := etcdutils.Compact(cfg, currentRev); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		endpoints := make([]string, 0, len(s.pods))
+		var leaderEp string
+		for _, m := range s.health.Members {
+			if m.Status == nil {
+				continue
+			}
+			if m.Status.Leader == m.Status.Header.MemberId {
+				leaderEp = m.Ep
+				continue
+			}
+			endpoints = append(endpoints, m.Ep)
+		}
+		endpoints = append(endpoints, leaderEp)
+
+		for _, ep := range endpoints {
+			if err := etcdutils.Defrag(cfg, ep); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+
+		if err := etcdutils.AlarmDisarm(cfg, s.health.Alarms); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
 
 	// 6. Per-member repair: continue a member already Recreating, or start
 	// fixing exactly one newly-unhealthy Ready member (requirement 6).
