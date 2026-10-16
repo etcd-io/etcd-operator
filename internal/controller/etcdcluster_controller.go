@@ -75,6 +75,13 @@ type reconcileState struct {
 	tlsConfig      *tls.Config                  // etcd client TLS config used by every etcdutils call in this loop (nil for non-TLS clusters)
 }
 
+// clusterBootstrapped reports whether a live etcd cluster may already exist,
+// that is, whether at least one member Pod is present. The Pod list can be
+// trusted, because fetchAndValidateState requeues when listing Pods fails.
+func (s *reconcileState) clusterBootstrapped() bool {
+	return len(s.pods) > 0
+}
+
 // +kubebuilder:rbac:groups=operator.etcd.io,resources=etcdclusters,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=operator.etcd.io,resources=etcdclusters/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=operator.etcd.io,resources=etcdclusters/finalizers,verbs=update
