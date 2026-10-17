@@ -8,7 +8,9 @@ import (
 	"log"
 	"net"
 	"net/url"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -250,9 +252,21 @@ func getPeerCertName(etcdClusterName string) string {
 	return fmt.Sprintf("%s-%s-tls", etcdClusterName, "peer")
 }
 
+// validityDurationDayPrefix matches a leading integer day segment, e.g. "365d" or the "100d" in "100d12h".
+var validityDurationDayPrefix = regexp.MustCompile(`^(\d+)d`)
+
+// parseValidityDuration expands a leading day segment (e.g. "365d", "100d12h") to
+// hours, since time.ParseDuration does not support the "d" unit.
 func parseValidityDuration(customizedDuration string, defaultDuration time.Duration) (time.Duration, error) {
 	if customizedDuration == "" {
 		return defaultDuration, nil
+	}
+	if m := validityDurationDayPrefix.FindStringSubmatch(customizedDuration); m != nil {
+		days, err := strconv.Atoi(m[1])
+		if err != nil {
+			return 0, fmt.Errorf("failed to parse ValidityDuration: %w", err)
+		}
+		customizedDuration = fmt.Sprintf("%dh%s", days*24, customizedDuration[len(m[0]):])
 	}
 	duration, err := time.ParseDuration(customizedDuration)
 	if err != nil {
