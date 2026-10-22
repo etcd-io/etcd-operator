@@ -12,6 +12,8 @@ import (
 
 	"github.com/go-logr/logr"
 	"go.uber.org/zap"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
@@ -22,6 +24,12 @@ import (
 
 // defaultTimeout is the default timeout used for etcd client SDK calls.
 const defaultTimeout = 10 * time.Second
+
+// defragTimeout is longer than defaultTimeout: defragmenting a member rewrites
+// its whole backend db on disk and legitimately takes longer than a metadata
+// call. A defrag that still exceeds this is treated as timed out by the
+// caller, which records the attempt so it isn't retried within the same cycle.
+const defragTimeout = 30 * time.Second
 
 // ClientConfig is the subset of etcd client settings consumed by the helpers in this package.
 type ClientConfig struct {
@@ -334,6 +342,49 @@ func RemoveMember(cfg ClientConfig, memberID uint64) error {
 
 	_, err = c.MemberRemove(ctx, memberID)
 	return err
+}
+
+// Compact compacts the cluster's keyspace to the given revision, dropping the
+// history before it. The request is served by the leader and returns as soon
+// as the compaction is scheduled; it is not waited for physically (no
+// WithCompactPhysical), matching the non-blocking step the NOSPACE remediation
+// cycle wants.
+func Compact(cfg ClientConfig, rev int64) error {
+	c, err := clientv3.New(cfg.buildConfig())
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+	defer func() { closeAndCancel(c, cancel) }()
+
+	_, err = c.Compact(ctx, rev)
+	return err
+}
+
+// Defragment defragments the etcd member serving the given endpoint. Unlike
+// Compact this is a local maintenance call: it rewrites that member's backend
+// db in place, so it targets one endpoint at a time (the NOSPACE remediation
+// cycle defragments one member per reconcile).
+func Defragment(cfg ClientConfig, endpoint string) error {
+	c, err := clientv3.New(cfg.buildConfig())
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), defragTimeout)
+	defer func() { closeAndCancel(c, cancel) }()
+
+	_, err = c.Defragment(ctx, endpoint)
+	return err
+}
+
+// IsTimedOut reports whether err is a context- or RPC-deadline-exceeded
+// error: our wait for the call gave up, and the call itself may still be
+// in flight server-side.
+func IsTimedOut(err error) bool {
+	return err != nil &&
+		(errors.Is(err, context.DeadlineExceeded) || status.Code(err) == codes.DeadlineExceeded)
 }
 
 func MoveLeader(cfg ClientConfig, memberId uint64) error {

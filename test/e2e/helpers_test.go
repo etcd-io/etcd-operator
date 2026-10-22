@@ -85,6 +85,15 @@ func getAvailableStorageClass(ctx context.Context, t *testing.T, c *envconf.Conf
 // createEtcdClusterWithPVC creates an EtcdCluster with persistent storage
 func createEtcdClusterWithPVC(ctx context.Context, t *testing.T, c *envconf.Config, name string, size int) {
 	t.Helper()
+	createEtcdClusterWithPVCOptions(ctx, t, c, name, size, nil)
+}
+
+// createEtcdClusterWithPVCOptions creates a PVC-backed EtcdCluster with extra
+// etcd command-line options (e.g. a small --quota-backend-bytes).
+func createEtcdClusterWithPVCOptions(
+	ctx context.Context, t *testing.T, c *envconf.Config, name string, size int, etcdOptions []string,
+) {
+	t.Helper()
 	storageClassName := getAvailableStorageClass(ctx, t, c)
 
 	etcdCluster := &ecv1alpha1.EtcdCluster{
@@ -93,8 +102,9 @@ func createEtcdClusterWithPVC(ctx context.Context, t *testing.T, c *envconf.Conf
 			Namespace: namespace,
 		},
 		Spec: ecv1alpha1.EtcdClusterSpec{
-			Size:    size,
-			Version: etcdVersion,
+			Size:        size,
+			Version:     etcdVersion,
+			EtcdOptions: etcdOptions,
 			StorageSpec: &ecv1alpha1.StorageSpec{
 				AccessModes:       corev1.ReadWriteOnce,
 				StorageClassName:  storageClassName,
@@ -594,6 +604,20 @@ func waitForNoAlarms(t *testing.T, c *envconf.Config, podName string) error {
 		}
 		return strings.TrimSpace(stdout) == "", nil
 	}, wait.WithTimeout(3*time.Minute), wait.WithInterval(2*time.Second))
+}
+
+// waitForAlarmPresent waits until `etcdctl alarm list` on podName reports at
+// least one alarm.
+func waitForAlarmPresent(t *testing.T, c *envconf.Config, podName string) error {
+	t.Helper()
+	return wait.For(func(ctx context.Context) (bool, error) {
+		stdout, stderr, err := execInPod(t, c, podName, namespace, []string{"etcdctl", "alarm", "list"})
+		if err != nil {
+			t.Logf("etcdctl alarm list via %s: %v, stderr: %s", podName, err, stderr)
+			return false, nil
+		}
+		return strings.TrimSpace(stdout) != "", nil
+	}, wait.WithTimeout(2*time.Minute), wait.WithInterval(2*time.Second))
 }
 
 func verifyDataOperations(t *testing.T, c *envconf.Config, etcdClusterName, key, val string, tlsEnabled bool) {
