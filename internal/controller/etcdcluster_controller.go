@@ -466,8 +466,9 @@ func (r *EtcdClusterReconciler) dispatch(ctx context.Context, s *reconcileState)
 	}
 
 	// 5. NOSPACE alarm remediation (§4.7).
-	// TODO: §4.9 item 5 — compact/defragment/disarm cycle (M4). Same
-	// as above, s.health.Alarms already has the data.
+	if res, err := r.handleNoSpaceAlarm(ctx, s); err != nil || !res.IsZero() {
+		return res, err
+	}
 
 	// 6. Per-member repair: continue a member already Recreating, or start
 	// fixing exactly one newly-unhealthy Ready member (requirement 6).
