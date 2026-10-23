@@ -9,7 +9,7 @@ require (
 	github.com/golangci/golangci-lint/v2 v2.14.0
 	go.etcd.io/gofail v0.2.0
 	sigs.k8s.io/controller-runtime/tools/setup-envtest v0.25.2 // @release-0.19
-	sigs.k8s.io/controller-tools v0.22.0
+	sigs.k8s.io/controller-tools v0.23.0
 	sigs.k8s.io/kind v0.33.0
 	sigs.k8s.io/kustomize/kustomize/v5 v5.8.3
 )
@@ -248,7 +248,7 @@ require (
 	golang.org/x/sync v0.23.0 // indirect
 	golang.org/x/sys v0.48.0 // indirect
 	golang.org/x/text v0.42.0 // indirect
-	golang.org/x/tools v0.50.0 // indirect
+	golang.org/x/tools v0.51.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260526163538-3dc84a4a5aaa // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260819154853-08b0e4226688 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
