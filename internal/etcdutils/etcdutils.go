@@ -228,7 +228,7 @@ func MemberHealth(cfg ClientConfig) ([]EpHealth, error) {
 		name string
 	}
 
-	var cfgs = make([]epConfig, 0, len(cfg.Endpoints))
+	cfgs := make([]epConfig, 0, len(cfg.Endpoints))
 	for i, ep := range cfg.Endpoints {
 		epCfg := ClientConfig{Endpoints: []string{ep}, TLS: cfg.TLS}
 		built := epCfg.buildConfig()
@@ -285,7 +285,7 @@ func MemberHealth(cfg ClientConfig) ([]EpHealth, error) {
 	wg.Wait()
 	close(healthCh)
 
-	var healthList = make([]EpHealth, 0, len(healthCh))
+	healthList := make([]EpHealth, 0, len(healthCh))
 	for h := range healthCh {
 		healthList = append(healthList, h)
 	}
@@ -346,5 +346,35 @@ func MoveLeader(cfg ClientConfig, memberId uint64) error {
 	defer func() { closeAndCancel(c, cancel) }()
 
 	_, err = c.MoveLeader(ctx, memberId)
+	return err
+}
+
+func Compact(cfg ClientConfig, targetRev int64) error {
+	c, err := clientv3.New(cfg.buildConfig())
+	if err != nil {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+	defer func() { closeAndCancel(c, cancel) }()
+	if _, err := c.Compact(ctx, targetRev, clientv3.WithCompactPhysical()); err != nil {
+		if errors.Is(err, rpctypes.ErrCompacted) {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+func Defrag(cfg ClientConfig, endpoint string) error {
+	c, err := clientv3.New(cfg.buildConfig())
+	if err != nil {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+	defer func() { closeAndCancel(c, cancel) }()
+
+	_, err = c.Defragment(ctx, endpoint)
 	return err
 }
