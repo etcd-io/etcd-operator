@@ -1,0 +1,76 @@
+# GoReleaser configuration for etcd-operator. Releases are published by the
+# Release GitHub workflow (.github/workflows/release.yaml) when a version tag is
+# pushed. See RELEASE.md for the release process.
+version: 2
+
+project_name: etcd-operator
+
+# The repository's dist/ directory holds the installation YAMLs of previous
+# releases, so GoReleaser must not use (and clean) it.
+dist: _output/goreleaser
+
+env:
+- IMAGE=gcr.io/etcd-development/etcd-operator
+
+before:
+  hooks:
+  # Generate the installation YAML outside GoReleaser's dist directory, as it
+  # must be empty when the build starts.
+  - make build-installer IMG={{ .Env.IMAGE }}:{{ .Tag }} INSTALL_YAML=_output/install.yaml
+  # Restore the image reference set by build-installer.
+  - git checkout -- config/manager/kustomization.yaml
+
+# The manager binary is built by the Dockerfile, in the same way as for local
+# development.
+builds:
+- skip: true
+
+# The operator is distributed as a container image, don't publish binaries.
+archives:
+- formats:
+  - none
+
+dockers_v2:
+- id: manager
+  dockerfile: Dockerfile
+  # GoReleaser builds the image from a separate build context. These are the
+  # files copied by the Dockerfile, keep them in sync.
+  extra_files:
+  - go.mod
+  - go.sum
+  - cmd/main.go
+  - api
+  - internal
+  - pkg
+  images:
+  - "{{ .Env.IMAGE }}"
+  tags:
+  - "{{ .Tag }}"
+  platforms:
+  - linux/amd64
+  - linux/arm64
+  labels:
+    org.opencontainers.image.source: https://github.com/etcd-io/etcd-operator
+    org.opencontainers.image.version: "{{ .Tag }}"
+    org.opencontainers.image.revision: "{{ .FullCommit }}"
+    org.opencontainers.image.created: "{{ .CommitDate }}"
+
+checksum:
+  extra_files:
+  - glob: _output/install.yaml
+
+# Use GitHub's generated release notes, configured in .github/release.yml.
+changelog:
+  use: github-native
+
+release:
+  # Set explicitly, as GoReleaser would otherwise infer it from the origin
+  # remote, which may point to a fork.
+  github:
+    owner: etcd-io
+    name: etcd-operator
+  # Maintainers review the release notes before publishing the release.
+  draft: true
+  prerelease: auto
+  extra_files:
+  - glob: _output/install.yaml
