@@ -1,6 +1,6 @@
 # Install the etcd operator on Kubernetes
 
-Welcome to version 0.1.0 of the etcd-operator!  At this point it doesn't do a lot, but it can be installed, and you can play with it.
+Welcome to the etcd-operator! It's still in early development (`v0.x.x`), but it can be installed, and you can play with it.
 
 ## Prerequisites
 
@@ -10,13 +10,15 @@ Welcome to version 0.1.0 of the etcd-operator!  At this point it doesn't do a lo
 
 ## Install the Operator
 
-To install the default generated operator, run the following command:
+To install the latest released version of the operator, run the following command:
 
 ```bash
-curl -L https://raw.githubusercontent.com/etcd-io/etcd-operator/refs/heads/main/dist/install-v0.1.0.yaml | kubectl apply -f -
+kubectl apply -f https://github.com/etcd-io/etcd-operator/releases/latest/download/install.yaml
 ```
 
-If this isn't a good approach for your environment, download the `install-v0.1.0.yaml` installation file from GitHub, and use your chosen Kubernetes management tool to apply it.
+To install a specific version, use `https://github.com/etcd-io/etcd-operator/releases/download/<version>/install.yaml` instead (e.g., `v0.3.0`).
+
+If this isn't a good approach for your environment, download the `install.yaml` installation file from the [GitHub Releases](https://github.com/etcd-io/etcd-operator/releases) page, and use your chosen Kubernetes management tool to apply it.
 
 You should see the operator objects being created:
 
@@ -118,11 +120,11 @@ Execute: `kubectl delete etcdcluster test-cluster`
 To completely remove the operator from the Kubernetes cluster, run the following:
 
 ```bash
-$ curl -L https://raw.githubusercontent.com/etcd-io/etcd-operator/refs/heads/main/dist/install-v0.1.0.yaml | kubectl delete -f -
+kubectl delete -f https://github.com/etcd-io/etcd-operator/releases/download/<version>/install.yaml
 ```
 
 Or, if you've downloaded the install file:
 
 ```bash
-kubectl delete -f install-v0.1.0.yaml
+kubectl delete -f install.yaml
 ```
