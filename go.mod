@@ -5,7 +5,7 @@ go 1.27
 toolchain go1.27.3
 
 require (
-	github.com/cert-manager/cert-manager v1.21.2
+	github.com/cert-manager/cert-manager v1.21.3
 	github.com/coreos/go-semver v0.3.1
 	github.com/go-logr/logr v1.4.4
 	github.com/stretchr/testify v1.12.1
