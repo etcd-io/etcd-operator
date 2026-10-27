@@ -161,11 +161,13 @@ docker-buildx: ## Build and push docker image for the manager for cross-platform
 	- $(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) --tag ${IMG} .
 	- $(CONTAINER_TOOL) buildx rm etcd-operator-builder
 
+# INSTALL_YAML defines the output path of the consolidated installation YAML.
+INSTALL_YAML ?= dist/install.yaml
 .PHONY: build-installer
 build-installer: manifests generate kustomize ## Generate a consolidated YAML with CRDs and deployment.
-	mkdir -p dist
+	mkdir -p $(dir $(INSTALL_YAML))
 	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
-	$(KUSTOMIZE) build config/default > dist/install$(VERSION_SUFFIX).yaml
+	$(KUSTOMIZE) build config/default > $(INSTALL_YAML)
 
 ##@ Deployment
 
