@@ -27,3 +27,6 @@ go.work
 
 # macOS
 .DS_Store
+
+# Release artifacts
+/_output/
