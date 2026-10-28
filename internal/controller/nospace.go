@@ -106,7 +106,7 @@ func (r *EtcdClusterReconciler) reconcileNoSpaceCompacting(ctx context.Context, 
 	}
 
 	logger.Info("[NoSpace] compacting the keyspace", "revision", rev)
-	endpoints := clientEndpointsFromPods(s.cluster.Name, s.cluster.Namespace, s.pods, clusterTLSEnabled(s.cluster))
+	endpoints := clientEndpointsFromPods(s.cluster.Name, s.cluster.Namespace, s.dnsDomain, s.pods, clusterTLSEnabled(s.cluster))
 	err = etcdutils.Compact(etcdutils.ClientConfig{Endpoints: endpoints, TLS: s.tlsConfig}, rev)
 	// ErrCompacted means rev is already compacted — by a retry after a
 	// crash between the RPC and the status update, or by etcd's own
@@ -134,7 +134,7 @@ func (r *EtcdClusterReconciler) reconcileNoSpaceDefragmenting(ctx context.Contex
 	// The db-size check then fails and the cycle restarts.
 
 	if target := pickMemberToDefragment(s.members, findLeaderName(s.health.Members), cycleStarted); target != nil {
-		endpoint := clientEndpointForOrdinal(s.cluster.Name, s.cluster.Namespace, target.Spec.Ordinal, clusterTLSEnabled(s.cluster))
+		endpoint := clientEndpointForOrdinal(s.cluster.Name, s.cluster.Namespace, s.dnsDomain, target.Spec.Ordinal, clusterTLSEnabled(s.cluster))
 		logger.Info("[NoSpace] defragmenting member", "member", target.Name, "endpoint", endpoint)
 		err := etcdutils.Defragment(etcdutils.ClientConfig{Endpoints: []string{endpoint}, TLS: s.tlsConfig}, endpoint)
 		if err != nil {
@@ -156,7 +156,7 @@ func (r *EtcdClusterReconciler) reconcileNoSpaceDefragmenting(ctx context.Contex
 	// Every member has been defragmented this cycle.
 	if dbSizesUnderQuota(s) {
 		logger.Info("[NoSpace] the keyspace was reclaimed; disarming the NOSPACE alarm")
-		endpoints := clientEndpointsFromPods(s.cluster.Name, s.cluster.Namespace, s.pods, clusterTLSEnabled(s.cluster))
+		endpoints := clientEndpointsFromPods(s.cluster.Name, s.cluster.Namespace, s.dnsDomain, s.pods, clusterTLSEnabled(s.cluster))
 		if err := etcdutils.AlarmDisarm(etcdutils.ClientConfig{Endpoints: endpoints, TLS: s.tlsConfig}, alarms); err != nil {
 			return ctrl.Result{}, fmt.Errorf("disarming the NOSPACE alarm: %w", err)
 		}

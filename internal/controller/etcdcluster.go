@@ -47,7 +47,7 @@ type clusterHashInput struct {
 // drifted, rolling the whole cluster once. TestEtcdClusterHashPinned fails
 // on such a change; when it does, revisit this function before updating its
 // pinned expected value.
-func EtcdClusterHash(ec *v1alpha1.EtcdCluster) string {
+func EtcdClusterHash(ec *v1alpha1.EtcdCluster, dnsDomain string) string {
 	input := clusterHashInput{
 		ImageRegistry: ec.Spec.ImageRegistry,
 		StorageSpec:   ec.Spec.StorageSpec,
@@ -55,7 +55,7 @@ func EtcdClusterHash(ec *v1alpha1.EtcdCluster) string {
 		// Hash the effective argument list: operator default arguments
 		// (including the TLS-dependent ones) merged with the user's options,
 		// so the hash reflects what the etcd process actually runs.
-		EtcdOptions: createArgs(ec.Name, ec.Spec.EtcdOptions, clusterTLSEnabled(ec)),
+		EtcdOptions: createArgs(ec.Name, ec.Spec.EtcdOptions, dnsDomain, clusterTLSEnabled(ec)),
 	}
 	if ec.Spec.PodTemplate != nil {
 		// Only Spec rolls Pods; Metadata is applied in place. A nil Spec

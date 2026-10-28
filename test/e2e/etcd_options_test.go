@@ -47,8 +47,8 @@ func TestEtcdOptions(t *testing.T) {
 		"--name=$(POD_NAME)",
 		"--listen-peer-urls=http://0.0.0.0:2380",
 		"--listen-client-urls=http://0.0.0.0:2379",
-		"--initial-advertise-peer-urls=http://$(POD_NAME).example.$(POD_NAMESPACE).svc.cluster.local:2380",
-		"--advertise-client-urls=http://$(POD_NAME).example.$(POD_NAMESPACE).svc.cluster.local:2379",
+		"--initial-advertise-peer-urls=http://$(POD_NAME).example.$(POD_NAMESPACE).svc:2380",
+		"--advertise-client-urls=http://$(POD_NAME).example.$(POD_NAMESPACE).svc:2379",
 		"--peer-skip-client-san-verification",
 	}
 

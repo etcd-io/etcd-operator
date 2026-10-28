@@ -432,7 +432,7 @@ func TestDeleteMemberPVC(t *testing.T) {
 }
 
 func TestRemoveEtcdNode(t *testing.T) {
-	_, peerURL2 := peerEndpointForOrdinalIndex(leaveTestCluster(), 2)
+	_, peerURL2 := peerEndpointForOrdinalIndex(leaveTestCluster(), "", 2)
 
 	t.Run("No membership snapshot returns an error", func(t *testing.T) {
 		state := &reconcileState{cluster: leaveTestCluster(), memberListResp: nil}
@@ -663,7 +663,7 @@ func TestHandleCorruptAlarm(t *testing.T) {
 				member := leaveTestMember(ordinal)
 				member.Status.Phase = ready
 				state.members = append(state.members, *member)
-				name, peerURL := peerEndpointForOrdinalIndex(ec, ordinal)
+				name, peerURL := peerEndpointForOrdinalIndex(ec, "", ordinal)
 				state.memberListResp.Members = append(state.memberListResp.Members,
 					&etcdserverpb.Member{ID: uint64(10 + ordinal), Name: name, PeerURLs: []string{peerURL}})
 			}

@@ -157,16 +157,17 @@ func TestBuildMemberPodUsesLifecycleInputs(t *testing.T) {
 	builder, ok := any(buildMemberPod).(func(
 		*ecv1alpha1.EtcdCluster,
 		*ecv1alpha1.EtcdMember,
+		string,
 		etcdClusterState,
 		string,
 		*runtime.Scheme,
 	) (*corev1.Pod, error))
-	require.True(t, ok, "buildMemberPod should accept the target EtcdMember and explicit topology")
+	require.True(t, ok, "buildMemberPod should accept the target EtcdMember, DNS domain, and explicit topology")
 
 	for _, state := range []etcdClusterState{etcdClusterStateNew, etcdClusterStateExisting} {
 		t.Run(string(state), func(t *testing.T) {
 			const initialCluster = "etcd-0=http://peer-0:2380,etcd-1=http://peer-1:2380"
-			pod, err := builder(cluster, member, state, initialCluster, scheme)
+			pod, err := builder(cluster, member, "", state, initialCluster, scheme)
 			require.NoError(t, err)
 
 			env := envVarsToMap(pod)
@@ -197,13 +198,14 @@ func TestCreateMemberPod(t *testing.T) {
 	t.Run("creates pod-0 with state=new", func(t *testing.T) {
 		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ec).Build()
 		member := testMemberForCluster(ec, 0)
-		_, peerURL := peerEndpointForOrdinalIndex(ec, 0)
+		_, peerURL := peerEndpointForOrdinalIndex(ec, "", 0)
 		err := createMemberPod(
 			ctx,
 			logger,
 			fakeClient,
 			ec,
 			member,
+			"",
 			etcdClusterStateNew,
 			member.Name+"="+peerURL,
 			scheme,
@@ -229,7 +231,7 @@ func TestCreateMemberPod(t *testing.T) {
 		member := testMemberForCluster(ec, 2)
 		clusterParts := make([]string, 0, 3)
 		for ordinal := range 3 {
-			name, peerURL := peerEndpointForOrdinalIndex(ec, ordinal)
+			name, peerURL := peerEndpointForOrdinalIndex(ec, "", ordinal)
 			clusterParts = append(clusterParts, name+"="+peerURL)
 		}
 		err := createMemberPod(
@@ -238,6 +240,7 @@ func TestCreateMemberPod(t *testing.T) {
 			fakeClient,
 			ec,
 			member,
+			"",
 			etcdClusterStateExisting,
 			strings.Join(clusterParts, ","),
 			scheme,
@@ -462,6 +465,7 @@ func TestCreateMemberPodWithAnnotations(t *testing.T) {
 				fakeClient,
 				ec,
 				member,
+				"",
 				etcdClusterStateNew,
 				"ignored",
 				scheme,
@@ -577,6 +581,7 @@ func TestCreateMemberPodWithLabels(t *testing.T) {
 				fakeClient,
 				ec,
 				member,
+				"",
 				etcdClusterStateNew,
 				"ignored",
 				scheme,
@@ -612,8 +617,8 @@ func TestCreatingArgs(t *testing.T) {
 				"--name=$(POD_NAME)",
 				"--listen-peer-urls=http://0.0.0.0:2380",
 				"--listen-client-urls=http://0.0.0.0:2379",
-				"--initial-advertise-peer-urls=http://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc.cluster.local:2380",
-				"--advertise-client-urls=http://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc.cluster.local:2379",
+				"--initial-advertise-peer-urls=http://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc:2380",
+				"--advertise-client-urls=http://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc:2379",
 			},
 		},
 		{
@@ -625,8 +630,8 @@ func TestCreatingArgs(t *testing.T) {
 				"--name=$(POD_NAME)",
 				"--listen-peer-urls=https://0.0.0.0:2380",
 				"--listen-client-urls=https://0.0.0.0:2379",
-				"--initial-advertise-peer-urls=https://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc.cluster.local:2380",
-				"--advertise-client-urls=https://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc.cluster.local:2379",
+				"--initial-advertise-peer-urls=https://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc:2380",
+				"--advertise-client-urls=https://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc:2379",
 				"--cert-file=" + serverCertFile,
 				"--key-file=" + serverKeyFile,
 				"--trusted-ca-file=" + serverTrustedCAFile,
@@ -648,8 +653,8 @@ func TestCreatingArgs(t *testing.T) {
 				"--name=$(POD_NAME)",
 				"--listen-peer-urls=http://0.0.0.0:2380",
 				"--listen-client-urls=http://0.0.0.0:2379",
-				"--initial-advertise-peer-urls=http://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc.cluster.local:2380",
-				"--advertise-client-urls=http://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc.cluster.local:2379",
+				"--initial-advertise-peer-urls=http://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc:2380",
+				"--advertise-client-urls=http://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc:2379",
 				"--max-wals=7",
 				"--discovery-failbox=proxy",
 			},
@@ -665,8 +670,8 @@ func TestCreatingArgs(t *testing.T) {
 				"--name=$(POD_NAME)",
 				"--listen-peer-urls=https://0.0.0.0:2380",
 				"--listen-client-urls=https://0.0.0.0:2379",
-				"--initial-advertise-peer-urls=https://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc.cluster.local:2380",
-				"--advertise-client-urls=https://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc.cluster.local:2379",
+				"--initial-advertise-peer-urls=https://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc:2380",
+				"--advertise-client-urls=https://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc:2379",
 				"--cert-file=" + serverCertFile,
 				"--key-file=" + serverKeyFile,
 				"--trusted-ca-file=" + serverTrustedCAFile,
@@ -689,8 +694,8 @@ func TestCreatingArgs(t *testing.T) {
 				"--name=$(POD_NAME)",
 				"--listen-peer-urls=http://0.0.0.0:2380",
 				"--listen-client-urls=http://0.0.0.0:2379",
-				"--initial-advertise-peer-urls=http://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc.cluster.local:2380",
-				"--advertise-client-urls=http://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc.cluster.local:2379",
+				"--initial-advertise-peer-urls=http://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc:2380",
+				"--advertise-client-urls=http://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc:2379",
 				"--max-wals 7",
 				"--discovery-failbox proxy",
 			},
@@ -705,8 +710,8 @@ func TestCreatingArgs(t *testing.T) {
 				"--name=$(POD_NAME)",
 				"--listen-peer-urls=http://0.0.0.0:2380",
 				"--listen-client-urls=http://0.0.0.0:2379",
-				"--initial-advertise-peer-urls=http://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc.cluster.local:2380",
-				"--advertise-client-urls=http://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc.cluster.local:2379",
+				"--initial-advertise-peer-urls=http://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc:2380",
+				"--advertise-client-urls=http://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc:2379",
 				"--experimental-peer-skip-client-san-verification",
 			},
 		},
@@ -720,8 +725,8 @@ func TestCreatingArgs(t *testing.T) {
 			expectedResult: []string{
 				"--name=$(POD_NAME)",
 				"--listen-client-urls=http://0.0.0.0:2379",
-				"--initial-advertise-peer-urls=http://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc.cluster.local:2380",
-				"--advertise-client-urls=http://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc.cluster.local:2379",
+				"--initial-advertise-peer-urls=http://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc:2380",
+				"--advertise-client-urls=http://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc:2379",
 				"--listen-peer-urls=http://0.0.0.0:3200",
 				"--experimental-peer-skip-client-san-verification",
 			},
@@ -737,8 +742,8 @@ func TestCreatingArgs(t *testing.T) {
 				"--name=$(POD_NAME)",
 				"--listen-peer-urls=https://0.0.0.0:2380",
 				"--listen-client-urls=https://0.0.0.0:2379",
-				"--initial-advertise-peer-urls=https://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc.cluster.local:2380",
-				"--advertise-client-urls=https://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc.cluster.local:2379",
+				"--initial-advertise-peer-urls=https://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc:2380",
+				"--advertise-client-urls=https://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc:2379",
 				"--key-file=" + serverKeyFile,
 				"--trusted-ca-file=" + serverTrustedCAFile,
 				"--client-cert-auth=true",
@@ -753,7 +758,7 @@ func TestCreatingArgs(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.testName, func(t *testing.T) {
-			result := createArgs(tt.clusterName, tt.etcdOptions, tt.tlsEnabled)
+			result := createArgs(tt.clusterName, tt.etcdOptions, "", tt.tlsEnabled)
 			assert.Equal(t, tt.expectedResult, result)
 		})
 	}
@@ -768,19 +773,24 @@ func TestClientEndpointForOrdinal(t *testing.T) {
 		name       string
 		ordinal    int
 		tlsEnabled bool
+		dnsDomain  string
 		expected   string
 	}{
-		{name: "ordinal 0 no TLS", ordinal: 0, tlsEnabled: false, expected: "http://test-cluster-0.test-cluster.default.svc.cluster.local:2379"},
-		{name: "ordinal 1 no TLS", ordinal: 1, tlsEnabled: false, expected: "http://test-cluster-1.test-cluster.default.svc.cluster.local:2379"},
-		{name: "ordinal 2 no TLS", ordinal: 2, tlsEnabled: false, expected: "http://test-cluster-2.test-cluster.default.svc.cluster.local:2379"},
-		{name: "ordinal 0 with TLS", ordinal: 0, tlsEnabled: true, expected: "https://test-cluster-0.test-cluster.default.svc.cluster.local:2379"},
-		{name: "ordinal 1 with TLS", ordinal: 1, tlsEnabled: true, expected: "https://test-cluster-1.test-cluster.default.svc.cluster.local:2379"},
-		{name: "ordinal 2 with TLS", ordinal: 2, tlsEnabled: true, expected: "https://test-cluster-2.test-cluster.default.svc.cluster.local:2379"},
+		{name: "ordinal 0 no TLS", ordinal: 0, tlsEnabled: false, dnsDomain: "", expected: "http://test-cluster-0.test-cluster.default.svc:2379"},
+		{name: "ordinal 1 no TLS", ordinal: 1, tlsEnabled: false, dnsDomain: "", expected: "http://test-cluster-1.test-cluster.default.svc:2379"},
+		{name: "ordinal 2 no TLS", ordinal: 2, tlsEnabled: false, dnsDomain: "", expected: "http://test-cluster-2.test-cluster.default.svc:2379"},
+		{name: "ordinal 0 with TLS", ordinal: 0, tlsEnabled: true, dnsDomain: "", expected: "https://test-cluster-0.test-cluster.default.svc:2379"},
+		{name: "ordinal 1 with TLS", ordinal: 1, tlsEnabled: true, dnsDomain: "", expected: "https://test-cluster-1.test-cluster.default.svc:2379"},
+		{name: "ordinal 2 with TLS", ordinal: 2, tlsEnabled: true, dnsDomain: "", expected: "https://test-cluster-2.test-cluster.default.svc:2379"},
+		{name: "explicit cluster.local reproduces legacy full form no TLS", ordinal: 0, tlsEnabled: false, dnsDomain: "cluster.local", expected: "http://test-cluster-0.test-cluster.default.svc.cluster.local:2379"},
+		{name: "explicit cluster.local reproduces legacy full form with TLS", ordinal: 0, tlsEnabled: true, dnsDomain: "cluster.local", expected: "https://test-cluster-0.test-cluster.default.svc.cluster.local:2379"},
+		{name: "custom domain no TLS", ordinal: 0, tlsEnabled: false, dnsDomain: "corp.local", expected: "http://test-cluster-0.test-cluster.default.svc.corp.local:2379"},
+		{name: "custom domain with TLS", ordinal: 1, tlsEnabled: true, dnsDomain: "corp.local", expected: "https://test-cluster-1.test-cluster.default.svc.corp.local:2379"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := clientEndpointForOrdinal("test-cluster", "default", tt.ordinal, tt.tlsEnabled)
+			result := clientEndpointForOrdinal("test-cluster", "default", tt.dnsDomain, tt.ordinal, tt.tlsEnabled)
 			assert.Equal(t, tt.expected, result)
 		})
 	}
@@ -813,9 +823,9 @@ func TestClientEndpointsFromPods(t *testing.T) {
 			pods:       threePods,
 			tlsEnabled: false,
 			expected: []string{
-				"http://test-sts-0.test-sts.default.svc.cluster.local:2379",
-				"http://test-sts-1.test-sts.default.svc.cluster.local:2379",
-				"http://test-sts-2.test-sts.default.svc.cluster.local:2379",
+				"http://test-sts-0.test-sts.default.svc:2379",
+				"http://test-sts-1.test-sts.default.svc:2379",
+				"http://test-sts-2.test-sts.default.svc:2379",
 			},
 		},
 		{
@@ -823,9 +833,9 @@ func TestClientEndpointsFromPods(t *testing.T) {
 			pods:       threePods,
 			tlsEnabled: true,
 			expected: []string{
-				"https://test-sts-0.test-sts.default.svc.cluster.local:2379",
-				"https://test-sts-1.test-sts.default.svc.cluster.local:2379",
-				"https://test-sts-2.test-sts.default.svc.cluster.local:2379",
+				"https://test-sts-0.test-sts.default.svc:2379",
+				"https://test-sts-1.test-sts.default.svc:2379",
+				"https://test-sts-2.test-sts.default.svc:2379",
 			},
 		},
 		{
@@ -838,7 +848,7 @@ func TestClientEndpointsFromPods(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := clientEndpointsFromPods("test-sts", "default", tt.pods, tt.tlsEnabled)
+			result := clientEndpointsFromPods("test-sts", "default", "", tt.pods, tt.tlsEnabled)
 			assert.Equal(t, tt.expected, result)
 		})
 	}
@@ -863,7 +873,7 @@ func TestBuildMemberPodTLSVolumes(t *testing.T) {
 
 	t.Run("TLS cluster mounts both secrets readonly and adds TLS args", func(t *testing.T) {
 		ec := mkCluster(&ecv1alpha1.TLSCertificate{Provider: "auto"}, nil)
-		pod, err := buildMemberPod(ec, testMemberForCluster(ec, 0), etcdClusterStateNew, "ignored", scheme)
+		pod, err := buildMemberPod(ec, testMemberForCluster(ec, 0), "", etcdClusterStateNew, "ignored", scheme)
 		require.NoError(t, err)
 
 		container := pod.Spec.Containers[0]
@@ -900,7 +910,7 @@ func TestBuildMemberPodTLSVolumes(t *testing.T) {
 
 	t.Run("non-TLS cluster adds no secret mounts and stays http", func(t *testing.T) {
 		ec := mkCluster(nil, nil)
-		pod, err := buildMemberPod(ec, testMemberForCluster(ec, 0), etcdClusterStateNew, "ignored", scheme)
+		pod, err := buildMemberPod(ec, testMemberForCluster(ec, 0), "", etcdClusterStateNew, "ignored", scheme)
 		require.NoError(t, err)
 
 		for _, m := range pod.Spec.Containers[0].VolumeMounts {
@@ -938,7 +948,7 @@ func TestBuildMemberPodStorageVolumes(t *testing.T) {
 		member := testMemberForCluster(ec, 0)
 		podName := memberPodName(ec.Name, member.Spec.Ordinal)
 
-		pod, err := buildMemberPod(ec, member, etcdClusterStateNew, "ignored", scheme)
+		pod, err := buildMemberPod(ec, member, "", etcdClusterStateNew, "ignored", scheme)
 		require.NoError(t, err)
 
 		require.Len(t, pod.Spec.Containers[0].VolumeMounts, 1)
@@ -956,7 +966,7 @@ func TestBuildMemberPodStorageVolumes(t *testing.T) {
 		member := testMemberForCluster(ec, 0)
 		podName := memberPodName(ec.Name, member.Spec.Ordinal)
 
-		pod, err := buildMemberPod(ec, member, etcdClusterStateNew, "ignored", scheme)
+		pod, err := buildMemberPod(ec, member, "", etcdClusterStateNew, "ignored", scheme)
 		require.NoError(t, err)
 
 		require.Len(t, pod.Spec.Containers[0].VolumeMounts, 1)
@@ -968,4 +978,55 @@ func TestBuildMemberPodStorageVolumes(t *testing.T) {
 		require.Len(t, pod.Spec.Volumes, 1)
 		assert.Equal(t, "shared-pvc", pod.Spec.Volumes[0].PersistentVolumeClaim.ClaimName)
 	})
+}
+
+// TestBuildMemberPodAdvertiseURLsHonorsServiceDNSDomain verifies that the
+// --advertise-peer-urls and --advertise-client-urls flags written into the
+// Pod spec use the dnsDomain argument passed to buildMemberPod:
+// an empty argument produces the short form, a non-empty argument produces
+// the full form.
+func TestBuildMemberPodAdvertiseURLsHonorsServiceDNSDomain(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+	require.NoError(t, ecv1alpha1.AddToScheme(scheme))
+
+	cases := []struct {
+		name       string
+		dnsDomain  string
+		wantPeer   string
+		wantClient string
+	}{
+		{
+			name:       "empty domain uses short form",
+			dnsDomain:  "",
+			wantPeer:   "http://$(POD_NAME).testcluster.$(POD_NAMESPACE).svc:2380",
+			wantClient: "http://$(POD_NAME).testcluster.$(POD_NAMESPACE).svc:2379",
+		},
+		{
+			name:       "custom domain uses full form",
+			dnsDomain:  "corp.local",
+			wantPeer:   "http://$(POD_NAME).testcluster.$(POD_NAMESPACE).svc.corp.local:2380",
+			wantClient: "http://$(POD_NAME).testcluster.$(POD_NAMESPACE).svc.corp.local:2379",
+		},
+		{
+			name:       "explicit cluster.local reproduces legacy form",
+			dnsDomain:  "cluster.local",
+			wantPeer:   "http://$(POD_NAME).testcluster.$(POD_NAMESPACE).svc.cluster.local:2380",
+			wantClient: "http://$(POD_NAME).testcluster.$(POD_NAMESPACE).svc.cluster.local:2379",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ec := &ecv1alpha1.EtcdCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: "testcluster", Namespace: "default", UID: "abc"},
+				Spec:       ecv1alpha1.EtcdClusterSpec{Size: 3, Version: "3.5.17"},
+			}
+			member := testMemberForCluster(ec, 0)
+			pod, err := buildMemberPod(ec, member, tc.dnsDomain, etcdClusterStateNew, "ignored", scheme)
+			require.NoError(t, err)
+			args := strings.Join(pod.Spec.Containers[0].Args, "\n")
+			assert.Contains(t, args, "--initial-advertise-peer-urls="+tc.wantPeer)
+			assert.Contains(t, args, "--advertise-client-urls="+tc.wantClient)
+		})
+	}
 }
