@@ -698,7 +698,7 @@ func TestDispatch(t *testing.T) {
 			WithObjects(ec, recreating, corrupted).
 			Build()
 		r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
-		_, peerURL := peerEndpointForOrdinalIndex(ec, 1)
+		_, peerURL := peerEndpointForOrdinalIndex(ec, "", 1)
 		state := &reconcileState{
 			cluster: ec,
 			members: []ecv1alpha1.EtcdMember{*recreating, *corrupted},
@@ -733,9 +733,9 @@ func TestDispatch(t *testing.T) {
 			cluster: ec,
 			members: createReadyMembers(ec, 3),
 			pods: []*corev1.Pod{
-				makeConfigDriftPod(ec, 0, EtcdClusterHash(ec)),
-				makeConfigDriftPod(ec, 1, EtcdClusterHash(ec)),
-				makeConfigDriftPod(ec, 2, EtcdClusterHash(ec)),
+				makeConfigDriftPod(ec, 0, EtcdClusterHash(ec, "")),
+				makeConfigDriftPod(ec, 1, EtcdClusterHash(ec, "")),
+				makeConfigDriftPod(ec, 2, EtcdClusterHash(ec, "")),
 			},
 			health: &etcdutils.ClusterHealth{Healthy: true},
 		}
@@ -1087,7 +1087,7 @@ func TestUpdateConfig(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "etcd", Namespace: "default", UID: "1"},
 		Spec:       ecv1alpha1.EtcdClusterSpec{Size: 3, Version: "3.5.17"},
 	}
-	expectedHash := EtcdClusterHash(ec)
+	expectedHash := EtcdClusterHash(ec, "")
 	staleHash := "stale-hash-000001"
 
 	// Cluster of size 1 for single-node tests
@@ -1095,7 +1095,7 @@ func TestUpdateConfig(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "etcd", Namespace: "default", UID: "1"},
 		Spec:       ecv1alpha1.EtcdClusterSpec{Size: 1, Version: "3.5.17"},
 	}
-	expectedHashSize1 := EtcdClusterHash(ecSize1)
+	expectedHashSize1 := EtcdClusterHash(ecSize1, "")
 
 	tests := []struct {
 		name           string
@@ -1604,6 +1604,57 @@ func TestUpgradeCluster(t *testing.T) {
 				assert.Equal(t, originalVersion, got.Spec.Version)
 				assert.Equal(t, ecv1alpha1.EtcdMemberReady, got.Status.Phase)
 			}
+		})
+	}
+}
+
+// TestServiceDNSDomainPlumbsThroughBuildMemberPod verifies that the
+// value held in EtcdClusterReconciler.ServiceDNSDomain is what ends up in
+// the Pod's --advertise-* URLs. This is the controller-level wiring check
+// that guarantees the flag actually flows into the Pod template, separate
+// from the unit test on buildMemberPod alone.
+func TestServiceDNSDomainPlumbsThroughBuildMemberPod(t *testing.T) {
+	tests := []struct {
+		name       string
+		domain     string
+		wantPeer   string
+		wantClient string
+	}{
+		{
+			name:       "empty domain uses short form",
+			domain:     "",
+			wantPeer:   "http://$(POD_NAME).example.$(POD_NAMESPACE).svc:2380",
+			wantClient: "http://$(POD_NAME).example.$(POD_NAMESPACE).svc:2379",
+		},
+		{
+			name:       "custom domain uses full form",
+			domain:     "corp.local",
+			wantPeer:   "http://$(POD_NAME).example.$(POD_NAMESPACE).svc.corp.local:2380",
+			wantClient: "http://$(POD_NAME).example.$(POD_NAMESPACE).svc.corp.local:2379",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			require.NoError(t, corev1.AddToScheme(scheme))
+			require.NoError(t, ecv1alpha1.AddToScheme(scheme))
+			r := &EtcdClusterReconciler{Scheme: scheme, ServiceDNSDomain: tt.domain}
+			ec := &ecv1alpha1.EtcdCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default", UID: "abc"},
+				Spec:       ecv1alpha1.EtcdClusterSpec{Size: 3, Version: "3.5.17"},
+			}
+			member := &ecv1alpha1.EtcdMember{
+				ObjectMeta: metav1.ObjectMeta{Name: "example-0", Namespace: ec.Namespace},
+				Spec:       ecv1alpha1.EtcdMemberSpec{ClusterName: ec.Name, Ordinal: 0, Version: ec.Spec.Version},
+			}
+			pod, err := buildMemberPod(ec, member, r.ServiceDNSDomain, etcdClusterStateNew, "ignored", scheme)
+			require.NoError(t, err)
+			args := ""
+			for _, a := range pod.Spec.Containers[0].Args {
+				args += a + "\n"
+			}
+			assert.Contains(t, args, "--initial-advertise-peer-urls="+tt.wantPeer)
+			assert.Contains(t, args, "--advertise-client-urls="+tt.wantClient)
 		})
 	}
 }

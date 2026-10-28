@@ -63,6 +63,10 @@ type EtcdClusterReconciler struct {
 	Scheme        *runtime.Scheme
 	Recorder      events.EventRecorder
 	ImageRegistry string
+	// ServiceDNSDomain is the Kubernetes service DNS suffix used to build
+	// member FQDNs and default cert SANs. See the --service-dns-domain flag.
+	// Empty means the short form `<pod>.<svc>.<ns>.svc` is used.
+	ServiceDNSDomain string
 }
 
 // reconcileState holds all transient data for a single reconciliation loop.
@@ -73,6 +77,7 @@ type reconcileState struct {
 	memberListResp *clientv3.MemberListResponse // member list fetched from the etcd cluster
 	health         *etcdutils.ClusterHealth     // cluster/member health and active alarms from the latest health check
 	tlsConfig      *tls.Config                  // etcd client TLS config used by every etcdutils call in this loop (nil for non-TLS clusters)
+	dnsDomain      string                       // member FQDN DNS suffix from the operator's --service-dns-domain flag (empty = short form)
 }
 
 // +kubebuilder:rbac:groups=operator.etcd.io,resources=etcdclusters,verbs=get;list;watch;create;update;patch;delete
@@ -215,7 +220,7 @@ func (r *EtcdClusterReconciler) fetchAndValidateState(ctx context.Context, req c
 		return nil, ctrl.Result{RequeueAfter: requeueDuration}, nil
 	}
 
-	return &reconcileState{cluster: ec, members: members, pods: pods}, ctrl.Result{}, nil
+	return &reconcileState{cluster: ec, members: members, pods: pods, dnsDomain: r.ServiceDNSDomain}, ctrl.Result{}, nil
 }
 
 // PopulateDefaultValues mutates `ec` in place to apply operator-side defaults
@@ -352,7 +357,7 @@ func (r *EtcdClusterReconciler) ensureClusterPrereqs(ctx context.Context, s *rec
 	logger := log.FromContext(ctx)
 
 	if s.cluster.Spec.TLS != nil {
-		if err := createClientCertificate(ctx, s.cluster, r.Client); err != nil {
+		if err := createClientCertificate(ctx, s.cluster, r.ServiceDNSDomain, r.Client); err != nil {
 			logger.Error(err, "Failed to create Client Certificate.")
 		}
 		// Server/peer certs must exist before buildReconcileClientTLS below reads
@@ -364,7 +369,7 @@ func (r *EtcdClusterReconciler) ensureClusterPrereqs(ctx context.Context, s *rec
 		// server/peer certs are a member concern. Issue the operator a
 		// dedicated client certificate instead, so this phase doesn't need to
 		// reach into member-owned certificate state at all.
-		if err := applyEtcdMemberCerts(ctx, s.cluster, r.Client); err != nil {
+		if err := applyEtcdMemberCerts(ctx, s.cluster, r.ServiceDNSDomain, r.Client); err != nil {
 			logger.Error(err, "Failed to create server/peer certificates.")
 		}
 	} else {
@@ -395,7 +400,7 @@ func (r *EtcdClusterReconciler) refreshClusterState(ctx context.Context, s *reco
 	logger.Info("Now checking health of the cluster members")
 
 	var err error
-	s.memberListResp, s.health, err = healthCheck(s.cluster.Name, s.cluster.Namespace, s.pods, clusterTLSEnabled(s.cluster), s.tlsConfig, logger)
+	s.memberListResp, s.health, err = healthCheck(s.cluster.Name, s.cluster.Namespace, r.ServiceDNSDomain, s.pods, clusterTLSEnabled(s.cluster), s.tlsConfig, logger)
 	if err != nil {
 		logger.Info("health check found errors", "errors", err)
 	}
@@ -600,7 +605,7 @@ func (r *EtcdClusterReconciler) clearMemberFinalizer(ctx context.Context, m *ecv
 // first, transferring leadership first if needed (§4.5).
 func (r *EtcdClusterReconciler) updateConfig(ctx context.Context, s *reconcileState) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
-	hash := EtcdClusterHash(s.cluster)
+	hash := EtcdClusterHash(s.cluster, r.ServiceDNSDomain)
 
 	var healthInfo map[string]etcdutils.EpHealth
 	if s.health != nil {

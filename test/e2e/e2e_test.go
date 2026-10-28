@@ -946,7 +946,7 @@ func TestClusterHash(t *testing.T) {
 		// apply the same logic (setting default values) before hashing.
 		reconciler := &controller.EtcdClusterReconciler{ImageRegistry: controller.DefaultImageRegistry}
 		reconciler.PopulateDefaultValues(etcdCluster)
-		clusterHash = controller.EtcdClusterHash(etcdCluster)
+		clusterHash = controller.EtcdClusterHash(etcdCluster, "")
 		return ctx
 	})
 

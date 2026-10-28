@@ -136,7 +136,7 @@ func waitForAllPodHashAligned(t *testing.T, c *envconf.Config, ec *ecv1alpha1.Et
 	}
 	reconciler := &controller.EtcdClusterReconciler{ImageRegistry: controller.DefaultImageRegistry}
 	reconciler.PopulateDefaultValues(&current)
-	expectedHash := controller.EtcdClusterHash(&current)
+	expectedHash := controller.EtcdClusterHash(&current, "")
 
 	return wait.For(func(ctx context.Context) (bool, error) {
 		var pods corev1.PodList
@@ -553,7 +553,7 @@ const (
 func etcdctlCmd(podName, etcdClusterName, namespace string, tlsEnabled bool) []string {
 	args := []string{"etcdctl"}
 	if tlsEnabled {
-		endpoint := fmt.Sprintf("https://%s.%s.%s.svc.cluster.local:2379",
+		endpoint := fmt.Sprintf("https://%s.%s.%s.svc:2379",
 			podName, etcdClusterName, namespace)
 		args = append(args,
 			"--cacert="+etcdServerCAFile,

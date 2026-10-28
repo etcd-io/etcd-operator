@@ -217,7 +217,7 @@ func removeEtcdNode(s *reconcileState, member *ecv1alpha1.EtcdMember) error {
 		return nil // already removed from the membership
 	}
 
-	endpoints := clientEndpointsFromPods(s.cluster.Name, s.cluster.Namespace, s.pods, clusterTLSEnabled(s.cluster))
+	endpoints := clientEndpointsFromPods(s.cluster.Name, s.cluster.Namespace, s.dnsDomain, s.pods, clusterTLSEnabled(s.cluster))
 	cfg := etcdutils.ClientConfig{Endpoints: endpoints, TLS: s.tlsConfig}
 	if err := etcdutils.RemoveMember(cfg, etcdNode.ID); err != nil {
 		return fmt.Errorf("failed to remove the etcd node for EtcdMember %q: %w", member.Name, err)
@@ -236,7 +236,7 @@ func disarmForEtcdMember(s *reconcileState, member *ecv1alpha1.EtcdMember) error
 		}
 	}
 	if len(alarms) > 0 {
-		endpoints := clientEndpointsFromPods(s.cluster.Name, s.cluster.Namespace, s.pods, clusterTLSEnabled(s.cluster))
+		endpoints := clientEndpointsFromPods(s.cluster.Name, s.cluster.Namespace, s.dnsDomain, s.pods, clusterTLSEnabled(s.cluster))
 		cfg := etcdutils.ClientConfig{Endpoints: endpoints, TLS: s.tlsConfig}
 		if err := etcdutils.AlarmDisarm(cfg, alarms); err != nil {
 			return fmt.Errorf("failed to disarm alarms for EtcdMember %q: %w", member.Name, err)
@@ -301,7 +301,7 @@ func (r *EtcdClusterReconciler) handleCorruptAlarm(ctx context.Context, s *recon
 	logger.Info("Disarming the CORRUPT alarm")
 	// The removed member has stopped, so its endpoint can't serve any requests.
 	pods := slices.DeleteFunc(slices.Clone(s.pods), func(p *corev1.Pod) bool { return member != nil && p.Name == member.Name })
-	endpoints := clientEndpointsFromPods(s.cluster.Name, s.cluster.Namespace, pods, clusterTLSEnabled(s.cluster))
+	endpoints := clientEndpointsFromPods(s.cluster.Name, s.cluster.Namespace, s.dnsDomain, pods, clusterTLSEnabled(s.cluster))
 	cfg := etcdutils.ClientConfig{Endpoints: endpoints, TLS: s.tlsConfig}
 	if err := etcdutils.AlarmDisarm(cfg, []*etcdserverpb.AlarmMember{alarm}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to disarm the CORRUPT alarm of etcd member %x: %w", alarm.MemberID, err)
@@ -509,7 +509,7 @@ func (r *EtcdClusterReconciler) reconcileRecreating(
 
 	// 4. Node is healthy and conditions(configs, version) are all met, set Phase=Ready
 	configMatches := memberPod.Annotations[HashMetadataKey] ==
-		EtcdClusterHash(state.cluster)
+		EtcdClusterHash(state.cluster, state.dnsDomain)
 	expectedImage := fmt.Sprintf("%s:%s", state.cluster.Spec.ImageRegistry, member.Spec.Version)
 	onTargetVersion := memberPod.Spec.Containers[0].Image == expectedImage
 
@@ -562,7 +562,7 @@ func (r *EtcdClusterReconciler) reconcileRecreating(
 		extraFields = []any{"currentImage", memberPod.Spec.Containers[0].Image, "targetImage", expectedImage}
 	} else if !configMatches {
 		deleteReason = "[Recreating] deleting pod: healthy but config hash mismatch"
-		extraFields = []any{"podConfigHash", memberPod.Annotations[HashMetadataKey], "expectedConfigHash", EtcdClusterHash(state.cluster)}
+		extraFields = []any{"podConfigHash", memberPod.Annotations[HashMetadataKey], "expectedConfigHash", EtcdClusterHash(state.cluster, state.dnsDomain)}
 	} else {
 		deleteReason = "[Recreating] deleting pod"
 	}
@@ -579,7 +579,7 @@ func (r *EtcdClusterReconciler) reconcileRecreating(
 // operation: if no healthy target is found, or there are no live client
 // endpoints, it is a no-op.
 func (r *EtcdClusterReconciler) transferLeader(ctx context.Context, state *reconcileState, member *ecv1alpha1.EtcdMember) error {
-	endpoints := clientEndpointsFromPods(state.cluster.Name, state.cluster.Namespace, state.pods, clusterTLSEnabled(state.cluster))
+	endpoints := clientEndpointsFromPods(state.cluster.Name, state.cluster.Namespace, state.dnsDomain, state.pods, clusterTLSEnabled(state.cluster))
 	if len(endpoints) == 0 {
 		return nil
 	}
@@ -616,7 +616,7 @@ func (r *EtcdClusterReconciler) transferLeader(ctx context.Context, state *recon
 // provisionCertificates ensures the cluster's shared server/peer TLS
 // certificates exist before a member's Pod mounts them. Idempotent.
 func (r *EtcdClusterReconciler) provisionCertificates(ctx context.Context, state *reconcileState) error {
-	if err := applyEtcdMemberCerts(ctx, state.cluster, r.Client); err != nil {
+	if err := applyEtcdMemberCerts(ctx, state.cluster, r.ServiceDNSDomain, r.Client); err != nil {
 		return fmt.Errorf("provisioning certificates for EtcdCluster %q: %w", state.cluster.Name, err)
 	}
 	return nil
@@ -645,12 +645,12 @@ func (r *EtcdClusterReconciler) provisionPVC(ctx context.Context, state *reconci
 // The member's Pod is created in a later pass that renders
 // ETCD_INITIAL_CLUSTER from a fresh membership snapshot.
 func (r *EtcdClusterReconciler) addLearner(ctx context.Context, state *reconcileState, member *ecv1alpha1.EtcdMember) error {
-	endpoints := clientEndpointsFromPods(state.cluster.Name, state.cluster.Namespace, state.pods, clusterTLSEnabled(state.cluster))
+	endpoints := clientEndpointsFromPods(state.cluster.Name, state.cluster.Namespace, state.dnsDomain, state.pods, clusterTLSEnabled(state.cluster))
 	if len(endpoints) == 0 {
 		return fmt.Errorf("cannot add learner for EtcdMember %q: no live client endpoints", member.Name)
 	}
 
-	_, peerURL := peerEndpointForOrdinalIndex(state.cluster, member.Spec.Ordinal)
+	_, peerURL := peerEndpointForOrdinalIndex(state.cluster, state.dnsDomain, member.Spec.Ordinal)
 	log.FromContext(ctx).Info("Adding learner for EtcdMember", "EtcdMember", member.Name, "peerURL", peerURL)
 	if _, err := etcdutils.AddMember(etcdutils.ClientConfig{Endpoints: endpoints, TLS: state.tlsConfig}, []string{peerURL}, true); err != nil {
 		return fmt.Errorf("failed to add learner for EtcdMember %q: %w", member.Name, err)
@@ -672,6 +672,7 @@ func (r *EtcdClusterReconciler) promoteLearnerForEtcdMember(
 	endpoints := clientEndpointsFromPods(
 		state.cluster.Name,
 		state.cluster.Namespace,
+		state.dnsDomain,
 		state.pods,
 		clusterTLSEnabled(state.cluster),
 	)
@@ -714,6 +715,7 @@ func (r *EtcdClusterReconciler) createPodForEtcdMember(
 		r.Client,
 		state.cluster,
 		member,
+		state.dnsDomain,
 		initialClusterState,
 		initialClusterForPod(state, member, bootstrap),
 		r.Scheme,
@@ -736,7 +738,7 @@ func (r *EtcdClusterReconciler) createPodForEtcdMember(
 func (r *EtcdClusterReconciler) refreshMemberStatus(ctx context.Context, s *reconcileState, member *ecv1alpha1.EtcdMember) error {
 	logger := log.FromContext(ctx)
 
-	endpoint := clientEndpointForOrdinal(s.cluster.Name, s.cluster.Namespace, member.Spec.Ordinal, clusterTLSEnabled(s.cluster))
+	endpoint := clientEndpointForOrdinal(s.cluster.Name, s.cluster.Namespace, s.dnsDomain, member.Spec.Ordinal, clusterTLSEnabled(s.cluster))
 	probes, err := etcdutils.MemberHealth(etcdutils.ClientConfig{
 		Endpoints: []string{endpoint},
 		Names:     []string{member.Name},
@@ -779,10 +781,10 @@ func (r *EtcdClusterReconciler) refreshMemberStatus(ctx context.Context, s *reco
 // membership rendered from the cluster's EtcdMembers.
 func initialClusterForPod(state *reconcileState, member *ecv1alpha1.EtcdMember, bootstrap bool) string {
 	if bootstrap {
-		name, peerURL := peerEndpointForOrdinalIndex(state.cluster, member.Spec.Ordinal)
+		name, peerURL := peerEndpointForOrdinalIndex(state.cluster, state.dnsDomain, member.Spec.Ordinal)
 		return fmt.Sprintf("%s=%s", name, peerURL)
 	}
-	return renderInitialCluster(state.cluster, state.members)
+	return renderInitialCluster(state.cluster, state.dnsDomain, state.members)
 }
 
 // findPodForEtcdMember looks up the member's Pod in the reconcile snapshot:
@@ -946,10 +948,10 @@ func findHealthStatusForEtcdMember(state *reconcileState, member *ecv1alpha1.Etc
 // renderInitialCluster renders ETCD_INITIAL_CLUSTER from the cluster's
 // EtcdMembers, assuming they are consistent with the live etcd membership.
 // It never infers topology from an ordinal range.
-func renderInitialCluster(cluster *ecv1alpha1.EtcdCluster, members []ecv1alpha1.EtcdMember) string {
+func renderInitialCluster(cluster *ecv1alpha1.EtcdCluster, dnsDomain string, members []ecv1alpha1.EtcdMember) string {
 	entries := make([]string, 0, len(members))
 	for i := range members {
-		name, peerURL := peerEndpointForOrdinalIndex(cluster, members[i].Spec.Ordinal)
+		name, peerURL := peerEndpointForOrdinalIndex(cluster, dnsDomain, members[i].Spec.Ordinal)
 		entries = append(entries, fmt.Sprintf("%s=%s", name, peerURL))
 	}
 

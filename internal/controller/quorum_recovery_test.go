@@ -74,7 +74,7 @@ func (f *recoveryFixture) reconciler(t *testing.T) *EtcdClusterReconciler {
 	require.NoError(t, err)
 	stored := &ecv1alpha1.EtcdCluster{}
 	require.NoError(t, json.Unmarshal(data, stored))
-	hash := EtcdClusterHash(stored)
+	hash := EtcdClusterHash(stored, "")
 
 	objs := make([]client.Object, 0, 1+len(f.members)+len(f.pods)+len(f.pvcs))
 	objs = append(objs, f.cluster)

@@ -196,7 +196,7 @@ func (r *EtcdClusterReconciler) recreateSurvivorWithForceNewCluster(ctx context.
 		r.publishQuorumRecoveryStarted(s, survivor)
 		// etcd ignores the initial cluster once its data directory exists, so
 		// it only lists the survivor, the one member of the new cluster.
-		newPod, err := buildMemberPod(s.cluster, survivor, etcdClusterStateExisting, initialClusterForPod(s, survivor, true), r.Scheme)
+		newPod, err := buildMemberPod(s.cluster, survivor, s.dnsDomain, etcdClusterStateExisting, initialClusterForPod(s, survivor, true), r.Scheme)
 		if err != nil {
 			return err
 		}

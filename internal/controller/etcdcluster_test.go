@@ -205,8 +205,8 @@ func TestEtcdClusterHash(t *testing.T) {
 	// Loop through the table executing each row in isolation
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			baseHash := EtcdClusterHash(tt.baseCluster)
-			currentHash := EtcdClusterHash(tt.cluster)
+			baseHash := EtcdClusterHash(tt.baseCluster, "")
+			currentHash := EtcdClusterHash(tt.cluster, "")
 
 			if tt.checkLength {
 				assert.Len(t, currentHash, hashLength, "Hash must respect the %d-character limit constraint", hashLength)
@@ -227,10 +227,11 @@ func TestEtcdClusterHash(t *testing.T) {
 // the schema change should affect the hash before updating
 // expectedEmptySpecHash.
 func TestEtcdClusterHashPinned(t *testing.T) {
-	// Captured for an all-zero-value EtcdClusterSpec at commit
-	// 5483df641bf23347d98a56b8d966bc2c495edcb5.
-	const expectedEmptySpecHash = "f71305f40ce2"
-	currentHash := EtcdClusterHash(&v1alpha1.EtcdCluster{Spec: v1alpha1.EtcdClusterSpec{}})
+	// Captured for an all-zero-value EtcdClusterSpec with the short-form
+	// DNS suffix ("svc") default of --service-dns-domain at commit
+	// a933d3c8f4e16978a47dd0faff7cc1c6f49729c5.
+	const expectedEmptySpecHash = "77e7c862d3c2"
+	currentHash := EtcdClusterHash(&v1alpha1.EtcdCluster{Spec: v1alpha1.EtcdClusterSpec{}}, "")
 	assert.Equal(t, expectedEmptySpecHash, currentHash,
 		"hash input changed, see comment above before updating this constant")
 }
