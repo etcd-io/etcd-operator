@@ -11,6 +11,8 @@ Package v1alpha1 contains API Schema definitions for the operator v1alpha1 API g
 ### Resource Types
 - [EtcdCluster](#etcdcluster)
 - [EtcdClusterList](#etcdclusterlist)
+- [EtcdMember](#etcdmember)
+- [EtcdMemberList](#etcdmemberlist)
 
 
 
@@ -111,6 +113,86 @@ _Appears in:_
 | `tls` _[TLSCertificate](#tlscertificate)_ | TLS is the TLS certificate configuration to use for the etcd cluster and etcd operator. |  |  |
 | `etcdOptions` _string array_ | etcd configuration options are passed as command line arguments to the etcd container, refer to etcd documentation for configuration options applicable for the version of etcd being used. |  |  |
 | `podTemplate` _[PodTemplate](#podtemplate)_ | PodTemplate is the pod template to use for the etcd cluster. |  |  |
+| `paused` _boolean_ | Paused lets a human operator pause EtcdClusterReconciler's reconciliation<br />of this cluster, so they can debug or repair by hand without the<br />controller fighting them over the same Pods, PVCs, or etcd membership.<br />While paused, no mutating action runs — including CORRUPT/NOSPACE<br />remediation and lost-quorum recovery — but the always-on, read-only<br />status/health refresh keeps running so observability doesn't go stale. |  | Optional: \{\} <br /> |
+| `allowVersionUpgradeOnRepair` _boolean_ | AllowVersionUpgradeOnRepair lets a human operator unblock a member that<br />is stuck in a repair loop and can never become Ready, which would<br />otherwise permanently block the upgrade phase (it only runs once every<br />member is Ready). While set, every repair recreate of a member's Pod<br />also brings that member to Version, instead of leaving it pinned at<br />the member's current running version until the dedicated upgrade<br />phase gets to it one member at a time. Off by default; the operator<br />should turn it back off once the cluster is healthy again. |  | Optional: \{\} <br /> |
+
+
+
+
+#### EtcdMember
+
+
+
+EtcdMember is the Schema for the etcdmembers API.
+
+
+
+_Appears in:_
+- [EtcdMemberList](#etcdmemberlist)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `apiVersion` _string_ | `operator.etcd.io/v1alpha1` | | |
+| `kind` _string_ | `EtcdMember` | | |
+| `metadata` _[ObjectMeta](https://kubernetes.io/docs/reference/generated/kubernetes-api/v/#objectmeta-v1-meta)_ | Refer to Kubernetes API documentation for fields of `metadata`. |  |  |
+| `spec` _[EtcdMemberSpec](#etcdmemberspec)_ |  |  |  |
+
+
+#### EtcdMemberList
+
+
+
+EtcdMemberList contains a list of EtcdMember.
+
+
+
+
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `apiVersion` _string_ | `operator.etcd.io/v1alpha1` | | |
+| `kind` _string_ | `EtcdMemberList` | | |
+| `metadata` _[ListMeta](https://kubernetes.io/docs/reference/generated/kubernetes-api/v/#listmeta-v1-meta)_ | Refer to Kubernetes API documentation for fields of `metadata`. |  |  |
+| `items` _[EtcdMember](#etcdmember) array_ |  |  |  |
+
+
+#### EtcdMemberPhase
+
+_Underlying type:_ _string_
+
+EtcdMemberPhase is the coarse lifecycle phase of a member.
+
+
+
+_Appears in:_
+- [EtcdMemberStatus](#etcdmemberstatus)
+
+| Field | Description |
+| --- | --- |
+| `Pending` | EtcdMemberPending means the controller hasn't started creating this member's resources yet.<br /> |
+| `Provisioning` | EtcdMemberProvisioning means resource creation is under way: Pod not yet healthy, OR healthy but still an unpromoted learner.<br /> |
+| `Ready` | EtcdMemberReady means the member is healthy AND (bootstrap member OR promoted to voting member).<br /> |
+| `Recreating` | EtcdMemberRecreating means the member is unhealthy and a Pod delete+recreate is in progress.<br /> |
+| `Replacing` | EtcdMemberReplacing means recreate retries are exhausted (or a CORRUPT alarm fired); the member is leaving, about to rejoin fresh.<br /> |
+| `Terminating` | EtcdMemberTerminating means DeletionTimestamp is set; the member is leaving the cluster for good.<br /> |
+
+
+#### EtcdMemberSpec
+
+
+
+EtcdMemberSpec defines the desired state of one etcd member/ordinal.
+
+
+
+_Appears in:_
+- [EtcdMember](#etcdmember)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `clusterName` _string_ | ClusterName is the owning EtcdCluster's name (same namespace). |  |  |
+| `ordinal` _integer_ | Ordinal is this member's fixed position, e.g. 0, 1, 2. The member Pod<br />and PVC are named "\{clusterName\}-\{ordinal\}" / "etcd-data-\{clusterName\}-\{ordinal\}". |  | Minimum: 0 <br /> |
+| `version` _string_ | Version is the etcd version this member's Pod should run. Normally<br />equal to EtcdCluster.Spec.Version, but during a rolling upgrade<br />EtcdClusterReconciler bumps this one member at a time, so members can<br />transiently run different versions than the cluster's target. |  |  |
 
 
 
@@ -136,6 +218,41 @@ _Appears in:_
 | `isLeader` _boolean_ | IsLeader indicates if this member is currently the cluster leader. |  | Optional: \{\} <br /> |
 
 
+#### NoSpaceRemediationPhase
+
+_Underlying type:_ _string_
+
+NoSpaceRemediationPhase is the current step of an in-progress NOSPACE
+alarm remediation cycle.
+
+
+
+_Appears in:_
+- [NoSpaceRemediationStatus](#nospaceremediationstatus)
+
+| Field | Description |
+| --- | --- |
+| `Compacting` | RemediationCompacting means the cluster's keyspace is being compacted to the current revision.<br /> |
+| `Defragmenting` | RemediationDefragmenting means members are being defragmented one at a time, leader last.<br /> |
+
+
+#### NoSpaceRemediationStatus
+
+
+
+NoSpaceRemediationStatus tracks an in-progress NOSPACE alarm remediation cycle.
+
+
+
+_Appears in:_
+- [EtcdClusterStatus](#etcdclusterstatus)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `phase` _[NoSpaceRemediationPhase](#nospaceremediationphase)_ |  |  |  |
+| `cycleStarted` _[Time](https://kubernetes.io/docs/reference/generated/kubernetes-api/v/#time-v1-meta)_ | CycleStarted marks when this remediation attempt began. Bumped to<br />"now" any time the sequence (re-)starts from Compacting — including a<br />restart after the post-Defragmenting db-size check finds the cycle<br />didn't reclaim enough — which is what invalidates old<br />LastCompactTime/LastDefragTime values and forces a real redo instead<br />of trusting stale timestamps. |  |  |
+
+
 #### PodMetadata
 
 
@@ -153,6 +270,24 @@ _Appears in:_
 | `labels` _object (keys:string, values:string)_ |  |  |  |
 
 
+#### PodSpec
+
+
+
+
+
+
+
+_Appears in:_
+- [PodTemplate](#podtemplate)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `affinity` _[Affinity](https://kubernetes.io/docs/reference/generated/kubernetes-api/v/#affinity-v1-core)_ |  |  |  |
+| `nodeSelector` _object (keys:string, values:string)_ |  |  |  |
+| `tolerations` _[Toleration](https://kubernetes.io/docs/reference/generated/kubernetes-api/v/#toleration-v1-core) array_ |  |  |  |
+
+
 #### PodTemplate
 
 
@@ -167,6 +302,7 @@ _Appears in:_
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `metadata` _[PodMetadata](#podmetadata)_ | Refer to Kubernetes API documentation for fields of `metadata`. |  |  |
+| `spec` _[PodSpec](#podspec)_ |  |  |  |
 
 
 #### ProviderAutoConfig
@@ -226,6 +362,22 @@ _Appears in:_
 | --- | --- | --- | --- |
 | `autoCfg` _[ProviderAutoConfig](#providerautoconfig)_ |  |  |  |
 | `certManagerCfg` _[ProviderCertManagerConfig](#providercertmanagerconfig)_ |  |  |  |
+
+
+#### QuorumRecoveryStatus
+
+
+
+QuorumRecoveryStatus tracks an in-progress lost-quorum recovery.
+
+
+
+_Appears in:_
+- [EtcdClusterStatus](#etcdclusterstatus)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `survivor` _integer_ | Survivor is the ordinal of the member that becomes the new<br />single-member cluster. For now it is only ever specified by a human<br />operator, through the operator.etcd.io/recover-cluster-from<br />annotation on the EtcdCluster; automatic recovery isn't supported.<br />This is a decision, not something re-derivable live once other<br />members are gone, and terminating every other member needs to know<br />exactly which one to spare. |  |  |
 
 
 #### StorageSpec
