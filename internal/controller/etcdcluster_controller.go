@@ -352,8 +352,14 @@ func (r *EtcdClusterReconciler) ensureClusterPrereqs(ctx context.Context, s *rec
 	logger := log.FromContext(ctx)
 
 	if s.cluster.Spec.TLS != nil {
+		// A certificate that could not be provisioned (issuer not ready, RBAC,
+		// a transient API error) must stop this reconcile: returning the error
+		// requeues with backoff and the cluster converges once the issuer is
+		// ready. Proceeding without it would leave the operator with no usable
+		// client identity and surface the failure later, downstream, with a
+		// less obvious symptom.
 		if err := createClientCertificate(ctx, s.cluster, r.Client); err != nil {
-			logger.Error(err, "Failed to create Client Certificate.")
+			return fmt.Errorf("failed to create client certificate: %w", err)
 		}
 		// Server/peer certs must exist before buildReconcileClientTLS below reads
 		// the server cert Secret. reconcileProvisioning also calls this
@@ -365,7 +371,7 @@ func (r *EtcdClusterReconciler) ensureClusterPrereqs(ctx context.Context, s *rec
 		// dedicated client certificate instead, so this phase doesn't need to
 		// reach into member-owned certificate state at all.
 		if err := applyEtcdMemberCerts(ctx, s.cluster, r.Client); err != nil {
-			logger.Error(err, "Failed to create server/peer certificates.")
+			return fmt.Errorf("failed to create server/peer certificates: %w", err)
 		}
 	} else {
 		logger.Info(fmt.Sprintf(
