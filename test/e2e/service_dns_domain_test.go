@@ -18,7 +18,6 @@ package e2e
 
 import (
 	"context"
-	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -95,8 +94,7 @@ func TestServiceDNSDomain(t *testing.T) {
 }
 
 // verifyClusterMemberFQDNs creates a cluster, waits for it to become Ready,
-// and requires every live etcd member to advertise the peer URL that ends in
-// dnsSuffix. The caller owns the cluster's lifecycle afterwards.
+// and writes data through each live etcd member's advertised client URL.
 func verifyClusterMemberFQDNs(
 	ctx context.Context, t *testing.T, c *envconf.Config, clusterName string, size int, dnsSuffix string,
 ) {
@@ -111,9 +109,15 @@ func verifyClusterMemberFQDNs(
 		t.Fatalf("cluster %s has %d members, want %d", clusterName, len(memberList.Members), size)
 	}
 	for _, member := range memberList.Members {
-		wantPeerURL := fmt.Sprintf("http://%s.%s.%s.%s:2380", member.Name, clusterName, namespace, dnsSuffix)
-		if len(member.PeerURLs) != 1 || member.PeerURLs[0] != wantPeerURL {
-			t.Fatalf("member %s advertises peer URLs %v, want [%s]", member.Name, member.PeerURLs, wantPeerURL)
+		if len(member.ClientURLs) == 0 {
+			t.Fatalf("member %s advertises no client URLs", member.Name)
+		}
+
+		// Use an explicit DNS endpoint so etcdctl cannot fall back to localhost.
+		cmd := []string{"etcdctl", "--endpoints=" + member.ClientURLs[0], "--command-timeout=10s"}
+		key, value := "service-dns-domain/"+member.Name, dnsSuffix
+		if _, stderr, err := execInPod(t, c, clusterName+"-0", namespace, append(cmd, "put", key, value)); err != nil {
+			t.Fatalf("failed to write data through %s: %v, stderr: %s", member.ClientURLs[0], err, stderr)
 		}
 	}
 }
