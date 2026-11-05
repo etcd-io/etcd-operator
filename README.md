@@ -15,6 +15,16 @@ You can reach the maintainers of this project at:
 
 Participation in the Kubernetes community is governed by the [Kubernetes Code of Conduct](code-of-conduct.md).
 
+## Installation
+
+To install the latest released version of the operator, run the following command:
+
+```bash
+kubectl apply -f https://github.com/etcd-io/etcd-operator/releases/latest/download/install.yaml
+```
+
+Please refer to the [installation documentation](docs/install.md) for detailed instructions.
+
 ## Getting Started
 
 ### Prerequisites
@@ -78,29 +88,6 @@ make uninstall
 
 ```sh
 make undeploy
-```
-
-## Project Distribution
-
-Following are the steps to build the installer and distribute this project to users.
-
-1. Build the installer for the image built and published in the registry:
-
-```sh
-make build-installer IMG=<some-registry>/etcd-operator:tag
-```
-
-NOTE: The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without
-its dependencies.
-
-2. Using the installer
-
-Users can just run kubectl apply -f <URL for YAML BUNDLE> to install the project, i.e.:
-
-```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/etcd-operator/<tag or branch>/dist/install.yaml
 ```
 
 ## Contributing
