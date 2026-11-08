@@ -13,7 +13,7 @@ Welcome to the etcd-operator! It's still in early development (`v0.x.x`), but it
 To install the latest released version of the operator, run the following command:
 
 ```bash
-kubectl apply -f https://github.com/etcd-io/etcd-operator/releases/latest/download/install.yaml
+kubectl apply -f https://github.com/etcd-io/etcd-operator/blob/main/dist/install.yaml
 ```
 
 To install a specific version, use `https://github.com/etcd-io/etcd-operator/releases/download/<version>/install.yaml` instead (e.g., `v0.3.0`).
