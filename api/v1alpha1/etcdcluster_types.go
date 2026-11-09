@@ -104,6 +104,7 @@ type AltNames struct {
 
 	// IPs is the expected array of IP address subject alternative names.
 	// +optional
+	// +kubebuilder:validation:items:Type=string
 	IPs []net.IP `json:"ipAddresses,omitempty"`
 }
 
