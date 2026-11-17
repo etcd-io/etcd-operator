@@ -41,8 +41,10 @@ are tagged from the `main` branch.
    are marked as pre-releases.
 5. The OWNER reviews and edits the draft release notes, and publishes the
    release.
-6. The release issue is closed.
-7. The release is announced on the mailing lists.
+6. Open a pull request to update the `dist/install.yaml` file to the latest
+   version (by running `make build-installer`).
+7. The release issue is closed.
+8. The release is announced on the mailing lists.
 
 ## Testing the release configuration
 
