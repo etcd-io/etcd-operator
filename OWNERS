@@ -3,11 +3,12 @@
 approvers:
   - ahrtr
   - ivanvc
-  - jmhbnz
   - hakman
   - jberkus
   - justinsb
+  - silentred
 reviewers:
   - ArkaSaha30
   - nwnt
-  - silentred
+emeritus_approvers:
+  - jmhbnz
