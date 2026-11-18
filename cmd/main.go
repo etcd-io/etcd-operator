@@ -63,6 +63,7 @@ func main() {
 	var secureMetrics bool
 	var enableHTTP2 bool
 	var serviceDNSDomain string
+	var concurrency int
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&imageRegistry, "image-registry", controller.DefaultImageRegistry,
 		"The container registry to pull etcd images from. Defaults to "+controller.DefaultImageRegistry+".")
@@ -81,6 +82,8 @@ func main() {
 			"Empty (the default) uses the short form <pod>.<svc>.<ns>.svc, "+
 			"resolvable via the pod's DNS search path. "+
 			"Set this to the kubelet's --cluster-domain value to use the full FQDN form <pod>.<svc>.<ns>.svc.<domain>.")
+	flag.IntVar(&concurrency, "concurrency", 100,
+		"The maximum number of concurrent Reconciles which can be run by the EtcdCluster controller. Must be >= 1.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -88,6 +91,11 @@ func main() {
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	if concurrency < 1 {
+		setupLog.Error(nil, "invalid --concurrency value, must be >= 1", "concurrency", concurrency)
+		os.Exit(1)
+	}
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
@@ -159,6 +167,8 @@ func main() {
 		Scheme:           mgr.GetScheme(),
 		ImageRegistry:    imageRegistry,
 		ServiceDNSDomain: serviceDNSDomain,
+
+		MaxConcurrentReconciles: concurrency,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "EtcdCluster")
 		os.Exit(1)

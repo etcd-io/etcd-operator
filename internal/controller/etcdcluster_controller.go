@@ -34,6 +34,7 @@ import (
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	ctrlcontroller "sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -67,6 +68,9 @@ type EtcdClusterReconciler struct {
 	// member FQDNs and default cert SANs. See the --service-dns-domain flag.
 	// Empty means the short form `<pod>.<svc>.<ns>.svc` is used.
 	ServiceDNSDomain string
+	// MaxConcurrentReconciles is the maximum number of concurrent Reconciles.
+	// Values <= 0 fall back to the controller-runtime default (1).
+	MaxConcurrentReconciles int
 }
 
 // reconcileState holds all transient data for a single reconciliation loop.
@@ -901,6 +905,9 @@ func isCertManagerCRDPresent(mgr ctrl.Manager) bool {
 	return err == nil
 }
 
+// defaultReconciliationTimeout is the timeout applied to the context of each Reconcile call.
+const defaultReconciliationTimeout = 3 * time.Minute
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *EtcdClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.Recorder = mgr.GetEventRecorder("etcdcluster-controller")
@@ -910,6 +917,12 @@ func (r *EtcdClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&ecv1alpha1.EtcdCluster{}).
 		Owns(&ecv1alpha1.EtcdMember{}).
 		Owns(&corev1.Service{})
+
+	opts := ctrlcontroller.Options{ReconciliationTimeout: defaultReconciliationTimeout}
+	if r.MaxConcurrentReconciles > 0 {
+		opts.MaxConcurrentReconciles = r.MaxConcurrentReconciles
+	}
+	builder = builder.WithOptions(opts)
 
 	if isCertManagerCRDPresent(mgr) {
 		builder = builder.Owns(&certv1.Certificate{})
