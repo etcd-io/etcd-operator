@@ -79,6 +79,22 @@ type PodSpec struct {
 	Affinity     *corev1.Affinity    `json:"affinity,omitempty"`
 	NodeSelector map[string]string   `json:"nodeSelector,omitempty"`
 	Tolerations  []corev1.Toleration `json:"tolerations,omitempty"`
+	// Resources sets equal CPU/memory requests and limits on the etcd container for Guaranteed QoS.
+	// +optional
+	Resources *ResourceRequirements `json:"resources,omitempty"`
+}
+
+// ResourceRequirements configures the etcd container's Guaranteed resource allocation.
+type ResourceRequirements struct {
+	// Requests specifies the CPU and memory quantities for the etcd container.
+	// If resources is set, both cpu and memory must be provided and positive.
+	// They are copied to the container's requests and limits; other resources
+	// are not supported for now.
+	// +kubebuilder:validation:MaxProperties=2
+	// +kubebuilder:validation:XValidation:rule="'cpu' in self && 'memory' in self",message="requests must include both cpu and memory"
+	// +kubebuilder:validation:XValidation:rule="self.all(k, k in ['cpu', 'memory'])",message="only cpu and memory requests are supported"
+	// +kubebuilder:validation:XValidation:rule="self.all(k, isQuantity(string(self[k])) && quantity(string(self[k])).isGreaterThan(quantity('0')))",message="requests must be positive resource quantities"
+	Requests corev1.ResourceList `json:"requests"`
 }
 
 type PodMetadata struct {
