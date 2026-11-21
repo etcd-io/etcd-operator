@@ -17,6 +17,8 @@ limitations under the License.
 package controller
 
 import (
+	"context"
+	"errors"
 	"slices"
 	"testing"
 
@@ -31,6 +33,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 	"go.etcd.io/etcd-operator/internal/etcdutils"
@@ -440,6 +443,38 @@ func TestEnsureClusterPrereqs(t *testing.T) {
 		svc := &corev1.Service{}
 		require.NoError(t, fakeClient.Get(ctx, client.ObjectKey{Name: ec.Name, Namespace: ec.Namespace}, svc))
 		assert.Equal(t, "None", svc.Spec.ClusterIP)
+	})
+
+	t.Run("Returns the error when a certificate cannot be provisioned", func(t *testing.T) {
+		// A failed certificate must stop the reconcile so it is retried, not be
+		// logged and skipped: the operator would otherwise carry on without a
+		// usable client identity and fail later with a less obvious symptom.
+		// RBAC denying the certificate Secret stands in for any provisioning
+		// failure (issuer not ready, transient API error).
+		ctx := t.Context()
+		tlsCluster := ec.DeepCopy()
+		tlsCluster.Spec.TLS = &ecv1alpha1.TLSCertificate{Provider: "auto"}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(tlsCluster).
+			WithInterceptorFuncs(interceptor.Funcs{
+				Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+					if _, isSecret := obj.(*corev1.Secret); isSecret {
+						return apierrors.NewForbidden(corev1.Resource("secrets"), key.Name, errors.New("no access"))
+					}
+					return c.Get(ctx, key, obj, opts...)
+				},
+			}).Build()
+		r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
+		state := &reconcileState{cluster: tlsCluster}
+
+		err := r.ensureClusterPrereqs(ctx, state)
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "client certificate")
+		assert.ErrorContains(t, err, "forbidden")
+
+		// Nothing after the certificates ran: the headless Service was not created.
+		svc := &corev1.Service{}
+		getErr := fakeClient.Get(ctx, client.ObjectKey{Name: ec.Name, Namespace: ec.Namespace}, svc)
+		assert.True(t, apierrors.IsNotFound(getErr), "expected no Service, got %v", getErr)
 	})
 
 	t.Run("No-op when Service already exists", func(t *testing.T) {
