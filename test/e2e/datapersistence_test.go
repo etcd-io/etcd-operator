@@ -63,7 +63,7 @@ func TestDataPersistence(t *testing.T) {
 		},
 		Spec: ecv1alpha1.EtcdClusterSpec{
 			Size:    1,
-			Version: "v3.5.18",
+			Version: etcdVersion,
 			StorageSpec: &ecv1alpha1.StorageSpec{
 				AccessModes:       corev1.ReadWriteOnce,
 				StorageClassName:  "standard",

@@ -19,7 +19,6 @@ package e2e
 import (
 	"context"
 	"fmt"
-	"os"
 	"reflect"
 	"slices"
 	"testing"
@@ -63,7 +62,7 @@ func TestEtcdOptions(t *testing.T) {
 		},
 		Spec: ecv1alpha1.EtcdClusterSpec{
 			Size:    1,
-			Version: os.Getenv("ETCD_VERSION"),
+			Version: etcdVersion,
 			EtcdOptions: []string{
 				"--peer-skip-client-san-verification",
 			},
