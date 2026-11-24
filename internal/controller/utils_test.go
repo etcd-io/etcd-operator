@@ -187,6 +187,12 @@ func TestValidateEtcdUpgradePath(t *testing.T) {
 		{name: "unknown current version", current: "3.9.0", target: "4.0.0", canParse: true, expectErr: true},
 		{name: "unknown target version", current: "4.0.0", target: "4.1.0", canParse: true, expectErr: true},
 		{name: "invalid upgrade skipping minor", current: "3.4.0", target: "3.6.0", canParse: true, expectErr: true},
+		{name: "v-prefixed valid patch level upgrade", current: "v3.4.0", target: "v3.4.1", canParse: true, expectErr: false},
+		{name: "v-prefixed valid minor level upgrade", current: "v3.4.0", target: "v3.5.0", canParse: true, expectErr: false},
+		{name: "v-prefixed invalid upgrade skipping minor", current: "v3.4.0", target: "v3.6.0", canParse: true, expectErr: true},
+		{name: "v-prefixed minor downgrade not allowed", current: "v3.2.0", target: "v3.1.0", canParse: true, expectErr: true},
+		{name: "mixed prefixes valid minor level upgrade", current: "3.4.0", target: "v3.5.0", canParse: true, expectErr: false},
+		{name: "only one leading v is accepted", current: "vv3.4.0", target: "v3.4.1", canParse: false, expectErr: true},
 	}
 
 	for _, tt := range tests {

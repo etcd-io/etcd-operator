@@ -254,6 +254,38 @@ func TestValidateUpgradeVersion(t *testing.T) {
 			},
 		},
 		{
+			name:    "Valid v-prefixed patch upgrade",
+			version: "v3.6.12",
+			pods:    []*corev1.Pod{podWithImage("v3.6.11")},
+			assert: func(t *testing.T, err error) {
+				assert.NoError(t, err)
+			},
+		},
+		{
+			name:    "Valid v-prefixed minor upgrade",
+			version: "v3.7.2",
+			pods:    []*corev1.Pod{podWithImage("v3.6.12")},
+			assert: func(t *testing.T, err error) {
+				assert.NoError(t, err)
+			},
+		},
+		{
+			name:    "Invalid v-prefixed upgrade path",
+			version: "v3.7.1",
+			pods:    []*corev1.Pod{podWithImage("v3.5.17")},
+			assert: func(t *testing.T, err error) {
+				assert.Error(t, err)
+			},
+		},
+		{
+			name:    "v-prefixed downgrades are unsupported",
+			version: "v3.5.1",
+			pods:    []*corev1.Pod{podWithImage("v3.6.10")},
+			assert: func(t *testing.T, err error) {
+				assert.Error(t, err)
+			},
+		},
+		{
 			name:    "Upgrade with non-semver versions",
 			version: "foo",
 			pods:    []*corev1.Pod{podWithImage("bar")},
