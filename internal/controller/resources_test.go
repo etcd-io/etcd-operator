@@ -17,7 +17,7 @@ func TestResourceRequirementsAdmission(t *testing.T) {
 		"kind":       "EtcdCluster",
 		"metadata":   map[string]interface{}{"name": "resource-validation", "namespace": "default"},
 		"spec": map[string]interface{}{
-			"size": int64(1), "version": "3.5.17",
+			"size": int64(1), "version": testEtcdVersion,
 			"podTemplate": map[string]interface{}{"spec": map[string]interface{}{
 				"resources": map[string]interface{}{"requests": map[string]interface{}{"cpu": "100m", "memory": "256Mi"}},
 			}},

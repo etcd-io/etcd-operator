@@ -1042,7 +1042,7 @@ func TestBuildMemberPodResources(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{Name: "rs-cluster", Namespace: "default", UID: "1"},
 			Spec: ecv1alpha1.EtcdClusterSpec{
 				Size:    3,
-				Version: "3.5.17",
+				Version: testEtcdVersion,
 				PodTemplate: &ecv1alpha1.PodTemplate{
 					Spec: &ecv1alpha1.PodSpec{
 						Resources: resources,

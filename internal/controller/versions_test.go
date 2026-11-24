@@ -20,7 +20,9 @@ import etcdversion "go.etcd.io/etcd/api/v3/version"
 // version but do not depend on its value. It follows the etcd API module
 // version in go.mod, the same source the Makefile uses for E2E_ETCD_VERSION,
 // so it moves forward with dependency bumps instead of being edited by hand.
+// etcdversion.Version has no "v" prefix (for example 3.7.4), so it is added
+// here to match the etcd image tags that EtcdCluster.Spec.Version refers to.
 //
 // Tests that exercise version semantics (upgrade paths, downgrades, version
 // skew) keep their own explicit versions.
-var testEtcdVersion = etcdversion.Version
+var testEtcdVersion = "v" + etcdversion.Version
