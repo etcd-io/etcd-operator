@@ -1,0 +1,31 @@
+name: Verify API reference docs
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  verify-api-docs:
+    name: Verify API reference documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Regenerate API reference documentation
+        run: make api-docs
+      - name: Check API reference documentation is current
+        run: |
+          if ! git diff --quiet -- docs/api-references/docs.md; then
+            echo "::error file=docs/api-references/docs.md::API reference documentation is stale. Run 'make api-docs' and commit the updated docs/api-references/docs.md."
+            git diff -- docs/api-references/docs.md
+            exit 1
+          fi
