@@ -19,7 +19,6 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
-	"strings"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -275,17 +274,18 @@ func dbSizesUnderQuota(s *reconcileState) bool {
 }
 
 // backendQuotaBytes returns the cluster's etcd backend quota, from
-// --quota-backend-bytes in EtcdOptions, or etcd's default when unset.
+// --quota-backend-bytes in EtcdOptions, or etcd's default when unset or
+// unparsable. If the flag is repeated the last valid occurrence wins.
 func backendQuotaBytes(etcdOptions []string) int64 {
-	for _, opt := range etcdOptions {
-		if getArgName(opt) != backendQuotaFlag {
+	quota := int64(defaultBackendQuotaBytes)
+	for _, opt := range normalizeEtcdOptions(etcdOptions) {
+		name, value, _ := parseEtcdOption(opt)
+		if name != backendQuotaFlag {
 			continue
 		}
-		value := strings.TrimSpace(strings.TrimPrefix(opt, backendQuotaFlag))
-		value = strings.TrimPrefix(value, "=")
-		if n, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64); err == nil && n > 0 {
-			return n
+		if n, err := strconv.ParseInt(value, 10, 64); err == nil && n > 0 {
+			quota = n
 		}
 	}
-	return defaultBackendQuotaBytes
+	return quota
 }

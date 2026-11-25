@@ -45,7 +45,15 @@ type EtcdClusterSpec struct {
 	StorageSpec *StorageSpec `json:"storageSpec,omitempty"`
 	// TLS is the TLS certificate configuration to use for the etcd cluster and etcd operator.
 	TLS *TLSCertificate `json:"tls,omitempty"`
-	// etcd configuration options are passed as command line arguments to the etcd container, refer to etcd documentation for configuration options applicable for the version of etcd being used.
+	// EtcdOptions are command-line flags passed to the etcd container; refer to the
+	// etcd documentation for the options applicable to the etcd version in use.
+	// A flag can be given as "--flag=value", "--flag value" in one element, or as
+	// `"--flag" "value"` in two consecutive elements; all are normalized to
+	// "--flag=value". A boolean flag is just "--flag". For example
+	// "--quota-backend-bytes=4294967296". A value that starts with "-" must use
+	// the "--flag=value" form. If an option sets a flag that the operator also
+	// sets by default (for example "--listen-client-urls"), the default is
+	// dropped and the option is used instead.
 	EtcdOptions []string `json:"etcdOptions,omitempty"`
 	// PodTemplate is the pod template to use for the etcd cluster.
 	PodTemplate *PodTemplate `json:"podTemplate,omitempty"`
