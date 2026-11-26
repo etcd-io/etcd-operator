@@ -34,7 +34,7 @@ func TestListOwnedPods(t *testing.T) {
 
 	ec := &ecv1alpha1.EtcdCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "my-cluster", Namespace: "default", UID: "abc"},
-		Spec:       ecv1alpha1.EtcdClusterSpec{Size: 3, Version: "3.5.17"},
+		Spec:       ecv1alpha1.EtcdClusterSpec{Size: 3, Version: testEtcdVersion},
 	}
 
 	makePod := func(name string) *corev1.Pod {
@@ -143,7 +143,7 @@ func TestBuildMemberPodUsesLifecycleInputs(t *testing.T) {
 	cluster := &ecv1alpha1.EtcdCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "etcd", Namespace: "default", UID: "cluster-uid"},
 		Spec: ecv1alpha1.EtcdClusterSpec{
-			Version:       "3.5.17",
+			Version:       testEtcdVersion,
 			ImageRegistry: "registry.example/etcd",
 		},
 	}
@@ -193,7 +193,7 @@ func TestCreateMemberPod(t *testing.T) {
 
 	ec := &ecv1alpha1.EtcdCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-etcd", Namespace: "default", UID: "1"},
-		Spec:       ecv1alpha1.EtcdClusterSpec{Size: 3, Version: "3.5.17"},
+		Spec:       ecv1alpha1.EtcdClusterSpec{Size: 3, Version: testEtcdVersion},
 	}
 
 	t.Run("creates pod-0 with state=new", func(t *testing.T) {
@@ -409,7 +409,7 @@ func TestCreateMemberPodWithAnnotations(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Namespace: "default", UID: "1"},
 		Spec: ecv1alpha1.EtcdClusterSpec{
 			Size:    3,
-			Version: "3.5.17",
+			Version: testEtcdVersion,
 		},
 	}
 
@@ -569,7 +569,7 @@ func TestCreateMemberPodWithLabels(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{Name: tt.clusterName, Namespace: "default", UID: "1"},
 				Spec: ecv1alpha1.EtcdClusterSpec{
 					Size:        3,
-					Version:     "3.5.17",
+					Version:     testEtcdVersion,
 					PodTemplate: tt.podTemplate,
 				},
 			}
@@ -865,7 +865,7 @@ func TestBuildMemberPodTLSVolumes(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{Name: "tls-cluster", Namespace: "default", UID: "1"},
 			Spec: ecv1alpha1.EtcdClusterSpec{
 				Size:        3,
-				Version:     "3.5.17",
+				Version:     testEtcdVersion,
 				TLS:         tls,
 				StorageSpec: storage,
 			},
@@ -938,7 +938,7 @@ func TestBuildMemberPodStorageVolumes(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{Name: "storage-cluster", Namespace: "default", UID: "1"},
 			Spec: ecv1alpha1.EtcdClusterSpec{
 				Size:        3,
-				Version:     "3.5.17",
+				Version:     testEtcdVersion,
 				StorageSpec: storage,
 			},
 		}
@@ -1020,7 +1020,7 @@ func TestBuildMemberPodAdvertiseURLsHonorsServiceDNSDomain(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ec := &ecv1alpha1.EtcdCluster{
 				ObjectMeta: metav1.ObjectMeta{Name: "testcluster", Namespace: "default", UID: "abc"},
-				Spec:       ecv1alpha1.EtcdClusterSpec{Size: 3, Version: "3.5.17"},
+				Spec:       ecv1alpha1.EtcdClusterSpec{Size: 3, Version: testEtcdVersion},
 			}
 			member := testMemberForCluster(ec, 0)
 			pod, err := buildMemberPod(ec, member, tc.dnsDomain, etcdClusterStateNew, "ignored", scheme)
@@ -1042,7 +1042,7 @@ func TestBuildMemberPodResources(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{Name: "rs-cluster", Namespace: "default", UID: "1"},
 			Spec: ecv1alpha1.EtcdClusterSpec{
 				Size:    3,
-				Version: "3.5.17",
+				Version: testEtcdVersion,
 				PodTemplate: &ecv1alpha1.PodTemplate{
 					Spec: &ecv1alpha1.PodSpec{
 						Resources: resources,

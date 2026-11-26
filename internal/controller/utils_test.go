@@ -110,7 +110,7 @@ func TestCreatePVCForMember(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{Name: "test-etcd", Namespace: "default", UID: "1"},
 			Spec: ecv1alpha1.EtcdClusterSpec{
 				Size:    3,
-				Version: "3.5.17",
+				Version: testEtcdVersion,
 				StorageSpec: &ecv1alpha1.StorageSpec{
 					VolumeSizeRequest: resource.MustParse("2Gi"),
 				},

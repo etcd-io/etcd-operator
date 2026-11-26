@@ -91,8 +91,8 @@ func TestFetchAndValidateState(t *testing.T) {
 		}
 		return member, pod
 	}
-	ownedMember, ownedPod := memberAndPod("etcd", "default", "2", "3.5.17")
-	foreignMember, foreignPod := memberAndPod("etcd", "default", "other-uid", "3.5.17")
+	ownedMember, ownedPod := memberAndPod("etcd", "default", "2", testEtcdVersion)
+	foreignMember, foreignPod := memberAndPod("etcd", "default", "other-uid", testEtcdVersion)
 
 	cases := []struct {
 		name    string
@@ -115,7 +115,7 @@ func TestFetchAndValidateState(t *testing.T) {
 			name: "No Pods Found",
 			ec: &ecv1alpha1.EtcdCluster{
 				ObjectMeta: metav1.ObjectMeta{Name: "etcd", Namespace: "default", UID: "1"},
-				Spec:       ecv1alpha1.EtcdClusterSpec{Size: 1, Version: "3.5.17"},
+				Spec:       ecv1alpha1.EtcdClusterSpec{Size: 1, Version: testEtcdVersion},
 			},
 			req: ctrl.Request{NamespacedName: types.NamespacedName{Name: "etcd", Namespace: "default"}},
 			assert: func(t *testing.T, state *reconcileState, res ctrl.Result, err error) {
@@ -130,7 +130,7 @@ func TestFetchAndValidateState(t *testing.T) {
 			name: "Pod Exists and Owned",
 			ec: &ecv1alpha1.EtcdCluster{
 				ObjectMeta: metav1.ObjectMeta{Name: "etcd", Namespace: "default", UID: "2"},
-				Spec:       ecv1alpha1.EtcdClusterSpec{Size: 1, Version: "3.5.17"},
+				Spec:       ecv1alpha1.EtcdClusterSpec{Size: 1, Version: testEtcdVersion},
 			},
 			members: []*ecv1alpha1.EtcdMember{ownedMember},
 			pods:    []*corev1.Pod{ownedPod},
@@ -147,7 +147,7 @@ func TestFetchAndValidateState(t *testing.T) {
 			name: "Pod Not Owned By This Cluster Is Ignored",
 			ec: &ecv1alpha1.EtcdCluster{
 				ObjectMeta: metav1.ObjectMeta{Name: "etcd", Namespace: "default", UID: "3"},
-				Spec:       ecv1alpha1.EtcdClusterSpec{Size: 1, Version: "3.5.17"},
+				Spec:       ecv1alpha1.EtcdClusterSpec{Size: 1, Version: testEtcdVersion},
 			},
 			// The Pod's controlling member belongs to a different cluster
 			// (UID mismatch) → filtered out by listOwnedPods.
@@ -424,7 +424,7 @@ func TestEnsureClusterPrereqs(t *testing.T) {
 		},
 		Spec: ecv1alpha1.EtcdClusterSpec{
 			Size:    3,
-			Version: "3.5.17",
+			Version: testEtcdVersion,
 		},
 	}
 
@@ -474,7 +474,7 @@ func TestScaleCluster(t *testing.T) {
 		},
 		Spec: ecv1alpha1.EtcdClusterSpec{
 			Size:    3,
-			Version: "3.5.17",
+			Version: testEtcdVersion,
 		},
 	}
 
@@ -615,7 +615,7 @@ func TestDispatch(t *testing.T) {
 	baseCluster := func() *ecv1alpha1.EtcdCluster {
 		return &ecv1alpha1.EtcdCluster{
 			ObjectMeta: metav1.ObjectMeta{Name: "etcd", Namespace: "default", UID: "1"},
-			Spec:       ecv1alpha1.EtcdClusterSpec{Size: 3, Version: "3.5.17"},
+			Spec:       ecv1alpha1.EtcdClusterSpec{Size: 3, Version: testEtcdVersion},
 		}
 	}
 
@@ -818,7 +818,7 @@ func TestGapAwareScaleOutCreatesLowestMissingOrdinal(t *testing.T) {
 	clusterUID := types.UID("cluster-uid")
 	cluster := &ecv1alpha1.EtcdCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "etcd", Namespace: "default", UID: clusterUID},
-		Spec:       ecv1alpha1.EtcdClusterSpec{Size: 3, Version: "3.5.17"},
+		Spec:       ecv1alpha1.EtcdClusterSpec{Size: 3, Version: testEtcdVersion},
 	}
 	readyMember := func(ordinal int) ecv1alpha1.EtcdMember {
 		return ecv1alpha1.EtcdMember{
@@ -881,7 +881,7 @@ func TestReconcilePaused(t *testing.T) {
 
 	ec := &ecv1alpha1.EtcdCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "etcd", Namespace: "default", UID: "1"},
-		Spec:       ecv1alpha1.EtcdClusterSpec{Size: 3, Version: "3.5.17", Paused: true},
+		Spec:       ecv1alpha1.EtcdClusterSpec{Size: 3, Version: testEtcdVersion, Paused: true},
 	}
 
 	fakeClient := fake.NewClientBuilder().
@@ -916,7 +916,7 @@ func TestEnsureClusterFinalizer(t *testing.T) {
 		ctx := t.Context()
 		ec := &ecv1alpha1.EtcdCluster{
 			ObjectMeta: metav1.ObjectMeta{Name: "etcd", Namespace: "default"},
-			Spec:       ecv1alpha1.EtcdClusterSpec{Size: 1, Version: "3.5.17"},
+			Spec:       ecv1alpha1.EtcdClusterSpec{Size: 1, Version: testEtcdVersion},
 		}
 
 		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ec).Build()
@@ -934,7 +934,7 @@ func TestEnsureClusterFinalizer(t *testing.T) {
 		ctx := t.Context()
 		ec := &ecv1alpha1.EtcdCluster{
 			ObjectMeta: metav1.ObjectMeta{Name: "etcd", Namespace: "default", Finalizers: []string{clusterCleanupFinalizer}},
-			Spec:       ecv1alpha1.EtcdClusterSpec{Size: 1, Version: "3.5.17"},
+			Spec:       ecv1alpha1.EtcdClusterSpec{Size: 1, Version: testEtcdVersion},
 		}
 
 		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ec).Build()
@@ -1085,7 +1085,7 @@ func TestUpdateConfig(t *testing.T) {
 
 	ec := &ecv1alpha1.EtcdCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "etcd", Namespace: "default", UID: "1"},
-		Spec:       ecv1alpha1.EtcdClusterSpec{Size: 3, Version: "3.5.17"},
+		Spec:       ecv1alpha1.EtcdClusterSpec{Size: 3, Version: testEtcdVersion},
 	}
 	expectedHash := EtcdClusterHash(ec, "")
 	staleHash := "stale-hash-000001"
@@ -1093,7 +1093,7 @@ func TestUpdateConfig(t *testing.T) {
 	// Cluster of size 1 for single-node tests
 	ecSize1 := &ecv1alpha1.EtcdCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "etcd", Namespace: "default", UID: "1"},
-		Spec:       ecv1alpha1.EtcdClusterSpec{Size: 1, Version: "3.5.17"},
+		Spec:       ecv1alpha1.EtcdClusterSpec{Size: 1, Version: testEtcdVersion},
 	}
 	expectedHashSize1 := EtcdClusterHash(ecSize1, "")
 
@@ -1327,7 +1327,7 @@ func TestFinalizeCluster(t *testing.T) {
 				DeletionTimestamp: &now,
 				Finalizers:        []string{clusterCleanupFinalizer},
 			},
-			Spec: ecv1alpha1.EtcdClusterSpec{Size: 1, Version: "3.5.17"},
+			Spec: ecv1alpha1.EtcdClusterSpec{Size: 1, Version: testEtcdVersion},
 		}
 	}
 
@@ -1641,7 +1641,7 @@ func TestServiceDNSDomainPlumbsThroughBuildMemberPod(t *testing.T) {
 			r := &EtcdClusterReconciler{Scheme: scheme, ServiceDNSDomain: tt.domain}
 			ec := &ecv1alpha1.EtcdCluster{
 				ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default", UID: "abc"},
-				Spec:       ecv1alpha1.EtcdClusterSpec{Size: 3, Version: "3.5.17"},
+				Spec:       ecv1alpha1.EtcdClusterSpec{Size: 3, Version: testEtcdVersion},
 			}
 			member := &ecv1alpha1.EtcdMember{
 				ObjectMeta: metav1.ObjectMeta{Name: "example-0", Namespace: ec.Namespace},

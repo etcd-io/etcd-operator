@@ -280,7 +280,7 @@ func leaveTestCluster() *ecv1alpha1.EtcdCluster {
 		ObjectMeta: metav1.ObjectMeta{Name: "etcd", Namespace: "default", UID: "1"},
 		Spec: ecv1alpha1.EtcdClusterSpec{
 			Size:    3,
-			Version: "3.5.17",
+			Version: testEtcdVersion,
 			StorageSpec: &ecv1alpha1.StorageSpec{
 				AccessModes:       corev1.ReadWriteOnce,
 				VolumeSizeRequest: resource.MustParse("1Gi"),
@@ -292,7 +292,7 @@ func leaveTestCluster() *ecv1alpha1.EtcdCluster {
 func leaveTestMember(ordinal int) *ecv1alpha1.EtcdMember {
 	return &ecv1alpha1.EtcdMember{
 		ObjectMeta: metav1.ObjectMeta{Name: etcdMemberName("etcd", ordinal), Namespace: "default"},
-		Spec:       ecv1alpha1.EtcdMemberSpec{ClusterName: "etcd", Ordinal: ordinal, Version: "3.5.17"},
+		Spec:       ecv1alpha1.EtcdMemberSpec{ClusterName: "etcd", Ordinal: ordinal, Version: testEtcdVersion},
 	}
 }
 
@@ -724,7 +724,7 @@ func TestPickMemberToUpdate(t *testing.T) {
 	staleHash := "fed654cba321"
 	ec := &ecv1alpha1.EtcdCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "etcd", Namespace: "default", UID: "1"},
-		Spec:       ecv1alpha1.EtcdClusterSpec{Size: 3, Version: "3.5.17"},
+		Spec:       ecv1alpha1.EtcdClusterSpec{Size: 3, Version: testEtcdVersion},
 	}
 
 	// healthWithLeader returns the EpHealth map with the given ordinal as leader.
