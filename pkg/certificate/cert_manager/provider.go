@@ -219,10 +219,8 @@ func (cm *CertManagerProvider) GetCertificateConfig(ctx context.Context,
 	}
 
 	var ipAddresses []net.IP
-	if len(cmCertificate.Spec.IPAddresses) != 0 {
-		ipAddresses = make([]net.IP, len(cmCertificate.Spec.IPAddresses))
-	} else {
-		ipAddresses = nil
+	for _, ip := range cmCertificate.Spec.IPAddresses {
+		ipAddresses = append(ipAddresses, net.ParseIP(ip))
 	}
 
 	cfg := &interfaces.Config{
