@@ -282,6 +282,10 @@ func (ac *Provider) createNewSecret(ctx context.Context, secretKey client.Object
 				hosts = append(hosts, hostPort)
 			}
 		}
+		// SelfCert turns the hosts that parse as IP addresses into IP SANs.
+		for _, ip := range cfg.AltNames.IPs {
+			hosts = append(hosts, net.JoinHostPort(ip.String(), "5500"))
+		}
 	}
 
 	log.Printf("calling SelfCert with hosts: %v", hosts)

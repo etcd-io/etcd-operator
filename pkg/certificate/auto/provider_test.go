@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/x509"
 	"encoding/pem"
+	"net"
 	"testing"
 	"time"
 
@@ -63,4 +64,43 @@ func TestEnsureCertificateSecretCertHasClientAuth(t *testing.T) {
 	assert.NotEmpty(t, secret.Data["tls.key"])
 	assert.NotEmpty(t, secret.Data["ca.crt"])
 	assert.Equal(t, corev1.SecretTypeTLS, secret.Type)
+}
+
+// The certificate must carry the IP addresses of the TLS altNames, so that
+// clients connecting to etcd by IP can verify it.
+func TestEnsureCertificateSecretCertHasIPAddresses(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+
+	fakeClient := clientfake.NewClientBuilder().WithScheme(scheme).Build()
+	provider := New(fakeClient)
+
+	secretKey := client.ObjectKey{Name: "test-server-tls", Namespace: "default"}
+	cfg := &interfaces.Config{
+		CommonName:       "etcd.test",
+		ValidityDuration: interfaces.DefaultAutoValidity,
+		AltNames: interfaces.AltNames{
+			DNSNames: []string{"test.default.svc.cluster.local"},
+			IPs:      []net.IP{net.ParseIP("10.0.0.1"), net.ParseIP("fd00::1")},
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	require.NoError(t, provider.EnsureCertificateSecret(ctx, secretKey, cfg))
+
+	secret := &corev1.Secret{}
+	require.NoError(t, fakeClient.Get(ctx, secretKey, secret))
+	block, _ := pem.Decode(secret.Data["tls.crt"])
+	require.NotNil(t, block, "tls.crt is valid PEM")
+	cert, err := x509.ParseCertificate(block.Bytes)
+	require.NoError(t, err, "tls.crt parses as a certificate")
+
+	ips := make([]string, 0, len(cert.IPAddresses))
+	for _, ip := range cert.IPAddresses {
+		ips = append(ips, ip.String())
+	}
+	assert.ElementsMatch(t, []string{"10.0.0.1", "fd00::1"}, ips)
+	assert.Contains(t, cert.DNSNames, "test.default.svc.cluster.local")
 }

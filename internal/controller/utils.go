@@ -6,7 +6,6 @@ import (
 	"crypto/x509"
 	"fmt"
 	"log"
-	"net"
 	"net/url"
 	"slices"
 	"strings"
@@ -277,7 +276,7 @@ func createCMCertificateConfig(ec *ecv1alpha1.EtcdCluster, dnsDomain string) (*c
 	if cmConfig.AltNames.DNSNames != nil {
 		getAltNames = certInterface.AltNames{
 			DNSNames: cmConfig.AltNames.DNSNames,
-			IPs:      make([]net.IP, len(cmConfig.AltNames.DNSNames)),
+			IPs:      cmConfig.AltNames.IPs,
 		}
 	} else {
 		suffix := memberDNSSuffix(dnsDomain)
@@ -285,7 +284,7 @@ func createCMCertificateConfig(ec *ecv1alpha1.EtcdCluster, dnsDomain string) (*c
 			fmt.Sprintf("*.%s.%s.%s", ec.Name, ec.Namespace, suffix),
 			fmt.Sprintf("%s.%s.%s", ec.Name, ec.Namespace, suffix),
 		}
-		getAltNames = certInterface.AltNames{DNSNames: defaultDNSNames}
+		getAltNames = certInterface.AltNames{DNSNames: defaultDNSNames, IPs: cmConfig.AltNames.IPs}
 	}
 
 	return &certInterface.Config{
@@ -321,7 +320,7 @@ func createAutoCertificateConfig(ec *ecv1alpha1.EtcdCluster, dnsDomain string) (
 	if autoConfig.AltNames.DNSNames != nil {
 		altNames = certInterface.AltNames{
 			DNSNames: autoConfig.AltNames.DNSNames,
-			IPs:      make([]net.IP, len(autoConfig.AltNames.DNSNames)),
+			IPs:      autoConfig.AltNames.IPs,
 		}
 	} else {
 		suffix := memberDNSSuffix(dnsDomain)
@@ -329,7 +328,7 @@ func createAutoCertificateConfig(ec *ecv1alpha1.EtcdCluster, dnsDomain string) (
 			fmt.Sprintf("*.%s.%s.%s", ec.Name, ec.Namespace, suffix),
 			fmt.Sprintf("%s.%s.%s", ec.Name, ec.Namespace, suffix),
 		}
-		altNames = certInterface.AltNames{DNSNames: defaultDNSNames}
+		altNames = certInterface.AltNames{DNSNames: defaultDNSNames, IPs: autoConfig.AltNames.IPs}
 	}
 
 	return &certInterface.Config{
