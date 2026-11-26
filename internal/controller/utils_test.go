@@ -648,3 +648,110 @@ func TestVerifySecretHasCA(t *testing.T) {
 		assert.Contains(t, err.Error(), "cert-manager")
 	})
 }
+
+func TestParseEtcdOption(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     string
+		wantName  string
+		wantValue string
+		wantHas   bool
+	}{
+		{name: "equals form", input: "--quota-backend-bytes=1024", wantName: "--quota-backend-bytes", wantValue: "1024", wantHas: true},
+		{name: "space form in one element", input: "--quota-backend-bytes 1024", wantName: "--quota-backend-bytes", wantValue: "1024", wantHas: true},
+		{name: "bare boolean flag", input: "--enable-pprof", wantName: "--enable-pprof"},
+		{name: "space form with equals in value", input: "--initial-cluster-token a=b", wantName: "--initial-cluster-token", wantValue: "a=b", wantHas: true},
+		{name: "equals form with space in value", input: "--flag=a b", wantName: "--flag", wantValue: "a b", wantHas: true},
+		{name: "bare flag with trailing space", input: "--enable-pprof ", wantName: "--enable-pprof"},
+		{name: "value containing equals", input: "--initial-cluster=a=http://x:2380", wantName: "--initial-cluster", wantValue: "a=http://x:2380", wantHas: true},
+		{name: "empty value", input: "--flag=", wantName: "--flag", wantHas: true},
+		{name: "value in separate element is not a value", input: "1024", wantName: "1024"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			name, value, has := parseEtcdOption(tt.input)
+			assert.Equal(t, tt.wantName, name)
+			assert.Equal(t, tt.wantValue, value)
+			assert.Equal(t, tt.wantHas, has)
+		})
+	}
+}
+
+func TestBackendQuotaBytes(t *testing.T) {
+	tests := []struct {
+		name string
+		opts []string
+		want int64
+	}{
+		{name: "unset", want: defaultBackendQuotaBytes},
+		{name: "equals form", opts: []string{"--quota-backend-bytes=4096"}, want: 4096},
+		{name: "space form", opts: []string{"--quota-backend-bytes 4096"}, want: 4096},
+		{name: "other flags ignored", opts: []string{"--name=x", "--quota-backend-bytes=4096"}, want: 4096},
+		{name: "last occurrence wins", opts: []string{"--quota-backend-bytes=1", "--quota-backend-bytes=2"}, want: 2},
+		{name: "later invalid occurrence is skipped", opts: []string{"--quota-backend-bytes=4096", "--quota-backend-bytes=abc"}, want: 4096},
+		{name: "invalid value falls back to default", opts: []string{"--quota-backend-bytes=abc"}, want: defaultBackendQuotaBytes},
+		{name: "non-positive falls back to default", opts: []string{"--quota-backend-bytes=0"}, want: defaultBackendQuotaBytes},
+		{name: "bare flag falls back to default", opts: []string{"--quota-backend-bytes"}, want: defaultBackendQuotaBytes},
+		{name: "value in separate element", opts: []string{"--quota-backend-bytes", "4096"}, want: 4096},
+		{name: "separate-element value followed by another flag", opts: []string{"--name=x", "--quota-backend-bytes", "4096", "--max-txn-ops=64"}, want: 4096},
+		{name: "bare flag followed by another flag has no value", opts: []string{"--quota-backend-bytes", "--max-txn-ops=64"}, want: defaultBackendQuotaBytes},
+		{name: "flag name prefix is not a match", opts: []string{"--quota-backend-bytes-extra=4096"}, want: defaultBackendQuotaBytes},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, backendQuotaBytes(tt.opts))
+		})
+	}
+}
+
+func TestCreateArgsNormalizesOptions(t *testing.T) {
+	args := createArgs("c", []string{
+		"--quota-backend-bytes 4096", // space form in one element
+		"--name=custom",              // overrides a default
+		"--enable-pprof",             // bare boolean flag
+		"--max-txn-ops=64",
+		"--initial-cluster-token a=b", // space form whose value contains '='
+		"--snapshot-count 100 ",       // trailing whitespace
+		"--debug ",                    // bare flag with trailing whitespace
+		"--election-timeout", "1000",  // value in a separate element
+	}, "", false)
+
+	assert.Contains(t, args, "--quota-backend-bytes=4096")
+	assert.NotContains(t, args, "--quota-backend-bytes 4096")
+	assert.Contains(t, args, "--enable-pprof")
+	assert.Contains(t, args, "--max-txn-ops=64")
+	assert.Contains(t, args, "--initial-cluster-token=a=b")
+	assert.Contains(t, args, "--snapshot-count=100")
+	assert.Contains(t, args, "--debug")
+	assert.Contains(t, args, "--election-timeout=1000")
+	assert.NotContains(t, args, "1000")
+	assert.Contains(t, args, "--name=custom")
+	assert.NotContains(t, args, "--name=$(POD_NAME)", "the default --name must be replaced")
+}
+
+func TestNormalizeEtcdOptions(t *testing.T) {
+	tests := []struct {
+		name  string
+		input []string
+		want  []string
+	}{
+		{name: "nil", input: nil, want: []string{}},
+		{name: "equals form unchanged", input: []string{"--a=1", "--b=2"}, want: []string{"--a=1", "--b=2"}},
+		{name: "space form", input: []string{"--a 1"}, want: []string{"--a=1"}},
+		{name: "separate elements are merged", input: []string{"--a", "1", "--b=2"}, want: []string{"--a=1", "--b=2"}},
+		{name: "separate value containing spaces and equals", input: []string{"--a", "x=y z"}, want: []string{"--a=x=y z"}},
+		{name: "bare flags stay bare", input: []string{"--a", "--b"}, want: []string{"--a", "--b"}},
+		{name: "bare flag at the end", input: []string{"--a=1", "--b"}, want: []string{"--a=1", "--b"}},
+		{name: "bare flag followed by a flag with a value", input: []string{"--a", "--b=2"}, want: []string{"--a", "--b=2"}},
+		{name: "boolean flag before a separate pair", input: []string{"--force-new-cluster", "--quota-backend-bytes", "4096"}, want: []string{"--force-new-cluster", "--quota-backend-bytes=4096"}},
+		{name: "boolean flag between flags", input: []string{"--name=x", "--force-new-cluster", "--max-txn-ops=64"}, want: []string{"--name=x", "--force-new-cluster", "--max-txn-ops=64"}},
+		{name: "boolean flag last after a separate pair", input: []string{"--quota-backend-bytes", "4096", "--force-new-cluster"}, want: []string{"--quota-backend-bytes=4096", "--force-new-cluster"}},
+		{name: "consecutive separate pairs", input: []string{"--a", "1", "--b", "2"}, want: []string{"--a=1", "--b=2"}},
+		{name: "surrounding whitespace is trimmed", input: []string{" --a ", " 1 "}, want: []string{"--a=1"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, normalizeEtcdOptions(tt.input))
+		})
+	}
+}

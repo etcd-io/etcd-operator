@@ -136,28 +136,66 @@ func RemoveStringFromSlice(s []string, str string) []string {
 	return s
 }
 
+// parseEtcdOption splits an etcdOptions element into the flag name and value.
+// It accepts "--flag=value", "--flag value" and a bare "--flag" (hasValue is
+// false). Whichever of '=' and ' ' comes first is the separator, and
+// surrounding whitespace is ignored.
+func parseEtcdOption(opt string) (name, value string, hasValue bool) {
+	opt = strings.TrimSpace(opt)
+	idx := strings.IndexAny(opt, "= ")
+	if idx == -1 {
+		return opt, "", false
+	}
+	return opt[:idx], strings.TrimSpace(opt[idx+1:]), true
+}
+
 func getArgName(s string) string {
-	idx := strings.Index(s, "=")
-	if idx != -1 {
-		return s[:idx]
+	name, _, _ := parseEtcdOption(s)
+	return name
+}
+
+// normalizeEtcdOption rewrites the single-element "--flag value" form to
+// "--flag=value". Options are passed to etcd in exec form, so a "--flag value"
+// element would reach etcd as one token with a space in the flag name and be
+// rejected. Surrounding whitespace is trimmed; the "--flag=value" and bare
+// "--flag" forms are otherwise returned unchanged.
+func normalizeEtcdOption(opt string) string {
+	opt = strings.TrimSpace(opt)
+	name, value, hasValue := parseEtcdOption(opt)
+	if hasValue && opt[len(name)] == ' ' && strings.HasPrefix(name, "-") {
+		return name + "=" + value
 	}
-	idx = strings.Index(s, " ")
-	if idx != -1 {
-		return s[:idx]
+	return opt
+}
+
+// normalizeEtcdOptions rewrites every option to the canonical "--flag=value"
+// (or bare "--flag") form. It normalizes the single-element "--flag value"
+// form and merges the two-element form []string{"--flag", "value"} into
+// []string{"--flag=value"}. etcd takes no positional arguments, so an element
+// that does not start with "-" right after a bare flag can only be that flag's
+// value.
+func normalizeEtcdOptions(opts []string) []string {
+	out := make([]string, 0, len(opts))
+	for i := 0; i < len(opts); i++ {
+		opt := normalizeEtcdOption(opts[i])
+		if name, _, hasValue := parseEtcdOption(opt); !hasValue && strings.HasPrefix(name, "-") && i+1 < len(opts) {
+			if next := strings.TrimSpace(opts[i+1]); next != "" && !strings.HasPrefix(next, "-") {
+				opt = name + "=" + next
+				i++
+			}
+		}
+		out = append(out, opt)
 	}
-	return strings.TrimSpace(s)
+	return out
 }
 
 func createArgs(name string, etcdOptions []string, dnsDomain string, tlsEnabled bool) []string {
 	defaultArgs := defaultArgs(name, dnsDomain, tlsEnabled)
-	if len(etcdOptions) > 0 {
-		for i := range etcdOptions {
-			argName := getArgName(etcdOptions[i])
-			defaultArgs = RemoveStringFromSlice(defaultArgs, argName)
-		}
+	normalized := normalizeEtcdOptions(etcdOptions)
+	for _, opt := range normalized {
+		defaultArgs = RemoveStringFromSlice(defaultArgs, getArgName(opt))
 	}
-	defaultArgs = append(defaultArgs, etcdOptions...)
-	return defaultArgs
+	return append(defaultArgs, normalized...)
 }
 
 // ---------------------------------------------------------------------------

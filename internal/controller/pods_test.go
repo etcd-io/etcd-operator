@@ -685,7 +685,7 @@ func TestCreatingArgs(t *testing.T) {
 			},
 		},
 		{
-			testName: "Etcd options with spaces",
+			testName: "Etcd options with spaces are normalized to --flag=value",
 			etcdOptions: []string{
 				"--max-wals 7",
 				"--discovery-failbox proxy",
@@ -697,8 +697,8 @@ func TestCreatingArgs(t *testing.T) {
 				"--listen-client-urls=http://0.0.0.0:2379",
 				"--initial-advertise-peer-urls=http://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc:2380",
 				"--advertise-client-urls=http://$(POD_NAME).testCluster.$(POD_NAMESPACE).svc:2379",
-				"--max-wals 7",
-				"--discovery-failbox proxy",
+				"--max-wals=7",
+				"--discovery-failbox=proxy",
 			},
 		},
 		{
