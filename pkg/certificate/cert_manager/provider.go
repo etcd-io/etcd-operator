@@ -171,14 +171,10 @@ func (cm *CertManagerProvider) DeleteCertificateSecret(ctx context.Context, secr
 			Namespace: secretKey.Namespace,
 		},
 	}
-	certStatusErr := cm.checkCertificateStatus(secretKey.Name, secretKey.Namespace, ctx)
-	if certStatusErr != nil {
-		log.Printf("Certificate associated not ready yet, try again later.")
-		return certStatusErr
-	}
-
+	// Delete the Certificate whatever its status: cleanup must also succeed when
+	// cert-manager never issued it, or when it's already gone.
 	dErr := cm.Delete(ctx, cmCertificate)
-	if dErr != nil {
+	if dErr != nil && !k8serrors.IsNotFound(dErr) {
 		return dErr
 	}
 
